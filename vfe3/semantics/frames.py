@@ -20,7 +20,9 @@ computed in the gauge-fixed chart
 with ``m`` the bi-invariant (exponential) barycenter of the reference frames. ``U_hat`` is invariant
 under (i) and (iii) when ``m`` is the fixed point (up to the barycenter residual otherwise); statistics of the raw coordinates are labeled as statements about the trained
 trivialization. For ``transport_mode="flat"`` the transport :math:`\Omega_{ij} = U_i U_j^{-1}`
-telescopes, so holonomy is identically the identity and is never plotted.
+telescopes, so its loop holonomy is identically the identity and is never plotted; the relational content
+links are a separate connection whose triangle holonomy is not the identity in general and is not measured
+here (:func:`_frame_holonomy_note`).
 
 All matrix work is float64 torch on the CPU, batched over tokens and chunked over rows.
 """
@@ -50,6 +52,7 @@ from vfe3.semantics.common import (
     save_figure,
     write_table,
 )
+from vfe3.semantics.stats import holm_adjust
 
 Tensor = torch.Tensor
 
@@ -62,7 +65,7 @@ _PAR_MIN_ROWS = 64           # smallest per-worker share of a batch worth a thre
 
 # run_phi_section budgets; every key is overridable through ctx.options
 PHI_DEFAULTS: Dict[str, Any] = {
-    "frame_ref_count":          4096,   # reference set for the barycenter and D0 (top frequency)
+    "frame_ref_count":          4096,   # barycenter and D0 reference set (top frequency; id order without counts)
     "frame_rerank":             100,    # group-analogy rerank pool
     "frame_rerank_questions":   500,    # benchmark questions reranked (seeded sample; curated: all)
     "frame_null":               500,    # relation-transport permutation-null draws
@@ -70,6 +73,15 @@ PHI_DEFAULTS: Dict[str, Any] = {
     "frame_max_positions":      None,   # positional analysis window (None -> cfg.max_seq_len)
     "frame_positional_null":    200,    # position-permutation null draws of the relative-position R^2
 }
+
+# Stable per-step streams np.random.default_rng([seed, _PHI_STREAM, id]) of run_phi_section, so each
+# stochastic step draws the same numbers whichever others ran, failed or changed budget (as in
+# vectors._STEP_STREAM; audit 2026-10-16 F73). Ids are nonzero: trailing zero words do not change a
+# SeedSequence pool, so [seed, _PHI_STREAM, 0] would collide with [seed, _PHI_STREAM].
+_PHI_STREAM = 0x70E1
+_TRANSPORT_ALPHA = 0.01      # relation transports: consistent when the permutation p (and Holm-adjusted p) < this
+_PHI_STEP_STREAM: Dict[str, int] = {"positional": 1, "commutators_raw": 2, "commutators_canonical": 3,
+                                    "group_analogies_benchmark": 4, "relation_transports": 5}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1255,6 +1267,56 @@ def _barycenter_qualifier(cf: CanonicalFrames) -> str:
     return f" only up to O(r), r = {cf.diagnostics['barycenter_residual_max']:.1e},"
 
 
+def _frame_holonomy_note(cfg: Any) -> str:
+    r"""Report sentence on holonomy: identity for the frame transport only, not for the content links.
+
+    The flat transport :math:`\Omega_{ij} = U_iU_j^{-1}` telescopes, so its loop holonomy is the identity.
+    The head-sum content link :math:`L_{ij} = U_i\hat O B_{ij}\hat T U_j^{-1}` is a separate connection:
+    for tiled heads (:math:`Hd = K`) and invertible maps its triangle holonomy :math:`L_{ik}^{-1}L_{ij}L_{jk}`
+    is conjugate to :math:`R_{ijk}\hat T\hat O` with
+    :math:`R_{ijk} = \bigoplus_h \rho^h_{ijk} I_d`, :math:`\rho^h_{ijk} = \beta^h_{ij}\beta^h_{jk}/\beta^h_{ik}`
+    (:func:`vfe3.metrics.routing_triangle_defect_sums`), which is not the identity in general even with
+    ``content_link_edges="off"`` (audit 2026-10-16 F74); edge links add per-edge factors.
+
+    The minimal-agent readout (:func:`minimal_agent_readout_route`) has no content map :math:`O`: head
+    :math:`h` carries the message :math:`T_h\xi_j` into the receiver through
+    :math:`G^h_{ij} = C_iS_h^\top W_{ij}^{-1}`, :math:`W_{ij} = A_i + B_j`, which depends on the edge and on
+    the beliefs, so the content transport around a loop is not the identity in general either.
+    """
+    frame = ("flat frame transport: Omega_ij = U_i U_j^-1 telescopes, so its loop holonomy is identically the "
+             "identity; no frame holonomy is computed or plotted. ")
+    if minimal_agent_readout_route(cfg):
+        return frame + ("The minimal-agent content transport is a separate connection: head h carries the message "
+                        "T_h xi_j into receiver i through G_ij = C_i S_h^T W_ij^-1, which depends on the edge and on "
+                        "the beliefs, so the transport around a loop is not the identity in general; this section "
+                        "does not measure it.")
+    edges = getattr(cfg, "content_link_edges", "off")
+    edge_clause = ("" if edges in (None, "off") else
+                   f", and the edge links G_ij of content_link_edges={edges!r} add per-edge factors")
+    return frame + ("The relational content links are a separate connection: the head-sum link "
+                    "L_ij = U_i O B_ij T U_j^-1 has triangle holonomy L_ik^-1 L_ij L_jk, which for tiled invertible "
+                    "maps is conjugate to R_ijk T O with R_ijk the head-wise routing ratios beta_ij beta_jk / beta_ik, "
+                    f"so it is not the identity in general{edge_clause}; this section does not measure it (during "
+                    "training, diagnostics/routing_holonomy.csv records the path-weighted mean and RMS of "
+                    "log rho_ijk).")
+
+
+def minimal_agent_readout_route(cfg: Any) -> bool:
+    r"""Whether the run's readout is the minimal agent, which has no content map ``O`` (no head-sum link)."""
+    return getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
+
+
+def reference_set_phrase(n_ref: int, *, by_count: bool) -> str:
+    r"""How the ``n_ref`` reference frames of the barycenter and ``D0`` were chosen.
+
+    They are the first ``n_ref`` candidates, which :func:`vfe3.semantics.run.prepare_context` orders by
+    descending training count, or by token id when counts are unavailable (audit 2026-10-16 F76).
+    """
+    if by_count:
+        return f"the {int(n_ref)} most frequent candidate frames"
+    return f"the first {int(n_ref)} candidate frames in token-id order (training counts unavailable)"
+
+
 def _rerank_rank_text(q: Mapping[str, Any], pool: int) -> str:
     r"""Log-rerank rank of one question's answer, or why it has none."""
     if q["rank_rerank"] is not None:
@@ -1641,6 +1703,7 @@ def _relation_table(rel: Dict[str, Any]) -> str:
                      "consistency": v["consistency"] if ok else None,
                      "null mean": v["null_mean"] if ok else None, "null sd": v["null_std"] if ok else None,
                      "z": v["z"] if ok else None, "p": v["p"] if ok else None,
+                     "p (Holm)": v.get("p_holm") if ok else None,
                      "mean ||log T||_F": v["log_norm_mean"] if ok else None})
     return markdown_table(rows)
 
@@ -1709,9 +1772,12 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         finally:
             timings[name] = timings.get(name, 0.0) + time.perf_counter() - t0
 
-    rng = np.random.default_rng([int(ctx.seed), 0x70E1])
+    def rng(step_name: str) -> np.random.Generator:
+        return np.random.default_rng([int(ctx.seed), _PHI_STREAM, _PHI_STEP_STREAM[step_name]])
+
     n_ref = int(min(int(_opt(ctx, "frame_ref_count")), ids.size))
-    ref_ids = ids[:n_ref]
+    ref_ids = ids[:n_ref]                    # candidates are in count order, or id order without counts
+    ref_by_count = ctx.counts is not None
     cfg = run.cfg
     d_status, d_reason = diagonal_redundancy_status(cfg)
 
@@ -1721,7 +1787,8 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         qual = _barycenter_qualifier(cf)
         res.notes.append(
             f"Per-token frame statistics use the gauge-fixed chart U_hat = D0 e^X m^-1 D0^-1 (m = bi-invariant "
-            f"barycenter of the {n_ref} most frequent candidate frames, D0 from their mean log-variance), which is "
+            f"barycenter of {reference_set_phrase(n_ref, by_count=ref_by_count)}, D0 from their mean "
+            f"log-variance), which is "
             f"invariant{qual} under the split redundancy e^X -> e^X k and the global positive-diagonal rescaling. "
             "Norms, commutators and BCH gaps of the raw coordinates describe the trained trivialization only.")
         if qual:
@@ -1735,11 +1802,7 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                              "log (eigenvalue on the closed negative real axis) and are excluded from log-chart "
                              "statistics.")
     res.notes.append(_diagonal_note(d_status, d_reason))
-    res.notes.append("flat frame transport: Omega_ij = U_i U_j^-1 telescopes, so its loop holonomy is identically "
-                     "the identity; no frame holonomy is computed or plotted."
-                     + ("" if getattr(cfg, "content_link_edges", "off") in (None, "off") else
-                        f" The content links G_ij of content_link_edges={cfg.content_link_edges!r} are a separate "
-                        "connection whose triangle holonomy is not the identity; this report does not measure it."))
+    res.notes.append(_frame_holonomy_note(cfg))
     if getattr(run, "phi_frozen", False):
         res.notes.append("phi is not updated in context: each realized frame is the token's lookup frame "
                          "times the positional right factor e^{Y_p}.")
@@ -1750,11 +1813,11 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
              if scalars is not None and log_count is not None else None)
 
     n_pairs = int(_opt(ctx, "frame_commutator_pairs"))
-    comm = step("commutators_raw", lambda: commutator_diagnostics(run, ids, rng, n_pairs))
+    comm = step("commutators_raw", lambda: commutator_diagnostics(run, ids, rng("commutators_raw"), n_pairs))
 
     def _canonical_commutators() -> Dict[str, Any]:
         ok_rows = np.flatnonzero(cf.ok)
-        pa, pb = _random_pairs(ok_rows.size, n_pairs, rng)
+        pa, pb = _random_pairs(ok_rows.size, n_pairs, rng("commutators_canonical"))
         ta, tb = torch.from_numpy(ok_rows[pa]), torch.from_numpy(ok_rows[pb])
         return _commutator_stats([Lb[ta] for Lb in cf.L], [Lb[tb] for Lb in cf.L])
 
@@ -1763,7 +1826,8 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     rerank = int(_opt(ctx, "frame_rerank"))
     ga_bench = (step("group_analogies_benchmark",
                      lambda: group_analogies(cf, ctx.analogies, rerank=rerank,
-                                             max_rerank_questions=_opt(ctx, "frame_rerank_questions"), rng=rng))
+                                             max_rerank_questions=_opt(ctx, "frame_rerank_questions"),
+                                             rng=rng("group_analogies_benchmark")))
                 if cf is not None and ctx.analogies else None)
     ga_cur = (step("group_analogies_curated", lambda: group_analogies(cf, ctx.curated_analogies, rerank=rerank))
               if cf is not None and ctx.curated_analogies else None)
@@ -1773,13 +1837,27 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                          "on all covered questions and on exactly that sample, and only the latter pairs with the "
                          "rerank accuracy.")
 
-    rel = ((step("relation_transports", lambda: relation_transports(cf, ctx.relations, rng, int(_opt(ctx, "frame_null"))))
+    rel = ((step("relation_transports", lambda: relation_transports(cf, ctx.relations, rng("relation_transports"),
+                                                                    int(_opt(ctx, "frame_null"))))
             if cf is not None and ctx.relations else None) or {})
+    tested = [k for k, v in rel.items() if v.get("status") == "ok" and v.get("p") is not None]
+    if tested:
+        # One family: every relation whose transports were tested (audit 2026-10-16 F71).
+        for k, p_holm in zip(tested, holm_adjust([rel[k]["p"] for k in tested])):
+            rel[k]["p_holm"] = p_holm
+        n_null = int(_opt(ctx, "frame_null"))
+        floor = len(tested) / (1.0 + n_null)
+        res.notes.append(
+            f"Relation-transport p-values are Holm-adjusted over the {len(tested)} tested relations (p_holm; "
+            "family-wise error under any dependence between relations that share words)."
+            + (f" With {n_null} null draws the smallest attainable adjusted p is {len(tested)}/(1 + {n_null}) = "
+               f"{floor:.3g} >= {_TRANSPORT_ALPHA:g}, so no relation can pass the adjusted test at this budget "
+               "(frame_null)." if floor >= _TRANSPORT_ALPHA else ""))
 
     n_perm = int(_opt(ctx, "frame_positional_null"))
-    pos_rng = np.random.default_rng([int(ctx.seed), 0x70E1, 1])
     pos = step("positional_frames",
-               lambda: positional_frames(run, _opt(ctx, "frame_max_positions"), n_perm=n_perm, rng=pos_rng))
+               lambda: positional_frames(run, _opt(ctx, "frame_max_positions"), n_perm=n_perm,
+                                         rng=rng("positional")))
     if pos is None and not any(f["step"] == "positional_frames" for f in failed):
         res.notes.append("No positional frames (pos_phi='none'): the realized frame is the token frame.")
     elif pos is not None:
@@ -1832,7 +1910,7 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         positional["y_norm"] = _summary(pos["y_norm"])
     res.metrics = {
         "chart": cf.diagnostics if cf is not None else None,
-        "n_tokens": int(ids.size), "n_ref": n_ref,
+        "n_tokens": int(ids.size), "n_ref": n_ref, "ref_order": "frequency" if ref_by_count else "token_id",
         "diagonal_redundancy": {"status": d_status, "reason": d_reason},
         "invariants": ({k: {"summary": _summary(scalars[k]),
                             "spearman_log_count": None if spear is None else spear[k]}
@@ -1881,8 +1959,12 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
             f"{q['rank_chart']} / {_rerank_rank_text(q, ga_cur['rerank_pool'])}")
     ok_rel = [v for v in rel.values() if v.get("status") == "ok"]
     if ok_rel:
-        head["phi: relations with consistent transports (p < 0.01)"] = (
-            f"{sum(1 for v in ok_rel if v['p'] is not None and v['p'] < 0.01)} / {len(ok_rel)}")
+        head[f"phi: relations with consistent transports (p < {_TRANSPORT_ALPHA:g})"] = (
+            f"{sum(1 for v in ok_rel if v['p'] is not None and v['p'] < _TRANSPORT_ALPHA)} / {len(ok_rel)}")
+        holm = [v["p_holm"] for v in ok_rel if v.get("p_holm") is not None]
+        if holm:
+            head[f"phi: relations with consistent transports (Holm-adjusted p < {_TRANSPORT_ALPHA:g} over the "
+                 f"{len(holm)} relations)"] = f"{sum(1 for p in holm if p < _TRANSPORT_ALPHA)} / {len(holm)}"
     if pos is not None:
         key = "phi: positional R2 by offset / by absolute m (position-permutation null mean, q95, p)"
         null = pos["null"] or {}

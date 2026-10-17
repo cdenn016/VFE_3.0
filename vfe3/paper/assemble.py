@@ -20,7 +20,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import numpy as np
 

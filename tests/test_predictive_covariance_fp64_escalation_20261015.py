@@ -3,8 +3,8 @@ r"""float64 escalation of the moment-matched covariance update (``predictive_cov
 diag(U C^att U^T) leaves the reference coordinates through U, so float32 rounding of C^att is amplified by about
 kappa(U)^2. On the K=160 block_glk run a variance came out at -5164 (about 1e-3 of its absolute term sum), and the
 next layer's diagonal comparison route took its square root. Under the toggle a float32 update with any nonpositive
-(or non-finite) variance, or a non-positive-definite full covariance, is recomputed whole in float64, cast back and
-counted in its own counter (covariance_escalation_elements; audit 2026-10-15); a float64 failure raises. Off, the update is unchanged. The failing float32
+(or non-finite) variance, or a non-positive-definite full covariance, has its failing sequences recomputed in
+float64, cast back and counted in its own counter (covariance_escalation_elements; audit 2026-10-15); a float64 failure raises. Off, the update is unchanged. The failing float32
 update is injected so the trigger is exercised exactly; tiny CPU shapes only.
 """
 from typing import Callable

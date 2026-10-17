@@ -16,7 +16,8 @@ read as ``-``, ``,``, ``.``, and each ``<unk>`` of the word-level text matched a
 original word of at most :data:`MAX_UNK_CHARS` characters (the word-level release replaced rare words
 by ``<unk>``; a BPE stream built from the raw variant carries the words). The result is the fraction of
 word-level characters matched in order, the fraction of BPE characters accounted for, and the verdict
-``same_text`` (both exactly one).
+``same_text`` (both exactly one, with every segment found in its wildcard window and every ``<unk>``
+matched).
 
 (b) :func:`target_coverage` checks that the scored target positions are exactly :math:`1, \dots, T-1`
 for a :math:`T`-token stream (the first token is never a target).
@@ -177,14 +178,18 @@ def text_audit(
     located in order in the normalized BPE text, starting between one and ``max_unk_chars`` characters
     per preceding wildcard after the previous match. A segment that is not found there is matched
     piecewise (:data:`RESYNC_PIECE_CHARS`) to count its characters and resynchronize, and recorded as a
-    mismatch example.
+    mismatch example; the wildcards before it count as unmatched. A trailing wildcard is matched when the
+    BPE tail after the last segment has between one and ``max_unk_chars`` characters per wildcard.
+    ``same_text`` requires every word character matched, every BPE character accounted for, no
+    mismatched segment and no unmatched wildcard: a resynchronized segment's characters count as matched,
+    so the character counts alone can be complete while a word the BPE text lacks went unmatched.
     """
     B = normalize_for_audit(bpe_text)
     W = normalize_for_audit(word_text)
     segments = W.split(UNK)
     n_unk = len(segments) - 1
     word_chars = len(W) - len(UNK) * n_unk
-    matched = wildcard_chars = cursor = pending = mismatched_segments = 0
+    matched = wildcard_chars = cursor = pending = mismatched_segments = unmatched_wildcards = 0
     examples: List[Dict[str, Any]] = []
     for k, segment in enumerate(segments):
         if k > 0:
@@ -200,6 +205,7 @@ def text_audit(
             cursor = found + len(segment)
         else:
             mismatched_segments += 1
+            unmatched_wildcards += pending
             if len(examples) < MISMATCH_EXAMPLES:
                 examples.append({"segment": k, "bpe_offset": cursor, "word_text": segment[:80],
                                  "bpe_text": B[cursor:cursor + 80]})
@@ -212,14 +218,18 @@ def text_audit(
         if pending <= tail <= pending * max_unk_chars:
             wildcard_chars += tail
             cursor = len(B)
+        else:
+            unmatched_wildcards += pending
     unmatched_bpe = len(B) - matched - wildcard_chars
-    same = matched == word_chars and unmatched_bpe == 0
+    same = (matched == word_chars and unmatched_bpe == 0 and mismatched_segments == 0
+            and unmatched_wildcards == 0)
     return {
         "same_text": bool(same),
         "char_match_fraction": matched / word_chars if word_chars else float("nan"),
         "bpe_chars_accounted_fraction": (matched + wildcard_chars) / len(B) if B else float("nan"),
         "word_chars": int(word_chars), "bpe_chars": int(len(B)), "matched_chars": int(matched),
         "unk_wildcards": int(n_unk), "unk_wildcard_chars": int(wildcard_chars),
+        "unmatched_unk_wildcards": int(unmatched_wildcards),
         "unmatched_bpe_chars": int(unmatched_bpe), "mismatched_segments": int(mismatched_segments),
         "mismatch_examples": examples,
         "raw_counts": {
@@ -372,7 +382,8 @@ def calibration_table(result: Mapping[str, Any]) -> str:
               f"{100 * audit['char_match_fraction']:.4f}% of {audit['word_chars']:,} word-level characters matched "
               f"in order; {100 * audit['bpe_chars_accounted_fraction']:.4f}% of {audit['bpe_chars']:,} BPE characters "
               f"accounted for, {audit['unk_wildcards']:,} <unk> wildcards covering {audit['unk_wildcard_chars']:,} "
-              f"characters; {audit['mismatched_segments']} mismatched segments. Normalization: "
+              f"characters ({audit.get('unmatched_unk_wildcards', 0)} unmatched); "
+              f"{audit['mismatched_segments']} mismatched segments. Normalization: "
               + "; ".join(audit["normalization"].values()) + "."]
     if status == "incomplete_coverage":
         lines.append(f"Coverage incomplete: {head.get('reason')}.")

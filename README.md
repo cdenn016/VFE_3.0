@@ -30,7 +30,8 @@ whole model: the diagonal family cannot represent $g\Sigma g^\top$, and local
 `block_coordinates` and `decode_coordinates` apply the block norm, the block MLP and the
 decoder to frame-dependent coordinates. Setting `family="gaussian_full"` with
 `block_coordinates="reference"` and `decode_coordinates="reference"` on the
-projected-predictive route without RoPE (these admit a `none` or `layernorm` norm and the
+projected-predictive route with `rope_mode` `none` or a comparison mode (frame-space RoPE
+folds a rotation into the content frame; these admit a `none` or `layernorm` norm and the
 coordinate, Gaussian-template or prototype block MLP, all conjugated by the realized frame)
 gives the frame-covariant path.
 In this sense the model expresses coordination among agents as inference: whom to trust, how
@@ -116,8 +117,10 @@ SPD family closed under the block_glk congruence. It is stored in the dense $(K,
 with zero off-head blocks, and the moment-matched update returns the head blocks
 $U_{i,h}[C_i^{\mathrm{att}}]_{hh}U_{i,h}^\top$, the moment projection onto the family, which
 does not depend on the frame. It is defined on the kernel predictive readout with compact
-head-block frames (block_glk, block_so, block_co, block_glmc or an equal-block so_n tower, any
-tying), edge links off, a passthrough block MLP, and the `linear`,
+head-block frames (block_glk, block_so, block_co, block_sl, block_borel, block_unipotent,
+block_glmc or an equal-block so_n or su_n tower, any tying), edge links off, a block MLP whose
+covariance is read through its head-block projection (`posterior` needs
+`block_mlp_inference="mean_field"`), no CG coupling, and the `linear`,
 `diagonal_chunked` or `full_chunked` decoders (the diagonal decoder reads
 $\operatorname{diag}\Sigma_i$, exact up to a per-position constant). With identity frames
 (`gauge_transport="off"`), `prior_covariance_table="block_cholesky"` replaces the diagonal
@@ -288,8 +291,11 @@ persistence term, and the prior-anchored floor $f\Sigma_{p,i}$, with $f$ =
 `predictive_covariance_floor` and $\Sigma_{p,i}$ the token's local prior covariance (the layer
 prior, the embedding prior under `prior_handoff_sigma=0`). The floor involves no frame, so a
 common reference change leaves the covariance unchanged. It replaced the floor
-$f(\mathrm{tr}C_i/K)I$ in reference coordinates on 2026-10-12; a run saved before then replays
-with the new floor, and its saved configuration does not record which floor it trained under.
+$f(\mathrm{tr}C_i/K)I$ in reference coordinates on 2026-10-12, which remains selectable as
+`predictive_covariance_floor_mode="relative"`. A configuration saved before then records no floor
+mode and no `phi_frame_condition_max` (added the same day), and `config_from_serialized` reloads
+it with `"relative"`, the floor it trained under; one saved between 2026-10-12 and the
+floor-mode field (2026-10-16) carries `phi_frame_condition_max` and reloads with `"prior"`.
 Neither is a routed population
 joint law. Subsequent block transforms and
 stack handoff have separate covariance policies, and neither contract is exact Gaussian
@@ -498,25 +504,78 @@ the validator for the complete admission rules.
 | `predictive_readout="minimal_agent"` | Replaces the kernel readout by each receiver's exact Gaussian conditioning on a noisy comparison record whose key is tied to the content ($S_K=T$, no $O$). Routing is the source posterior at temperature 1, so `relational_routing`, `kappa_beta` and `kl_max` are unread. `minimal_agent_inference="exact"` combines per-head exact posteriors by assumed-density filtering; `"mean_field"` uses KL labels and an information-form fusion, with `minimal_agent_cavi_steps` coordinate-ascent sweeps. |
 | `predictive_covariance="spread_corrected"` | Minimal agent with mean-field inference only. Restores the between-source spread that the mean field drops: the mean-field covariance $P$ plus the linearized label spread $\sum_h PS_h^\top R'_hS_hP$, $R'_h=\sum_j\beta_{ij}^{(h)}d_jd_j^\top$, plus the floor; invariant under a reference change. |
 | `relational_routing="noisy_key"` | Kernel readout only. Routes on $D_{\mathrm{KL}}(\mathcal N(a_i,V_{Q,i})\Vert\mathcal N(b_j,V_{K,j}+n_hI))$ at temperature 1, with a learned per-head key noise $n_h$ (`routing_key_log_noise`, initialized from `relational_key_noise`, score learning rate, no weight decay). |
-| `diagnose_agent_elbo` | Default `False`. At the evaluation cadence, logs per layer the ELBO of the minimal agent's posterior and of each prototype-agent block, the evidence of the declared record model and their gap, in nats per token; computed without autograd and never in the loss. With coupled heads the minimal agent's evidence is an assumed-density value, so its gap is not guaranteed nonnegative. The mean-field minimal agent also reports the channel-noise M-step optimum $n_h^\star$ (`channel_noise_mstep`) as a diagnostic; the learned noise is not set to it. |
+| `diagnose_agent_elbo` | Default `False`. At the evaluation cadence, logs per layer the ELBO of the minimal agent's posterior and of each prototype-agent block, the evidence of the declared record model and their gap, in nats per token; computed without autograd and never in the loss. With coupled heads the minimal agent's evidence is an assumed-density value, so its gap is not guaranteed nonnegative. The minimal agent also logs a 64-draw importance-sampled evidence under its posterior q with the effective sample size fraction of the weights (`is_ess`); with heterogeneous source covariances the mean-field q is narrower than the posterior mixture, single receivers can be off by more than a nat, and a low `is_ess` flags them. The mean-field minimal agent also reports the channel-noise M-step optimum $n_h^\star$ (`channel_noise_mstep`) as a diagnostic; the learned noise is not set to it. |
 | `block_mlp_mode="prototype_agents"` | Replaces the feed-forward block MLP by the minimal-agent model on $M$ = `block_mlp_expansion`·$K$ template agents. `block_mlp_inference` selects `"mean_field"` (KL-label responsibilities and a power posterior, `block_mlp_cavi_steps` sweeps) or `"exact"` (the mixture posterior); `block_mlp_covariance="posterior"` returns the template posterior covariance; `block_mlp_em_weight>0` adds an EM M-step term on the templates; `block_mlp_template_init` is `"absolute"` or `"working_variance"`. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `rope_mode="none"` or comparison-space RoPE (`"comparison"` or `"comparison_invariant"`). |
 | `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
-| `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays uniform. Not with `predictive_readout="minimal_agent"`. |
+| `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays at the attention prior $\pi$ (uniform under a causal mask). Not with `predictive_readout="minimal_agent"`. |
 | `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
 zero weight decay.
 
-Three numerical safeguards trade cost for conditioning; each is at its cheapest setting by default.
+Four numerical safeguards trade cost for conditioning; each is at its cheapest setting by default.
 
 | Setting | Effect |
 |---|---|
-| `phi_frame_condition_max` | Default `None`. A number $\kappa_{\max}>1$ bounds $\mathrm{cond}_2(U_i)\le\kappa_{\max}$ after each accepted step: through $\kappa_2(e^X)\le e^{\mathrm{spread}(\mathrm{sym}X)}$, the eigenvalue spread of the traceless symmetric part of every head block of each frame factor is limited to $\log\kappa_{\max}/n_{\mathrm{factors}}$, keeping the trace and the skew part. `block_glk` and `block_glmc` with `m_phi_update_mode="adamw"` and `encode_mode="per_token"` only; under `pos_phi="frozen"` the frozen positional factor is not bounded. |
+| `phi_frame_condition_max` | Default `None`. A number $\kappa_{\max}>1$ bounds $\mathrm{cond}_2(U_i)\le\kappa_{\max}$ after each accepted step: through $\kappa_2(e^X)\le e^{\mathrm{spread}(\mathrm{sym}X)}$, the eigenvalue spread of the traceless symmetric part of every head block of each frame factor is limited to $\log\kappa_{\max}/n_{\mathrm{factors}}$, keeping the trace and the skew part. `block_glk`, `block_glmc` and `block_sl` with `m_phi_update_mode="adamw"` and `encode_mode="per_token"` only (inert, since $\mathrm{cond}_2=1$, for `block_so`, `block_co`, `so_n` and `su_n`; refused for `block_borel` and `block_unipotent`); under `pos_phi="frozen"` the frozen positional factor is not bounded. |
 | `projected_factorization` | Factorization of the projected Gaussian-KL scorer. `"gram"` (default) factors the float32 Gram matrix (error $O(\epsilon\kappa^2)$); `"gram_certified"` also rebuilds entries that factor but fail a condition certificate; `"cholesky_qr2_certified"` factors by CholeskyQR2 (error $O(\epsilon\kappa)$) where the scorer has source roots. The certified modes are costly on CUDA. |
 | `frame_pair_escalation_tol` | Default `None`. A tolerance in $(0,1)$ recomputes a frame producer call in float64 when its float32 frame pair has $\epsilon_{32}\kappa_F(U)$ above it; about 7 times the cost of an escalated step. |
+| `predictive_covariance_precision` | Default `"fp32"`. `"fp64"` computes the kernel moment-matched covariance update in float64 from float32 beliefs and casts it back, removing the float32 round-trip error amplified by about $\kappa(U)^2$ (positive-but-wrong variances that `predictive_covariance_fp64_escalation` does not see); the minimal agent does not read it. The cost is not measured; the estimate is about twice the step time at $K=128$. |
+
+`relational_tile_mib` (default 32) is the byte budget, in MiB, of one tile of the relational
+scorer and of the routed spread's query rows. A larger budget dispatches fewer kernels and holds
+more transient memory; values change only by float32 reduction order, and every loop above
+32 MiB stays checkpointed, so a raised budget changes the tile count and never what autograd
+saves. Its step-time effect on CUDA is not measured.
+
+Under `m_phi_update_mode="pullback_group"`, `m_phi_group_differential_mode` selects how the
+strict Frobenius-pullback direction evaluates the trivialized exponential differentials
+$\Psi_R(z)=(e^z-1)/z$ and $\Psi_L(z)=(1-e^{-z})/z$ at $z=\mathrm{ad}_\varphi$. The default
+`"series"` truncates their power series at a certified order between 8 and 128; `"spectral"`
+evaluates the exact Daleckii-Krein closed form from one eigendecomposition of the chart block,
+trading the truncation error for a conditioning one, and uses the series whenever that
+eigenbasis fails its condition or imaginary-residue guard. The optimizer checkpoints the
+route, and a resumed run keeps the saved one.
+
+Under `m_phi_update_mode="pullback_group"` or `"fisher_group"`, `m_phi_group_trust_radius`
+$R$ is an upper bound on each row's right-factor step $\|\eta s\xi\|_F$, the embedded
+Frobenius norm of the body generator; under `fisher_group` it bounds that Frobenius norm,
+not the Fisher norm, so unlike `m_table_fisher_trust_radius` it does not bound the per-step
+KL. `m_phi_group_retraction="group_log"` realizes $R$ exactly. The default `"chart"`
+retraction also accepts every step only after a fixed $10^{-6}$ check of the exact right
+product, a residual quadratic in the step, so away from the identity frame it halves a
+trust-saturated step before $R$ binds: in the derivation of 2026-09-28 the certified step
+falls from about $4\times10^{-2}$ at $\|\varphi\|_F=0.05$ to $7\times10^{-3}$ at
+$\|\varphi\|_F=1.7$ ($d=6$), and a larger $R$ changes nothing there. The optimizer reports
+the halvings as `phi_group_backtracks_mean` and `phi_group_backtracks_max` on both retractions.
+
+Under `m_phi_update_mode="pullback_group"` with `m_phi_group_retraction="group_log"`, a row
+whose blocks lie inside the principal strip (margin 0.25) and satisfy
+$\max_h\kappa_2(U_h)\le10^3$ takes the closed-form direction $\xi=U^{-1}\bar G$, and
+`m_phi_group_log_fallback` routes the other rows. The default `"series"` uses the certified
+strict pullback direction, whose dense structure constants ($3\cdot 8 n_{\rm gen}^2 d^2$
+bytes per block against a 512 MiB budget) limit `block_glk` to $d_{\rm head}\le16$.
+`"eigenbasis"` recovers $\bar G$ on each off-strip block by inverting
+$\Psi_L(\mathrm{ad}_{X^\top})$ in the eigenbasis of the chart block, which is exact wherever
+$\Psi_L$ is invertible and is the series direction without its $10^{-6}$ Gram ridge, and it
+rejects the rows with $\max_h\kappa_2(U_h)>10^3$. It builds no structure constants, so the
+budget does not apply. A rejected row keeps its chart. The eigenbasis gate is the spectral
+round-off budget $\kappa_F(V)^2(\gamma_{8d}+r_{\rm eig})\le10^{-10}$ that the `fisher_group`
+off-strip solve also uses. Since $\kappa_F(V)\ge d$ it is tight at $d=32$: it rejected all
+48 random non-normal off-strip blocks of a $d=32$ probe (median $\kappa_F(V)\approx120$) and
+passed every one at $d\le8$.
+
+The belief-Fisher frame metric of `fisher_group` vanishes on the stabilizer of each belief, so
+it is completed by `m_phi_fisher_rotation_weight` $\lambda$. Under
+`m_phi_fisher_completion="rotation"` (default) the weight acts on every rotation of the
+whitened generator, which also stiffens the rotations that move the mean, so no $\lambda$
+gives the natural gradient there. `"stabilizer"` puts it on the stabilizer only: the
+token-frame step is then the pseudo-inverse belief-Fisher natural gradient on the
+Fisher-visible directions plus a kernel step proportional to $1/\lambda$. It is refused with
+`pos_phi="learned"`, whose pooled positional metric has no stabilizer-only form.
 
 When every covariance contract passes the covariance through
 (`predictive_covariance="passthrough"`, `block_mlp_covariance="passthrough"` and
@@ -528,9 +587,14 @@ losses and an exactly zero off-diagonal covariance. The current launcher's
 `predictive_covariance="moment_matched"` densifies it, so on the launcher's route the
 diagonal family keeps only the diagonal of the local moment-matched covariance and the two
 families differ. A genuinely full covariance requires `gaussian_full` together with
-`block_mlp_covariance="delta_full"`, `block_norm_covariance="pushforward"`,
-`predictive_covariance="moment_matched"`, or the covariance updates of
-`attention_mode="projected_gradient"`.
+`block_mlp_covariance="delta_full"`, `block_norm_covariance="pushforward"` or
+`"pushforward_moment"`, `predictive_covariance="moment_matched"`, or the covariance updates of
+`attention_mode="projected_gradient"`. Of the two LayerNorm pushforwards, `"pushforward"` is the
+delta method at the norm's scale $s$, capped at the sphere bound where $\Sigma/s^2$ is large, so
+there it keeps the delta method's near rank-one radial shape; `"pushforward_moment"` evaluates the
+same expression at the effective scale $s_{\mathrm{eff}}^2=s^2+\operatorname{tr}(\Pi\Sigma\Pi)/K$ with a
+span floor, a moment estimate of the LayerNorm output at every $\Sigma/s^2$ (within 4% per
+coordinate of Monte Carlo at $K=128$). Both are read only under `norm_type_block="layernorm"`.
 `VFE3Config.inactive_fields()`
 reports this equivalence when it holds, together with every other setting that no active path reads
 (for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
@@ -645,11 +709,15 @@ $O'$ and is kept for charts too ill-conditioned for the inverse's float64 certif
 the entropy $\alpha+\sum_h\lambda_h$ times) and the `relational_receiver_law` field were
 removed on 2026-10-12. `relational_receiver_update="closed_form"` (default) applies the exact frozen-context
 natural-parameter update with damping `relational_receiver_damping` in $(0,1]$
-($1$ is the minimizer; then extra E-steps change nothing). Under
+($1$ is the minimizer of the energy with $\alpha$ frozen at the current iterate). Every accepted
+`lambda_alpha_mode` recomputes $\alpha$ from the receiver at each E-step, so under
 `lambda_alpha_mode="state_dependent"` that update is one majorize-minimize step on the profiled
-energy $c_0\log(b_0+D)+G$; `"closed_form_profiled"` returns the limit of those steps, the
-fixed point $\alpha=c_0/(b_0+D(q^\star(\alpha)))$ reached from the current state, in one
-scalar root solve per receiver with implicit gradients (not available per coordinate). `"euler"` is the explicit
+energy $c_0\log(b_0+D)+G$ and further E-steps continue the iteration;
+`"closed_form_profiled"` returns the limit of those steps, the fixed point
+$\alpha=c_0/(b_0+D(q^\star(\alpha)))$ reached from the current state, in one scalar root
+solve per receiver with implicit gradients (not available per coordinate). Only
+`closed_form_profiled` at $\rho=1$ makes extra E-steps leave the belief unchanged, up to the
+root solve's tolerance. `"euler"` is the explicit
 Fisher step governed by `e_q_mu_lr`, `e_q_sigma_lr` and the trust radii; it is stable
 only for `e_q_mu_lr` below $2/\lambda_{\max}(\Sigma\Lambda)$. Serialized configs that
 predate `relational_receiver_update` reload with `euler`; a `projected_gradient` config that
@@ -664,7 +732,8 @@ layer. There are no configurable input/output scope fields or identity-content a
 
 `projected_gradient` takes `lambda_alpha_mode` `state_dependent` or
 `state_dependent_per_coord` (the last on `gaussian_diagonal` only), `n_e_steps>=1`, `relational_routing="gaussian_kl"`,
-`family` in {`gaussian_diagonal`, `gaussian_full`, `gaussian_block`}, at least two heads,
+`family` in {`gaussian_diagonal`, `gaussian_full`} (`gaussian_block` is refused: it is defined on the
+projected-predictive kernel readout only), at least two heads,
 filtering, and unrolled updates. `predictive_covariance` and `attention_residual` are
 predictive-readout fields: under `projected_gradient` they are inert (listed by
 `inactive_fields()`), not refused. Under `euler` its inner mean and covariance learning
@@ -974,9 +1043,11 @@ by a base of positive dimension with an induced connection would make the constr
 field of such agent populations; the theory admits that extension, and this repository does
 not implement it.
 
-The `grow_K_mup` scaling route varies `e_q_mu_lr` and requires gradient belief
-updates; it rejects `predictive_content`, which does not read that rate.
-Use the standard width/depth/budget grids for predictive content; see
-[scaling settings](docs/scaling-settings.md).
+The `grow_K_mup` scaling route pairs each width K with a twin that applies the muP Adam
+learning-rate rule $K_0/K$ to the hidden and output matrices (relational score and content
+maps, block MLP, linear readout; Yang et al. 2022, Table 3). The input tables and the E-step
+rate stay at the baseline. It is the rate rule only, not full muP: the readout init variance
+and the attention temperature are unchanged. A scaling cell is refused only when one of its
+overrides is inert under its own config; see [scaling settings](docs/scaling-settings.md).
 
 Decoder memory/compute options and independent mean/variance rates are documented in [Decoder controls](docs/decoder-controls.md).

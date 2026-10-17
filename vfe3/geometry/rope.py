@@ -12,10 +12,15 @@ rotate by theta_{n,k} = n * base^{-2k/d}. The executable laws are:
   a_i -> R(theta_i) a_i and G_i -> R(theta_i) G_i R(theta_i)^T (gradients/relational.py), never on a
   frame.
 
-R(theta) coincides with a structure-group element ONLY on blocks where the irrep image is full
-SO(d) (block_glk heads; the l1 defining rep of SO(3)). On higher so_n irrep blocks (dim > N) the
-coordinate-pair rotation is a generic SO(d) element OUTSIDE the irrep image rho(SO(N)) (config.py
-warns at build); the code never assumes R in rho(G). Block-diagonal on irrep_dims so R is
+R(theta) lies in the structure group exactly when the head image contains the coordinate-pair
+rotations, which the registration trait ``contains_pair_rotations`` records
+(:func:`vfe3.geometry.groups.group_traits`; config.py warns at build when it is False). The image
+contains full SO(d) on block_glk, block_so, block_co and block_sl heads and on the l1 defining
+block of so_n. block_glmc contains the pair rotations without containing SO(d): each rotation
+cI + sJ on a pair is the realification of e^{i theta}, an element of U(1)^m in GL(m, C).
+block_borel and block_unipotent contain no rotation, and on the so_n irrep blocks above the
+defining one (dim > N) and on the su_n blocks the pair rotation is generally an SO(d) element
+outside the irrep image rho(G). The code never assumes R in rho(G). Block-diagonal on irrep_dims so R is
 orthogonal (the GL(K)-congruence divergence invariance and the block-diagonal exp fast path are
 unaffected). Parameter-free; default-off (config ``rope_mode="none"``).
 """

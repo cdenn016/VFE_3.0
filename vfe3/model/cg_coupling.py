@@ -56,6 +56,8 @@ def cg_moment_energy_rows(
     pre-CG value (means-only under 'passthrough', mean-and-covariance under 'delta_full'). NOT a
     second hierarchical total -- it reads only the belief (q) channel, never s/p/h. Divergence- and
     family-agnostic: ``divergence_family`` selects the functional, ``family`` the covariance kernel.
+    The block passes neither ``divergence_family`` nor ``renyi_order`` (their config fields are retired
+    and pinned to KL), so the live rows are always KL (audit 2026-10-16 F93).
     """
     from vfe3.families.base import get_family
     from vfe3.free_energy import self_divergence
@@ -71,8 +73,8 @@ class CGCoupling(nn.Module):
 
     def __init__(
         self,
-        group_n:      int,                       # N of SO(N)
-        algebra:      str,                       # 'so'
+        group_n:      int,                       # N of SO(N) or SU(N)
+        algebra:      str,                       # 'so' | 'su'
         irrep_dims:   List[int],                 # per-block dims
         irrep_labels: Optional[List[str]],       # per-block labels (REQUIRED non-None)
 
@@ -90,7 +92,7 @@ class CGCoupling(nn.Module):
         self.cg_covariance_floor = float(cg_covariance_floor)
         if irrep_labels is None:
             raise ValueError(
-                "CGCoupling requires a labeled irrep tower (gauge_group 'so_n')"
+                "CGCoupling requires a labeled irrep tower (gauge_group 'so_n' or 'su_n')"
             )
         starts = [0]
         for d in irrep_dims:

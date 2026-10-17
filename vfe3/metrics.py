@@ -293,8 +293,10 @@ def free_energy_terms(
 ) -> Dict[str, float]:
     r"""Per-term free-energy decomposition: self-coupling, belief-coupling, attention entropy.
 
-    Mirrors ``vfe3.free_energy.free_energy`` so the reported ``total`` equals the scalar that
-    function returns for the SAME inputs (within float32 rounding):
+    A test-only reference, like the scalar it mirrors: no production path calls it, and the projected
+    routes' canonical diagnostic assembles its own float64 rows (audit 2026-10-16 F92). It mirrors
+    ``vfe3.free_energy.free_energy`` so the reported ``total`` equals the scalar that function returns
+    for the SAME inputs (within float32 rounding):
 
         F = sum_i [ alpha_i D(q_i||p_i) + R(alpha_i)
                   + lambda_beta ( sum_j beta_ij E_ij
@@ -343,7 +345,10 @@ def free_energy_terms(
         _belief_free_energy_rows, _broadcast_tau, hierarchical_free_energy_terms,
     )
     _tau_e = _broadcast_tau(tau, energy)
-    entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - log_pi))).sum())
+    # xlogy, as in the rows that assemble ``total``: zero at beta == 0 with no floor on a positive tail
+    # probability, so the reported block is the one ``total`` carries (audit 2026-10-16 F92).
+    beta_for_log = torch.where(beta > 0.0, beta, torch.ones_like(beta))
+    entropy = float((_tau_e * (torch.special.xlogy(beta, beta_for_log) - beta * log_pi)).sum())
     observation_likelihood = None
     if log_likelihood is not None:
         observation_likelihood = float(log_likelihood.sum())
@@ -611,7 +616,8 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     ``skip_belief_sigma_update=True``. Later seams can also rewrite sigma: a block MLP with any
     non-passthrough ``block_mlp_covariance`` (the delta-method ``'delta_full'`` or the prototype-agent
     ``'posterior'``) or CG coupling with ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone,
-    except the block LayerNorm under ``block_norm_covariance='pushforward'``, which carries Sigma to post-norm units
+    except the block LayerNorm under a ``block_norm_covariance`` pushforward (``'pushforward'`` or
+    ``'pushforward_moment'``), which carries Sigma to post-norm units
     through the context-dependent scale of the mean. Without those updates, tr Sigma_q(x_i) depends only
     on the input token, so B1/EXP-3 measures input-token variance against next-token CE.
     """
@@ -625,9 +631,32 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
                           and getattr(cfg, "block_mlp_covariance", "passthrough") != "passthrough")
     cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))
                          and getattr(cfg, "cg_covariance_mode", "passthrough") == "delta_full")
-    # Validation admits 'pushforward' only for a local-coordinate block LayerNorm.
-    norm_rewrites_sigma = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward"
+    # A block_norm_covariance pushforward rewrites Sigma only under the block LayerNorm (inert elsewhere; F5).
+    norm_rewrites_sigma = (getattr(cfg, "block_norm_covariance", "passthrough") in ("pushforward", "pushforward_moment")
+                           and getattr(cfg, "norm_type_block", "none") == "layernorm")
     return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma or norm_rewrites_sigma)
+
+
+def variance_guard_activity(cfg: object) -> Tuple[bool, bool]:
+    r"""Whether the ``eps`` variance floor and the ``sigma_max`` ceiling clamp a layer's converged covariance.
+
+    Returns ``(floor, ceiling)``. :func:`guard_saturation` counts the variances within a relative window of
+    ``eps`` and of ``sigma_max``; the count certifies a clamp only where the route applies one to the covariance
+    it reads. The ceiling is the sigma E-step's SPD bound, absent when ``sigma_max`` is None or
+    ``cfg.inactive_fields()`` marks it inert (projected-predictive routes, ``skip_belief_sigma_update``, the
+    closed-form full-covariance receiver), the rule ``vfe3.viz.report`` applies to its ceiling row. The floor is
+    absent where a moment-matched readout (``predictive_covariance`` ``'moment_matched'`` or ``'spread_corrected'``
+    on ``attention_mode='projected_predictive'``, the routes on which ``predictive_covariance_floor`` is active)
+    writes the converged covariance: it returns :math:`\Sigma_i^+ = \Sigma_i^{\mathrm{att}} + f\Sigma_{p,i}`, an
+    additive floor with no clamp at ``eps``. That readout's one clamp, the Loewner ceiling
+    :math:`\Sigma_i^+ \preceq c\Sigma_{p,i}`, is counted in ``covariance_ceiling_elements``. Elsewhere the converged
+    covariance is the sigma E-step's retraction onto :math:`[\epsilon, \sigma_{\max}]` or a passthrough of the
+    encoded table variance, which :func:`vfe3.numerics.bounded_variance_from_log` clamps at ``eps``.
+    """
+    inactive = cfg.inactive_fields()
+    floor = "predictive_covariance_floor" in inactive
+    ceiling = getattr(cfg, "sigma_max", None) is not None and "sigma_max" not in inactive
+    return floor, ceiling
 
 
 def rank_one_residual(
@@ -644,6 +673,11 @@ def rank_one_residual(
     FFN-brake object of F2/EXP-7, computed on the MEAN stream -- DISTINCT from ``effective_rank``,
     which is the spectral rank of the per-token COVARIANCE Sigma (a different object). Reference:
     Dong et al. 2021, "Attention is not all you need: pure attention loses rank doubly exponentially".
+
+    r is not invariant under per-token linear maps of the rows. Local-coordinate means mu_i = U_i xi_i carry
+    each token's frame U_i, so their r counts frame diversity as spread; the frame-invariant reading of the
+    mixed content is r of the reference means xi_i = U_i^{-1} mu_i (the model's
+    ``relational_rank_one_residual_reference``, audit 2026-10-16 F45).
     """
     xbar = mu.mean(dim=-2, keepdim=True)                                  # (..., 1, K) mean token
     num = torch.linalg.norm((mu - xbar).flatten(-2, -1), dim=-1)          # ||X - 1 xbar^T||_F

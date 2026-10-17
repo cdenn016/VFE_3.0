@@ -49,7 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized, serialize_config
+from vfe3.config import _INHERITED_HYPERPARAMETERS, VFE3Config, config_from_serialized, serialize_config
 from vfe3.data.datasets import (
     _tokenizer_tag,
     cache_source_identity,
@@ -218,7 +218,7 @@ config = dict(
 
     ####################################
     #       Positional Encoding
-    #    BCH gauge-frame PE (pos_phi)
+    #    gauge-frame PE (pos_phi): exact right factor exp(X_i) exp(Y_n)
     #     gauge-RoPE (rope_mode)
     ####################################
 
@@ -364,7 +364,8 @@ config = dict(
     # buys only ~1.8x, while the SAME algebra in float64 buys nine decades. It is a precision
     # problem, not a factorization problem. sigma_log_embed trains freely against only the eps=1e-6
     # floor, so this is harmless at init and about one order of magnitude of shrinkage from
-    # material; watch decode_sigma_v_min. Default "fp32" is bit-identical to every run on disk.
+    # material; watch the decode_sigma_v_min column of metrics.csv. Default "fp32" is bit-identical
+    # to every run on disk.
     decode_av_precision                  = "fp64",     #  "fp32" | "fp64"
 
 
@@ -436,32 +437,50 @@ _VFE3_DEFAULTS = {f.name: f.default for f in _dc_fields(VFE3Config)}
 
 def _baseline_value(key: str) -> float:
     r"""Operating-point value of a VFE3Config float field: the local ``config`` dict (BASELINE) if it
-    sets it, else the dataclass default. Lets the muP route scale LRs / init relative to the anchor
-    width without hard-coding the operating point."""
-    return float(BASELINE.get(key, _VFE3_DEFAULTS.get(key)))
+    sets it, else the dataclass default. A rate left at None resolves through its parent in
+    ``_INHERITED_HYPERPARAMETERS`` (the rule ``VFE3Config.resolved_hyperparameter`` applies), so the muP
+    route scales the rate the anchor cell actually trains with, without hard-coding the operating point."""
+    value = BASELINE.get(key, _VFE3_DEFAULTS.get(key))
+    while value is None:
+        key = _INHERITED_HYPERPARAMETERS[key]
+        value = BASELINE.get(key, _VFE3_DEFAULTS.get(key))
+    return float(value)
+
+
+# M-step groups whose matrices have fan-in proportional to K at fixed n_heads: the query/key score maps
+# raw_score_q/k (n, d, K), the content maps T (n, d, K) and O (n, K, d), the block MLP Linear(K, mK) and
+# Linear(mK, K) (hidden weights), and the linear readout output_proj_weight (V, K) (output weights).
+_MUP_HIDDEN_OUTPUT_RATES: Tuple[str, ...] = (
+    "m_relational_score_lr", "m_relational_content_lr", "m_block_mlp_lr", "m_decode_mu_lr")
 
 
 def route_grow_k_mup(embed_dims: List[int], n_heads: int = 4, anchor_k: int = 20) -> List[Dict[str, Any]]:
-    r"""muP width-stability route for the inverse-K exponent (F1/EXP-6). For each K it emits a matched
-    PAIR: a 'fixed' arm at the baseline mean LR/init (the width-fixed control) and a 'mup' arm that
-    scales the E/M-step mean LRs ~ anchor_k/K and the mean-init std ~ sqrt(anchor_k/K) (Tensor-Programs
-    muP for width). BOTH arms run at kl_max = 8*K per cell (BASELINE's kl_max=None), which avoids the
-    frozen-kl_max width confound (see docs/experiments/2026-06-21-experiment-readiness.md). Anchored at
-    K=anchor_k, where the muP factors are 1 and the two arms coincide. Scoped to this route so the
-    other routes (incl. an active blocksize run) are untouched. The fitted exponent should be compared
-    against embed_dim, not n_params (which is K^2-dominated by phi_embed)."""
-    base_eqmu = _baseline_value("e_q_mu_lr")
-    base_mpmu = _baseline_value("m_p_mu_lr")
-    base_init = _baseline_value("mu_init_std")
+    r"""Width-stability route with the muP Adam learning-rate rule for the hidden and output matrices
+    (F1/EXP-6; Yang et al. 2022, arXiv:2203.03466, Table 3).
+
+    For each K it emits a matched PAIR at fixed ``n_heads``: a ``K{k}_fixed`` arm at the baseline rates
+    (the width-fixed control) and a ``K{k}_mup`` arm that multiplies every rate in
+    ``_MUP_HIDDEN_OUTPUT_RATES`` by :math:`K_0/K`, Table 3's Adam rate :math:`\propto 1/\mathrm{fan\_in}`
+    for hidden and output weights. Table 3 holds the input tables width-independent, so the mean table's
+    rate ``m_p_mu_lr`` and init ``mu_init_std``, and likewise ``m_p_sigma_lr``, ``m_phi_lr`` and
+    ``m_pos_phi_lr``, stay at the baseline, as does the vector affine rate ``m_layernorm_lr`` (the
+    "biases" column). ``e_q_mu_lr`` is an E-step step size with no muP rule and is not varied. The
+    arm is the muP rate rule only, not full muP: the readout init variance (xavier_uniform,
+    :math:`2/(K+V)`, against muP's :math:`1/\mathrm{fan\_in}^2`) and the attention temperature
+    :math:`\tau = \kappa \sqrt{d_\mathrm{head}}` (Transformer muP uses :math:`1/d`; whether the KL score
+    needs the analogue is open) are unchanged. BOTH arms run at kl_max = 8*K per cell (BASELINE's
+    kl_max=None), which avoids the frozen-kl_max width confound. Anchored at K=anchor_k, where the factor
+    is 1 and the two arms coincide. Scoped to this route so the other routes are untouched. The fitted
+    exponent should be compared against embed_dim, not n_params (which is K^2-dominated by phi_embed)."""
+    base_rates = {key: _baseline_value(key) for key in _MUP_HIDDEN_OUTPUT_RATES}
     cells: List[Dict[str, Any]] = []
     for k in embed_dims:
         common = {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}
         cells.append({"label": f"K{k}_fixed", "route": "grow_K_mup", "scale_knob": "embed_dim",
                       "overrides": dict(common)})
-        w = anchor_k / k                                     # muP width ratio (1 at the anchor)
+        w = anchor_k / k                                     # muP width ratio K_0/K (1 at the anchor)
         cells.append({"label": f"K{k}_mup", "route": "grow_K_mup", "scale_knob": "embed_dim",
-                      "overrides": {**common, "e_q_mu_lr": base_eqmu * w,
-                                    "m_p_mu_lr": base_mpmu * w, "mu_init_std": base_init * (w ** 0.5)}})
+                      "overrides": {**common, **{key: rate * w for key, rate in base_rates.items()}}})
     return cells
 
 
@@ -548,7 +567,8 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #     blocks_K48    FIXED K=48, VARY the block GL(b): b=48,24,12,8,6; n_heads=K/b; n_gen=b*K
 #                   (bigger block = FEWER heads = MORE params -- e.g. GL(48) is the largest model here).
 #     grow_K        grow K at FIXED n_heads=4 (so the block grows with K; n_gen ~ K^2/4, quadratic).
-#     grow_K_mup    grow_K + a muP LR/init-rescaled twin per K (F1/EXP-6 width-stability), kl_max=8*K.
+#     grow_K_mup    grow_K + a twin per K with the muP Adam rate rule K_0/K on the hidden and output
+#                   matrices (Yang et al. 2022, Table 3; F1/EXP-6 width-stability), kl_max=8*K.
 #     blocksize     FIXED K=64, vary n_heads in {8,4,2} (= block GL(8),GL(16),GL(32)); same idea as
 #                   blocks_K48 but parameterized by n_heads instead of GL(b).
 #   INFERENCE routes (FLAT N -- plotted on a SEPARATE inference-capacity figure, NEVER on L(N)):
@@ -575,7 +595,7 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
         extra_overrides={"encode_mode": "per_token_additive", "pos_phi": "none"}),
     
     "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
-    "grow_K_mup":    route_grow_k_mup([20, 40, 60, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
+    "grow_K_mup":    route_grow_k_mup([20, 40, 60, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP rate)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
     "infer_T":       route_inference_t([1, 2, 4, 8]),
     "infer_L":       route_inference_l([1, 2, 4, 6]),
@@ -1369,10 +1389,18 @@ def _validate_cell_controls(
     cell: Dict[str, Any],
     max_steps: Optional[int],
 ) -> None:
-    """Reject sweep axes erased by a different active update or global budget."""
-    if cell["route"] == "grow_K_mup" and cfg.relational_readout_mode == "predictive_content":
-        raise ValueError("grow_K_mup varies e_q_mu_lr and requires a gradient belief update; "
-                         "predictive_content does not read that learning rate")
+    """Reject sweep axes erased by a different active update or global budget.
+
+    A cell is refused when one of its overrides is inert under the cell's own resolved config
+    (``VFE3Config.inactive_fields``, the rule ``ablation.py`` applies to its arms), since that axis would
+    not change what the cell computes. A control arm without an inert override is admitted.
+    """
+    inactive = cfg.inactive_fields()
+    inert = sorted(set(cell["overrides"]) & set(inactive))
+    if inert:
+        detail = "; ".join(f"{name} ({inactive[name]})" for name in inert)
+        raise ValueError(f"cell {cell['label']!r} overrides inert field(s), so its sweep axis would "
+                         f"not change the run: {detail}")
     if cell["scale_knob"] == "max_steps" and max_steps is not None:
         raise ValueError("set CONFIG['max_steps']=None for the train_steps sweep; "
                          "a global override would erase its budget axis")

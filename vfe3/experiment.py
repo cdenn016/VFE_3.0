@@ -5,24 +5,35 @@ argument (the config, the dataset, the output root, the model seed, the data-ord
 run label), so experiment launchers such as ``paper_arms.py`` can run many configurations in one
 process without editing or importing the click-to-run launcher and its module globals.
 
-The sequence is the launcher's, step for step. The global RNG is seeded from ``seed`` before the
-model is built and again after it (so later global draws do not depend on how much RNG the model's
-construction consumed); the training loader shuffles with its own generator seeded from
-``data_seed``, so the batch order is a function of the data seed alone; validation and test read the
-whole split in order with the config's evaluation stride. After training, the final validation
-handed back by the loop (or a fresh evaluation) is logged, :func:`vfe3.run_artifacts.finalize_run`
+The sequence is the launcher's, and the trained weights and test scores match it bitwise. The global
+RNG is seeded from ``seed`` before the model is built and again after it (so later global draws do
+not depend on how much RNG the model's construction consumed); the training loader shuffles with its
+own generator seeded from ``data_seed``, so the batch order is a function of the data seed alone;
+validation and test read the whole split in order with the config's evaluation stride. All three
+splits are opened before training (building a sequential loader draws no RNG), so a missing test
+cache fails at launch rather than after the training budget (audit 2026-10-16 F122). After training,
+the final validation handed back by the loop (or a fresh evaluation) is logged, :func:`vfe3.run_artifacts.finalize_run`
 scores the test split and writes the run's records, and the directory
 ``<out_root>/<timestamp>_<label>`` is renamed to ``<out_root>/<test PPL>_<label>``.
+
+:func:`saved_train_window_mode` recovers the training-window origin a saved run trained with. Every run
+this code trains draws a per-epoch random origin (:data:`CURRENT_TRAIN_WINDOW_MODE`); the config loaders
+drop a saved ``train_window_offset`` silently, so launchers that reuse or pool saved runs read the
+protocol here (audit 2026-10-16 F59).
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
+import re
+import shutil
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -30,7 +41,75 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 from vfe3.runtime import restored_fp32_matmul_precision
 
-__all__ = ["run_vfe", "reserve_directory", "rename_run_by_test_ppl"]
+__all__ = ["run_vfe", "reserve_directory", "rename_run_by_test_ppl", "saved_train_window_mode",
+           "CURRENT_TRAIN_WINDOW_MODE", "TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT"]
+
+# The training-window origin. ``train_window_offset`` existed from 2026-10-09 (default ``'fixed'``; before
+# then every training window started at a fixed origin) until the commit below hardcoded the per-epoch
+# random origin on 2026-10-12. Every run trained by this code draws that origin.
+TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT = "1b50c6ea4b16223b68ded489ffb131e9efdd8488"
+CURRENT_TRAIN_WINDOW_MODE = "per_epoch_random"
+_TRAIN_WINDOW_MODES = ("fixed", "per_epoch_random")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@functools.lru_cache(maxsize=None)
+def _descends_from_window_retirement(git_sha: str) -> Optional[bool]:
+    r"""Whether commit ``git_sha`` contains :data:`TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT`, or None when git
+    cannot tell (no git, an unknown commit, a repository without the retirement commit)."""
+    git = shutil.which("git")
+    if git is None:
+        return None
+    from vfe3.run_artifacts import _git_environment
+
+    try:
+        completed = subprocess.run(
+            [git, "-c", f"safe.directory={_REPO_ROOT.as_posix()}", "merge-base", "--is-ancestor",
+             TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT, git_sha],
+            cwd=str(_REPO_ROOT), env=_git_environment(git), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: True, 1: False}.get(completed.returncode)
+
+
+def saved_train_window_mode(
+    config_raw: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> Tuple[str, str]:
+    r"""The training-window origin a saved run trained with, and the evidence: ``(mode, evidence)``.
+
+    ``mode`` is ``"fixed"`` (window :math:`i` starts at :math:`i s` in every epoch), ``"per_epoch_random"``
+    (at :math:`o + i s` with an origin :math:`o` drawn per epoch) or ``"unknown"``. The two protocols present
+    different training windows, so their runs are not replicates of one configuration. The saved
+    ``train_window_offset`` (``config_raw``, the run's serialized config) decides when present, then a
+    ``provenance["train_window_mode"]`` record. Otherwise the run trained before the option existed or after
+    its retirement, and the run's commit (``provenance["git_sha"]``) decides: a commit containing
+    :data:`TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT` trained with per-epoch random origins, any other with
+    fixed windows.
+    """
+    if "train_window_offset" in config_raw:
+        value = config_raw["train_window_offset"]
+        if value in _TRAIN_WINDOW_MODES:
+            return str(value), "config.json records train_window_offset"
+        return "unknown", f"config.json records train_window_offset={value!r}"
+    recorded = provenance.get("train_window_mode")
+    if recorded in _TRAIN_WINDOW_MODES:
+        return str(recorded), "provenance.json records train_window_mode"
+    git_sha = provenance.get("git_sha")
+    if not isinstance(git_sha, str) or re.fullmatch(r"[0-9a-fA-F]{7,64}", git_sha) is None:
+        return "unknown", "config.json records no train_window_offset and provenance.json no git_sha"
+    short = git_sha[:10]
+    descends = _descends_from_window_retirement(git_sha.lower())
+    if descends is None:
+        return "unknown", (f"git cannot place commit {short} relative to the 2026-10-12 retirement of "
+                           f"train_window_offset ({TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT[:10]})")
+    if descends:
+        return "per_epoch_random", (f"trained at commit {short}, which contains the 2026-10-12 retirement of "
+                                    "train_window_offset")
+    return "fixed", (f"trained at commit {short}, before the 2026-10-12 retirement of train_window_offset, "
+                     "and config.json records no train_window_offset (fixed windows were the only mode "
+                     "before 2026-10-09 and the option's default after)")
 
 
 def reserve_directory(root: Path, base: str) -> Path:
@@ -52,20 +131,25 @@ def rename_run_by_test_ppl(
     label:    str,
     test_ppl: Optional[float],
     logger:   logging.Logger,
+
+    *,
+    prefix:   str = "",
 ) -> Path:
-    r"""Rename ``run_dir`` to ``<parent>/<test_ppl:.2f>_<label>`` (``_2``, ... on a clash).
+    r"""Rename ``run_dir`` to ``<parent>/<prefix><test_ppl:.2f>_<label>`` (``_2``, ... on a clash).
 
     Nothing within the run is selected on test; the name is a sorting convenience applied after
     the test evaluation. Across runs the name exposes the test perplexity, so recipes chosen by
     comparing run names were chosen on the test split. The directory keeps its timestamped name when the perplexity is missing or not
     finite, or when the operating system refuses the move (the results are already on disk).
+    ``prefix`` marks a name that carries another perplexity: ``train_baseline`` names a learning-rate
+    sweep arm, which never scores test, ``val<best_val_ppl:.2f>_<label>``.
     """
-    if test_ppl is None or not math.isfinite(test_ppl) or not run_dir.exists():
+    if test_ppl is None or not math.isfinite(float(test_ppl)) or not run_dir.exists():
         return run_dir
-    target = run_dir.parent / f"{test_ppl:.2f}_{label}"
+    target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}"
     index = 2
     while target.exists():
-        target = run_dir.parent / f"{test_ppl:.2f}_{label}_{index}"
+        target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}_{index}"
         index += 1
     try:
         run_dir.rename(target)
@@ -159,6 +243,11 @@ def run_vfe(
     train_loader = _loader(dataset, cfg, "train", data_seed)
     val_loader = _loader(dataset, cfg, "validation", data_seed)
     val_tpc = tokens_per_char(dataset, "validation")
+    # The test split is opened here, with the others, so a missing or unreadable test cache fails at
+    # launch rather than after the whole training budget (audit 2026-10-16 F122). Building a
+    # sequential loader draws no RNG, so the run is unchanged.
+    test_loader = _loader(dataset, cfg, "test", data_seed)
+    test_tpc = tokens_per_char(dataset, "test")
 
     run_dir = reserve_directory(Path(out_root), f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{label}")
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device,
@@ -200,11 +289,10 @@ def run_vfe(
                 metrics["ce"], metrics["ppl"], metrics["bits_per_token"],
                 f"{float(metrics['bpc']):.4f}" if metrics["bpc"] is not None else "unavailable")
 
-    test_loader = _loader(dataset, cfg, "test", data_seed)
     results = finalize_run(
         model, artifacts, cfg,
         final_validation=metrics,
-        tokens_per_char=tokens_per_char(dataset, "test"),
+        tokens_per_char=test_tpc,
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,

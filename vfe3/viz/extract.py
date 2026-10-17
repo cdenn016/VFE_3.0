@@ -55,6 +55,7 @@ def _cpu_bank_value(value: object) -> object:
         return CanonicalFrameContext(
             forward=_cpu_bank_tensor(value.forward),
             inverse=_cpu_bank_tensor(value.inverse),
+            block_diagonal=value.block_diagonal,              # compact (..., H, d, d) head blocks stay compact
         )
     if isinstance(value, CompactBlockElement):
         return CompactBlockElement(
@@ -200,6 +201,12 @@ def collect_inference_bank(
                     _cpu_bank_value(canonical_frame)
                     if canonical_frame is not None else None
                 ),
+                # The stack-input covariance a decode_covariance='encoded' decoder reads, kept only under that
+                # setting so the bank's memory is unchanged elsewhere (audit 2026-10-16 F64).
+                "encoded_sigma": (
+                    _cpu_bank_value(capture["prior"].sigma)
+                    if getattr(model.cfg, "decode_covariance", "belief") == "encoded" else None
+                ),
             })
             stop = max_batches is not None and i + 1 >= max_batches
             # The record now owns detached CPU copies. Release every accelerator-side inference
@@ -239,13 +246,16 @@ def _decode_inference_record(
         canonical_frame = CanonicalFrameContext(
             forward=canonical_frame.forward.to(device),
             inverse=canonical_frame.inverse.to(device),
+            block_diagonal=canonical_frame.block_diagonal,
         )
+    encoded_sigma = record.get("encoded_sigma")
     logits = model._decode_belief_with_context(
         mu,
         sigma,
         canonical_frame=canonical_frame,
+        encoded_sigma=(encoded_sigma.to(device) if isinstance(encoded_sigma, torch.Tensor) else None),
     )
-    del mu, sigma, canonical_frame
+    del mu, sigma, canonical_frame, encoded_sigma
     return logits
 
 
@@ -433,8 +443,7 @@ def e_step_belief_trace(
     r"""The captured receiver states ``q_0, ..., q_T`` of sequence 0 and their fixed-context costs.
 
     Projected routes compute routing and content in distinct conditional stages, so no global free
-    energy is defined: ``free_energy`` is the snapshot's (empty) trace and ``free_energy_available``
-    is False. Returns ``mu`` (T+1, N, K), ``sigma`` (T+1, N, [K]), ``phi`` (T+1, N, n_gen), plus the
+    energy is defined: the trace carries no free-energy series and ``free_energy_available`` is False. Returns ``mu`` (T+1, N, K), ``sigma`` (T+1, N, [K]), ``phi`` (T+1, N, n_gen), plus the
     receiver costs before/after the update on the full-link readout. ``n_iter`` must equal the
     configured ``cfg.n_e_steps``.
     """
@@ -449,7 +458,6 @@ def e_step_belief_trace(
         "mu": torch.stack([belief.mu[0] for belief in snapshot.trace_states]),
         "sigma": torch.stack([belief.sigma[0] for belief in snapshot.trace_states]),
         "phi": torch.stack([belief.phi[0] for belief in snapshot.trace_states]),
-        "free_energy": snapshot.trace_free_energy,
         "diagonal_covariance": model.cfg.diagonal_covariance,
         "inference_semantics": model.conditional_semantics,
         "free_energy_available": False,
@@ -509,42 +517,77 @@ def numerical_health(
     *,
     snapshot: 'Optional[DiagnosticSnapshot]' = None,
 ) -> Dict[str, float]:
-    r"""Non-finite fractions of the captured intermediates + the worst covariance conditioning.
+    r"""Non-finite fractions of every layer's captured intermediates + the worst covariance conditioning.
 
-    Reads the first layer's converged belief and its captured routing score / weights and
-    reports ``nan_inf_fraction`` for mu, sigma, phi, energy, and beta (``nan_<x>``) with the entry
-    count each fraction is taken over (``numel_<x>``, so a fraction converts to "k of N"), plus the
-    maximum spectral condition number of the belief covariances. A near-zero finiteness map certifies stability is
-    genuine convergence, not masked blow-ups. (Numerical-FALLBACK activation counters --
+    Reads sequence 0 of each layer's converged belief :math:`(\mu_\ell, \Sigma_\ell, \phi_\ell)` and of each
+    layer's own routing capture (the pre-update cost ``score_energy_pre`` and weights ``beta_pre`` of
+    ``snapshot.layer_conditional_captures``; the shared ``conditional_capture`` holds only the LAST block's)
+    for :math:`\ell = 1, \dots, L`. Each field :math:`x` is pooled over the layers,
+
+    .. math::
+
+        \mathrm{nan}_x = \frac{\sum_\ell \#\{\text{non-finite entries of } x_\ell\}}{\sum_\ell |x_\ell|},
+
+    reported as ``nan_<x>`` with the pooled entry count ``numel_<x>`` :math:`= \sum_\ell |x_\ell|` (so a
+    fraction converts exactly to "k of N"), together with ``max_condition``
+    :math:`= \max_\ell \max_i \kappa(\Sigma_{\ell, i})`, the spectral condition number over every layer's
+    covariances in the family's layout, and ``n_layers`` :math:`= L`. The kernel routes capture the cost after
+    the ``kl_max`` clamp, which maps NaN and :math:`+\infty` to the cap, so ``nan_energy`` counts the pre-clamp map
+    ``score_nonfinite_pre`` where a capture carries it (audit 2026-10-16 F10). A near-zero finiteness map certifies
+    stability is genuine convergence, not masked blow-ups. (Numerical-FALLBACK activation counters --
     safe_cholesky jitter rounds, pinv fallbacks -- would require instrumenting numerics and are
     left to a future pass.)
     """
-    from vfe3.numerics import nan_inf_fraction
-
     if snapshot is None:
         snapshot = model.build_diagnostic_snapshot(token_ids)
     snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-    out = _snapshot_sequence(snapshot.layer_converged[0])
-    capture = snapshot.conditional_capture
-    if capture is None:
-        raise RuntimeError("projected numerical health requires the executed inference capture")
-    condition = metrics.belief_spectrum(
-        out.sigma, diagonal=True, eps=model.cfg.eps, family=model.cfg.family)["condition"]
-    return {
-        "nan_mu": nan_inf_fraction(out.mu),
-        "nan_sigma": nan_inf_fraction(out.sigma),
-        "nan_phi": nan_inf_fraction(out.phi),
-        "nan_energy": nan_inf_fraction(capture["score_energy_pre"]),
-        "nan_beta": nan_inf_fraction(capture["beta_pre"]),
-        "max_condition": float(condition.max()),
-        **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi,
-                        energy=capture["score_energy_pre"], beta=capture["beta_pre"]),
+    beliefs = [_snapshot_sequence(belief) for belief in snapshot.layer_converged]
+    captures = tuple(snapshot.layer_conditional_captures)
+    if not captures:
+        # A one-capture snapshot carries only the shared capture, which is the last block's: it pairs with
+        # the converged belief only when there is one layer.
+        if snapshot.conditional_capture is None:
+            raise RuntimeError("projected numerical health requires the executed inference capture")
+        if len(beliefs) != 1:
+            raise RuntimeError(
+                f"projected numerical health needs one routing capture per layer; this {len(beliefs)}-layer "
+                "snapshot carries only the last layer's")
+        captures = (snapshot.conditional_capture,)
+    if len(captures) != len(beliefs):
+        raise ValueError(
+            f"snapshot has {len(beliefs)} converged layers but {len(captures)} routing captures")
+    fields: Dict[str, List[torch.Tensor]] = {
+        "mu":     [belief.mu for belief in beliefs],                          # each (N, K)
+        "sigma":  [belief.sigma for belief in beliefs],                       # each (N, K) or (N, K, K)
+        "phi":    [belief.phi for belief in beliefs],
+        "energy": [capture["score_energy_pre"][0] for capture in captures],   # each (H, N, N), sequence 0
+        "beta":   [capture["beta_pre"][0] for capture in captures],           # each (H, N, N), sequence 0
     }
-
-
-def _numel_counts(**tensors: torch.Tensor) -> Dict[str, int]:
-    r"""``numel_<name>``: the number of entries each ``nan_<name>`` fraction was taken over."""
-    return {f"numel_{name}": int(tensor.numel()) for name, tensor in tensors.items()}
+    # The kernel routes clamp the captured cost, so its non-finite entries are read from the pre-clamp map
+    # score_nonfinite_pre (the cost's shape); the minimal agent captures an unclamped cost (audit 2026-10-16 F10).
+    nonfinite_maps = {name: [~torch.isfinite(tensor) for tensor in tensors] for name, tensors in fields.items()}
+    nonfinite_maps["energy"] = [
+        capture["score_nonfinite_pre"][0] if capture.get("score_nonfinite_pre") is not None
+        else ~torch.isfinite(capture["score_energy_pre"][0])
+        for capture in captures]
+    health: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for name, tensors in fields.items():
+        numel = sum(int(tensor.numel()) for tensor in tensors)
+        nonfinite = sum(int(flags.sum()) for flags in nonfinite_maps[name])
+        health[f"nan_{name}"] = float(nonfinite) / numel if numel else 0.0
+        counts[f"numel_{name}"] = numel
+    conditions = torch.stack([                                                # (L,) per-layer maxima
+        metrics.belief_spectrum(
+            belief.sigma, diagonal=model.cfg.diagonal_covariance, eps=model.cfg.eps,
+            family=model.cfg.family)["condition"].max()
+        for belief in beliefs])
+    return {
+        **health,
+        "max_condition": float(conditions.max()),
+        **counts,
+        "n_layers": len(beliefs),
+    }
 
 
 def guard_denominators(

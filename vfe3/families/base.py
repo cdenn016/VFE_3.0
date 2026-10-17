@@ -21,14 +21,20 @@ from vfe3.numerics import safe_eigvalsh
 def x_minus_log1p(x: torch.Tensor) -> torch.Tensor:
     r"""Cancellation-free :math:`x - \log(1 + x)` for :math:`x > -1`.
 
-    A Taylor series for :math:`|x| < 10^{-3}` (truncation below :math:`x^6/6`), else ``x - log1p(x)``, whose
-    absolute error is about :math:`\varepsilon|x|` against a value near :math:`x^2/2`. The two-log form
-    :math:`(1 + x) - 1 - \log(1 + x)` loses about :math:`\varepsilon/x^2` relative accuracy instead (audit
-    2026-10-07, F36).
+    Inside the band :math:`|x| < u^{1/6}` (u the unit roundoff of ``x.dtype``: 0.0626 for float32, 2.2e-3
+    for float64) it is the Taylor series through :math:`x^6/6`. Outside it is ``x - log1p(x)``, whose absolute
+    error is about :math:`u|x|` against a value near :math:`x^2/2` (relative error near :math:`2u/|x|`), and
+    whose autograd derivative :math:`1 - 1/(1 + x)` carries relative error near :math:`u/|x|`. The series
+    truncates at relative :math:`2|x|^5/7` in the value and :math:`|x|^5` in the derivative
+    :math:`x - x^2 + \dots + x^5`, so the edge :math:`u^{1/6}` balances the derivative's two errors at
+    :math:`u^{5/6}` and keeps the value's below :math:`2u^{5/6}` (about 1e-6 in float32 and 1e-13 in float64).
+    The former fixed edge :math:`10^{-3}` left float32 at about 1e-4 relative error just outside it (audit
+    2026-10-16, F44). The two-log form :math:`(1 + x) - 1 - \log(1 + x)` loses about :math:`u/x^2` relative
+    accuracy instead (audit 2026-10-07, F36).
     """
-    near = x.abs() < 1e-3
+    near = x.abs() < (torch.finfo(x.dtype).eps / 2.0) ** (1.0 / 6.0)
     small = torch.where(near, x, torch.zeros_like(x))
-    series = small.square() * (0.5 + small * (-1.0 / 3.0 + small * (0.25 - small / 5.0)))
+    series = small.square() * (0.5 + small * (-1.0 / 3.0 + small * (0.25 + small * (-0.2 + small / 6.0))))
     wide = torch.where(near, torch.zeros_like(x), x)
     return torch.where(near, series, wide - torch.log1p(wide))
 

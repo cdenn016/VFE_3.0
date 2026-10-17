@@ -19,8 +19,36 @@ from vfe3.numerics import (
 )
 
 
-# Budget for one projected map L; its covariance product can require a second.
+# Byte budget of one scorer tile, set by set_projection_tile_bytes: a token tile of the projected maps in
+# projected_moments and _projected_root_factor (one map L, whose covariance product can require a second), a
+# GEMM-fallback direct pair tile, and a mean-distance query-row tile. Larger tiles dispatch fewer kernels and hold
+# more transient memory; the values change only by float32 reduction order (audit 2026-10-16 F26). The factor-route
+# recovery tiles and the noisy-query pair tiles keep their own fixed budgets.
 _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
+
+# A tile loop whose whole transient exceeds this is checkpointed under autograd also when a raised
+# _PROJECTION_TILE_BYTES leaves it a single tile: the budget sets the tile count, never what autograd saves.
+# It equals the default budget, so at the default every loop tiles and checkpoints exactly as before the knob.
+_CHECKPOINT_BYTES = 32 * 1024 ** 2
+
+# Byte budget of one factor-route recovery pair tile of projected_gaussian_kl: one r x r triangular-solve operand
+# per pair in each gathered (batch, head) slice that holds a recovered entry (audit 2026-10-16 F28).
+_RECOVERY_PAIR_TILE_BYTES = 32 * 1024 ** 2
+
+
+def set_projection_tile_bytes(nbytes: int) -> int:
+    r"""Set the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes; returns the previous value."""
+    if type(nbytes) is not int or nbytes < 1:
+        raise ValueError(f"projection tile budget must be a positive int of bytes, got {nbytes!r}")
+    global _PROJECTION_TILE_BYTES
+    previous = _PROJECTION_TILE_BYTES
+    _PROJECTION_TILE_BYTES = nbytes
+    return previous
+
+
+def projection_tile_bytes() -> int:
+    r"""Return the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes."""
+    return _PROJECTION_TILE_BYTES
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float32 shifted CholeskyQR3, or float64 QR where the float32 retry fails, the input is
@@ -94,7 +122,8 @@ GRAM_CONDITION_TOL: float = 1e-4
 _CONDITION_RECOVERY: bool = False
 
 # Working precision of a source recovery: fp32 on the Gram routes and the uncertified factor route. The flagged
-# factors are rebuilt by float32 shifted CholeskyQR3 of the source root (backward stable for kappa_2(X) <~ 1/eps_32;
+# factors are rebuilt by float32 shifted CholeskyQR3 of the source root (backward stable for kappa_2(X) up to about
+# 1/(u_32 sqrt(11 (m r + r (r + 1)))), O(1/u_32) with a dimension-dependent constant, see numerics.cholesky_qr2;
 # Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477), the factor stays in the working dtype, and the touched pairs
 # are evaluated by triangular-solve tiles in the working dtype. A call whose float32 retry fails, a float64 input,
 # and every rebuild on the certified factor route (cholesky_qr2_certified, where a float32 rebuild would keep the
@@ -230,7 +259,7 @@ def projected_moments(
     bytes_per_token = math.prod(batch) * roles * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.
-    if tokens * bytes_per_token > _PROJECTION_TILE_BYTES:
+    if tokens * bytes_per_token > min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
         step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
         means, covariances = [], []
         for start in range(0, tokens, step):
@@ -624,7 +653,7 @@ def _projected_root_factor(
         raise ValueError("source covariance shape does not match projected token/head dimensions")
     tokens = batch[-2]
     bytes_per_token = math.prod(batch[:-2]) * batch[-1] * r * width * (torch.finfo(dtype).bits // 8)
-    if tokens * bytes_per_token <= _PROJECTION_TILE_BYTES:
+    if tokens * bytes_per_token <= min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
         return _projected_root_factor_tile(Sigma, inverse, S, dtype, diagonal)
     step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
     factors, failures = [], []
@@ -792,8 +821,9 @@ def _strict_cholesky(
     :func:`projected_condition_recovery`, reconstruct the source root X = S U^{-1} Sigma^{1/2}
     (formed in float64, then rounded to the working dtype) and factor it by shifted CholeskyQR3 in
     the working dtype, whose factor C satisfies C C^T = (X + dX)(X + dX)^T with
-    ||dX|| <= c eps ||X|| for kappa_2(X) <~ 1/eps (Fukaya et al. 2020); the factor tensor stays in
-    the working dtype. No jitter, covariance floor, or projection constraint is introduced.
+    ||dX|| <= c eps ||X|| for kappa_2(X) up to about 1/(u sqrt(11 (m r + r (r + 1)))) (Fukaya et al. 2020;
+    see :func:`vfe3.numerics.cholesky_qr2`); the factor tensor stays in the working dtype. No jitter,
+    covariance floor, or projection constraint is introduced.
 
     ``factored`` marks a ``prepared`` factor from :func:`_factor_status` (CholeskyQR2 of the source
     root); its healthy entries keep their prepared factor bitwise. Without the certificate
@@ -877,8 +907,9 @@ def _strict_cholesky(
                 recovered = _source_qr_factor(root)
             elif factored:
                 # Uncertified factor route (or a float64 input, where nothing is flagged): outright
-                # CholeskyQR2 failures retry shifted CholeskyQR3 in the working dtype (valid to
-                # kappa(X) ~ 1/eps), and failed retries take the float64 QR.
+                # CholeskyQR2 failures retry shifted CholeskyQR3 in the working dtype (valid to about
+                # kappa(X) ~ 1/(u sqrt(11 (m r + r (r + 1)))), see cholesky_qr2), and failed retries take the
+                # float64 QR.
                 shifted, shifted_failed = cholesky_qr2(root.to(G.dtype), shift=True)
                 recovered = torch.where(shifted_failed[..., None, None],
                                         torch.zeros((), dtype=root.dtype, device=root.device),
@@ -956,7 +987,8 @@ def projected_gaussian_kl(
     (:class:`_IEEEFP32Recompute`). With ``gemm_expansion_tol`` set (default None: off), a (batch, head)
     slice whose GEMM error estimate (:func:`_gemm_expansion_error`) exceeds it in nats is scored instead
     by the direct-difference tiles at IEEE fp32 and counted in :func:`gemm_fallback_slices`; the verdict
-    joins the existing decision read. Recovered factors use bounded checkpointed pair tiles of triangular solves
+    joins the existing decision read. Recovered factors use bounded checkpointed pair tiles of triangular solves,
+    over only the (batch, head) slices that hold a recovered entry (``_RECOVERY_PAIR_TILE_BYTES`` per tile),
     instead of cancelling covariance/precision products, in the working dtype, or in float64 where the
     recovery fell back to float64 (:func:`_strict_cholesky`). No floor, cap, symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
     source tuples allow inaccurate rounded covariances and projected means to
@@ -1143,8 +1175,14 @@ def projected_gaussian_kl(
                      else torch.zeros(nq_flags, dtype=torch.bool, device=Gq.device))
             k_tok = (_token_recover_flags(rec_k, nk_flags) if rec_k is not None
                      else torch.zeros(nk_flags, dtype=torch.bool, device=Gk.device))
-            flags = torch.cat((q_tok, k_tok)).tolist()
-            q_needs, k_needs = flags[:nq_flags], flags[nq_flags:]
+            # (batch, head) slices holding a recovered entry: only they enter the factor-route tiles.
+            slice_rec = torch.zeros(slice_shape, dtype=torch.bool, device=Gq.device)       # (..., H)
+            for rec in (rec_q, rec_k):
+                if rec is not None:
+                    slice_rec = slice_rec | rec.any(dim=-2)
+            flags = torch.cat((q_tok, k_tok, slice_rec.reshape(-1))).tolist()
+            q_needs, k_needs = flags[:nq_flags], flags[nq_flags:nq_flags + nk_flags]
+            recovered_slices = [s for s, flag in enumerate(flags[nq_flags + nk_flags:]) if flag]
         else:
             # Healthy path: chol_k is the prepared factor, so this is its precision bit for bit.
             q_cov_healthy, k_prec_healthy = Gq, k_prec_prepared
@@ -1167,10 +1205,9 @@ def projected_gaussian_kl(
         else:
             logdet_q_healthy, logdet_k_healthy = logdet_q, logdet_k
         nq, nk = aq.shape[-2], ak.shape[-2]
-        batch_heads = aq.numel() // (nq * r)
 
-        def _tile_steps(element_size: int, per_pair: int) -> Tuple[int, int]:
-            pair_budget = max(1, (32 * 1024 ** 2) // (element_size * batch_heads * per_pair))
+        def _tile_steps(element_size: int, per_pair: int, slices: int) -> Tuple[int, int]:
+            pair_budget = max(1, _RECOVERY_PAIR_TILE_BYTES // (element_size * slices * per_pair))
             q_step = max(1, min(nq, 32, pair_budget))
             return q_step, max(1, min(nk, pair_budget // q_step))
 
@@ -1198,9 +1235,11 @@ def projected_gaussian_kl(
             selected = (_select(aq_healthy, 2), _select(ak_healthy, 2), _select(q_cov_healthy, 3),
                         _select(k_prec_healthy, 3), _select(logdet_q_healthy, 1), _select(logdet_k_healthy, 1))
             # A direct tile holds three (n, I, J, r) pair tensors (delta, P delta, their product).
-            pair_budget = max(1, _PROJECTION_TILE_BYTES // (aq_healthy.element_size() * len(fallback_slices) * 3 * r))
+            per_pair = aq_healthy.element_size() * len(fallback_slices) * 3 * r
+            pair_budget = max(1, _PROJECTION_TILE_BYTES // per_pair)
             q_step = max(1, min(nq, 32, pair_budget))
             k_step = max(1, min(nk, pair_budget // q_step))
+            checkpointed = nq > q_step or nk > k_step or nq * nk * per_pair > _CHECKPOINT_BYTES
             rows = []
             for i in range(0, nq, q_step):
                 columns = []
@@ -1208,7 +1247,7 @@ def projected_gaussian_kl(
                     tile_args = (selected[0][:, i:i+q_step], selected[1][:, j:j+k_step],
                                  selected[2][:, i:i+q_step], selected[3][:, j:j+k_step],
                                  selected[4][:, i:i+q_step], selected[5][:, j:j+k_step])
-                    if (torch.is_grad_enabled() and (nq > q_step or nk > k_step)
+                    if (torch.is_grad_enabled() and checkpointed
                             and any(x.requires_grad for x in tile_args)):
                         columns.append(checkpoint(_projected_kl_direct_tile, *tile_args,
                                                   use_reentrant=False, preserve_rng_state=False))
@@ -1218,32 +1257,45 @@ def projected_gaussian_kl(
             direct = torch.cat(rows, dim=-2)                                    # (n_fallback, Nq, Nk)
             healthy = (healthy.reshape(-1, nq, nk)
                        .index_copy(0, index, direct.to(healthy.dtype)).reshape(grid))
-        if not factor_trace_any:
+        if not factor_trace_any or not recovered_slices:
             return healthy.to(dtype)
-        # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j).
+        # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j). Only the (batch, head)
+        # slices holding one are gathered, and the tile size follows their count (audit 2026-10-16 F28); every
+        # triangular solve is per matrix, so a recovered slice scores as in a batch that holds it alone.
         q_rec = (rec_q.movedim(-1, -2) if rec_q is not None                       # (..., H, Nq)
                  else torch.zeros(Gq.shape[:-4] + (Gq.shape[-3], Gq.shape[-4]),
                                   dtype=torch.bool, device=Gq.device))
         k_rec = (rec_k.movedim(-1, -2) if rec_k is not None                       # (..., H, Nk)
                  else torch.zeros(Gk.shape[:-4] + (Gk.shape[-3], Gk.shape[-4]),
                                   dtype=torch.bool, device=Gk.device))
-        pair_rec = q_rec.unsqueeze(-1) | k_rec.unsqueeze(-2)                      # (..., H, Nq, Nk)
-        q_step, k_step = _tile_steps(aq.element_size(), r * r)
+        grid = healthy.shape                                                      # (..., H, Nq, Nk)
+        index = torch.unravel_index(torch.tensor(recovered_slices, dtype=torch.long, device=healthy.device),
+                                    grid[:-2])
+
+        def _gather(t: torch.Tensor, tail: int) -> torch.Tensor:                 # (n_recovered, *tail)
+            trailing = t.shape[t.ndim - tail:]
+            return t.expand(*grid[:-2], *trailing)[index]
+
+        pair_rec = _gather(q_rec, 1).unsqueeze(-1) | _gather(k_rec, 1).unsqueeze(-2)   # (n, Nq, Nk)
+        route = (_gather(aq, 2), _gather(ak, 2), _gather(q_factor, 3), _gather(k_factor, 3),
+                 _gather(logdet_q, 1), _gather(logdet_k, 1))
+        current = _gather(healthy, 2)                                             # (n, Nq, Nk)
+        q_step, k_step = _tile_steps(aq.element_size(), r * r, len(recovered_slices))
         rows = []
         for i in range(0, nq, q_step):
             columns = []
             i_rec = any(q_needs[i:i+q_step])
             for j in range(0, nk, k_step):
-                value = healthy[..., i:i+q_step, j:j+k_step]
+                value = current[:, i:i+q_step, j:j+k_step]
                 if i_rec or any(k_needs[j:j+k_step]):
-                    args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
-                            q_factor[..., i:i+q_step, :, :], k_factor[..., j:j+k_step, :, :],
-                            logdet_q[..., i:i+q_step], logdet_k[..., j:j+k_step])
+                    args = (route[0][:, i:i+q_step], route[1][:, j:j+k_step],
+                            route[2][:, i:i+q_step], route[3][:, j:j+k_step],
+                            route[4][:, i:i+q_step], route[5][:, j:j+k_step])
                     factor_value = _tile(args, True, q_step, k_step).to(dtype)
-                    value = torch.where(pair_rec[..., i:i+q_step, j:j+k_step], factor_value, value)
+                    value = torch.where(pair_rec[:, i:i+q_step, j:j+k_step], factor_value, value)
                 columns.append(value)
             rows.append(torch.cat(columns, dim=-1))
-        return torch.cat(rows, dim=-2).to(dtype)
+        return healthy.index_put(index, torch.cat(rows, dim=-2).to(healthy.dtype)).to(dtype)
 
 
 def _healthy_kl_verdict(host: List[bool]) -> None:
@@ -1754,10 +1806,11 @@ def projected_mean_distance_cost(
         nq = aq.shape[-2]
         per_row = ak.numel() * ak.element_size()                              # one query row's (..., H, Nk, r)
         step = max(1, min(nq, _PROJECTION_TILE_BYTES // max(1, per_row)))
+        checkpointed = step < nq or nq * per_row > _CHECKPOINT_BYTES
         rows = []
         for i in range(0, nq, step):
             tile = aq[..., i:i + step, :]
-            if torch.is_grad_enabled() and step < nq and (tile.requires_grad or ak.requires_grad):
+            if torch.is_grad_enabled() and checkpointed and (tile.requires_grad or ak.requires_grad):
                 rows.append(checkpoint(_mean_distance_tile, tile, ak, use_reentrant=False, preserve_rng_state=False))
             else:
                 rows.append(_mean_distance_tile(tile, ak))

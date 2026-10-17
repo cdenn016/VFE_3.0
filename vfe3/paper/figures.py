@@ -310,19 +310,29 @@ def sigma_schedule(run: RunRecord, n_updates: int) -> Tuple[Optional[np.ndarray]
     ``prior_bank.sigma_log_embed`` in the latest training checkpoint (``initial_lr``,
     ``weight_decay``), else the config (``m_p_sigma_lr``; ``sigma_weight_decay``, inheriting
     ``weight_decay`` when None, as :func:`vfe3.train.build_optimizer` groups it). Schedule: the
-    per-update multiplier of :func:`vfe3.train._floor_lr_lambdas` (warmup, half cosine, floors) at
-    the accepted-update count :math:`k` (the scheduler steps once per accepted update). The logged
-    ``lr_sigma`` column (the rate of the next update after ``step`` updates) is used to check the
-    reconstruction; on a mismatch beyond :data:`LR_CROSSCHECK_RTOL`, or when the schedule cannot be
-    rebuilt, the logged rates are interpolated instead.
+    per-update multiplier :math:`f(k)` of :func:`vfe3.train._floor_lr_lambdas` (warmup, half cosine,
+    floors) at the accepted-update count :math:`k` (the scheduler steps once per accepted update), so
+    :math:`\eta_k = \mathrm{lr}_0 f(k)`.
+
+    The logged ``lr_sigma`` column (the rate of the next update after ``step`` updates) checks the
+    reconstruction. Under ``m_table_update_mode='fisher'`` it records the natural table step
+    :math:`\eta_F f(s)` with :math:`\eta_F` = ``m_table_fisher_lr`` (:func:`vfe3.train._table_fisher_learning_rates`,
+    audit 2026-10-10 round 2, item 37), while :mod:`vfe3.table_optim` decays the table by
+    :math:`1 - \mathrm{lr}_0 f(k)\lambda` at the AdamW group rate; fisher runs logged before item 37 recorded
+    that AdamW rate. Each convention the run can carry is checked and the closer one is recorded under
+    ``lr_logged_as``. On a mismatch beyond :data:`LR_CROSSCHECK_RTOL`, or when the schedule cannot be
+    rebuilt, the logged rates are interpolated instead, converted to the AdamW rate by
+    :math:`\mathrm{lr}_0/\eta_F` when they are read as the Fisher step (audit 2026-10-16 F21).
     """
     info: Dict[str, Any] = {}
     base = lam = None
+    table_fisher: Optional[bool] = None          # the executed group marker, when a checkpoint holds the group
     groups = optimizer_groups(run)
     if groups is not None:
         for group in groups["groups"]:
             if SIGMA_TABLE_KEY in group["names"]:
                 base, lam = group["initial_lr"], group["weight_decay"]
+                table_fisher = group.get("table_fisher") == "sigma"
                 info["hyperparameter_source"] = f"optimizer group in {Path(groups['checkpoint']).name}"
                 break
     if base is None or lam is None:
@@ -334,6 +344,15 @@ def sigma_schedule(run: RunRecord, n_updates: int) -> Tuple[Optional[np.ndarray]
     if base is None or lam is None or n_updates <= 0:
         info["reason"] = "sigma learning rate or weight decay not recorded"
         return None, info
+    # Scales the logged lr_sigma can carry over the multiplier f(s): the AdamW rate lr_0 f(s), and under the
+    # Fisher table step (the checkpoint marker, else the config) also eta_F f(s), since lr_t/lr_0 = f(s).
+    if table_fisher is None:
+        table_fisher = run.value("m_table_update_mode") == "fisher"
+    eta_fisher = finite_float(run.value("m_table_fisher_lr")) if table_fisher else None
+    conventions: List[Tuple[str, float, bool]] = [("AdamW rate lr_0 f(s)", float(base), False)]   # (label, c, Fisher)
+    if eta_fisher is not None and eta_fisher > 0:
+        conventions.append(("Fisher step eta_F f(s) (m_table_fisher_lr)", float(eta_fisher), True))
+        info["table_fisher_lr"] = eta_fisher
     k = np.arange(int(n_updates))
     lrs = None
     multiplier: Optional[Callable[[int], float]] = None
@@ -351,19 +370,32 @@ def sigma_schedule(run: RunRecord, n_updates: int) -> Tuple[Optional[np.ndarray]
     if logged is not None and "step" in metrics:
         rows = np.isfinite(metrics["step"]) & np.isfinite(logged)
         steps_logged, lr_logged = metrics["step"][rows], logged[rows]
+        # Without a cross-check the logged column is read in the convention of the current trainer.
+        label, logged_scale, read_as_fisher = conventions[-1]
         if steps_logged.size and multiplier is not None:
-            predicted = np.array([base * multiplier(int(s)) for s in steps_logged])
+            factors = np.array([multiplier(int(s)) for s in steps_logged])                  # (n_rows,) f(s)
             scale = np.maximum(np.abs(lr_logged), 1e-300)
-            info["lr_crosscheck_max_rel_error"] = float(np.max(np.abs(predicted - lr_logged) / scale))
-            if info["lr_crosscheck_max_rel_error"] > LR_CROSSCHECK_RTOL:
+            errors = [(float(np.max(np.abs(c * factors - lr_logged) / scale)), name, c, fisher)
+                      for name, c, fisher in conventions]
+            error, label, logged_scale, read_as_fisher = min(errors, key=lambda entry: entry[0])
+            info["lr_crosscheck_max_rel_error"] = error
+            if error > LR_CROSSCHECK_RTOL:
                 lrs = None
-                info["lr_crosscheck"] = "mismatch: logged lr_sigma used"
+                info["lr_crosscheck"] = "mismatch: logged lr_sigma used" + (
+                    ", converted to the AdamW rate by lr_0/eta_F" if read_as_fisher else "")
             else:
                 info["lr_crosscheck"] = "ok"
+        elif steps_logged.size and len(conventions) > 1:
+            label += " (assumed: the trainer's convention since audit 2026-10-10 round 2, item 37)"
+        if steps_logged.size:
+            info["lr_logged_as"] = label
         if lrs is None and steps_logged.size >= 2:
             order = np.argsort(steps_logged)
             lrs = np.interp(k, steps_logged[order], lr_logged[order])
-            info["lr_source"] = "metrics.csv lr_sigma interpolated between log rows"
+            if read_as_fisher:                     # eta_F f(s) -> lr_0 f(s), the rate table_optim decays with
+                lrs = lrs * (float(base) / logged_scale)
+            info["lr_source"] = "metrics.csv lr_sigma interpolated between log rows" + (
+                ", times lr_0/eta_F" if read_as_fisher else "")
     if lrs is None:
         info["reason"] = "the sigma learning-rate schedule could not be rebuilt or read"
     return lrs, info

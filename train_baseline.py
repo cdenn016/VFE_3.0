@@ -64,6 +64,7 @@ from vfe3.data.datasets import (
     make_dataloader,
     tokens_per_char as _tokens_per_char,
 )
+from vfe3.experiment import rename_run_by_test_ppl, reserve_directory
 from vfe3.runtime import seed_everything
 from vfe3.train import evaluate, train
 
@@ -219,38 +220,6 @@ def _default_label(cfg: BaselineConfig, dataset: str) -> str:
     return f"{dataset}_K{cfg.embed_dim}_baseline{table}_s{cfg.seed}"
 
 
-def _reserve_directory(root: Path, base: str) -> Path:
-    r"""Atomically reserve ``root/base`` (numeric suffixes on collision)."""
-    root.mkdir(parents=True, exist_ok=True)
-    suffix = 1
-    while True:
-        candidate = root / (base if suffix == 1 else f"{base}_{suffix}")
-        try:
-            candidate.mkdir(exist_ok=False)
-        except FileExistsError:
-            suffix += 1
-            continue
-        return candidate
-
-
-def _rename_by_test_ppl(run_dir: Path, label: str, test_ppl: Optional[float],
-                        logger: logging.Logger, *, prefix: str = "") -> Path:
-    r"""Rename ``run_dir`` to ``<prefix><ppl:.2f>_<label>`` (unchanged when the PPL is missing or the OS refuses)."""
-    if test_ppl is None or not math.isfinite(float(test_ppl)) or not run_dir.exists():
-        return run_dir
-    target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}"
-    index = 2
-    while target.exists():
-        target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}_{index}"
-        index += 1
-    try:
-        run_dir.rename(target)
-    except OSError as exc:
-        logger.warning("could not rename run dir to %s (%s); kept %s", target.name, exc, run_dir.name)
-        return run_dir
-    return target
-
-
 def run_baseline(
     cfg: BaselineConfig,
 
@@ -289,9 +258,14 @@ def run_baseline(
     train_loader = _select_loader(dataset, cfg, split="train", data_seed=data_seed, max_tokens=max_tokens)
     val_loader = _select_loader(dataset, cfg, split="validation", data_seed=data_seed)
     val_tpc = _tokens_per_char(dataset, "validation")
+    # The test split is opened with the others, so a missing or unreadable test cache fails at launch
+    # rather than after the whole training budget (audit 2026-10-16 F122); a sweep arm never reads it.
+    test_loader = (_select_loader(dataset, cfg, split="test", data_seed=data_seed) if score_test
+                   else None)
+    test_tpc = _tokens_per_char(dataset, "test")
     run_label = label or _default_label(cfg, dataset)
     from datetime import datetime
-    run_dir = _reserve_directory(Path(out_root), f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{run_label}")
+    run_dir = reserve_directory(Path(out_root), f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{run_label}")
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=str(device),
                              timestamp=datetime.now().isoformat(timespec="seconds"))
     n_params = sum(p.numel() for p in model.parameters())
@@ -314,17 +288,15 @@ def run_baseline(
     else:
         metrics = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
     logger.info("Final (val) | CE: %.4f | PPL: %.2f", metrics["ce"], metrics["ppl"])
-    test_loader = (_select_loader(dataset, cfg, split="test", data_seed=data_seed) if score_test
-                   else None)
     results = finalize_run(
-        model, artifacts, cfg, final_validation=metrics, tokens_per_char=_tokens_per_char(dataset, "test"),
+        model, artifacts, cfg, final_validation=metrics, tokens_per_char=test_tpc,
         train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, losses=losses,
         data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=_tokenizer_tag(dataset),
         device=device, wall_time=wall, logger=logger)
     if score_test:
-        final_dir = _rename_by_test_ppl(run_dir, run_label, results.get("test_ppl"), logger)
+        final_dir = rename_run_by_test_ppl(run_dir, run_label, results.get("test_ppl"), logger)
     else:
-        final_dir = _rename_by_test_ppl(run_dir, run_label, results.get("best_val_ppl"), logger, prefix="val")
+        final_dir = rename_run_by_test_ppl(run_dir, run_label, results.get("best_val_ppl"), logger, prefix="val")
     logger.info("Artifacts written to %s", final_dir)
     return final_dir
 
@@ -344,7 +316,9 @@ def lr_sweep(
     r"""Short runs at each peak learning rate; the winner has the lowest best validation perplexity.
 
     Every run keeps the protocol of ``cfg`` except ``lr`` and ``max_steps`` (the warmup is capped at
-    ``max_steps``); selection reads only ``summary.json`` ``best_val_ppl`` (validation).
+    ``max_steps``); selection reads only ``summary.json`` ``best_val_ppl`` (validation). ``at_grid_edge`` is True
+    when the winner is the lowest or highest swept rate, so the grid does not bracket the optimum (None without a
+    winner). The edge is that of the swept grid, so a diverged rate beyond the winner brackets it.
     """
     rows = []
     for lr in lrs:
@@ -359,8 +333,10 @@ def lr_sweep(
     finite = [row for row in rows if isinstance(row["best_val_ppl"], (int, float))
               and math.isfinite(row["best_val_ppl"])]
     best = min(finite, key=lambda row: row["best_val_ppl"]) if finite else None
+    swept_lrs = [float(lr) for lr in lrs]
+    at_grid_edge = (best["lr"] in (min(swept_lrs), max(swept_lrs))) if best else None
     return {"rows": rows, "best_lr": (best["lr"] if best else None), "selection": "best_val_ppl",
-            "max_steps": int(max_steps)}
+            "at_grid_edge": at_grid_edge, "max_steps": int(max_steps)}
 
 
 def calibrate_widths(
@@ -398,7 +374,7 @@ def calibrate_widths(
         seed_everything(wide.seed, deterministic=wide.deterministic)
         model = BaselineTransformer(wide).to(device)
         loader = _select_loader(dataset, wide, split="train", data_seed=data_seed, max_tokens=max_tokens)
-        run_dir = _reserve_directory(Path(out_root), f"calibration_K{width}_s{seed}")
+        run_dir = reserve_directory(Path(out_root), f"calibration_K{width}_s{seed}")
         artifacts = RunArtifacts(run_dir, wide, model, dataset=dataset, device=str(device),
                                  save_model_artifacts=False)
         seed_everything(wide.seed, deterministic=wide.deterministic)
@@ -488,6 +464,9 @@ def main() -> None:
         if sweep["best_lr"] is not None:
             cfg = replace(cfg, lr=sweep["best_lr"])
             logger.info("lr sweep: selected lr=%g on validation", sweep["best_lr"])
+            if sweep["at_grid_edge"]:
+                logger.warning("lr sweep: the selected lr=%g is at the edge of LR_SWEEP; the optimum may lie "
+                               "outside the grid, so extend it before trusting this rate", sweep["best_lr"])
     for seed in SEEDS:
         run_baseline(cfg, dataset=DATASET, out_root=out_root, seed=int(seed), data_seed=DATA_SEED,
                      label=(f"{LABEL}_s{seed}" if LABEL else None), **run_kwargs)

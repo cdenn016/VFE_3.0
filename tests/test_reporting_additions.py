@@ -497,7 +497,6 @@ def _write_scaling_analysis_run(
     test_ce,
     scale_knob="n_params",
     n_e_steps=1,
-    estep_final_f_per_token=None,
     tokens_seen=1000,
     git_sha="git-a",
     train_sha="train-a",
@@ -553,7 +552,6 @@ def _write_scaling_analysis_run(
     }
     (run / "summary.json").write_text(json.dumps({
         **metrics,
-        "estep_final_f_per_token": estep_final_f_per_token,
         "scaling_reuse_contract_sha256": digest,
         "scaling_point": {
             **metrics,
@@ -586,7 +584,10 @@ def _write_scaling_analysis_run(
 def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
     # Two routes, four sizes each, and two seeds per cell give every table and
     # overlay enough sizes for the requested offset estimator.  With symmetric
-    # seed values mean +/- 0.05, SEM is exactly 0.05 at every point.
+    # seed values mean +/- 0.05, SEM is exactly 0.05 at every point.  The routes differ in
+    # n_e_steps: the fixture config does not depend on the size, so equal configs would make the
+    # two routes' cells identical training runs, which the frontier test counts once (audit
+    # 2026-10-16 F55).
     import pytest
     pytest.importorskip("scipy")
 
@@ -601,6 +602,7 @@ def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
                     seed=seed,
                     n_params=n_params,
                     test_ce=mean + delta,
+                    n_e_steps=1 + route_i,
                 )
 
     real_fit = figs._fit_power_law
@@ -863,7 +865,6 @@ def test_write_scaling_md(tmp_path):
         "per_route": {"grow_K": {"alpha": 0.11, "r2": 0.97, "n_sizes": 4}},
         "frontier_collapse": {"testable": True, "collapses": True, "df1": 2, "df2": 8,
                               "F": 0.5, "p_value": 0.62},
-        "estep_structural": {"n_arms": 3, "pearson_ne_final_f": -0.95, "pearson_final_f_test_ce": 0.1},
         "provenance": {"git_sha": ["abc"], "train_data_sha256": ["train"],
                        "val_data_sha256": ["val"], "test_data_sha256": ["test"],
                        "data_sha256": ["test"], "code_drift": False, "mixed_corpus": False,
@@ -875,22 +876,19 @@ def test_write_scaling_md(tmp_path):
     scaling_analysis._write_scaling_md(out, summary)
     text = out.read_text(encoding="utf-8")
     for section in ("Pooled L(N) power law", "Per-route exponents", "Frontier-collapse F-test",
-                    "E-step structural-EM check", "Provenance and confounds"):
+                    "Provenance and confounds"):
         assert section in text
-    assert "expect strongly negative" not in text
-    assert "expect ~0" not in text
-    assert "separate objectives" in text
+    # No run records a final E-step free energy, so the structural-EM check is gone (audit 2026-10-16 F86).
+    assert "E-step structural-EM check" not in text
 
-def test_analyze_reports_target_blind_correlations_without_expected_signs(
+def test_analyze_runs_the_inference_arms_without_an_estep_free_energy(
     tmp_path,
     monkeypatch,
     capsys,
 ):
-    for n_e_steps, final_f, test_ce in (
-        (1, 3.0, 4.0),
-        (2, 2.4, 4.2),
-        (3, 2.1, 4.1),
-    ):
+    # No route records a final E-step free energy per token, so the structural-EM check and its CSV
+    # column are gone (audit 2026-10-16 F86); the n_e_steps arms still analyze.
+    for n_e_steps, test_ce in ((1, 4.0), (2, 4.2), (3, 4.1)):
         _write_scaling_analysis_run(
             tmp_path,
             route=scaling_analysis.INFERENCE_ROUTE,
@@ -900,7 +898,6 @@ def test_analyze_reports_target_blind_correlations_without_expected_signs(
             test_ce=test_ce,
             scale_knob="n_e_steps",
             n_e_steps=n_e_steps,
-            estep_final_f_per_token=final_f,
         )
 
     monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
@@ -911,13 +908,10 @@ def test_analyze_reports_target_blind_correlations_without_expected_signs(
     scaling_analysis.analyze()
 
     console = capsys.readouterr().out
-    assert "Pearson(n_e_steps, final F/token)" in console
-    assert "Pearson(final F/token, test CE)" in console
-    assert "expect strongly negative" not in console
-    assert "expect ~0" not in console
-    assert "target blindness alone implies no Pearson sign" in console
+    assert "Pearson(n_e_steps, final F/token)" not in console
     summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
-    assert summary["estep_structural"]["interpretation"].endswith("no Pearson sign.")
+    assert "estep_structural" not in summary and summary["n_inference_points"] == 3
+    assert "estep_final_f_per_token" not in scaling_analysis._CSV_COLUMNS
 
 
 

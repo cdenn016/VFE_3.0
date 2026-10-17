@@ -791,7 +791,9 @@ class PriorBank(nn.Module):
         # divergence_family / renyi_order drive the reference decode (reference_decode): logits =
         # -D_configured(q||p_v)/tau_eff scored through get_functional(divergence_family) at
         # alpha=renyi_order. The fast Gaussian kernels hardcode alpha=1 KL. The defaults are the KL
-        # readout every projected route uses.
+        # readout every projected route uses: VFEModel passes neither argument, because both config
+        # fields are retired and pinned to renyi at alpha=1, so other values come from tests only
+        # (audit 2026-10-16 F93).
         self.divergence_family = divergence_family
         self.renyi_order = renyi_order
         self.encode_mode = encode_mode
@@ -981,8 +983,10 @@ class PriorBank(nn.Module):
         working precision has to carry roughly ``log10(1/(sigma_v * tau))`` digits before the logits
         start moving (audit 2026-08-06 F32). This is the one number that says how much headroom is
         left: at the ``sigma_init``-scale table the induced logit error is ~2e-4, at 1e-3 it is ~1.5
-        logits, and at 1e-4 ~12. ``sigma_log_embed`` trains freely against only the ``eps`` floor, so
-        the margin is not structurally bounded -- it has to be watched. Switch
+        logits, and at 1e-4 ~12. The decode log-variance table (``decode_sigma_log_embed`` when untied, else
+        ``sigma_log_embed``) trains freely against only the ``eps`` floor, so the margin is not structurally
+        bounded -- it has to be watched; vfe3.train logs it as the ``decode_sigma_v_min`` column of every metrics
+        row, beside ``decode_sigma_log_mean`` and ``decode_sigma_log_sd``. Switch
         ``decode_av_precision="fp64"`` if this falls far enough to matter.
         """
         return float(bounded_variance_from_log(

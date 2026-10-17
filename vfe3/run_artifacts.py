@@ -10,7 +10,8 @@ A training run produces a self-contained directory::
       best_model.pt      {model_state, config, config_fingerprint} at the lowest validation PPL
       test_results.json  end-of-run TEST-split eval on the reloaded best checkpoint
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
-      loss_curve.png     training cross-entropy trajectory
+      loss_curve.png     per-step training-loss trajectory (the optimizer objective, metrics.csv's
+                         train_loss) at the absolute training step
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
       free_energy_relationship.png     final-iterate objective vs validation CE
@@ -376,16 +377,20 @@ def _require_identity_sha256(value: object, field: str) -> str:
     return value
 
 
-_DECLARATIVE_DRIVER_NAME = re.compile(r"^(?:config|[A-Z][A-Z0-9_]*)$")
+_DECLARATIVE_DRIVER_NAME = re.compile(r"^(?:config|fully_gauge_covariant|[A-Z][A-Z0-9_]*)$")
 
 
 def _is_declarative_driver_statement(statement: ast.stmt) -> bool:
     r"""Whether a top-level driver statement only assigns click-to-run settings.
 
-    The launchers keep their live settings in a top-level ``config`` dictionary and public UPPER_CASE
-    names (``CONFIG``, ``SWEEPS``, ``DATA_SEED``, ``RUN_DIR`` ...), including ``config[...] = ...``
-    item assignments. Those values are bound by the run's own config fingerprint and contracts, not by
-    the executable-code identity, so editing them (for example adding ``resume_from``) is not code drift.
+    The launchers keep their live settings in a top-level ``config`` dictionary, the lowercase launcher
+    toggle ``fully_gauge_covariant`` (``train_vfe3.py``, ``ablation.py``), and public UPPER_CASE names
+    (``CONFIG``, ``SWEEPS``, ``DATA_SEED``, ``RUN_DIR`` ...), including ``config[...] = ...`` item
+    assignments. Those values are bound by the run's own config fingerprint and contracts, not by the
+    executable-code identity, so editing them (for example adding ``resume_from``) is not code drift. The
+    toggle acts through the gauge overrides it writes into the config, which the fingerprint binds, and a
+    refusal gate that computes nothing; ``ablation.py``'s runner hash lists it as declarative too (audit
+    2026-10-16 F78).
     """
     if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
         return False
@@ -899,6 +904,33 @@ def _snapshot_report_batches(
     return batches
 
 
+def _losses_start_step(
+    artifacts: 'RunArtifacts',
+    losses:    Optional[List[float]],
+    logger:    logging.Logger,
+) -> int:
+    r"""Absolute optimizer steps completed before ``losses[0]``.
+
+    ``train`` appends one loss per step of ``range(start_step, n_steps)`` and records
+    ``final_step = n_steps``, so a resumed run's continuation list satisfies
+    ``start_step = final_step - len(losses)`` and ``losses[k]`` belongs to the 1-based step
+    ``start_step + k + 1`` (the ``step`` column of ``metrics.csv``). A caller without a recorded
+    ``final_step`` (or an inconsistent one) falls back to 0, the from-scratch axis.
+    """
+    if not losses:
+        return 0
+    final_step = getattr(artifacts, "final_step", None)
+    if type(final_step) is not int:
+        return 0
+    start_step = final_step - len(losses)
+    if start_step < 0:
+        logger.warning(
+            "final_step %d is shorter than the %d-step loss history; loss_curve.png uses steps 1..n",
+            final_step, len(losses))
+        return 0
+    return start_step
+
+
 def _run_figures_isolated(
     model:     torch.nn.Module,
     artifacts: 'RunArtifacts',
@@ -947,6 +979,7 @@ def _run_figures_isolated(
                 request = {
                     "run_dir":             str(run_dir),
                     "losses":              ([float(value) for value in losses] if losses else None),
+                    "losses_start_step":   _losses_start_step(artifacts, losses, logger),
                     "generate_publication": bool(generate_publication),
                     "report_batches_path": (str(batches_path) if report_batches is not None else None),
                     "model_bundle_path":   live_model_path,
@@ -1877,6 +1910,16 @@ def _checkpoint_numerics_counters(
     return out or None
 
 
+def _checkpoint_divergence_state(
+    value: object,
+) -> Optional[Dict[str, object]]:
+    r"""The checkpoint's divergence-monitor record, validated by ``vfe3.train._checkpoint_divergence_state``
+    (None when missing or malformed: a diagnostic, so it never fails a save or a resume)."""
+    from vfe3.train import _checkpoint_divergence_state as validated
+
+    return validated(value)
+
+
 class RunArtifacts:
     r"""Owns a run directory and its incremental metrics, reports, and optional model files.
 
@@ -1957,6 +2000,14 @@ class RunArtifacts:
         # checkpoint carried in (set by load_checkpoint), so metrics.csv wall_clock_s continues.
         self.wall_clock_state: Optional[float] = None
         self.resumed_wall_clock_s: Optional[float] = None
+        # Divergence-monitor host state a checkpoint carries (set by train()) and the validated record a
+        # resumed checkpoint carried in (set by load_checkpoint), so spike detection continues exactly.
+        self.divergence_state: Optional[Dict[str, object]] = None
+        self.resumed_divergence_state: Optional[Dict[str, object]] = None
+        # The run a resume continues (set by load_checkpoint; None from scratch). This directory's
+        # metrics.csv, diagnostics and figures start after saved_step, while best_step is run-wide, so
+        # summary.json names where the earlier history lives (audit 2026-10-16 F123).
+        self.resume_source: Optional[Dict[str, object]] = None
         # Source bytes at run start: vfe3/**/*.py, root *.py drivers and pyproject.toml, zipped with
         # their hash, the Git HEAD and the dirty-file list. Best-effort: a failure is recorded in
         # the returned mapping (and later in provenance.json), never raised.
@@ -2270,6 +2321,9 @@ class RunArtifacts:
                 "numerics_counters": _checkpoint_numerics_counters(
                     getattr(self, "numerics_counters_state", None)),
                 "wall_clock_s":    getattr(self, "wall_clock_state", None),
+                # Divergence-monitor EMAs, warmups, cooldown and open interval with the skip counters
+                # (vfe3.train._divergence_checkpoint_record, or None); a diagnostic like the counters above.
+                "divergence_monitor": _checkpoint_divergence_state(getattr(self, "divergence_state", None)),
             }, tmp)
             _atomic_replace(path, tmp)
         return path
@@ -2727,6 +2781,16 @@ def load_checkpoint(
         artifacts.resumed_wall_clock_s = (
             float(saved_wall_clock) if isinstance(saved_wall_clock, (int, float))
             and not isinstance(saved_wall_clock, bool) and math.isfinite(saved_wall_clock) else None)
+        # Divergence-monitor state (None for an older checkpoint or a malformed record); train() continues it.
+        artifacts.resumed_divergence_state = _checkpoint_divergence_state(ckpt.get("divergence_monitor"))
+        resolved_checkpoint = checkpoint_path.resolve()
+        artifacts.resume_source = {
+            # <run_dir>/checkpoints/step_<N>.pt; None for a checkpoint kept outside a run directory.
+            "source_run_dir":  (str(resolved_checkpoint.parent.parent)
+                                if resolved_checkpoint.parent.name == "checkpoints" else None),
+            "checkpoint_path": str(resolved_checkpoint),
+            "saved_step":      saved_step,
+        }
         saved_code_identity = ckpt.get("code_identity_sha256")
         code_identity_match = (
             saved_code_identity == expected_code_identity
@@ -3194,6 +3258,9 @@ def _write_provenance(
         "cuda_version":        torch.version.cuda,
         **_execution_device_fields(model),
         "data_seed":           (int(data_seed) if data_seed is not None else None),
+        # The training-window origin ('per_epoch_random' for every TokenWindows run trained now), so
+        # vfe3.experiment.saved_train_window_mode reads it without the repository history (audit 2026-10-16 F59).
+        "train_window_mode":   getattr(getattr(train_loader, "dataset", None), "window_offset_mode", None),
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
         "code_identity_sha256":       artifacts.code_identity_sha256,
@@ -4202,9 +4269,9 @@ def finalize_run(
         "test_padding_targets": results.get("test_padding_targets"),
         "test_stream_transitions": results.get("test_stream_transitions"),
         "diagnostics":  results["diagnostics"],
-        "estep_final_iterate_f_per_token": results.get("estep_final_iterate_f_per_token"),
-        "estep_final_f_per_token": results.get("estep_final_f_per_token"),
-        "estep_iterate_evidence": results.get("estep_iterate_evidence"),
+        # No estep_final_iterate_f_per_token / estep_final_f_per_token / estep_iterate_evidence: nothing on the
+        # projected routes produces an E-step iterate sequence, so those keys were always null (audit 2026-10-16
+        # F86); the legacy_reduced_free_energy diagnostic records why the shared F is unavailable.
         "scheduler": _scheduler_metadata(
             min_lr_frac=cfg.min_lr_frac,
             base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
@@ -4213,6 +4280,9 @@ def finalize_run(
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
+        # A resumed run's metrics.csv starts after resume_source.saved_step; earlier rows (and a best_step at or
+        # before it) are in resume_source.source_run_dir. None from scratch.
+        "resume_source": getattr(artifacts, "resume_source", None),
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
         # The expected-likelihood CE kernel that last ran ('torch' | 'triton'; None when that decoder never
@@ -4332,9 +4402,19 @@ def _log_mechanism_diagnostics(
                 100.0 * (deepest.get("step1_share_of_displacement") or 0.0))
     if beta is not None and beta.get("available"):
         deltas = beta["delta_ce"]
-        logger.info(
-            "Attention channels (delta CE, nats): positional prior %+.4f vs content energy %+.4f",
-            deltas["positional_channel"], deltas["content_channel"])
+        if beta.get("energy_includes_rope_position"):
+            # Under RoPE the routing cost carries position too; the rotation-only arm is a separate,
+            # non-additive ablation (audit 2026-10-16, F25).
+            rope = deltas.get("rope_position_channel")
+            logger.info(
+                "Attention channels (delta CE, nats): positional prior %+.4f vs routing cost "
+                "(content + RoPE position) %+.4f%s",
+                deltas["positional_channel"], deltas["content_channel"],
+                (f" vs RoPE position (rotation only) {rope:+.4f}" if rope is not None else ""))
+        else:
+            logger.info(
+                "Attention channels (delta CE, nats): positional prior %+.4f vs content energy %+.4f",
+                deltas["positional_channel"], deltas["content_channel"])
     if context is not None and context.get("stages"):
         logger.info(
             "Context injection (relative belief shift under prefix randomization): %s",
@@ -4384,14 +4464,17 @@ def collect_beta_channel_decomposition(
 
     The belief attention weight is :math:`\beta_{ij}=\mathrm{softmax}_j(\log\pi_{ij}-E_{ij}/\tau)`,
     where :math:`\log\pi` is the positional/precision prior and :math:`E_{ij}` is the
-    belief-coupling energy -- the only content-dependent channel. Three arms isolate them:
+    belief-coupling energy -- the only content-dependent channel. Three arms isolate them, and a fourth
+    (``no_rope``, below) runs under RoPE:
 
     ============ ============================================ ==================================
     arm          beta                                         reads
     ============ ============================================ ==================================
     ``full``     ``softmax(log_prior - E/tau)``                as trained; reproduces the baseline
-    ``no_energy``  ``softmax(log_prior)``                      the CONTENT channel's worth
+    ``no_energy``  ``softmax(log_prior)``                      the CONTENT channel's worth (plus
+                                                               RoPE position under a rope_mode)
     ``no_prior``   ``softmax(-E/tau)``                         the POSITIONAL channel's worth
+    ``no_rope``    ``full`` with the rotation :math:`R_i = I`  RoPE position (rope_mode != 'none')
     ============ ============================================ ==================================
 
     Measured 2026-07-25 on the K=300 baseline: flattening the prior cost 0.612 nats against 0.210
@@ -4907,6 +4990,7 @@ def finalize_validation_run(
         "final_train_loss":    final_train_loss,
         "wall_time_s":         (float(wall_time) if wall_time is not None else None),
         "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
+        "resume_source":       getattr(artifacts, "resume_source", None),   # as in finalize_run
         "terminal_checkpoint": terminal_checkpoint,
         "save_model_artifacts": artifacts.save_model_artifacts,
         "figures_written":     figures_written,
@@ -5027,11 +5111,11 @@ def _pure_path_report(
     if runtime_exactness_key is None:
         # No runtime exactness certificate is registered for this transport: the flat cocycle is
         # exact by construction (no edge factor to approximate), so there is nothing to observe.
-        regime_ii_covariant_exact = True
-        regime_ii_covariant_exactness = "not_applicable"
+        transport_runtime_exact = True
+        transport_runtime_exactness = "not_applicable"
     elif not family_group_invariant:
-        regime_ii_covariant_exact = False
-        regime_ii_covariant_exactness = "diagonal_projection_approximation"
+        transport_runtime_exact = False
+        transport_runtime_exactness = "diagonal_projection_approximation"
     else:
         observations = [row.get(runtime_exactness_key) for row in history]
         finite_observations = [
@@ -5042,9 +5126,9 @@ def _pure_path_report(
             isinstance(value, (int, float)) and math.isfinite(value)
             for value in observations
         )
-        regime_ii_covariant_exact = complete and all(value >= 0.5 for value in observations)
-        regime_ii_covariant_exactness = (
-            "exact_valid_spd_factorization" if regime_ii_covariant_exact else
+        transport_runtime_exact = complete and all(value >= 0.5 for value in observations)
+        transport_runtime_exactness = (
+            "exact_valid_spd_factorization" if transport_runtime_exact else
             "jitter_recovered_approximation" if any(value < 0.5 for value in finite_observations) else
             "unknown_missing_runtime_evidence"
         )
@@ -5052,10 +5136,10 @@ def _pure_path_report(
         transport_exactness_status = "not_applicable"
     elif not transport_registration.gauge_equivariant or not family_group_invariant:
         transport_exactness_status = "approximate"
-    elif regime_ii_covariant_exactness == "unknown_missing_runtime_evidence":
+    elif transport_runtime_exactness == "unknown_missing_runtime_evidence":
         transport_exactness_status = "unknown"
     else:
-        transport_exactness_status = "exact" if regime_ii_covariant_exact else "approximate"
+        transport_exactness_status = "exact" if transport_runtime_exact else "approximate"
 
     # Predictive attention assigns its configured readout covariance; projected_gradient
     # executes Fisher receiver updates unless its covariance update is disabled.
@@ -5264,11 +5348,13 @@ def _pure_path_report(
             # as under skip_belief_sigma_update.
             "fixed_covariance_surrogate":   not covariance_updated,
             "attention_mode":               attention_mode,
-            # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
-            # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
-            # so a diagonal covariant run is never reported as exact Route B.
-            "regime_ii_covariant_exact":    regime_ii_covariant_exact,
-            "regime_ii_covariant_exactness": regime_ii_covariant_exactness,
+            # The transport's runtime exactness certificate: not_applicable for the flat transport (no
+            # registered runtime_exactness_key, exact by construction). A registered certificate under
+            # gaussian_diagonal is a CONTROLLED APPROXIMATION (the diagonal cone is not closed under GL
+            # congruence Omega Sigma Omega^T -- audit C5), so such a run is never reported as exact. Named
+            # after the transport, not a retired regime (audit 2026-10-16 F94).
+            "transport_runtime_exact":      transport_runtime_exact,
+            "transport_runtime_exactness":  transport_runtime_exactness,
             "spd_retraction_route":         spd_retraction_route,
             "spd_retraction_exact":         spd_retraction_exact,
             "spd_retraction_trust_projection_active": spd_retraction_trust_projection_active,
@@ -5279,6 +5365,8 @@ def _pure_path_report(
             "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),
             "m_phi_group_retraction":        getattr(cfg, "m_phi_group_retraction", "chart"),
             "m_phi_fisher_rotation_weight":  float(getattr(cfg, "m_phi_fisher_rotation_weight", 2.0)),
+            # fisher_group's completed metric (audit 2026-10-16 F50); a record without it ran "rotation".
+            "m_phi_fisher_completion":       getattr(cfg, "m_phi_fisher_completion", "rotation"),
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
             "frame_pair_escalation_tol":     getattr(cfg, "frame_pair_escalation_tol", None),
@@ -5297,8 +5385,16 @@ def _save_figures(
     artifacts: RunArtifacts,
     losses:    Optional[List[float]],
     logger:    logging.Logger,
+
+    *,
+    losses_start_step: int = 0,
 ) -> None:
-    r"""Best-effort publication figures from the logged history (no model re-run)."""
+    r"""Best-effort publication figures from the logged history (no model re-run).
+
+    ``losses_start_step`` is the absolute number of optimizer steps completed before ``losses[0]``
+    (nonzero on a resumed run, whose list holds only the continuation), so ``loss_curve.png`` shares
+    the absolute ``step`` axis of every history trajectory.
+    """
     try:
         from vfe3.viz import figures as raw_figs
 
@@ -5386,9 +5482,17 @@ def _save_figures(
         readout_keys = tuple({key for row in artifacts.history for key in row
                               if key.startswith("relational_")})
         if readout_keys:
+            # The canonical-F panels read the diagnose_canonical_free_energy columns (NaN otherwise, so
+            # _hist_subset drops them), and their "F at the layer input" series is the per-layer figure's
+            # "total", which metrics.csv writes as inner_alignment_energy_total (audit 2026-10-16 F82).
             readout_history = _hist_subset(readout_keys + (
                 "attn_entropy", "attn_entropy_min", "effective_rank", "belief_cond_median",
-                "belief_cond_median_layer_max"))
+                "belief_cond_median_layer_max",
+                "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
+                "inner_alignment_energy_total", "canonical_total_output",
+                *(key for key, _ in raw_figs._CANONICAL_ROUTER_SERIES)))
+            if readout_history is not None and "inner_alignment_energy_total" in readout_history:
+                readout_history["total"] = readout_history.pop("inner_alignment_energy_total")
             if readout_history is not None:
                 try:
                     from vfe3.metrics import covariance_frozen_at_encode
@@ -5407,8 +5511,10 @@ def _save_figures(
                 figs.plt.close(fig)
 
         if losses:
-            # losses is one entry per optimizer step, so the 1-based step index IS the x-axis.
+            # losses is one entry per optimizer step from losses_start_step on, so losses[k] belongs to
+            # the 1-based absolute step losses_start_step + k + 1 (metrics.csv's step column).
             n = len(losses)
+            first = int(losses_start_step)
             steps_per_epoch = next(
                 (
                     int(r["steps_per_epoch"])
@@ -5419,14 +5525,17 @@ def _save_figures(
                 ),
                 0,
             )
-            epoch_boundaries = (
-                list(range(steps_per_epoch, n + 1, steps_per_epoch))
+            epoch_boundaries = (                               # absolute multiples inside (first, first + n]
+                list(range(steps_per_epoch * (first // steps_per_epoch + 1), first + n + 1,
+                           steps_per_epoch))
                 if steps_per_epoch
                 else None
             )
+            # The series is the optimizer objective (train_loss): CE plus any active second-order decode,
+            # self-coupling, CG-energy or EM term, so it is labelled as the loss rather than as CE.
             fig = figs.plot_trajectory(
-                losses, list(range(1, n + 1)), ylabel="train CE (nats/token)",
-                title="Training cross-entropy", color=figs._CB[0],
+                losses, list(range(first + 1, first + n + 1)), ylabel="train loss (nats/token)",
+                title="Training loss", color=figs._CB[0],
                 smooth=max(25, n // 240), annotate_final=True,
                 epoch_boundaries=epoch_boundaries,
                 path=str(run / "loss_curve.png"))
@@ -5499,32 +5608,51 @@ def _save_figures(
         # Free-energy figures: the per-token budget decomposition (snapshot + early/mid/late evolution)
         # and, separately, the final-iterate objective/CE relationship over training. Both need every plotted term
         # finite, so rows before the first eval (NaN val_*) are dropped.
-        fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
-        fe_rows = [r for r in artifacts.history
-                   if all(k in r and math.isfinite(r[k]) for k in fe_keys)]
-        if fe_rows:
-            cfg = getattr(artifacts, "cfg", None)
-            hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
-                    **{k: [r[k] for r in fe_rows] for k in fe_keys}}
-            # Scale the coupling terms by the static config lambda_beta scalar.
-            lam = getattr(cfg, "lambda_beta", 1.0)
-            # On the projected routes these columns are finite only under diagnose_canonical_free_energy, which
+        fe_terms = ("self_coupling", "belief_coupling", "attention_entropy")
+
+        def _finite_rows(keys: tuple) -> List[Dict]:
+            r"""History rows on which every column of ``keys`` is a finite number."""
+            return [r for r in artifacts.history
+                    if all(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]) for k in keys)]
+
+        def _canonical_rows(rows: List[Dict]) -> bool:
+            # On the projected routes the F columns are finite only under diagnose_canonical_free_energy, which
             # writes canonical_beta_tv beside them (relational_* columns mark the route): the canonical F at the
             # captured beliefs, which nothing there optimizes. Its figures carry no E-step or co-descent reading
             # and plot the self-divergence apart from R(alpha) (audit 2026-10-10 round 2, #17).
-            canonical_fe = any("canonical_beta_tv" in r or "relational_legacy_global_f_available" in r
-                               for r in fe_rows)
-            if canonical_fe:
+            return any("canonical_beta_tv" in r or "relational_legacy_global_f_available" in r for r in rows)
+
+        fe_rows = _finite_rows(fe_terms + ("val_ce",))
+        held_out_rows = _finite_rows(tuple(f"val_{k}" for k in fe_terms) + ("val_ce",))
+        # The canonical figures correlate F with val_ce, so they read the held-out val_* F columns of the same
+        # evaluation rows when the run logged them (the validation split val_ce is scored on), and otherwise the
+        # log step's training-batch columns, naming the population either way (audit 2026-10-16 F83).
+        if held_out_rows and _canonical_rows(held_out_rows):
+            population, rows, prefix = "held_out", held_out_rows, "val_"
+        elif fe_rows and _canonical_rows(fe_rows):
+            population, rows, prefix = "training_batch", fe_rows, ""
+        else:
+            population, rows, prefix = None, fe_rows, ""
+        if rows:
+            cfg = getattr(artifacts, "cfg", None)
+            hist = {"step": [r.get("step", i) for i, r in enumerate(rows)],
+                    **{k: [r[prefix + k] for r in rows] for k in fe_terms},
+                    "val_ce": [r["val_ce"] for r in rows]}
+            # Scale the coupling terms by the static config lambda_beta scalar.
+            lam = getattr(cfg, "lambda_beta", 1.0)
+            if population is not None:
                 for key in ("self_divergence",) + tuple(k for k, _ in raw_figs._CANONICAL_ROUTER_SERIES):
-                    column = [float(r[key]) if isinstance(r.get(key), (int, float)) else float("nan")
-                              for r in fe_rows]
+                    column = [float(r[prefix + key]) if isinstance(r.get(prefix + key), (int, float))
+                              else float("nan") for r in rows]
                     if any(math.isfinite(v) for v in column):
                         hist[key] = column
                 fig = figs.plot_canonical_free_energy_decomposition(
-                    hist, lambda_beta=lam, path=str(run / "canonical_free_energy_decomposition.png"))
+                    hist, lambda_beta=lam, population=population,
+                    path=str(run / "canonical_free_energy_decomposition.png"))
                 figs.plt.close(fig)
                 fig = figs.plot_canonical_free_energy_relationship(
-                    hist, lambda_beta=lam, path=str(run / "canonical_free_energy_relationship.png"))
+                    hist, lambda_beta=lam, population=population,
+                    path=str(run / "canonical_free_energy_relationship.png"))
                 figs.plt.close(fig)
             else:
                 fig = figs.plot_free_energy_decomposition(
@@ -5556,9 +5684,7 @@ def _save_figures(
             figs.plt.close(fig)
         # Held-out validation-sanity dashboard: the per-eval probes (_val_diagnostics) that were CSV-only
         # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
-        hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS + (
-            "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
-            "val_vertex_cond_p99"))
+        hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS)
         if hist_val:
             fig = figs.plot_validation_sanity(
                 hist_val,

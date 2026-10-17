@@ -6,9 +6,14 @@ Produces, in the shared cache directory, for ``DATASET`` (``wikitext-103-word`` 
   ``{DATASET}_{train,validation,test}_word_tokens.pt``   int64 id streams
   ``..._tokens.pt.meta.json``                            per-split build provenance
   ``{DATASET}_word_vocab.json``                          the id-to-word table
+  ``..._tokens.pt.provenance.json``                      per-split tokenizer-provenance manifest
 
 The run is source-bound: the corpus revision is pinned, and the tokenizer code is hashed into the
-sidecar, so a cache that was produced by different code or a different revision is detectable.
+sidecar, so a cache that was produced by different code or a different revision is detectable. Each
+split's metadata also records the SHA-256 of the vocabulary in id order (``vocabulary_sha256``), which
+the loader checks against the sidecar, so a same-size reordered table is refused; and each split gets a
+``.provenance.json`` manifest binding its payload digest and tokenizer identity, which the loader
+reports as ``tokenizer_provenance_status='manifest_verified'``.
 
 Vocabulary (see :mod:`vfe3.data.word_vocab`): every whitespace token type observed in the TRAIN
 split, ordered by descending frequency then lexicographically, with ``<unk>`` reserved at id 0.
@@ -25,9 +30,12 @@ the file. ``MIN_COUNT = DEFAULT_MIN_COUNT`` is the reference build; ``MIN_COUNT 
 vocabulary.
 Every split target is checked for existence before anything is written, so a refused rerun leaves
 the existing caches and their vocabulary untouched. Each split's metadata and token cache are
-published atomically, and the vocabulary sidecar is published LAST, so an interrupted build can leave
-caches whose recorded ``vocab_size``/``min_count`` disagree with the sidecar -- which the loader
-rejects -- but never a sidecar that silently relabels caches encoded with a different table.
+published atomically, and the vocabulary sidecar is published after every cache, so an interrupted
+build can leave caches whose recorded ``vocab_size``/``min_count``/``vocabulary_sha256`` disagree with
+the sidecar -- which the loader rejects -- but never a sidecar that silently relabels caches encoded
+with a different table. A split's earlier provenance manifest is removed before its new payload is
+published and a new one is written after the sidecar, so an interrupted build leaves a cache unverified
+rather than bound to a manifest of the payload it replaced.
 
 The corpus is fetched from the Hugging Face hub at the pinned revision on first run (about 500 MB
 of parquet) and re-read from the local hub cache afterwards.
@@ -44,7 +52,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from vfe3.data.datasets import cache_path, default_cache_dir
+from vfe3.data.datasets import cache_path, default_cache_dir, publish_cache_provenance, word_vocabulary_sha256
 from vfe3.data.word_vocab import (
     DEFAULT_MIN_COUNT,
     REFERENCE_N_TOKENS_EOS,
@@ -268,11 +276,13 @@ def build(
             "n_chars_source": int(n_chars_source),
             "tokens_per_char": (float(ids.size) / n_chars_source) if n_chars_source else None,
             "tokenization_code_sha256": code_sha,
+            # The table in id order: the loader refuses a sidecar of the same size in another order.
+            "vocabulary_sha256": word_vocabulary_sha256(vocabulary.words),
             "tokenizer_config_sha256": hashlib.sha256(json.dumps(
                 {"tokenizer": "word", "min_count": min_count, "vocab_size": vocabulary.vocab_size,
                  **({"eos": True} if eos else {})},
                 sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
-            # Recorded only by <eos> builds (the no-<eos> metadata keeps its original keys); the
+            # Recorded only by <eos> builds (the no-<eos> metadata carries no "eos" key); the
             # loader requires the vocabulary sidecar to agree on it.
             **({"eos": True} if eos else {}),
         }
@@ -280,6 +290,8 @@ def build(
         # visible to the loader as recorded vocab_size/min_count disagreeing with the old sidecar.
         meta_text = json.dumps(meta, sort_keys=True, separators=(",", ":"))
         _atomic_publish(meta_target, lambda path: path.write_text(meta_text, encoding="utf-8"))
+        # The manifest of the payload being replaced goes first; the new one follows the sidecar below.
+        Path(str(target) + ".provenance.json").unlink(missing_ok=True)
         _atomic_publish(target, lambda path: torch.save(torch.from_numpy(ids), path))
         summary["splits"][split] = {
             "rows": n_rows,
@@ -291,10 +303,12 @@ def build(
         print(f"      {split:11s} rows={n_rows:>9,} tokens={ids.size:>11,} "
               f"chars={n_chars_source:>11,} tpc={meta['tokens_per_char']:.6f}", flush=True)
 
-    # The vocabulary is published LAST (atomically, see WordVocabulary.save), after every cache it
-    # defines is in place.
+    # The vocabulary is published (atomically, see WordVocabulary.save) after every cache it defines is
+    # in place; the provenance manifests read its vocab_size, so they follow it.
     vocabulary.save(vocab_file)
-    print(f"[3/3] wrote {vocab_file}; done", flush=True)
+    for split in SPLIT_FILES:
+        summary["splits"][split]["provenance"] = str(publish_cache_provenance(dataset, split, cache_dir=root))
+    print(f"[3/3] wrote {vocab_file} and the provenance manifests; done", flush=True)
     return summary
 
 

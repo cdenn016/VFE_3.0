@@ -57,8 +57,11 @@ def test_launchers_leave_kl_max_to_its_eight_k_resolution() -> None:
     import parameter_optimization
     import scaling
     import train_vfe3
+    default = VFE3Config.__dataclass_fields__["kl_max"].default
+    assert default is None and test_config(kl_max=None, embed_dim=4).kl_max == 8.0 * 4   # None resolves to 8 K
     for launcher in (train_vfe3.config, ablation.BASELINE_CONFIG, scaling.config, parameter_optimization.config):
-        assert launcher["kl_max"] is None
+        # A launcher that omits the key runs at the default (audit 2026-10-16 F113: the omitted key raised KeyError).
+        assert launcher.get("kl_max", default) is None
     for cell in scaling.build_standard_routes({"widths": [20, 40], "depths": [1], "train_steps": [10]})["width"]:
         assert "kl_max" not in cell["overrides"]
 

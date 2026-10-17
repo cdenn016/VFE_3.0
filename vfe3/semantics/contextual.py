@@ -51,6 +51,7 @@ import torch
 
 from vfe3.semantics import stats, vectors
 from vfe3.semantics.common import (
+    GAUSSIAN_BANK_DECODE_KINDS,
     OKABE_ITO,
     AnalysisContext,
     SectionResult,
@@ -69,7 +70,7 @@ _SECTION = "contextual"
 # Budgets and switches read from ``ctx.options`` (any key may be overridden there). ``None`` batch
 # sizes and lens chunk are resolved per device by ``_resolved_options`` (CPU: 8 windows, 1024 tokens).
 CONTEXTUAL_DEFAULTS: Dict[str, Any] = {
-    "contextual_tokens":     32768,    # bank size (held-out tokens)
+    "contextual_tokens":     32768,    # bank size (tokens of contextual_split)
     "contextual_split":      "validation",
     "contextual_seq_len":    None,     # None -> cfg.max_seq_len
     "contextual_batch_size": None,     # windows per bank forward (None -> _auto_batch_windows)
@@ -367,17 +368,21 @@ def _forward_split(model: Any, x: torch.Tensor, log: _SplitLog, *, return_logits
     return pieces + [(a + h, b + h, out) for a, b, out in right]
 
 
-def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame: Any) -> torch.Tensor:
+def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame: Any,
+             *, encoded_sigma: Optional[torch.Tensor] = None) -> torch.Tensor:
     r"""Logits of one belief through the model's final readout, as ``forward_beliefs`` applies it.
 
     .. math:: \ell = \mathrm{decode}\big(\mu,\ \Sigma;\ U\big),
 
     i.e. ``VFEModel._decode_belief_with_context`` -- ``prior_bank.decode`` in the fp32 island with the
     realized frame ``U`` of the same forward (``decode_coordinates='reference'`` only) and the
-    unigram bias :math:`\kappa \log\pi_v`. Returns ``(B, N, V)`` float32 logits.
+    unigram bias :math:`\kappa \log\pi_v`. Under ``decode_covariance='encoded'`` the decoder reads
+    ``encoded_sigma``, the stack-input covariance (``layers[0].sigma``, the tensor ``forward_beliefs`` decodes with;
+    audit 2026-10-16 F64). Returns ``(B, N, V)`` float32 logits.
     """
     with torch.no_grad():
-        return model._decode_belief_with_context(mu, sigma, canonical_frame=canonical_frame)
+        return model._decode_belief_with_context(mu, sigma, canonical_frame=canonical_frame,
+                                                 encoded_sigma=encoded_sigma)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -386,7 +391,7 @@ def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame:
 
 @dataclass
 class ContextualBank:
-    r"""Per-layer beliefs of every position of ``n_seq`` held-out windows, window-major.
+    r"""Per-layer beliefs of every position of ``n_seq`` windows of one split, window-major.
 
     Row ``r`` is position ``positions[r]`` of window ``seq_index[r]`` (``windows[seq_index[r]]``);
     ``targets[r]`` is the next token of the stream (``-1`` if the stream ends). Layer 0 is the stack
@@ -449,7 +454,9 @@ def collect_bank(
     ``torch.no_grad()``, halved by :func:`_forward_split` when the model's exact-symmetry check fails;
     windows that fail alone are dropped, and both counts are in ``diagnostics["forward_resplit"]``.
     Whether Sigma and phi move is measured by ``torch.equal`` against the stack input at every layer
-    of every batch and recorded, together with the config-level flags.
+    of every batch and recorded, together with the config-level flags. ``diagnostics["selection_split"]``
+    is the split that selected the checkpoint (``None`` without a recorded identity), so a report can
+    tell a held-out bank from one drawn on the selection split (audit 2026-10-16 F121).
     """
     cfg = run.cfg
     N = int(seq_len if seq_len is not None else cfg.max_seq_len)
@@ -542,7 +549,8 @@ def collect_bank(
         mu=mu, sigma=None if sigma_equal else var, phi_moves=not phi_equal, sigma0=var[0].copy(),
         windows=windows, offsets=offsets, split=split, sigma_frozen=sigma_equal, sigma_kind=sigma_kind,
         diagnostics={
-            "split": split, "seq_len": N, "n_windows": int(n_windows), "n_tokens": int(n),
+            "split": split, "selection_split": (getattr(run, "selection_identity", None) or {}).get("split"),
+            "seq_len": N, "n_windows": int(n_windows), "n_tokens": int(n),
             "n_tokens_requested": int(n_tokens), "n_slots": int(n_slots), "stream_tokens": T,
             "sigma_frozen_measured": sigma_equal, "sigma_frozen_config": run.sigma_frozen,
             "phi_moves_measured": not phi_equal, "phi_frozen_config": run.phi_frozen,
@@ -624,7 +632,8 @@ def logit_lens(
             safe_tgt = tgt.clamp_min(0)[..., None]                      # (B, N, 1)
             rerun = torch.stack([b.mu.reshape(-1, bank.K) for b in layers]).float().cpu().numpy()   # (L+1, B*N, K)
             max_mu_diff = max(max_mu_diff, float(np.abs(rerun - bank.mu[:, b0 * N:b1 * N]).max()))
-            logits_L = _readout(model, layers[L].mu, layers[L].sigma, frame)  # (B, N, V)
+            logits_L = _readout(model, layers[L].mu, layers[L].sigma, frame,
+                                encoded_sigma=layers[0].sigma)                  # (B, N, V)
             logit_diff = torch.maximum(logit_diff, (logits_L - out["logits"]).abs().max().float())
             top_L = logits_L.argmax(dim=-1)                             # (B, N)
             logp_L = torch.log_softmax(logits_L.float(), dim=-1)        # (B, N, V)
@@ -636,7 +645,8 @@ def logit_lens(
                 if l == L:
                     logp, top = logp_L, top_L
                 else:
-                    logits = _readout(model, layers[l].mu, layers[l].sigma, frame)   # (B, N, V)
+                    logits = _readout(model, layers[l].mu, layers[l].sigma, frame,
+                                      encoded_sigma=layers[0].sigma)           # (B, N, V)
                     top = logits.argmax(dim=-1)                          # (B, N)
                     logp = torch.log_softmax(logits.float(), dim=-1)     # (B, N, V)
                     del logits
@@ -775,7 +785,7 @@ def layer_cka(bank: ContextualBank, run: Any, ctx: AnalysisContext) -> Dict[str,
     valid = tgt >= 0
     if run.decode_kind == "linear":
         decode_rows, label = run.decode_W(tgt[valid]), "linear decode row w_y (output_proj_weight)"
-    elif run.decode_kind == "gaussian":
+    elif run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
         decode_rows, label = run.decode_mu(tgt[valid]), "Gaussian decode mean m_y"
     else:
         decode_rows, label = None, None
@@ -1214,7 +1224,7 @@ def layerwise_semantics(occ: Dict[str, Any], run: Any, ctx: AnalysisContext) -> 
         ctx, _rng(ctx, "semantics"), n_boot)
     layer0 = np.stack([occ["vectors"][int(w)][0].astype(np.float64).mean(axis=0) for w in words])
     out["layer0_minus_static_max_abs"] = float(np.abs(layer0 - static).max())
-    if run.decode_kind in ("linear", "gaussian"):
+    if run.decode_kind == "linear" or run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
         table = run.decode_W(words) if run.decode_kind == "linear" else run.decode_mu(words)
         label = "linear decode rows" if run.decode_kind == "linear" else "Gaussian decode means"
         out["decode"] = {"label": label, **_battery_summary(
@@ -1844,8 +1854,17 @@ def contextual_summary(metrics: Mapping[str, Any]) -> str:
     ce = _pick(metrics, "logit_lens", "ce")
     if ce and ce[0].get("mean") is not None and ce[-1].get("mean") is not None:
         L = len(ce) - 1
+        split, selection = _pick(metrics, "bank", "split"), _pick(metrics, "bank", "selection_split")
+        if split is None:
+            tokens = "tokens"
+        elif selection is None:
+            tokens = f"{split}-split tokens"
+        elif split == selection:                        # audit 2026-10-16 F121: not held out from selection
+            tokens = f"{split}-split tokens, the split that selected the checkpoint"
+        else:
+            tokens = f"held-out {split}-split tokens"
         text = (f"Read out through the model's own final decode (logit lens on "
-                f"{_pick(metrics, 'logit_lens', 'n_tokens')} held-out tokens), the next-token cross-entropy "
+                f"{_pick(metrics, 'logit_lens', 'n_tokens')} {tokens}), the next-token cross-entropy "
                 f"{'falls' if ce[-1]['mean'] < ce[0]['mean'] else 'rises'} from {ce[0]['mean']:.3f} nats at the "
                 f"stack input to {ce[-1]['mean']:.3f} nats at block {L}")
         unigram = _pick(metrics, "logit_lens", "unigram_ce", "mean")

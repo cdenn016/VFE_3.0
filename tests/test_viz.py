@@ -405,7 +405,7 @@ def test_plot_estep_grad_norm_decomposition_saves(tmp_path):
 def test_plot_estep_convergence_saves(tmp_path):
     T, N, K, _ = _T()
     trace = {"mu": torch.randn(T, N, K).cumsum(0), "sigma": torch.rand(T, N, K) + 0.3,
-             "phi": torch.randn(T, N, 2), "free_energy": torch.linspace(50, 30, T)}
+             "phi": torch.randn(T, N, 2)}
     p = tmp_path / "f2.png"
     fig = plot_estep_convergence(trace, path=str(p))
     titles = [axis.get_title().lower() for axis in fig.axes]

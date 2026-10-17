@@ -32,7 +32,7 @@ import re
 import typing
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
 from vfe3.process_utils import run_isolated_python
@@ -479,10 +479,22 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
 
 
 _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
-# The data-order seed is reported through ``_data_order_status`` and the noise-band caption; it is
-# not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
-# aggregates, with the 'nonshared_or_mixed' status recorded.
+# The data-order seed is reported through ``_data_order_status``, the digest and the noise-band caption;
+# it is not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
+# aggregates, with the 'distinct' status recorded.
 _DATA_ORDER_KEYS = ("data_seed",)
+
+
+def _train_window_mode(run_dir: Path) -> tuple[str, str]:
+    r"""The training-window origin ``run_dir`` trained with (:func:`vfe3.experiment.saved_train_window_mode`),
+    read from its raw ``config.json`` and ``provenance.json``: the loaders drop ``train_window_offset``."""
+    from vfe3.experiment import saved_train_window_mode
+
+    serialized = _read_json(run_dir / "config.json")
+    raw = serialized.get("config", serialized) if isinstance(serialized, dict) else {}
+    provenance = _read_json(run_dir / "provenance.json")
+    return saved_train_window_mode(raw if isinstance(raw, dict) else {},
+                                   provenance if isinstance(provenance, dict) else {})
 
 
 def _mixed_code_identity_allowed() -> bool:
@@ -562,15 +574,27 @@ def _requested_seed_design(
         )
         for contract in provenance_contracts.values()
     }
-    data_order = _data_order_status([
-        contract.get("data_seed") for contract in provenance_contracts.values()
-    ])
+    data_order = _data_order_status(
+        [contract.get("data_seed") for contract in provenance_contracts.values()],
+        seeds=list(provenance_contracts),
+    )
+    # The training-window origin is part of the data contract, but the config loaders drop the retired
+    # train_window_offset, so it is read from the raw records; seeds whose known origins differ are not
+    # replicates of one protocol (audit 2026-10-16 F59). An origin that cannot be placed blocks nothing.
+    window_modes = {
+        cell["seed"]: _train_window_mode(Path(cell["run_dir"]))
+        for cell in cells
+        if cell["status"] == "complete" and cell.get("run_dir") is not None
+    }
+    known_window_modes = sorted({mode for mode, _evidence in window_modes.values() if mode != "unknown"})
+    mixed_window_modes = len(known_window_modes) > 1
     provenance_verified = (
         bool(cells)
         and len(provenance_contracts) == len(cells)
         and len(fingerprints) == 1
+        and not mixed_window_modes
     )
-    if manifest["request_verified"] and len(fingerprints) > 1:
+    if manifest["request_verified"] and (len(fingerprints) > 1 or mixed_window_modes):
         for cell in cells:
             if cell["status"] == "complete":
                 cell["status"] = "unverifiable"
@@ -613,6 +637,12 @@ def _requested_seed_design(
         "manifest_status": manifest["manifest_status"],
         "provenance_verified": provenance_verified,
         "data_order": data_order,
+        "train_window_mode": {
+            "modes": known_window_modes,
+            "mixed": mixed_window_modes,
+            "per_seed": {str(seed): mode for seed, (mode, _evidence) in sorted(window_modes.items())},
+            "evidence": {str(seed): evidence for seed, (_mode, evidence) in sorted(window_modes.items())},
+        },
         "code_identity": {
             "mixed_allowed": mixed_code_allowed,
             "n_distinct": n_code_identities,
@@ -935,11 +965,14 @@ CURVE_X_OPTIONS: Dict[str, str] = {"step": "training step", "tokens_seen": "trai
 # Headline scalars to aggregate (searched in summary.json -> test_results.json -> research.json).
 # Dotted keys dig into nested research blocks. ``test_best_*`` are the test split at the
 # best-validation weights and ``train_sample_ce_{final,best}`` the fixed training sample under the
-# evaluation protocol (summary.json of runs trained on or after 2026-09-28).
+# evaluation protocol (summary.json of runs trained on or after 2026-09-28). ``final_val_ppl`` beside
+# ``best_val_ppl``, and the realized-update counts ``skipped_steps`` / ``accepted_update_frac``, show a
+# seed that diverged after its best step, which the best-validation headline alone hides.
 SCALAR_KEYS: List[str] = [
-    "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_ppl", "best_val_ppl", "final_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "test_best_step",
     "train_sample_ce_final", "train_sample_ce_best",
+    "skipped_steps", "accepted_update_frac",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
     "fd_gradient_worst_rel_error",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
@@ -972,7 +1005,7 @@ CURVE_SPECS: List[tuple] = [
 # (a correlation, a gradient-check error, a step index, ECE) keep their SD on their own
 # scale but get no CV and are left out of the seed-stability ranking.
 CV_RATIO_SCALE_KEYS = frozenset({
-    "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_ppl", "best_val_ppl", "final_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "train_sample_ce_final", "train_sample_ce_best",
     "wall_time_s", "overall_ce",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
@@ -1008,13 +1041,46 @@ PER_LAYER_METRICS: List[str] = [                                  # per-layer ba
     "self_divergence", "total", "canonical_beta_tv", "canonical_total_delta",   # diagnose_canonical_free_energy
 ]
 
-def _data_order_status(data_seeds: Iterable[object]) -> Dict[str, object]:
+def _data_order_status(
+    data_seeds: Iterable[object],
+
+    *,
+    seeds: Optional[Sequence[int]] = None,
+) -> Dict[str, object]:
+    r"""Whether the accepted seeds shared one training data order, with the sentence the digest prints.
+
+    ``status`` is ``"shared_explicit"`` (every seed records one explicit common data seed: the across-seed
+    SD and the noise floor measure initialization and optimization only and are a lower bound on the
+    variance over data orders), ``"distinct"`` (no two seeds share an explicit data seed), ``"partially_shared"``
+    (some seeds share one and others do not), ``"nonshared_unspecified"`` (no seed records one) or
+    ``"no_seeds"``. A seed without an explicit data seed (``data_seed=None``) has a nonshared, unspecified
+    order, never a shared shuffle stream. ``seeds`` (the model seeds, in the order of ``data_seeds``) adds
+    the ``per_seed`` mapping.
+    """
     values = list(data_seeds)
-    if values and all(type(value) is int for value in values) and len(set(values)) == 1:
-        return {"status": "shared_explicit", "shared": True, "data_seed": values[0]}
-    if values and all(value is None for value in values):
-        return {"status": "nonshared_unspecified", "shared": False, "data_seed": None}
-    return {"status": "nonshared_or_mixed", "shared": False, "data_seed": None}
+    explicit = [value for value in values if type(value) is int]
+    listed = ", ".join("none" if value is None else str(value) for value in values)
+    out: Dict[str, object] = {"shared": False, "data_seed": None}
+    if seeds is not None:
+        out["per_seed"] = {str(seed): value for seed, value in zip(seeds, values)}
+    if not values:
+        return {**out, "status": "no_seeds", "caveat": "No accepted seed records its data order."}
+    if len(explicit) == len(values) and len(set(values)) == 1:
+        return {**out, "status": "shared_explicit", "shared": True, "data_seed": values[0],
+                "caveat": (f"All {len(values)} seeds share one training data order (data seed {values[0]}): "
+                           "the across-seed SD and the single-seed noise floor measure initialization and "
+                           "optimization only and are a lower bound on the variance over data orders.")}
+    if not explicit:
+        return {**out, "status": "nonshared_unspecified",
+                "caveat": ("No seed records an explicit data seed (data_seed=None: a nonshared, unspecified "
+                           "order), so the across-seed SD includes data-order variance.")}
+    if len(set(explicit)) == len(explicit):
+        return {**out, "status": "distinct",
+                "caveat": (f"No two seeds share a training data order (data seeds {listed}), so the "
+                           "across-seed SD includes data-order variance.")}
+    return {**out, "status": "partially_shared",
+            "caveat": (f"Some seeds share a training data order and others do not (data seeds {listed}), so "
+                       "the across-seed SD mixes seeds with and without data-order variance.")}
 
 
 CAVEAT = ("Data-order sharing is reported only for one explicit common data_seed; data_seed=None "
@@ -1065,6 +1131,24 @@ def _final_finite(d: Dict[str, np.ndarray]) -> Dict[str, Any]:
             "sd": (sd if math.isfinite(sd) else None), "n": int(d["n"][i])}
 
 
+def _divergence_lines(scalars: Mapping[str, Any]) -> List[str]:
+    r"""One line per seed whose run rejected an optimizer update (``skipped_steps > 0``), with its accepted
+    fraction when recorded; empty when every seed accepted every update or the counts are withheld."""
+    skipped = scalars.get("skipped_steps")
+    if not isinstance(skipped, Mapping):
+        return []
+    fractions = scalars.get("accepted_update_frac")
+    accepted = (dict(zip(fractions.get("seeds", []), fractions.get("values", [])))
+                if isinstance(fractions, Mapping) else {})
+    lines = []
+    for seed, value in zip(skipped.get("seeds", []), skipped.get("values", [])):
+        if value > 0:
+            fraction = accepted.get(seed)
+            lines.append(f"- seed {seed}: {int(value)} skipped optimizer update(s)"
+                         + (f" (accepted fraction {fraction:.4f})" if fraction is not None else ""))
+    return lines
+
+
 def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -1078,9 +1162,12 @@ def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
 
 
 def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
-              code_identity: Optional[Mapping[str, Any]] = None) -> None:
+              code_identity: Optional[Mapping[str, Any]] = None,
+              data_order: Optional[Mapping[str, Any]] = None) -> None:
     L: List[str] = [f"# Multi-seed digest: {root.name}", "",
                     f"Across {len(seeds)} seeds: {seeds}.", ""]
+    if data_order is not None:
+        L += [f"Seed data order: `{data_order.get('status')}`. {data_order.get('caveat', '')}".rstrip(), ""]
     if code_identity is not None and code_identity.get("mixed"):
         L += [f"**Mixed code identity:** {code_identity['n_distinct']} distinct git_sha / "
               "dirty-tree fingerprints across seeds, accepted by `allow_mixed_code_identity=True`. "
@@ -1112,6 +1199,11 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
         L.append(f"- Least seed-stable ratio-scale metric: `{least[0]}` "
                  f"(CV {100 * least[1]['cv']:.3f}%). Signed or near-zero metrics carry no CV; "
                  "read their SD on their own scale.")
+    divergence = _divergence_lines(scalars)
+    if divergence:
+        L += ["", "## Divergence indicators", "", *divergence, "",
+              "A best-validation value of such a seed can predate the divergence; compare `final_val_ppl` "
+              "with `best_val_ppl` and `test_ce` with `test_best_ce`."]
     if per_layer:
         L += ["", f"## Per-layer ({len(per_layer)} layer(s))", "",
               "See `figures/per_layer__*.png` for across-seed per-layer bars."]
@@ -1259,6 +1351,8 @@ def main() -> int:
             print("optional per-layer diagnostics are incomplete; that channel is withheld")
         if partial_scalars:
             print(f"withheld scalars (not complete across the accepted seeds): {partial_scalars}")
+        for line in _divergence_lines(scalars):
+            print(f"divergence indicator: {line[2:]}")
         if withheld_curves:
             print(f"withheld {len(withheld_curves)} curve column(s); reasons in "
                   "multiseed_summary.json diagnostics.withheld_curves")
@@ -1271,7 +1365,12 @@ def main() -> int:
     if code_identity["mixed"] and code_identity["mixed_allowed"]:
         print(f"WARNING: {code_identity['n_distinct']} distinct code identities accepted "
               f"(allow_mixed_code_identity=True); the across-seed SD includes any code effect")
-    print(f"\nNOTE: {CAVEAT}\n")
+    data_order = request_design["data_order"]
+    print(f"\nseed data order: {data_order['status']}. {data_order.get('caveat', '')}")
+    if request_design["train_window_mode"]["mixed"]:
+        print("WARNING: the seeds trained with different training-window origins "
+              f"{request_design['train_window_mode']['per_seed']}; they are not one protocol")
+    print(f"NOTE: {CAVEAT}\n")
 
     accepted_config_dirs = [
         Path(cell["run_dir"])
@@ -1301,6 +1400,7 @@ def main() -> int:
             "request_verified": request_design["request_verified"],
             "manifest_status": request_design["manifest_status"],
             "data_order": request_design["data_order"],
+            "train_window_mode": request_design["train_window_mode"],
             "code_identity": request_design["code_identity"],
             "status": "complete" if publication_complete else "incomplete",
             "complete": publication_complete,
@@ -1332,7 +1432,7 @@ def main() -> int:
     _write_json_atomic(root / "multiseed_summary.json", _json_clean(manifest))
     _write_csv(root / "multiseed_summary.csv", scalars)
     _write_md(root / "MULTISEED_ANALYSIS.md", root, seeds, scalars, per_layer,
-              code_identity=request_design["code_identity"])
+              code_identity=request_design["code_identity"], data_order=request_design["data_order"])
     for name in ("multiseed_summary.json", "multiseed_summary.csv", "MULTISEED_ANALYSIS.md"):
         print(f"  data    -> {root / name}")
 

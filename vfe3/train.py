@@ -80,6 +80,7 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     bounded_variance_from_log,
 )
 from vfe3.relational_scoring import (                                # projected float64 source-factor recovery count
+    gemm_fallback_slices, reset_gemm_fallback_slices,                   # ... and pair-KL GEMM fallback slices
     reset_source_recovery_elements, source_recovery_elements)
 from vfe3.geometry.transport import (                           # float64 frame-pair escalation count
     frame_pair_fp64_escalations,
@@ -450,6 +451,11 @@ def build_optimizer(
                 if phi_update_policy.requires_fisher_statistics else None
             ),
             phi_fisher_rotation_weight=cfg.m_phi_fisher_rotation_weight,
+            # The exact Daleckii-Krein route, the eigenbasis group_log fallback and the stabilizer completion are
+            # config fields, read per optimizer (audit 2026-10-16 F37, F40, F50).
+            phi_group_differential_mode=cfg.m_phi_group_differential_mode,
+            phi_group_log_fallback=cfg.m_phi_group_log_fallback,
+            phi_fisher_completion=cfg.m_phi_fisher_completion,
             weight_decay=cfg.weight_decay,
             fused=next(model.parameters()).is_cuda,
         )
@@ -806,7 +812,13 @@ def train_step(
     the clip sets of a role combined in quadrature; empty when no norm was transferred) and
     ``"clip_coefs"`` (per role, the smallest realized clip coefficient of its clipped sets; empty
     when no clip was applied). Asking for ``status_out`` also computes the set norms when clipping
-    is off, so they join the same transfer (audit 2026-10-10 round 2, item 1).
+    is off, so they join the same transfer (audit 2026-10-10 round 2, item 1). Under an enabled GradScaler,
+    asking for ``status_out`` unscales the gradients once before the norms (``GradScaler.step`` does not
+    repeat it), and with clipping off the set norms take their own transfer, as on the clipped scaler
+    route (audit 2026-10-16, F51). On a step that reaches
+    ``optimizer.step``, ``status_out["grads"]`` holds references, keyed by ``id``, to the gradients the
+    step consumed (after unscale and clip; no copy and no synchronization), because the table Fisher step
+    and the manifold phi step clear ``.grad`` inside ``step()`` (audit 2026-10-16, F4).
 
     ``frame_projection_out`` (S1 panel D counters): a ``(2,)`` int64 tensor on the generator
     device. When given and the post-update frame projection runs, the rows it rescales and the rows
@@ -942,14 +954,17 @@ def train_step(
         loss_finite = math.isfinite(step_loss)
     else:
         loss_finite = True                                  # resolved with the fused default-path scan below
-    # Unscale once when clipping/metrics needs true-unit gradients or the enabled scaler must classify
+    # Unscale once when clipping/metrics/status needs true-unit gradients or the enabled scaler must classify
     # a nonfinite scalar loss. GradScaler remembers that unscale_ ran; its later step does not repeat it.
+    # status_out joins the list so its role norms and the spike attribution read true units with clipping
+    # off (audit 2026-10-16, F51); without a scaler unscale_ is a no-op.
     need_unscale = (
         grad_accum_steps > 1
         or
         (grad_clip is not None and grad_clip > 0)
         or (metrics_out is not None)
         or (_scaler_enabled and not loss_finite)
+        or (_scaler_enabled and status_out is not None)
     )
     if need_unscale:
         _scaler.unscale_(optimizer)
@@ -1134,6 +1149,12 @@ def train_step(
     if metrics_out is not None:
         metrics_out["grad_finite"] = float(grad_finite)
     clip_applied = False
+    if (status_out is not None and _scaler_enabled and not clip_on and not skip_step
+            and set_norm_values is None and norm_sets):
+        # Enabled scaler with clipping off: no transfer above carried the set norms, so they take their own,
+        # as on the clipped scaler route below; the gradients were unscaled above (audit 2026-10-16, F51).
+        set_norm_values = torch.stack([norm.to(device=tokens.device, dtype=torch.float64)
+                                       for norm in _set_norms()]).tolist()
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         if clip_norms is None:                                  # scaler / fallback routes: own transfer
             set_norms = _set_norms()
@@ -1173,6 +1194,12 @@ def train_step(
         _table_provider = getattr(optimizer, "table_statistics_provider", None)
         if _table_provider is not None:
             _table_provider.set_batch(tokens, _scored_det)
+        if status_out is not None:
+            # References (no copy, no host sync) to the gradients that reach the step: the table Fisher step
+            # and the manifold phi step set .grad = None inside step(), so a post-step reader of .grad (the spike
+            # attribution, the known-dead set) would miss those tables (audit 2026-10-16, F4).
+            status_out["grads"] = {id(p): p.grad for group in optimizer.param_groups
+                                   for p in group["params"] if p.grad is not None}
         _scaler.step(optimizer)
         _scaler.update()
         if _fisher_provider is not None:
@@ -1561,6 +1588,10 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_score_klmax_frac",
     # the per-layer maximum and its layer (the headline column above reduces only the last layer)
     "val_relational_score_klmax_frac_layer_max", "val_relational_score_klmax_frac_argmax_layer",
+    # raw router costs that were non-finite before the kl_max clamp, and the router's label free energy
+    # (VFEModel._nonfinite_frac, VFEModel._routing_free_energy; audit 2026-10-16 F10, F114)
+    "val_relational_score_nonfinite_frac", "val_relational_score_nonfinite_frac_layer_max",
+    "val_relational_routing_free_energy",
     # per-(layer, head) router saturation, maxima over layers and heads (VFEModel._layer_guard_maxima)
     "val_relational_score_klmax_frac_head_max",
     "val_relational_clamped_row_frac_head_max", "val_relational_clamped_row_frac_argmax_layer",
@@ -1583,9 +1614,10 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count",
     "projected_cov_max_condition_layer_max",
     # covariance scale, the scale-free Gram-normalized lambda_min and the rank-one residual of the last layer,
-    # and their layer extremes (VFEModel._covariance_scale_statistics; audit 2026-10-10 round 2, items 3, 4, 13)
+    # and their layer extremes (VFEModel._covariance_scale_statistics; audit 2026-10-10 round 2, items 3, 4, 13),
+    # and the rank-one residual of the reference means (audit 2026-10-16 F45)
     "projected_cov_scale", "projected_cov_gram_min_eigenvalue", "comparison_map_norm_spread",
-    "input_cov_scale_ratio", "rank_one_residual",
+    "input_cov_scale_ratio", "rank_one_residual", "rank_one_residual_reference",
     "projected_cov_min_eigenvalue_layer_min", "projected_cov_min_eigenvalue_argmin_layer",
     "projected_cov_scale_layer_min", "projected_cov_scale_argmin_layer",
     "projected_cov_gram_min_eigenvalue_layer_min", "projected_cov_gram_min_eigenvalue_argmin_layer",
@@ -1665,9 +1697,12 @@ _GROUP_COLUMNS: Tuple[str, ...] = tuple(
     f"{kind}_group_{group}"
     for kind in ("grad_norm", "param_norm", "update_ratio") for group in PARAMETER_GROUPS)
 _GRAD_GROUP_COLUMNS: Tuple[str, ...] = tuple(f"grad_norm_group_{group}" for group in PARAMETER_GROUPS)
-# Per-element RMS realized step in units of the learning rate for the prior tables (audit 2026-10-09 round 2,
+# Per-element RMS realized step in units of the step size for the prior tables (audit 2026-10-09 round 2,
 # item 26): update_ratio_group_* of a log-scale table divides by a norm dominated by the log(sigma_init)
 # offset, so it is not a trainability measure; this column is O(1) for an AdamW table whose elements move.
+# Under m_table_update_mode='fisher' the unit is the realized Fisher step size eta*lr_t/lr_0 (the row's
+# lr_mu/lr_sigma), and the value scales with the gradient, the trust clip and the fraction of rows with
+# n_v > 0, so the O(1) reading does not carry over (audit 2026-10-16, F13).
 _STEP_LR_GROUPS: Tuple[str, ...] = ("mu_embed", "sigma_log_embed")
 _STEP_LR_COLUMNS: Tuple[str, ...] = tuple(f"update_rms_per_lr_group_{group}" for group in _STEP_LR_GROUPS)
 _TRAIN_SAMPLE_COLUMNS: Tuple[str, ...] = (
@@ -1716,7 +1751,8 @@ PROTOTYPE_TEMPLATE_FIELDS: Tuple[str, ...] = (
 # fixed validation windows, in nats: the evidence lower bound of the posterior the layer forms, the evidence of its
 # declared record model and their gap. Minimal agent (round 2, item 12 and M1): the ADF evidence over the heads
 # (assumed density, exact for uncoupled heads) and its gap, the exact evidence (NaN unless every receiver's heads are
-# uncoupled), and the importance-sampled evidence under q with its gap and sample count. Prototypes: exact.
+# uncoupled), and the importance-sampled evidence under q with its gap, the effective sample size fraction of its
+# weights (is_ess, unitless; audit 2026-10-16 F47) and sample count. Prototypes: exact.
 # Written to diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv only when the toggle is on.
 MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = (
     "step", "layer", *(key[len("relational_minimal_agent_"):] for key in MINIMAL_AGENT_ELBO_KEYS), "is_samples")
@@ -1745,8 +1781,8 @@ _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_C
 
 # Dead-router thresholds (audit 2026-10-09, round 2, item 9; audit 2026-10-10 round 2, item 7), read per
 # (layer, head) under every clamp reference. Under the absolute reference a head with more than
-# DEAD_ROUTER_CLAMPED_ROW_FRAC of its scored rows fully clamped at kl_max routes those rows uniformly with zero
-# router gradient (layer 1 of the 32.65 run); under 'row_min' and under tie_comparison_maps no row can be fully
+# DEAD_ROUTER_CLAMPED_ROW_FRAC of its scored rows fully clamped at kl_max routes those rows by the attention prior pi
+# alone (uniformly under a plain causal mask) with zero router gradient (layer 1 of the 32.65 run); under 'row_min' and under tie_comparison_maps no row can be fully
 # clamped. A head whose mean self weight beta_ii exceeds DEAD_ROUTER_SELF_WEIGHT saturates its softmax on the
 # self pair (layer 1 head 0 of the 99.68 run), whatever the reference. A head with more than
 # DEAD_ROUTER_CAPPED_FRAC of its admissible entries capped gives those entries no router gradient; under
@@ -1792,8 +1828,8 @@ def _warn_dead_router(
     a self-locked identity head and separates it from a locked head that does not pass content through.
 
     ``clamped``: ``relational_clamped_row_frac_head_max`` above :data:`DEAD_ROUTER_CLAMPED_ROW_FRAC`, at
-    ``relational_clamped_row_frac_argmax_{layer,head}``: fully clamped rows route uniformly with zero router
-    gradient. Only the absolute reference without the tie can clamp a whole row; the value is zero otherwise.
+    ``relational_clamped_row_frac_argmax_{layer,head}``: fully clamped rows route by the attention prior pi alone,
+    with zero router gradient. Only the absolute reference without the tie can clamp a whole row; the value is zero otherwise.
 
     ``capped``: ``relational_score_klmax_frac_head_max`` above :data:`DEAD_ROUTER_CAPPED_FRAC`, at
     ``relational_score_klmax_frac_head_argmax_{layer,head}``: the capped entries carry a constant cost and get no
@@ -1828,7 +1864,8 @@ def _warn_dead_router(
         elif kind == "clamped":
             logger.warning(
                 " router layer %s head %s: %.3f of its scored rows are fully clamped at kl_max (> %.2f); those rows "
-                "route uniformly with zero router gradient (consider routing_kl_max_reference='row_min')",
+                "route by the attention prior alone with zero router gradient "
+                "(consider routing_kl_max_reference='row_min')",
                 *where, value, threshold)
         else:
             logger.warning(
@@ -1936,10 +1973,10 @@ def _capture_numerics_counts(
     whose posterior applies no clamp) is counted under that rule.
 
     Fully clamped rows. A capped entry changes :math:`\beta` only when its row's smallest cost reaches
-    :math:`\kappa`; a row with :math:`|S_i| \ge 2` whose every entry is capped routes uniformly with zero
-    routing gradient. When ``rows_out`` is given, one list per layer of ``(clamped_rows, rows)`` per head
-    is appended to it, with ``rows`` the number of query rows with :math:`|S_i| \ge 2` (audit 2026-10-08
-    critic-gapfill-2#3). The entry counts above are unchanged.
+    :math:`\kappa`; a row with :math:`|S_i| \ge 2` whose every entry is capped routes by the attention prior
+    :math:`\pi` alone with zero routing gradient. When ``rows_out`` is given, one list per layer of
+    ``(clamped_rows, rows)`` per head is appended to it, with ``rows`` the number of query rows with
+    :math:`|S_i| \ge 2` (audit 2026-10-08 critic-gapfill-2#3). The entry counts above are unchanged.
 
     Factorizations. Each layer factors its reduced query and key covariances
     :math:`G = L \Sigma L^\top` (:math:`L = S U^{-1}`, comparison rank :math:`r`) once per (window,
@@ -2108,7 +2145,7 @@ RUN_TOTAL_COUNTER_KEYS: Tuple[str, ...] = (
     "nonfinite_tangent_elements", "mu_trust_fallback_elements", "decode_logdet_fallback_elements",
     "frame_pair_fp64_escalations", "public_spd_repair_elements", "public_spd_ceiling_contact_elements",
     "source_recovery_elements", "layernorm_trace_cap_elements", "covariance_ceiling_elements",
-    "covariance_escalation_elements", "matmul_precision_replays")
+    "covariance_escalation_elements", "gemm_fallback_slices", "phi_rejected_rows", "matmul_precision_replays")
 
 
 def _process_counter_values() -> Dict[str, int]:
@@ -2122,7 +2159,8 @@ def _process_counter_values() -> Dict[str, int]:
             "source_recovery_elements": int(source_recovery_elements()),
             "layernorm_trace_cap_elements": int(layernorm_trace_cap_elements()),
             "covariance_ceiling_elements": int(covariance_ceiling_elements()),
-            "covariance_escalation_elements": int(covariance_escalation_elements())}
+            "covariance_escalation_elements": int(covariance_escalation_elements()),
+            "gemm_fallback_slices": int(gemm_fallback_slices())}
 
 
 def _resumed_run_totals(
@@ -2149,10 +2187,18 @@ def _resumed_run_totals(
 def _run_total_counters(
     base:               Mapping[str, int],     # _resumed_run_totals
     precision_replays:  int,                   # whole-run count (already includes its base)
+
+    *,
+    phi_rejected_rows:  int = 0,               # GaugeManifoldAdamW.phi_rejected_rows of this process
 ) -> Dict[str, int]:
-    r"""Whole-run values of ``RUN_TOTAL_COUNTER_KEYS``: the resumed base plus this process's counts."""
+    r"""Whole-run values of ``RUN_TOTAL_COUNTER_KEYS``: the resumed base plus this process's counts.
+
+    The optimizer's rejected pullback-group rows restart at 0 after a resume (the count is not optimizer state),
+    so the whole-run total adds the count the checkpoint carried (audit 2026-10-16 F126).
+    """
     current = _process_counter_values()
     out = {key: int(base[key]) + current[key] for key in current}
+    out["phi_rejected_rows"] = int(base["phi_rejected_rows"]) + int(phi_rejected_rows)
     out["matmul_precision_replays"] = int(precision_replays)
     return out
 
@@ -2320,9 +2366,23 @@ def _parameter_learning_rates(
     model:     torch.nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> Dict[str, float]:
-    r"""Current learning rate of every optimized parameter, by parameter name (read before the step)."""
-    by_id = {id(parameter): float(group["lr"]) for group in optimizer.param_groups
-             for parameter in group["params"]}
+    r"""Current step size of every optimized parameter, by parameter name (read before the step).
+
+    The group's AdamW rate, except for a group marked ``table_fisher``: under
+    ``m_table_update_mode='fisher'`` that rate only schedules the table step and sets its decay, and the
+    table moves at the realized Fisher step size :math:`\eta\,\mathrm{lr}_t/\mathrm{lr}_0`, the value
+    ``lr_mu``/``lr_sigma`` report (audit 2026-10-16, F13).
+    """
+    eta = getattr(optimizer, "_table_fisher_lr", None)
+    if eta is not None:
+        from vfe3.table_optim import _schedule_factor
+
+    def rate(group: Mapping[str, Any]) -> float:
+        if eta is not None and group.get("table_fisher"):
+            return float(eta) * _schedule_factor(group)                  # type: ignore[arg-type]
+        return float(group["lr"])
+
+    by_id = {id(parameter): rate(group) for group in optimizer.param_groups for parameter in group["params"]}
     return {name: by_id[id(parameter)] for name, parameter in model.named_parameters() if id(parameter) in by_id}
 
 
@@ -2350,7 +2410,9 @@ def _group_update_statistics(
     .. math::
         s_G = \Big(\frac{1}{n_G}\sum_{p \in G} \frac{\|p_{t+1} - p_t\|_2^2}{\eta_p^2}\Big)^{1/2},
 
-    with :math:`n_G` the group's element count and :math:`\eta_p` the step's learning rate (NaN if any is 0).
+    with :math:`n_G` the group's element count and :math:`\eta_p` the step's realized step size from
+    :func:`_parameter_learning_rates` (NaN if any is 0): the AdamW learning rate, or under
+    ``m_table_update_mode='fisher'`` the Fisher step size :math:`\eta\,\mathrm{lr}_t/\mathrm{lr}_0`.
     """
     delta_sq: Dict[str, float] = {}
     norm_sq: Dict[str, float] = {}
@@ -2417,6 +2479,40 @@ def _sigma_log_statistics(
         values = values.float()
     sd, mean = torch.std_mean(values, correction=0)
     return {"sigma_log_mean": float(mean), "sigma_log_sd": float(sd)}
+
+
+# Decode-table variance columns of every metrics row (audit 2026-10-16 F12); NaN under the linear readout.
+DECODE_VARIANCE_COLUMNS: Tuple[str, ...] = (
+    "decode_sigma_v_min", "decode_sigma_log_mean", "decode_sigma_log_sd")
+
+
+@torch.no_grad()
+def _decode_variance_statistics(
+    model: torch.nn.Module,
+) -> Dict[str, float]:
+    r"""The variance margin of the table the prior-bank decoder scores against.
+
+    ``decode_sigma_v_min`` is :meth:`PriorBank.decode_sigma_v_min`,
+    :math:`\min_{v,k}\max(e^{\ell_{vk}}, \varepsilon)` over the decode log-variance table :math:`\ell`
+    (``decode_sigma_log_embed`` when the bank is untied, else ``sigma_log_embed``), the number that sets
+    how many digits the fp32 ``a_v`` reduction loses (``decode_av_precision``). The mean and standard
+    deviation of :math:`\ell` (``correction=0``) sit beside it: on an untied bank ``sigma_log_mean`` and
+    ``sigma_log_sd`` read the encoder table only, which does not see the decode table's lower tail.
+    NaN under ``decode_mode='linear'``, whose readout reads no variance table.
+    """
+    nan = {column: float("nan") for column in DECODE_VARIANCE_COLUMNS}
+    bank = getattr(model, "prior_bank", None)
+    if bank is None or getattr(bank, "decode_mode", "linear") == "linear":
+        return nan
+    table = bank._decode_sigma_log_table()                                # (V, K) decode log-variances
+    if not isinstance(table, torch.Tensor) or table.numel() == 0:
+        return nan
+    values = table.detach()
+    if not values.is_floating_point() or values.element_size() < 4:
+        values = values.float()
+    sd, mean = torch.std_mean(values, correction=0)
+    return {"decode_sigma_v_min": float(bank.decode_sigma_v_min()),
+            "decode_sigma_log_mean": float(mean), "decode_sigma_log_sd": float(sd)}
 
 
 SIGMA_LOG_CHUNK_TYPES: int = 4096          # vocabulary rows per block_cholesky covariance chunk
@@ -3621,6 +3717,35 @@ def _configure_train_window_offset(
     return dataset
 
 
+def _empty_training_epoch_message(
+    loader: object,
+) -> str:
+    r"""Describe a sized training loader that yields no batch per epoch, with the shortest stream that fills one.
+
+    With ``drop_last`` a loader over :math:`n` windows yields :math:`\lfloor n / B \rfloor` batches of :math:`B`.
+    For a :class:`~vfe3.data.datasets.TokenWindows` stream of :math:`T` tokens, window length :math:`L` and stride
+    :math:`s`, the per-epoch origins of training fit :math:`n = \lfloor (T - L) / s \rfloor` windows once
+    :math:`T \ge L + s` (one window below that), so a batch of :math:`B \ge 2` needs :math:`T \ge L + B s`; fixed
+    origins fit :math:`n = \lfloor (T - L - 1) / s \rfloor + 1` and need :math:`T \ge L + 1 + (B - 1) s`.
+    """
+    dataset = getattr(loader, "dataset", None)
+    batch_size = getattr(loader, "batch_size", None)
+    tokens = getattr(dataset, "tokens", None)
+    seq_len, stride = getattr(dataset, "seq_len", None), getattr(dataset, "stride", None)
+    message = "the training loader yields no batch per epoch (len(loader) == 0)"
+    if (not isinstance(tokens, torch.Tensor) or not isinstance(batch_size, int) or not isinstance(seq_len, int)
+            or not isinstance(stride, int)):
+        return message + "; give it at least one full batch"
+    if getattr(dataset, "window_offset_mode", "fixed") == "per_epoch_random":
+        minimum = seq_len + 1 if batch_size == 1 else seq_len + batch_size * stride
+    else:
+        minimum = seq_len + 1 + (batch_size - 1) * stride
+    return (f"{message}: {len(dataset)} training windows (seq_len={seq_len}, stride={stride}) of a "
+            f"{tokens.numel()}-token stream do not fill one batch of batch_size={batch_size} with drop_last; the "
+            f"stream needs at least {minimum} tokens. Raise the token cap (MAX_TOKENS / max_tokens) or lower "
+            "batch_size")
+
+
 def _training_cursor_fields(
     completed_step:  int,
     steps_per_epoch: int,
@@ -3725,8 +3850,19 @@ def _no_update_call_with_precision_retry(
 
 def _eval_forward_with_precision_retry(model: VFEModel, *args: Any, **kwargs: Any) -> Any:
     r"""Run a no-update evaluation forward ``model(*args, **kwargs)`` on the replay ladder of training
-    (:func:`_no_update_call_with_precision_retry`)."""
-    return _no_update_call_with_precision_retry(model, lambda: model(*args, **kwargs), "evaluation forward")
+    (:func:`_no_update_call_with_precision_retry`).
+
+    Each attempt runs inside :func:`~vfe3.contracts.deferred_host_checks`, as the forward of :func:`train_step`
+    does: its raise-only certificates join the forward's next mandatory host read instead of synchronizing one at
+    a time, and the scope closes (resolving anything still queued) when the forward returns, before the caller
+    reads its decode statistics, so a deferred verdict still raises inside the ladder and is replayed (audit
+    2026-10-16 F125). Training diagnostics stay outside the scope: ``model.diagnostics`` reads its values on the
+    host before it returns, which the scope's contract excludes.
+    """
+    def forward() -> Any:
+        with deferred_host_checks():
+            return model(*args, **kwargs)
+    return _no_update_call_with_precision_retry(model, forward, "evaluation forward")
 
 
 def _diagnostics_with_precision_retry(
@@ -3925,7 +4061,9 @@ def _spike_attribution(
 ) -> Dict[str, Any]:
     r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and why.
 
-    Reads the live gradients after the step (``train_step`` zeroes them on entry) and undoes each parameter's clip
+    Reads the gradients that reached ``optimizer.step``: the references ``train_step`` keeps in ``status["grads"]``,
+    since the table Fisher step and the manifold phi step clear ``.grad`` inside ``step()``, else the live
+    gradients (``train_step`` zeroes them on entry, not on exit). It undoes each parameter's clip
     coefficient (``status["clip_scales"]``), so :math:`\|g_p\|` is the pre-clip norm and a role's norm is
     :math:`(\sum_{p\in r}\|g_p\|^2)^{1/2}`. Shares are of the squared role norm. For the token and positional tables
     among the top parameters, the rows with the largest gradient are reported with their share of the table's
@@ -3934,16 +4072,20 @@ def _spike_attribution(
     the norm, and groups far above their last logged norm. One host transfer for the norms.
     """
     scales: Mapping[int, float] = status.get("clip_scales") or {}
+    stashed: Mapping[int, torch.Tensor] = status.get("grads") or {}
     role_of = {id(p): group.get("role", "other") for group in optimizer.param_groups for p in group["params"]}
     wanted = set(roles)
     entries: List[Tuple[str, torch.nn.Parameter, str, str]] = []
+    grad_of: Dict[str, torch.Tensor] = {}                          # the gradient each entry is read from
     norms: List[torch.Tensor] = []
     for name, parameter in model.named_parameters():
         role = role_of.get(id(parameter))
-        if parameter.grad is None or role is None:
+        grad = stashed.get(id(parameter), parameter.grad)
+        if grad is None or role is None:
             continue
         entries.append((name, parameter, role, _parameter_group(name)))
-        norms.append(torch.linalg.vector_norm(parameter.grad.detach()).to(torch.float64))
+        grad_of[name] = grad
+        norms.append(torch.linalg.vector_norm(grad.detach()).to(torch.float64))
     values = torch.stack(norms).cpu().tolist() if norms else []
     pre = [value / scales.get(id(parameter), 1.0) for value, (_, parameter, _, _) in zip(values, entries)]
     report: Dict[str, Any] = {"roles": {}, "top_parameters": [], "table_rows": {}, "group_norms": {}, "causes": []}
@@ -3971,10 +4113,11 @@ def _spike_attribution(
         index = _SPIKE_TABLE_INDEX.get(group)
         if index is None and targets is not None and name.rsplit(".", 1)[-1] in _SPIKE_DECODE_TABLES:
             index = "target"
-        if index is None or parameter.grad.dim() < 2:
+        grad = grad_of[name]
+        if index is None or grad.dim() < 2:
             continue
         with torch.no_grad():
-            rows = parameter.grad.detach().flatten(1).to(torch.float64).square().sum(dim=1)    # (rows,)
+            rows = grad.detach().flatten(1).to(torch.float64).square().sum(dim=1)              # (rows,)
             k = min(_SPIKE_TOP_ROWS, rows.numel())
             top_sq, top_rows = rows.topk(k)
             entry: Dict[str, Any] = {"indexed_by": index, "rows": top_rows.cpu().tolist(),
@@ -4140,6 +4283,162 @@ class _DivergenceMonitor:
         out["divergence_spike"] = float(flagged)
         return out
 
+    def state_dict(
+        self,
+        *,
+        interval_ends: bool,               # this step writes a log/eval row, which ends the open interval
+    ) -> Dict[str, Any]:
+        r"""The host state a resumed run needs to continue the EMAs, warmups, cooldown and interval exactly.
+
+        A periodic checkpoint is written before its step's metrics row, so on a log/eval step
+        (``interval_ends``) the saved interval is the empty one :meth:`reset_interval` leaves after the row.
+        Plain floats, ints and dicts, so the record loads under ``torch.load(weights_only=True)``.
+        """
+        def stat(value: _RunningStat) -> List[Any]:
+            return [value.count, value.total, value.peak]
+
+        source = _DivergenceMonitor() if interval_ends else self
+        return {
+            "loss_ema":   self._loss_ema,
+            "loss_seen":  self._loss_seen,
+            "norm_ema":   dict(self._norm_ema),
+            "norm_seen":  dict(self._norm_seen),
+            "last_spike": self._last_spike,
+            "interval": {
+                "steps":   source.steps,
+                "loss":    stat(source._loss),
+                "ce":      stat(source._ce),
+                "norms":   {role: stat(source._norms[role]) for role in DIVERGENCE_ROLES},
+                "clipped": source._clipped,
+                "binding": source._binding,
+            },
+        }
+
+    def load_state_dict(
+        self,
+        state: object,                     # a state_dict() record, possibly from an older or malformed checkpoint
+    ) -> bool:
+        r"""Restore :meth:`state_dict`; a malformed record leaves the monitor fresh and returns False."""
+        monitor = _divergence_monitor_state(state)
+        if monitor is None:
+            return False
+
+        def stat(values: List[Any]) -> _RunningStat:
+            out = _RunningStat()
+            out.count, out.total, out.peak = values
+            return out
+
+        interval = monitor["interval"]
+        self._loss_ema, self._loss_seen = monitor["loss_ema"], monitor["loss_seen"]
+        self._norm_ema, self._norm_seen = dict(monitor["norm_ema"]), dict(monitor["norm_seen"])
+        self._last_spike = monitor["last_spike"]
+        self.steps = interval["steps"]
+        self._loss, self._ce = stat(interval["loss"]), stat(interval["ce"])
+        self._norms = {role: stat(interval["norms"][role]) for role in DIVERGENCE_ROLES}
+        self._clipped, self._binding = interval["clipped"], interval["binding"]
+        return True
+
+
+DIVERGENCE_STATE_SCHEMA: int = 1          # checkpoint "divergence_monitor" record (audit 2026-10-16 F77)
+
+
+def _count(value: object) -> Optional[int]:
+    r"""``value`` when it is an int >= 0 (not a bool), else None."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _real(value: object) -> Optional[float]:
+    r"""``value`` as a float when it is a non-bool int or float, else None (NaN and infinities pass)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _divergence_monitor_state(
+    value: object,
+) -> Optional[Dict[str, Any]]:
+    r"""A validated copy of :meth:`_DivergenceMonitor.state_dict`, or None when anything is malformed."""
+    if not isinstance(value, Mapping):
+        return None
+
+    def stat(item: object) -> Optional[List[Any]]:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return None
+        count, total, peak = _count(item[0]), _real(item[1]), _real(item[2])
+        return None if count is None or total is None or peak is None else [count, total, peak]
+
+    def table(item: object, kind: Callable[[object], Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, Mapping):
+            return None
+        out = {key: kind(entry) for key, entry in item.items()}
+        return out if all(isinstance(key, str) and entry is not None for key, entry in out.items()) else None
+
+    loss_ema = value.get("loss_ema")
+    last_spike = value.get("last_spike")
+    interval = value.get("interval")
+    out: Dict[str, Any] = {
+        "loss_ema":   None if loss_ema is None else _real(loss_ema),
+        "loss_seen":  _count(value.get("loss_seen")),
+        "norm_ema":   table(value.get("norm_ema"), _real),
+        "norm_seen":  table(value.get("norm_seen"), _count),
+        "last_spike": None if last_spike is None else _count(last_spike),
+    }
+    if (out["loss_seen"] is None or out["norm_ema"] is None or out["norm_seen"] is None
+            or (loss_ema is not None and out["loss_ema"] is None)
+            or (last_spike is not None and out["last_spike"] is None) or not isinstance(interval, Mapping)):
+        return None
+    norms = interval.get("norms")
+    if not isinstance(norms, Mapping):
+        return None
+    restored = {
+        "steps":   _count(interval.get("steps")),
+        "loss":    stat(interval.get("loss")),
+        "ce":      stat(interval.get("ce")),
+        "norms":   {role: stat(norms.get(role)) for role in DIVERGENCE_ROLES},
+        "clipped": _count(interval.get("clipped")),
+        "binding": _count(interval.get("binding")),
+    }
+    if (any(restored[key] is None for key in ("steps", "loss", "ce", "clipped", "binding"))
+            or any(entry is None for entry in restored["norms"].values())):
+        return None
+    out["interval"] = restored
+    return out
+
+
+def _divergence_checkpoint_record(
+    divergence:        _DivergenceMonitor,
+    *,
+    interval_ends:     bool,                     # the checkpoint step writes a log/eval row after the save
+    skipped_steps:     int,                      # rejected updates so far (whole run)
+    consecutive_skips: int,
+    last_group_norms:  Mapping[str, float],      # pre-clip group norms of the last logged step
+) -> Dict[str, Any]:
+    r"""The checkpoint's ``divergence_monitor`` entry: the monitor state plus the host counters beside it."""
+    return {"schema": DIVERGENCE_STATE_SCHEMA,
+            "monitor": divergence.state_dict(interval_ends=interval_ends),
+            "skipped_steps": int(skipped_steps), "consecutive_skips": int(consecutive_skips),
+            "last_group_norms": {str(key): float(norm) for key, norm in last_group_norms.items()}}
+
+
+def _checkpoint_divergence_state(
+    value: object,
+) -> Optional[Dict[str, Any]]:
+    r"""A validated copy of a :func:`_divergence_checkpoint_record`, or None.
+
+    Tolerant like the checkpoint's numerics counters: the record is a diagnostic, so a missing or malformed
+    one (an older checkpoint) makes the resumed run restart its monitor instead of failing the resume.
+    """
+    if not isinstance(value, Mapping) or value.get("schema") != DIVERGENCE_STATE_SCHEMA:
+        return None
+    monitor = _divergence_monitor_state(value.get("monitor"))
+    skipped, consecutive = _count(value.get("skipped_steps")), _count(value.get("consecutive_skips"))
+    norms = value.get("last_group_norms")
+    if monitor is None or skipped is None or consecutive is None or not isinstance(norms, Mapping):
+        return None
+    group_norms = {key: _real(norm) for key, norm in norms.items()}
+    if not all(isinstance(key, str) and norm is not None for key, norm in group_norms.items()):
+        return None
+    return {"schema": DIVERGENCE_STATE_SCHEMA, "monitor": monitor, "skipped_steps": skipped,
+            "consecutive_skips": consecutive, "last_group_norms": group_norms}
+
 
 def _conform_row(
     row:    Mapping[str, Any],
@@ -4254,10 +4553,14 @@ def train(
                         else None)                           # None: the global CPU RNG
     try:
         steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
+        sized_loader = True
     except (TypeError, AttributeError):
-        steps_per_epoch = 0
+        steps_per_epoch, sized_loader = 0, False
     if steps_per_epoch < 0:
         raise ValueError(f"loader length must be nonnegative, got {steps_per_epoch}")
+    if sized_loader and steps_per_epoch == 0 and n_steps > 0:
+        # Every epoch would be empty: refuse before step 0 rather than die on a bare StopIteration.
+        raise ValueError(_empty_training_epoch_message(loader))
     periodic_checkpoint_requested = bool(
         artifacts is not None
         and cfg.checkpoint_interval > 0
@@ -4401,7 +4704,8 @@ def train(
                        else None)
     # Which parameters never even receive a gradient is read off the FIRST REAL STEP below rather
     # than from a synthetic parameter_report probe here: train_step zeroes grads on entry and not on
-    # exit, so the real .grad is still live when it returns. That costs no extra forward/backward,
+    # exit, so the real .grad is still live when it returns, and it keeps references to the gradients
+    # an optimizer clears inside step() (status_out["grads"]). That costs no extra forward/backward,
     # and it reports the graph the run actually trains through instead of a probe's approximation of
     # it. The end-of-run warning subtracts this set, so it fires only on a parameter that DID get a
     # gradient and still never moved -- the case no existing check covers.
@@ -4413,12 +4717,24 @@ def train(
     # on host values train_step already transfers.
     divergence = _DivergenceMonitor()
     last_group_norms: Dict[str, float] = {}               # pre-clip group norms of the last logged step
+    # A resumed run continues the monitor, the skip counters and the last logged group norms from the
+    # checkpoint, so its spikes and divergence columns match the uninterrupted run (audit 2026-10-16 F77).
+    # An older checkpoint carries none: the monitor restarts and spikes wait for DIVERGENCE_EMA_WARMUP steps.
+    resumed_divergence = getattr(artifacts, "resumed_divergence_state", None) if start_step > 0 else None
+    if resumed_divergence is not None and divergence.load_state_dict(resumed_divergence["monitor"]):
+        skipped_steps = resumed_divergence["skipped_steps"]
+        consecutive_skips = resumed_divergence["consecutive_skips"]
+        last_group_norms.update(resumed_divergence["last_group_norms"])
+    elif start_step > 0 and artifacts is not None:
+        logger.info(" resume: the checkpoint carries no divergence-monitor state; spike detection restarts "
+                    "and waits %d finite steps", DIVERGENCE_EMA_WARMUP)
     completed_steps = int(n_steps)
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
+    reset_gemm_fallback_slices()            # ... and pair-KL GEMM slices rescored by the direct tiles
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
     reset_layernorm_trace_cap_elements()    # ... and LayerNorm pushforward sphere-bound caps
     reset_covariance_ceiling_elements()     # ... and moment-matched covariance ceiling clamps
@@ -4514,6 +4830,16 @@ def train(
     resumed_wall_clock = getattr(artifacts, "resumed_wall_clock_s", None) if start_step > 0 else None
     timer = (TrainingTimer(device, wall_clock_offset=resumed_wall_clock or 0.0)
              if timing_enabled else None)
+    wall_clock_origin = time.perf_counter()
+
+    def _elapsed_wall_clock() -> float:
+        r"""Cumulative training wall clock (the resumed offset included) for a checkpoint: the timer's when it
+        runs, so metrics.csv ``wall_clock_s`` and the checkpoint agree, else a clock of this call
+        (audit 2026-10-16 F81: a run without log/eval rows has no timer, and its checkpoints carried None)."""
+        if timer is not None:
+            return timer.elapsed_wall_clock_s()
+        return (resumed_wall_clock or 0.0) + time.perf_counter() - wall_clock_origin
+
     last_val: Dict[str, Optional[float]] = {}        # most recent validation, carried into each CSV row
     # VFE-only diagnostics (held-out probes, residual/attention capture, frame-clamp warning) are
     # skipped for another model family; their columns keep the VFE schema and stay blank.
@@ -4631,7 +4957,13 @@ def train(
             if offset_windows is not None:
                 offset_windows.draw_window_offset(offset_generator)
             it = iter(loader)
-            tokens, targets = next(it)
+            try:
+                tokens, targets = next(it)
+            except StopIteration:
+                raise RuntimeError(
+                    f"the training loader yielded no batch after it was re-iterated for step {step}: "
+                    "train() cycles its loader, so it needs a re-iterable loader (a DataLoader or a list "
+                    "of batches), not a one-shot iterator, and at least one batch per epoch") from None
         batches_consumed += 1
         tokens_seen += int(tokens.numel())                   # input-token presentations (metadata only)
         tokens = tokens.to(device, non_blocking=True)
@@ -4813,8 +5145,7 @@ def train(
             # Nothing was collected before the step: the pre-step diagnostics are blank on this row.
             d = {key: float("nan") for key in (diag_keys or _TRAIN_DIAGNOSTIC_FALLBACK_KEYS)}
         if motion_snapshot is not None and not motion_dead_captured and step_status["did_step"]:
-            motion_known_dead = tuple(name for name, p in model.named_parameters()
-                                      if p.requires_grad and p.grad is None)
+            motion_known_dead = _known_dead_parameters(model, step_status)
             motion_dead_captured = True
         if do_log or do_csv or forced_row:                   # diagnostics (off graph), ONCE
             # train_ce is the PRE-step CE captured inside train_step (matches train_loss); the old
@@ -5015,12 +5346,17 @@ def train(
                 artifacts.numerics_counters_state = {
                     **(_frame_projection_state(frame_projection_counter, frame_projection_base,
                                                frame_projection_since) or {}),
-                    **_run_total_counters(run_total_base, precision_replays)}
+                    **_run_total_counters(run_total_base, precision_replays,
+                                      phi_rejected_rows=int(getattr(optimizer, "phi_rejected_rows", 0)))}
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state",
                                            exc, logger)
                 artifacts.numerics_counters_state = None
-            artifacts.wall_clock_state = timer.elapsed_wall_clock_s() if timer is not None else None
+            artifacts.wall_clock_state = _elapsed_wall_clock()
+            # The row of this step is written after the save and then ends the interval (do_log or do_csv).
+            artifacts.divergence_state = _divergence_checkpoint_record(
+                divergence, interval_ends=bool(do_log or do_csv), skipped_steps=skipped_steps,
+                consecutive_skips=consecutive_skips, last_group_norms=last_group_norms)
             try:
                 artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler,
                                           data_state=checkpoint_data_state)
@@ -5222,6 +5558,9 @@ def train(
                         "phi_conditioned_direction_norm_mean",
                         "phi_effective_step_scale_mean",
                         "phi_effective_step_scale_min",
+                        # factor-scale halvings of the accepted step, on both retractions (audit 2026-10-16 F14)
+                        "phi_group_backtracks_mean",
+                        "phi_group_backtracks_max",
                     ):
                         row[_pk] = _gd.get(_pk, float("nan"))
                     # group_log adds its own fixed key set; the chart route's columns are unchanged.
@@ -5254,6 +5593,12 @@ def train(
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "sigma_log_statistics", exc, logger)
                 row.update({"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")})
+            # The decode table's variance margin (decode_av_precision's gauge; NaN under the linear readout).
+            try:
+                row.update(_decode_variance_statistics(model))
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "decode_variance_statistics", exc, logger)
+                row.update({column: float("nan") for column in DECODE_VARIANCE_COLUMNS})
             # S1 panel D cumulative counters on every row (one host read of the device counter).
             try:
                 row.update(_cumulative_counter_columns(
@@ -5271,6 +5616,13 @@ def train(
             # Cumulative tokens of moment-matched covariance updates recomputed in float64.
             row["covariance_escalation_elements"] = (run_total_base["covariance_escalation_elements"]
                                                      + covariance_escalation_elements())
+            # Cumulative LayerNorm-pushforward tokens capped at the sphere bound (the delta method outside its
+            # regime; zero under pushforward_moment, whose cap is read net of its floor; audit 2026-10-16 F3).
+            row["layernorm_trace_cap_elements"] = (run_total_base["layernorm_trace_cap_elements"]
+                                                   + layernorm_trace_cap_elements())
+            # Cumulative (batch, head) slices whose pair KL the pair_kl_gemm_tol fallback moved to the direct
+            # tiles; 0 while pair_kl_gemm_tol is None (audit 2026-10-16 F95).
+            row["gemm_fallback_slices"] = run_total_base["gemm_fallback_slices"] + gemm_fallback_slices()
             row["tokens_seen"] = tokens_seen
             row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
@@ -5308,12 +5660,20 @@ def train(
     # S1 panel D handoff (2026-09-28), before the terminal callback so its checkpoint and summary see
     # it: the cumulative frame-projection counts for any later checkpoint, and summary.json's
     # "numerics_counters" (final cumulative counts, last measured per-evaluation counts, skip reasons).
+    # The terminal checkpoint also carries the run's wall clock and the divergence-monitor state, which only the
+    # periodic branch set before, so a resume from it keeps both (audit 2026-10-16 F77, F81). The last row has
+    # already ended its interval, so the monitor is saved as it stands.
     if artifacts is not None:
+        artifacts.wall_clock_state = _elapsed_wall_clock()
+        artifacts.divergence_state = _divergence_checkpoint_record(
+            divergence, interval_ends=False, skipped_steps=skipped_steps,
+            consecutive_skips=consecutive_skips, last_group_norms=last_group_norms)
         try:
             artifacts.numerics_counters_state = {
                 **(_frame_projection_state(frame_projection_counter, frame_projection_base,
                                            frame_projection_since) or {}),
-                **_run_total_counters(run_total_base, precision_replays)}
+                **_run_total_counters(run_total_base, precision_replays,
+                                      phi_rejected_rows=int(getattr(optimizer, "phi_rejected_rows", 0)))}
             artifacts.numerics_counters = _numerics_counters_summary(
                 completed_steps, optimizer, artifacts.numerics_counters_state, numerics_last_eval,
                 numerics_reasons, diagnostic_windows)
@@ -5343,7 +5703,8 @@ def train(
         if diagnostics_failures:
             logger.warning(" diagnostic failures during training (counted, training unaffected): %s",
                            dict(sorted(diagnostics_failures.items())))
-        run_totals = _run_total_counters(run_total_base, precision_replays)   # whole run across resumes
+        run_totals = _run_total_counters(                                 # whole run across resumes
+            run_total_base, precision_replays, phi_rejected_rows=int(getattr(optimizer, "phi_rejected_rows", 0)))
         neutralized = run_totals["nonfinite_tangent_elements"]
         mu_fallbacks = run_totals["mu_trust_fallback_elements"]
         artifacts.final_step = int(completed_steps)
@@ -5548,6 +5909,12 @@ def parameter_report(
     toggles change. The synthetic ids come from a LOCAL generator (the global RNG is untouched) and
     ``.grad`` is cleared afterward, so the probe is side-effect-free. Best-effort: any failure (e.g. a
     config whose loss does not require grad) falls back to ``live = trainable`` with ``probed=False``.
+
+    ``zero_grad_names`` lists the live parameters whose probe gradient is identically zero: autograd
+    reaches them but their contribution vanishes at this point, as for the first layer of a block whose
+    second layer starts at zero, or a path whose terms cancel. They stay counted as live, since a zero
+    gradient at init need not persist; the list only keeps them from passing as ordinary live parameters
+    (audit 2026-10-16, F110).
     """
     named     = list(model.named_parameters())
     total     = sum(p.numel() for _, p in named)
@@ -5560,6 +5927,7 @@ def parameter_report(
         "live": trainable,
         "dead": 0,
         "dead_names": [],
+        "zero_grad_names": [],
         "probed": False,
     }
     try:
@@ -5582,8 +5950,13 @@ def parameter_report(
             _prior_bank._WARNED_UNIGRAM_UNSET = unigram_warned
         dead_names = [name for name, p in named if p.requires_grad and p.grad is None]
         live = sum(p.numel() for _, p in named if p.requires_grad and p.grad is not None)
+        reached = [(name, p.grad) for name, p in named if p.requires_grad and p.grad is not None]
+        nonzero = (torch.stack([grad.detach().ne(0).any().to(device) for _, grad in reached]).cpu().tolist()
+                   if reached else [])                             # one host transfer for every flag
+        zero_grad_names = [name for (name, _), flag in zip(reached, nonzero) if not flag]
         model.zero_grad(set_to_none=True)                          # leave no grads for training
-        rep.update(live=live, dead=trainable - live, dead_names=dead_names, probed=True)
+        rep.update(live=live, dead=trainable - live, dead_names=dead_names,
+                   zero_grad_names=zero_grad_names, probed=True)
     except Exception as exc:
         rep["probe_error"] = repr(exc)                             # surfaced, not swallowed; live/dead stay unknown
     return rep
@@ -5599,6 +5972,22 @@ def snapshot_parameters(
     reported is motion since the resume point, not since the original init.
     """
     return {name: p.detach().to("cpu", copy=True) for name, p in model.named_parameters()}
+
+
+def _known_dead_parameters(
+    model:  torch.nn.Module,
+    status: Mapping[str, Any],                  # train_step status_out of an accepted step
+) -> Tuple[str, ...]:
+    r"""Names of the trainable parameters that received no gradient on an accepted step.
+
+    A parameter is live when it holds a gradient after the step or one reached ``optimizer.step``
+    (``status["grads"]``): the table Fisher step and the manifold phi step clear ``.grad`` inside
+    ``step()``, so ``p.grad is None`` alone would class those tables as dead and move a frozen one to
+    the unwarned ``frozen_known_dead`` list (audit 2026-10-16, F4).
+    """
+    stashed: Mapping[int, torch.Tensor] = status.get("grads") or {}
+    return tuple(name for name, p in model.named_parameters()
+                 if p.requires_grad and p.grad is None and id(p) not in stashed)
 
 
 def parameter_motion_report(
@@ -5675,6 +6064,9 @@ def _banner(
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
+    zero_line = ([" zero gradient at the init probe (counted live): "
+                  + ", ".join(n.replace("prior_bank.", "") for n in rep["zero_grad_names"])]
+                 if rep["probed"] and rep["zero_grad_names"] else [])
     return "\n".join([
         bar,
         f" Gauge VFE Transformer | {rep['total']:,} params{live_note}{probe_note} | {device}",
@@ -5684,6 +6076,7 @@ def _banner(
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
+        *zero_line,
         f" M-LRs: {_fmt_table_lrs(cfg)}  phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "

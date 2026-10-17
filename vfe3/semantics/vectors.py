@@ -85,7 +85,8 @@ _COMPARE_SECTION = "embeddings/compare"
 DIRECTION_NULL_DRAWS = 200               # concept-direction null: random-target draws
 DIRECTION_NULL_HALF_WINDOW = 50          # frequency matching: replacement within +/- this many frequency ranks
 DIRECTION_Z = 2.0                        # |z| below this is drawn grey in the concept-direction figure
-OFFSET_ALPHA = 0.05                      # offset heatmap: a dot marks re-pairing p < this
+OFFSET_ALPHA = 0.05                      # offset heatmap: a dot marks re-pairing p < this (filled: Holm-adjusted)
+DIRECTION_ALPHA = 0.05                   # concept directions: Holm-adjusted normal p < this counts as significant
 _ZERO_ACCURACY = 0.005                   # a view whose 3CosAdd rounds to 0.00 in every row is collapsed
 
 # Stable per-step stream ids, so each stochastic step draws the same numbers whichever others ran.
@@ -767,7 +768,9 @@ def offset_consistency(view: VectorView, relations: Mapping[str, Sequence[Tuple[
     * ``ocs`` -- Offset Concentration Score: mean pairwise cosine of the offsets
       (Fournier, Dupoux & Dunbar 2020);
     * re-pairing null -- the same with partners re-paired by a random cyclic derangement,
-      ``delta'_i = x_{a*_{pi(i)}} - x_{a_i}``; ``z`` and one-sided ``p = (1 + #\{null >= obs\})/(1 + n_perm)``;
+      ``delta'_i = x_{a*_{pi(i)}} - x_{a_i}``; ``z`` and one-sided ``p = (1 + #\{null >= obs\})/(1 + n_perm)``,
+      and ``p_holm``, the Holm adjustment of ``p`` over the view's tested relations
+      (:func:`vfe3.semantics.stats.holm_adjust`);
     * ``loo_proj`` -- projection of each offset on the unit mean of the other offsets
       (Park, Choe & Veitch 2024, Fig. 2), with the pooled re-paired projections (``null_loo_proj``);
     * random-pair baseline (Park, Choe & Veitch 2024, Fig. 2) -- ``m`` random pairs ``(r_k, s_k)``
@@ -850,6 +853,9 @@ def offset_consistency(view: VectorView, relations: Mapping[str, Sequence[Tuple[
             "top_pc_share": share,
             "null_top_pc_share_mean": float(null_share.mean()) if n_perm else float("nan"),
         }
+    names = list(out["relations"])
+    for name, p_holm in zip(names, stats.holm_adjust([out["relations"][k]["p"] for k in names])):
+        out["relations"][name]["p_holm"] = p_holm                      # family: the view's tested relations
     return out
 
 
@@ -894,6 +900,27 @@ def _matched_replacements(target_rows: np.ndarray, n: int, log_count: Optional[n
     return order[pos]
 
 
+def _direction_holm(z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Two-sided normal p-values :math:`p_{rs} = 2 \bar\Phi(|z_{rs}|)` of the concept-direction ``z`` and their
+    Holm adjustment over the :math:`R(R-1)/2` relation pairs (one family per view); ``(R, R)`` each, symmetric,
+    NaN on the diagonal and where ``z`` is NaN.
+
+    The normal tail is an approximation to the random-target null (its draws give the mean and sd that
+    standardize ``z``, too few for an empirical tail at the Holm thresholds); it is the reading the
+    :data:`DIRECTION_Z` grey threshold already rests on.
+    """
+    from scipy.stats import norm
+
+    R = z.shape[0]
+    p_normal = np.where(np.isfinite(z), 2.0 * norm.sf(np.abs(np.nan_to_num(z, nan=0.0))), np.nan)
+    iu = np.triu_indices(R, k=1)
+    p_holm = np.full((R, R), np.nan)
+    upper = [None if not np.isfinite(v) else float(v) for v in p_normal[iu]]
+    p_holm[iu] = [np.nan if v is None else v for v in stats.holm_adjust(upper)]
+    p_holm.T[iu] = p_holm[iu]
+    return p_normal, p_holm
+
+
 def _direction_null(X: np.ndarray, pair_rows: Sequence[Tuple[np.ndarray, np.ndarray]], P: Optional[np.ndarray],
                     observed: np.ndarray, rng: np.random.Generator, n_null: int,
                     log_count: Optional[np.ndarray], half_window: int) -> Dict[str, Any]:
@@ -936,6 +963,7 @@ def _direction_null(X: np.ndarray, pair_rows: Sequence[Tuple[np.ndarray, np.ndar
     excess[diag] = np.nan
     significant = np.abs(np.nan_to_num(z, nan=0.0)) >= DIRECTION_Z
     upper = np.triu(~diag)
+    p_normal, p_holm = _direction_holm(z)
     return {
         "null": ("targets a* replaced by random words of matched frequency "
                  f"(rank window ±{half_window}), sources kept" if log_count is not None
@@ -945,6 +973,8 @@ def _direction_null(X: np.ndarray, pair_rows: Sequence[Tuple[np.ndarray, np.ndar
         "null_mean": null_mean, "null_std": null_std, "z": z, "excess": excess,
         "significant": significant,
         "n_significant_pairs": int(significant[upper].sum()), "n_pairs_offdiag": int(upper.sum()),
+        "p_normal": p_normal, "p_holm": p_holm, "holm_alpha": DIRECTION_ALPHA,
+        "n_significant_pairs_holm": int((np.nan_to_num(p_holm[upper], nan=1.0) < DIRECTION_ALPHA).sum()),
         "mean_abs_excess_offdiag": float(np.nanmean(np.abs(excess[~diag]))),
     }
 
@@ -968,7 +998,9 @@ def concept_direction_cosines(view: VectorView, relations: Mapping[str, Sequence
     every target replaced by a random row of matched frequency (``log_count``: one value per view
     row; without it the replacement is uniform), sources kept. It adds ``null_mean``, ``null_std``,
     ``z``, ``excess = cosine - null_mean`` (``R x R``, NaN on the diagonal), ``significant``
-    (``|z| >= 2``) and summaries. ``device`` runs the covariance eigendecomposition.
+    (``|z| >= 2``, unadjusted), the normal-tail ``p_normal`` and its Holm adjustment ``p_holm`` over the
+    relation pairs with ``n_significant_pairs_holm`` (:func:`_direction_holm`), and summaries.
+    ``device`` runs the covariance eigendecomposition.
     """
     X = view.X.astype(np.float64)                                      # (n, D)
     names, directions, n_pairs, skipped, pair_rows = [], [], [], {}, []
@@ -1120,14 +1152,19 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
     ``axis`` = ``{"pairs": [(neg_id, pos_id), ...], "words": [ids], "neg_label": str,
     "pos_label": str}`` (resolved token ids). The axis direction is the unit mean of
     ``x_pos - x_neg`` over the pairs in the view (prepared rows); each word's score is its inner
-    product with it. ``loo_pair_accuracy`` is the fraction of pairs whose positive pole scores
-    above its negative pole on the axis built from the OTHER pairs (a held-out validity check).
+    product with it. A scored word that is also a pole word of a kept pair would be ranked on an
+    axis it helped define, so it is scored on the unit axis built from the pairs that do not
+    contain it (``held_out_pole_words``), and dropped when every pair contains it
+    (``dropped_pole_words``; audit 2026-10-16 F75). ``loo_pair_accuracy`` is the fraction of pairs
+    whose positive pole scores above its negative pole on the axis built from the OTHER pairs (a
+    held-out validity check).
     """
     ra, rb, kept = _row_pairs(view, [(int(n), int(p)) for n, p in axis["pairs"]])
     if not kept:
         return {"status": "skipped", "reason": "no axis pair in view"}
     Xp = prepare(view, center)
     diff = Xp[rb] - Xp[ra]                                              # (m, D) pos - neg
+    total = diff.sum(axis=0)                                            # (D,) sum of the pair offsets
     u = diff.mean(axis=0)
     u_norm = float(np.linalg.norm(u))
     if u_norm <= 0.0:
@@ -1135,18 +1172,38 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
     u = u / u_norm
     loo = None
     if len(kept) >= 2:
-        total = diff.sum(axis=0)
         hits = []
         for i in range(len(kept)):
             rest = total - diff[i]
             hits.append(float(diff[i] @ rest) > 0.0)
         loo = float(np.mean(hits))
-    words = [int(w) for w in axis.get("words", []) if view.has(w)]
-    wrows = view.rows(words)
-    scores = Xp[wrows] @ u if words else np.zeros(0)
+    pole_pairs: Dict[int, List[int]] = {}                               # pole word -> kept pairs containing it
+    for i, pair in enumerate(kept):
+        for w in set(pair):
+            pole_pairs.setdefault(w, []).append(i)
+    words: List[int] = []
+    scores_list: List[float] = []
+    held_out: List[int] = []
+    dropped: List[int] = []
+    for w in (int(w) for w in axis.get("words", []) if view.has(w)):
+        x = Xp[view.rows([w])[0]]                                       # (D,)
+        if w not in pole_pairs:
+            words.append(w)
+            scores_list.append(float(x @ u))
+            continue
+        rest = total - diff[pole_pairs[w]].sum(axis=0)                  # (D,) axis of the other pairs
+        rest_norm = float(np.linalg.norm(rest))
+        if len(pole_pairs[w]) == len(kept) or rest_norm <= 0.0:
+            dropped.append(w)
+            continue
+        words.append(w)
+        scores_list.append(float(x @ rest) / rest_norm)
+        held_out.append(w)
+    scores = np.asarray(scores_list, dtype=np.float64)
     order = np.argsort(-scores, kind="stable")
     return {
         "n_pairs": len(kept), "n_words": len(words),
+        "held_out_pole_words": held_out, "dropped_pole_words": dropped,
         "neg_label": axis.get("neg_label", "neg"), "pos_label": axis.get("pos_label", "pos"),
         "words": [(words[i], float(scores[i])) for i in order],
         "pair_words": [{"neg": a, "pos": b, "neg_score": float(Xp[r0] @ u), "pos_score": float(Xp[r1] @ u)}
@@ -1747,7 +1804,8 @@ def write_view_tables(view: VectorView, ctx: AnalysisContext, battery: Dict[str,
     if _ok(offsets):
         rows = [{"relation": name, "pairs": r["n_pairs"], "OCS": r["ocs"], "OCS re-paired": r["null_mean"],
                  "effect size": r.get("effect_size", _effect_size(r["ocs"], r["null_mean"])),
-                 "z": r["z"], "p": r["p"], "LOO proj": r["loo_proj_mean"], "re-paired": r["null_loo_proj_mean"],
+                 "z": r["z"], "p": r["p"], "p (Holm)": r.get("p_holm"),
+                 "LOO proj": r["loo_proj_mean"], "re-paired": r["null_loo_proj_mean"],
                  "random pairs": r.get("random_loo_proj_mean"), "random pairs sd": r.get("random_loo_proj_sd"),
                  "top-PC share": r["top_pc_share"], "top-PC re-paired": r["null_top_pc_share_mean"]}
                 for name, r in offsets["relations"].items()]
@@ -1757,7 +1815,8 @@ def write_view_tables(view: VectorView, ctx: AnalysisContext, battery: Dict[str,
             "re-paired: partners permuted within the relation by random cyclic derangements (Fournier, Dupoux & "
             "Dunbar 2020; keeps the two word sets, hence their group offset). effect size: (OCS − re-paired)/"
             "(1 − re-paired), comparable across views of different width (z is not: the null sd shrinks with "
-            "the dimension). LOO proj: projection of each "
+            "the dimension). p: one-sided permutation p of OCS; p (Holm): its Holm adjustment over the relations "
+            "of this view (family-wise error under any dependence). LOO proj: projection of each "
             "offset on the unit mean of the other offsets; random pairs: the same projection for as many random "
             "pairs of the view's words (mean and sd; the baseline of Park, Choe & Veitch 2024, Fig. 2).\n\n"
             + markdown_table(rows)))
@@ -2199,7 +2258,8 @@ def _heatmap(ax: Any, M: np.ndarray, row_labels: Sequence[str], col_labels: Sequ
 
 
 def _compare_offsets(results: Results, views: Views, ctx: AnalysisContext, order: List[str]) -> Optional[Any]:
-    r"""Heatmap relation x view of the offset effect size ``(OCS - null)/(1 - null)``, a dot where ``p < 0.05``.
+    r"""Heatmap relation x view of the offset effect size ``(OCS - null)/(1 - null)``, a dot where ``p < 0.05``
+    (filled where the Holm-adjusted p over the view's relations is below it too, open otherwise).
 
     The ``z`` of the re-pairing null is not comparable across views: its sd shrinks like
     :math:`D^{-1/2}`, so a wide chart gets a large ``z`` for a small excess. The effect size scales
@@ -2233,18 +2293,27 @@ def _compare_offsets(results: Results, views: Views, ctx: AnalysisContext, order
     fig, ax = plt.subplots(figsize=(width, 0.3 * len(rels) + 1.6))
     im = _heatmap(ax, E, [r.replace("_", " ") for r in rels], [views[v].label for v in order],
                   vmax=vmax, annotate=E.size <= 300, fmt="{:.2f}")
-    significant = np.isfinite(P) & (P < OFFSET_ALPHA) & np.isfinite(E)
-    rows, cols = np.nonzero(significant)
-    ax.plot(cols + 0.34, rows - 0.3, linestyle="none", marker="o", ms=2.6, mfc="#111111", mec="white",
-            mew=0.4)
+    # Holm over the relations of each view (one family per column), recomputed from the raw p so that
+    # results saved before p_holm existed are marked the same way (audit 2026-10-16 F71).
+    P_holm = np.full_like(P, np.nan)                                   # (n_rel, n_view)
+    for c in range(len(order)):
+        adjusted = stats.holm_adjust([float(p) if np.isfinite(p) else None for p in P[:, c]])
+        P_holm[:, c] = [np.nan if p is None else p for p in adjusted]
+    raw = np.isfinite(P) & (P < OFFSET_ALPHA) & np.isfinite(E)
+    holm = raw & (P_holm < OFFSET_ALPHA)
+    for mask, face, label in ((holm, "#111111", "holm"), (raw & ~holm, "white", "raw")):
+        rows, cols = np.nonzero(mask)
+        ax.plot(cols + 0.34, rows - 0.3, linestyle="none", marker="o", ms=2.6, mfc=face, mec="#111111",
+                mew=0.5, label=label)
     ax.set_xlim(-0.5, len(order) - 0.5)
     ax.set_ylim(len(rels) - 0.5, -0.5)
     fig.colorbar(im, ax=ax, fraction=0.05, pad=0.02, label="effect size (OCS − null)/(1 − null)")
     _suptitle(fig, "Relation-offset consistency: effect size over the re-pairing null")
     _footnote(fig, "OCS: mean pairwise cosine of the relation's offsets; null: the same with partners re-paired "
                    "by random cyclic derangements (Fournier et al. 2020). Color and value: (OCS − null)/(1 − null), "
-                   f"comparable across views of different width; dot: one-sided permutation p < {OFFSET_ALPHA:g}. "
-                   "Grey: fewer than 3 pairs in the view.", width=int(14 * width))
+                   "comparable across views of different width. Filled dot: one-sided permutation p < "
+                   f"{OFFSET_ALPHA:g} after the Holm adjustment over the view's relations; open dot: unadjusted "
+                   f"p < {OFFSET_ALPHA:g} only. Grey: fewer than 3 pairs in the view.", width=int(14 * width))
     return fig
 
 
@@ -2324,7 +2393,12 @@ def _compare_directions(results: Results, views: Views, ctx: AnalysisContext,
         im = _heatmap(ax, M, rows_shown, cols_shown, vmax=vmax, annotate=len(names) <= 12, fmt="{:.2f}",
                       muted=muted)
         d = results[v]["directions_whitened"]
-        ax.set_title(f"{views[v].label}, rank {d.get('whitening_rank')}/{d['dim']}", fontsize=8)
+        title = f"{views[v].label}, rank {d.get('whitening_rank')}/{d['dim']}"
+        if with_null:                            # recomputed from z: results saved before p_holm existed too
+            _, p_holm = _direction_holm(np.array(d["z"], dtype=np.float64))
+            upper = p_holm[np.triu_indices(len(names), k=1)]
+            title += f", Holm {int((np.nan_to_num(upper, nan=1.0) < DIRECTION_ALPHA).sum())}/{upper.size}"
+        ax.set_title(title, fontsize=8)
     for j in range(len(panels), nrows * ncols):
         axes[j // ncols, j % ncols].axis("off")
     fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.03, pad=0.02,
@@ -2338,7 +2412,9 @@ def _compare_directions(results: Results, views: Views, ctx: AnalysisContext,
     if with_null:
         d0 = results[key[0]]["directions_whitened"]
         note += (f"Cell: observed cosine minus its null mean; null: {d0.get('n_null')} draws, "
-                 f"{d0.get('null', 'targets a* replaced by random words')}. Grey: |z| < {DIRECTION_Z:g}. Relations built on "
+                 f"{d0.get('null', 'targets a* replaced by random words')}. Grey: |z| < {DIRECTION_Z:g} (unadjusted). "
+                 f"Holm k/M in a panel title: the relation pairs whose two-sided p = 2(1 − Φ(|z|)) stays below "
+                 f"{DIRECTION_ALPHA:g} after the Holm adjustment over the panel's M pairs. Relations built on "
                  "shared source words (capital and nationality from country names, comparative and superlative "
                  "from adjectives, past and gerund from verbs) share the term −mean(x_a), so their directions "
                  "have a positive expected cosine without any semantic coupling; the null keeps that term.")
@@ -2446,7 +2522,8 @@ def _compare_projections(results: Results, views: Views, ctx: AnalysisContext, h
         ax.set_xlabel(f"{p['neg_label']} $\\leftrightarrow$ {p['pos_label']}", fontsize=7)
     _panel_letters(axes[0])
     _suptitle(fig, f"{views[headline].label}: semantic projection")
-    _footnote(fig, "Shaded: score range of the negative (vermillion) and positive (blue) pole words; LOO: "
+    _footnote(fig, "Shaded: score range of the negative (vermillion) and positive (blue) pole words; a listed "
+                   "word that is also a pole word is scored on the axis built from the pairs without it; LOO: "
                    "fraction of pole pairs ordered correctly by the axis built from the other pairs "
                    "(Grand et al. 2022).", width=60 if len(axes_ok) == 1 else 100)
     return fig

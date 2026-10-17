@@ -472,9 +472,12 @@ def build_full_link_context(
                            channel_frame.inverse, *operators._content_parameters())
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work, sigma_work = mu.to(dtype), sigma.to(dtype)
-        score = clamped_routing_cost(relational_score(
-            mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), operators,
-            kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
+        raw_score = relational_score(
+            mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture)   # (..., H, N, N) D_ij
+        # Non-finite raw costs, which the clamp maps to kl_max (audit 2026-10-16 F10).
+        score_nonfinite = None if capture is None else ~torch.isfinite(raw_score.detach())   # (..., H, N, N)
+        score = clamped_routing_cost(raw_score, operators,
+                                     kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
         beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype), log_prior=(
             None if log_prior is None else log_prior.to(dtype)))
         weights = _head_weights(beta, lambda_beta)                       # (..., H, I, J)
@@ -517,7 +520,7 @@ def build_full_link_context(
         context = full_link_context_at(
             FullLinkContext(Lambda, eta, torch.zeros_like(prior_logdet), beta, score, profile), mu_work, sigma_work)
     if capture is not None:
-        capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
+        capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(), score_nonfinite_pre=score_nonfinite,
                        full_link_context=context)
     return context
 

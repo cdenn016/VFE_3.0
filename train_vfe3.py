@@ -48,6 +48,9 @@ from vfe3.data.datasets import (
     tokenizer_vocab_size as _tokenizer_vocab_size,
 )
 from vfe3.runtime import seed_everything
+# The shared run-directory helpers (audit 2026-10-16 F96): atomic reservation (base_2, base_3, ... on a collision)
+# and the rename by test perplexity.
+from vfe3.experiment import rename_run_by_test_ppl, reserve_directory as _reserve_directory
 from vfe3.train import _fmt_tau, evaluate, train
 
 
@@ -198,7 +201,7 @@ config = dict(
 
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
-    block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal)
+    block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal) | "pushforward_moment" (the same at the effective scale s^2 + tr(Pi Sigma Pi)/K with a span floor; a moment estimate at every Sigma/s^2)
 
     #################################
     #        Initialization
@@ -229,14 +232,14 @@ config = dict(
     #################################
     gauge_transport                  = "on",           # "on" | "off" | "frozen" (random fixed frame)
     gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
-    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
+    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n, su_n only)
     
     group_n                          = None,                # so_n / su_n only: the N of SO(N) (>= 2) or SU(N) (>= 3); None for every other group
     irrep_spec                       = None,                # so_n: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; su_n: [("pq<p>_<q>", mult), ...] (p >= q; SU(3) dims pq1_0 6, pq1_1 8, pq2_0 12); None otherwise
    
     ####################################
     #       Positional Encoding
-    #    BCH gauge-frame PE (pos_phi)
+    #    gauge-frame PE (pos_phi): exact right factor exp(X_i) exp(Y_n)
     #     gauge-RoPE (rope_mode)
     ####################################
 
@@ -251,6 +254,7 @@ config = dict(
     ######################################
     
     lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
+    mstep_self_coupling_weight       = 0.0,      # float >= 0: alpha_hat of the M-step term alpha_hat * mean_i alpha_i D(q_i*||p_i), gradient through q*; 0.0 = off
   
     ########################################
     #     Attention Belief/Model Settings
@@ -278,10 +282,13 @@ config = dict(
     
     m_phi_update_mode                = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
     m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
-    phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc)
+    m_phi_group_log_fallback         = "series",       # "series" (certified series direction; structure-constant budget, block_glk d_head <= 16) | "eigenbasis" (off-strip blocks by the eigenbasis Psi inverse, kappa_2(U) > 1e3 rows take no step; no width budget); pullback_group with group_log only
+    m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
+    phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
 
-    m_phi_group_trust_radius         = 0.1,
-    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on every rotation (also damps Fisher-visible ones)
+    m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
+    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight lambda (under "rotation" it also damps Fisher-visible rotations)
+    m_phi_fisher_completion          = "rotation",  # fisher_group only: "rotation" (lambda on every rotation) | "stabilizer" (lambda on the belief's stabilizer only: the belief-Fisher natural gradient on the visible subspace; not with pos_phi="learned")
 
     m_table_update_mode              = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
     m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
@@ -332,6 +339,7 @@ config = dict(
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
+    relational_tile_mib              = 32,         # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
     decode_ce_triton                 = False,      # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)
@@ -340,7 +348,8 @@ config = dict(
    
     frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
-    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo a non-PD fp32 update in fp64 (counted in source_recovery_elements)
+    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
+    predictive_covariance_precision  = "fp32",     # "fp32" | "fp64": moment_matched kernel readout: run the whole covariance update in float64 from fp32 beliefs (removes kappa(U)^2 rounding; costly)
         
    
     
@@ -360,9 +369,16 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
+    # Live parameters whose init-probe gradient is identically zero (audit 2026-10-16 F110), e.g. the first layer of
+    # a zero-initialized gate: benign at init, but named so a parameter that never moves is not mistaken for live.
+    zero_names = rep.get("zero_grad_names", [])
+    zero_line = ([" zero gradient at the init probe (counted live): "
+                  + ", ".join(n.replace("prior_bank.", "") for n in zero_names)]
+                 if rep["probed"] and zero_names else [])
+    probe_note = "" if rep["probed"] else "  [live/dead probe failed]"
     return "\n".join([
         bar,
-        f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
+        f" Gauge VFE Transformer | {rep['total']:,} params{live_note}{probe_note} | {device}",
         bar,
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  "
         f"heads={len(model.group.irrep_dims)}  "  # runtime attention heads = irrep blocks
@@ -370,6 +386,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
+        *zero_line,
         f" M-LRs: {_fmt_table_lrs(cfg)}  "
         f"phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
@@ -444,18 +461,6 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 
 
-def _reserve_directory(root: Path, base: str) -> Path:
-    """Atomically reserve ``root/base`` and retry deterministic numeric suffixes on collision."""
-    root.mkdir(parents=True, exist_ok=True)
-    suffix = 1
-    while True:
-        candidate = root / (base if suffix == 1 else f"{base}_{suffix}")
-        try:
-            candidate.mkdir(exist_ok=False)
-        except FileExistsError:
-            suffix += 1
-            continue
-        return candidate
 
 
 def _run_dir(
@@ -498,30 +503,7 @@ def _rename_run_by_test_ppl(
     the numeric results are already on disk, so a failed rename is logged, never fatal). A name clash
     gets a ``_2``, ``_3``, ... suffix so an existing run is never clobbered.
     """
-    import math
-    from pathlib import Path
-
-    src = Path(run_dir)
-    if test_ppl is None or not math.isfinite(test_ppl) or not src.exists():
-        return run_dir
-    dst = src.parent / f"{test_ppl:.2f}_{label}"
-    i = 2
-    while dst.exists():
-        dst = src.parent / f"{test_ppl:.2f}_{label}_{i}"
-        i += 1
-    try:
-        src.rename(dst)
-    except OSError as exc:                                # open handle / locked dir -> keep run, log it
-        logger.warning("could not rename run dir to %s (%s); kept %s", dst.name, exc, src.name)
-        return run_dir
-    logger.info("Renamed run dir -> %s", dst.name)
-    return str(dst)
-
-
-# Compatibility aliases for callers that imported an older boundary. The PPL argument is now the
-# held-out TEST perplexity, not validation.
-_rename_run_by_ppl = _rename_run_by_test_ppl
-_rename_run_by_validation_ppl = _rename_run_by_test_ppl
+    return str(rename_run_by_test_ppl(Path(run_dir), label, test_ppl, logger))
 
 
 def _run_once(
@@ -544,7 +526,8 @@ def _run_once(
 
     overrides = {}
     if fully_gauge_covariant:
-        from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
+        from vfe3.gauge_covariant import (describe_fully_gauge_covariant_overrides, fully_gauge_covariant_overrides,
+                                          gauge_covariance_failures)
         overrides = fully_gauge_covariant_overrides(config)
     cfg = VFE3Config(**{**config, **overrides, "seed": seed})   # the run's seed, from SEEDS
     if fully_gauge_covariant:
@@ -552,7 +535,7 @@ def _run_once(
         if failures:
             raise ValueError(f"fully_gauge_covariant=True left these gauge flags false: {failures}")
         logger.info("fully_gauge_covariant=True: overriding %s",
-                    ", ".join(f"{key}={config.get(key)!r} -> {value!r}" for key, value in overrides.items())
+                    describe_fully_gauge_covariant_overrides(config, overrides)
                     or "nothing (the config is already fully gauge covariant)")
     # Always shown, unlike the env-gated ConfigNotice: every setting this launcher names explicitly
     # that no active path reads under the resolved config, with the structural reason.
@@ -572,6 +555,11 @@ def _run_once(
     # -> BPC unavailable, while evaluate publishes the always-defined bits_per_token separately.
     from vfe3.data.datasets import tokens_per_char as _tokens_per_char
     val_tpc = _tokens_per_char(DATASET, "validation")
+    # The end-of-run test split opens here, with the train and validation splits, so a missing test cache fails
+    # before training and before a run directory exists (audit 2026-10-16 F122). A sequential loader draws no RNG.
+    persist = (RUN_ROOT if run_root is None else run_root) is not None
+    test_loader = _select_loader(DATASET, cfg, split="test") if persist else None
+    test_tpc = _tokens_per_char(DATASET, "test") if persist else None
 
     # Run-artifacts directory (config.json, metrics.csv, checkpoints/, best_model.pt, figures).
     # None disables persistence (RUN_ROOT = None); the synthetic fallback also runs unsaved-free.
@@ -643,11 +631,9 @@ def _run_once(
         (f"{float(m['bpc']):.4f}" if m["bpc"] is not None else "unavailable"),
     )
 
-    # End-of-run held-out TEST evaluation on the final training weights, plus summary +
-    # figures, on the dataset's test split (a missing cache raises -- no synthetic substitution).
+    # End-of-run held-out TEST evaluation on the final training weights, plus summary + figures, on the
+    # dataset's test split opened at launch (a missing cache raised there -- no synthetic substitution).
     if artifacts is not None:
-        test_loader = _select_loader(DATASET, cfg, split="test")
-        test_tpc = _tokens_per_char(DATASET, "test")
         results = finalize_run(
             model,
             artifacts,

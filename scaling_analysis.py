@@ -10,12 +10,15 @@ edit ``CONFIG`` and run ``python scaling_analysis.py``.
 
 The y-axis is ``test_ce`` (nats/token), the canonical additive scaling quantity; perplexity is a
 nonlinear re-read. The x-axis is the recorded ``n_params`` (never a derived ``d^2`` proxy); when the runs
-record ``n_non_embedding_params`` (total minus per-token / positional lookup tables, ~99% of ``n_params``
-at the scaling widths) the law is also fit against that axis. R^2, the exponent CI, and the lack-of-fit
+record ``n_non_embedding_params`` (total minus the per-token / positional lookup tables, which are ~99%
+of ``n_params`` at the scaling widths, so ~1% of ``n_params``) the law is also fit against that axis. R^2, the exponent CI, and the lack-of-fit
 test are reported only from four distinct sizes; fewer leave the fit ``not_testable``. Runs whose
 ``test_ce`` is null (no test split) or non-positive are dropped before the log fit; the analysis warns
 if the harvested points span more than one ``data_sha256`` (mixed corpus) or ``git_sha`` (code drift),
-either of which confounds a frontier.
+either of which confounds a frontier. The summary records whether the seeds of a cell shared one
+training data order (``data_order``; the shipped ``scaling.CONFIG["data_seed"] = 3`` gives every model
+seed the same order). Under a shared order the seed spread, and with it the pure error behind the exponent
+CI and the lack-of-fit test, omits data-order variance and is a lower bound on the replicate variance.
 
 Two further figures, ``capacity_scaling.png`` and ``pareto_frontier.png`` (audit finding PB-07), are
 dispatched separately from persisted validation metrics: ``vfe3.viz.sweep_adapters.aggregate_validation_points``
@@ -61,7 +64,6 @@ from vfe3.config import config_from_serialized, serialize_config
 from vfe3.metric_contracts import (  # noqa: E402
     scaling_min_testable_sizes,
     perplexity_matches_ce,
-    target_blind_objective_interpretation,
 )
 from vfe3.path_utils import portable_path_component_key
 
@@ -72,8 +74,6 @@ def _min_testable_sizes() -> int:
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
 
-
-F_CE_RELATIONSHIP_FILENAME = "f_ce_relationship.png"
 
 logger = logging.getLogger("scaling_analysis")
 
@@ -109,10 +109,10 @@ _CSV_COLUMNS = [
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
     "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
-    "tokens_seen", "est_flops_6ND",
+    "data_seed", "tokens_seen", "est_flops_6ND",
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
-    "estep_final_f_per_token", "best_val_ppl",
+    "best_val_ppl",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
     "git_sha", "code_identity_forced",
     "cell_git_dirty", "cell_git_dirty_fingerprint",
@@ -530,6 +530,9 @@ def harvest(
             "scale_knob":  cell["scale_knob"],
             "label":       cell["label"],
             "seed":        verified["seed"],
+            # the training data-order seed (null: the global RNG seeded by the model seed); absent
+            # when the cell does not record it
+            **({"data_seed": cell["data_seed"]} if "data_seed" in cell else {}),
             "artifact_verified": True,
             "n_params":    verified["n_params"],
             "n_learnable_params":      sp.get("n_learnable_params"),
@@ -551,7 +554,6 @@ def harvest(
             "test_ppl":    verified["test_ppl"],
             "test_bits_per_token": verified["test_bits_per_token"],
             "test_bpc": verified["test_bpc"],
-            "estep_final_f_per_token": summ.get("estep_final_f_per_token"),
             "best_val_ppl": summ.get("best_val_ppl"),
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
             "data_sha256": prov.get("data_sha256") or prov.get("test_data_sha256"),
@@ -837,25 +839,6 @@ def _as_float(x: Any) -> float:
     except (TypeError, ValueError):
         return float("nan")
 
-def _pearson_correlation(left: Sequence[float], right: Sequence[float]) -> float:
-    """Compute Pearson correlation without NumPy's unstable native corrcoef path."""
-    left_values = [float(value) for value in left]
-    right_values = [float(value) for value in right]
-    if (len(left_values) != len(right_values) or len(left_values) < 2
-            or any(not math.isfinite(value) for value in (*left_values, *right_values))):
-        return float("nan")
-    left_mean = math.fsum(left_values) / len(left_values)
-    right_mean = math.fsum(right_values) / len(right_values)
-    left_centered = [value - left_mean for value in left_values]
-    right_centered = [value - right_mean for value in right_values]
-    denominator = math.sqrt(
-        math.fsum(value * value for value in left_centered)
-        * math.fsum(value * value for value in right_centered))
-    if denominator == 0.0:
-        return float("nan")
-    return math.fsum(a * b for a, b in zip(left_centered, right_centered)) / denominator
-
-
 
 def _sorted_strings(rows: List[Dict[str, Any]], key: str) -> List[str]:
     return sorted({str(r[key]) for r in rows if r.get(key)})
@@ -901,6 +884,75 @@ def _analysis_provenance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "n_missing_token_budgets": sum(not np.isfinite(_as_float(r.get("tokens_seen"))) for r in rows),
         "missing": missing,
     }
+
+
+def _data_order_status(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    r"""Whether the seeds of each replicate cell shared one training data order, with its caveat.
+
+    A replicate cell is a (route, label) with two or more seed runs; only these give the seed spread
+    that the SEM weights, the pure error :math:`SS_{PE}` of the lack-of-fit test and the bootstrap
+    exponent CI rest on. A run's ``data_seed`` is the explicit seed of its training-order generator, or
+    ``None`` when the order follows the global RNG seeded by the model seed (``scaling.CONFIG["data_seed"]
+    = None``), which differs between model seeds. ``status`` is
+
+    - ``"shared_explicit"``: in every replicate cell all seeds record one explicit data seed, so the
+      spread measures initialization and optimization only and is a lower bound on the replicate
+      variance over data orders;
+    - ``"distinct"``: no two seeds of a replicate cell share an explicit data seed;
+    - ``"nonshared_unspecified"``: every replicate run records ``data_seed = None``;
+    - ``"partially_shared"``: some seeds share an order and others do not;
+    - ``"unknown"``: some replicate run does not record its data seed;
+    - ``"no_replicates"``: no cell has two seeds.
+
+    ``data_seeds`` lists the distinct explicit data seeds of the replicate runs."""
+    cells: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {}
+    for row in rows:
+        cells.setdefault((str(row.get("route")), str(row.get("label"))), []).append(row)
+    replicate = {key: grp for key, grp in sorted(cells.items()) if len(grp) >= 2}
+    runs = [row for grp in replicate.values() for row in grp]
+    explicit = sorted({row["data_seed"] for row in runs
+                       if "data_seed" in row and row["data_seed"] is not None})
+    out: Dict[str, Any] = {"n_replicate_cells": len(replicate), "data_seeds": explicit}
+    lower_bound = ("the across-seed spread, and with it the pure error behind the exponent CI and the "
+                   "lack-of-fit test, measures initialization and optimization only and is a lower bound "
+                   "on the replicate variance over data orders: the CI is conditional on that order, and "
+                   "the lack-of-fit test counts a data-order deviation from the law as lack of fit")
+    if not replicate:
+        return {**out, "status": "no_replicates",
+                "caveat": "No cell has two or more seeds, so no seed spread enters the analysis."}
+    unrecorded = sorted(f"{route}/{label}" for (route, label), grp in replicate.items()
+                        if any("data_seed" not in row for row in grp))
+    if unrecorded:
+        return {**out, "status": "unknown",
+                "caveat": ("The training data seed is not recorded for runs of " + ", ".join(unrecorded)
+                           + ", so whether their seeds share one data order is unknown. If they do, "
+                           + lower_bound + ".")}
+    shared_cells = distinct_cells = 0
+    for grp in replicate.values():
+        values = [row["data_seed"] for row in grp]
+        explicit_values = [value for value in values if value is not None]
+        if len(set(values)) == 1 and values[0] is not None:
+            shared_cells += 1
+        elif len(set(explicit_values)) == len(explicit_values):
+            distinct_cells += 1
+    seeds_text = ", ".join(str(value) for value in explicit)
+    if shared_cells == len(replicate):
+        return {**out, "status": "shared_explicit",
+                "caveat": (f"Every replicate cell's seeds share one training data order (data seed "
+                           f"{seeds_text}): " + lower_bound + ".")}
+    if distinct_cells == len(replicate):
+        if not explicit:
+            return {**out, "status": "nonshared_unspecified",
+                    "caveat": ("No replicate run records an explicit data seed (data_seed=None: the order "
+                               "follows the global RNG seeded by each model seed), so the seeds train on "
+                               "different orders and the across-seed spread includes data-order variance.")}
+        return {**out, "status": "distinct",
+                "caveat": ("No two seeds of a replicate cell share a training data order, so the "
+                           "across-seed spread includes data-order variance.")}
+    return {**out, "status": "partially_shared",
+            "caveat": (f"Some replicate seeds share a training data order and others do not ({shared_cells} "
+                       f"of {len(replicate)} replicate cells share one throughout), so the across-seed "
+                       "spread mixes seeds with and without data-order variance.")}
 
 
 def _pooled_status(
@@ -1052,8 +1104,8 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
         non_embedding = {_as_float(g.get("n_non_embedding_params")) for g in grp}
-        # C2/EXP-5: per-seed converged final E-step F/token and named bit metrics.
-        f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
+        # Named bit metrics. No run records a final E-step free energy per token: the projected routes define
+        # no shared free energy, so the E-step structural-EM check has no input (audit 2026-10-16 F86).
         bits_per_token = [
             value for value in (_as_float(g.get("test_bits_per_token")) for g in grp)
             if np.isfinite(value)
@@ -1082,8 +1134,6 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 str(g["effective_run_key"]) for g in grp if g.get("effective_run_key"))),
             "ce_mean": float(np.mean(ce)),
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
-            "f_seeds": f_seeds,
-            "f_mean": float(np.mean(f_seeds)) if f_seeds else float("nan"),
             "bits_per_token_seeds": bits_per_token,
             "bits_per_token_mean": (
                 float(np.mean(bits_per_token)) if bits_per_token else float("nan")),
@@ -1104,7 +1154,8 @@ def _collapse_identical_points(
     is ``width_depth`` K160_L{d}, trained with the same seeds, data order and deterministic kernels.
     Two points whose per-seed effective-run identities (config with float fields normalized,
     dataset, data seed, token cap, source and code identity) coincide are one set of observations,
-    so the pooled fit, the lack-of-fit test and the bootstrap must count them once. Returns the
+    so the pooled fit, the lack-of-fit test, the bootstrap and the frontier-collapse test must count
+    them once. Returns the
     retained points (first in (route, label) order) and a report of every collapsed group.
     Points without a recorded identity are kept as they are, and points must also record the same
     parameter count to collapse.
@@ -1310,7 +1361,18 @@ def ancova_frontier_collapse(
     distinct sizes per route and a converged offset fit for every route and for the pool;
     otherwise it is not testable. A significant F means the routes do NOT collapse. Non-rejection
     does not establish equivalence. Returns the F statistic, dof, p-value, rejection status, and
-    per-route point counts."""
+    per-route point counts.
+
+    Every training run enters the test once. The nested standard routes share cells (``width`` K{k}
+    is ``width_depth`` K{k}_L6 and ``depth`` L{d} is ``width_depth`` K160_L{d}), so a set of identical
+    runs (:func:`_collapse_identical_points`) is kept under the first route in (route, label) order
+    and dropped from the others; ``n_identical_points_dropped`` counts the copies. Counting a copy
+    under each route doubled its residual: under one shared offset law (5 widths x 4 depths, 3 seeds)
+    the duplicated design rejected 0 of 150 replicates (audit 2026-10-16 F55). Any partition of the
+    distinct runs into routes gives the F law under the null."""
+    points, collapsed = _collapse_identical_points(
+        sorted(points, key=lambda p: (str(p["route"]), str(p.get("label", "")))))
+    n_dropped = sum(len(group["dropped_as_identical"]) for group in collapsed)
     by_route: Dict[str, List[Dict[str, Any]]] = {}
     for p in points:
         n_params = _as_float(p.get("n_params"))
@@ -1322,6 +1384,7 @@ def ancova_frontier_collapse(
     out: Dict[str, Any] = {
         "routes": {r: len(ps) for r, ps in routes.items()},
         "distinct_sizes": {r: len(route_sizes[r]) for r in routes},
+        "n_identical_points_dropped": n_dropped,
         "testable": False,
     }
     if len(routes) < 2:
@@ -1505,6 +1568,7 @@ def analyze() -> None:
     # Persist every identity used to judge whether the parameter frontier is comparable.  Scope the
     # sets to the rows that actually enter L(N), not flat-N inference arms that are plotted separately.
     provenance = _analysis_provenance(param_rows)
+    data_order = _data_order_status(param_rows)
     if provenance["mixed_corpus"]:
         logger.warning("harvested parameter runs span multiple data SHA-256 identities -- mixed corpus confounds the fit")
     if provenance["code_drift"]:
@@ -1519,7 +1583,8 @@ def analyze() -> None:
     pooled_ids = {id(p) for p in pooled_param_points}
     pooled_mask = np.array([id(p) in pooled_ids for p in fit_param_points], dtype=bool)
     for group in collapsed_cells:
-        logger.warning("identical training runs %s counted once in the pooled fit (kept %s)",
+        logger.warning("identical training runs %s counted once in the pooled fit and the frontier "
+                       "test (kept %s)",
                        ", ".join(group["dropped_as_identical"]), group["kept"])
     frontier = (
         ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"],
@@ -1530,8 +1595,8 @@ def analyze() -> None:
     route_notes = {route: _ROUTE_NOTES[route] for route in routes if route in _ROUTE_NOTES}
 
     # Accumulate the printed fits / tests into a persisted summary (scaling_summary.json plus the
-    # SCALING_ANALYSIS.md report): the pooled fit, bootstrap CI, per-route exponents, the
-    # frontier-collapse F-test, and the E-step structural-EM correlations were console-only.
+    # SCALING_ANALYSIS.md report): the pooled fit, bootstrap CI, per-route exponents and the
+    # frontier-collapse F-test were console-only.
     summary: Dict[str, Any] = {
         "input_dir": str(input_dir), "n_runs": len(rows), "with_offset": CONFIG["with_offset"],
         "n_param_points": len(param_points), "n_inference_points": len(infer_points),
@@ -1541,10 +1606,10 @@ def analyze() -> None:
         "n_budget_points": len(budget_points),
         "budget_points_excluded_from_fit": sorted(f"{p['route']}/{p['label']}" for p in budget_points),
         "design": design,
-        "provenance": provenance, "pooled_fit": None, "pooled_fit_status": "not_fitted",
+        "provenance": provenance, "data_order": data_order, "pooled_fit": None, "pooled_fit_status": "not_fitted",
         "pooled_fit_confounds": [], "pooled_fit_lack_of_fit": None,
         "pooled_fit_non_embedding": None, "per_route": {}, "frontier_collapse": frontier,
-        "route_notes": route_notes, "estep_structural": None,
+        "route_notes": route_notes,
     }
 
     weights_by_route: Dict[str, np.ndarray] = {}
@@ -1606,6 +1671,7 @@ def analyze() -> None:
                           f"{lack_of_fit['F']:.3f}  p = {lack_of_fit['p_value']:.4g}")
                 else:
                     print(f"  lack-of-fit test not testable ({lack_of_fit.get('reason')})")
+                print(f"  seed data order: {data_order['status']}. {data_order['caveat']}")
             else:
                 print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}   "
                       f"A = {fit['A']:.4g}   over {fit['n_distinct_sizes']} distinct sizes -- "
@@ -1707,28 +1773,6 @@ def analyze() -> None:
         detail = f" ({', '.join(confounds)})" if confounds else ""
         print(f"pooled fit status: {status.upper()}{detail}")
 
-    # ---- C2/EXP-5: structural non-Neal-Hinton EM -- F-vs-CE decorrelation across the n_e_steps arms ----
-    estep_pts = sorted([p for p in fit_infer_points if p["scale_knob"] == "n_e_steps"
-                        and np.isfinite(p.get("f_mean", float("nan")))],
-                       key=lambda q: q["n_e_steps"])
-    if len(estep_pts) >= 2:
-        ne = np.array([p["n_e_steps"] for p in estep_pts])
-        ff = np.array([p["f_mean"] for p in estep_pts])
-        ce = np.array([p["ce_mean"] for p in estep_pts])
-
-        pearson_ne_f = _pearson_correlation(ne, ff)
-        pearson_f_ce = _pearson_correlation(ff, ce)
-        interpretation = target_blind_objective_interpretation()
-        print(f"\nE-step structural-EM check ({len(estep_pts)} n_e_steps arms):"
-              f"\n  Pearson(n_e_steps, final F/token) = {pearson_ne_f:+.4f}"
-              f"\n  Pearson(final F/token, test CE)   = {pearson_f_ce:+.4f}"
-              f"\n  Interpretation: {interpretation}")
-        summary["estep_structural"] = {
-            "n_arms": len(estep_pts), "pearson_ne_final_f": pearson_ne_f,
-            "pearson_final_f_test_ce": pearson_f_ce,
-            "interpretation": interpretation,
-        }
-
     # ---- persist the analysis summary (json + a human-readable markdown report); best-effort so a
     # serialization/render error never suppresses the figure pass below ----
     try:
@@ -1750,7 +1794,7 @@ def analyze() -> None:
 
 def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     r"""Render ``summary`` as a readable SCALING_ANALYSIS.md (the pooled fit, per-route exponents,
-    persisted provenance/confounds, frontier test, and E-step structural-EM correlations)."""
+    persisted provenance/confounds and the frontier test)."""
     L = ["# VFE_3.0 scaling analysis", "",
          f"- input: `{summary.get('input_dir')}`",
          f"- runs: {summary.get('n_runs')}  (parameter points: {summary.get('n_param_points')}, "
@@ -1836,6 +1880,9 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
             L.append(f"- lack-of-fit F({lof['df_lof']},{lof['df_pe']}) = {lof['F']:.3f}, "
                      f"p = {lof['p_value']:.4g}" if lof.get("testable")
                      else f"- lack-of-fit test not testable ({lof.get('reason')})")
+        data_order = summary.get("data_order")
+        if data_order:
+            L.append(f"- seed data order: `{data_order.get('status')}`. {data_order.get('caveat')}")
         ne = summary.get("pooled_fit_non_embedding")
         if ne:
             L.append(f"- non-embedding parameters: alpha = {ne['alpha']:.4f}, "
@@ -1874,19 +1921,12 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     collapsed = summary.get("collapsed_identical_cells") or []
     budget = summary.get("budget_points_excluded_from_fit") or []
     if collapsed or budget:
-        L += ["## Points not counted separately in the pooled fit", ""]
+        L += ["## Points not counted separately in the pooled fit and the frontier test", ""]
         L += [f"- identical runs: kept `{group['kept']}`, counted once with "
               f"{', '.join(f'`{label}`' for label in group['dropped_as_identical'])}"
               for group in collapsed]
         L += [f"- training-budget cell (fixed N; tokens axis only): `{label}`" for label in budget]
         L.append("")
-    es = summary.get("estep_structural")
-    if es:
-        L += ["## E-step structural-EM check", "",
-              f"- arms: {es['n_arms']}",
-              f"- Pearson(n_e_steps, final F/token) = {es['pearson_ne_final_f']:+.4f}",
-              f"- Pearson(final F/token, test CE) = {es['pearson_final_f_test_ce']:+.4f}",
-              f"- interpretation: {es.get('interpretation', target_blind_objective_interpretation())}", ""]
     path.write_text("\n".join(L), encoding="utf-8")
 
 
@@ -1999,30 +2039,6 @@ def _make_figures(
         n_flat = int(infer_points[0]["n_params"]) if np.isfinite(infer_points[0]["n_params"]) else None
         _try("inference_capacity.png", lambda: figs.plot_inference_capacity(
             series, n_params=n_flat, path=str(fig_dir / "inference_capacity.png")))
-
-        # C2/EXP-5: the n_e_steps arms -> the final-iterate objective/CE relationship
-        # (needs f_mean + ce_mean) and E-step-as-capacity (BPC + final-iterate F vs T; additionally
-        # needs bpc_mean, gated separately, so a heterogeneous run set missing test_bpc still gets
-        # the relationship figure rather than a NaN BPC point).
-        estep = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
-                        and np.isfinite(p.get("f_mean", float("nan")))],
-                       key=lambda q: q["n_e_steps"])
-        if len(estep) >= 2:
-            arms = [{"n_e_steps": p["n_e_steps"], "final_f": p["f_mean"], "ce": p["ce_mean"]}
-                    for p in estep]
-            # The projected routes fix the divergence to KL, the registered "renyi" functional at
-            # order 1; the retired divergence_family field is no longer serialized (audit 2026-10-07 F16).
-            divergence_family = "renyi"
-            _try(F_CE_RELATIONSHIP_FILENAME, lambda: figs.plot_f_ce_relationship(
-                arms, divergence_family=divergence_family,
-                path=str(fig_dir / F_CE_RELATIONSHIP_FILENAME)))
-            cap = [p for p in estep if np.isfinite(p.get("bpc_mean", float("nan")))]
-            if len(cap) >= 2:
-                _try("estep_capacity.png", lambda: figs.plot_estep_capacity(
-                    [p["n_e_steps"] for p in cap], [p["bpc_mean"] for p in cap],
-                    [p["f_mean"] for p in cap], n_params=n_flat,
-                    divergence_family=divergence_family,
-                    path=str(fig_dir / "estep_capacity.png")))
 
 
 def main() -> int:

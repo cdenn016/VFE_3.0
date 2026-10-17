@@ -135,7 +135,7 @@ def test_projected_e_step_trajectory_matches_production_snapshot() -> None:
     replay = extract.e_step_belief_trace(model, tokens)
     production = extract.e_step_belief_trace(model, tokens, snapshot=snapshot)
 
-    _assert_tensor_dict_close(replay, production, ("mu", "sigma", "phi", "free_energy"))
+    _assert_tensor_dict_close(replay, production, ("mu", "sigma", "phi"))
 
 
 def test_projected_across_layer_trace_matches_production_snapshot() -> None:

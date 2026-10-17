@@ -21,7 +21,8 @@ def _rows(widths, field: str, base: float, exponent: float, multipliers, diverge
         for m in multipliers:
             label = ablation._lr_width_transfer_label(embed_dim, n_heads, field, m)
             failed = (embed_dim, m) in diverged
-            rows.append({"label": label, "primary_val_ppl": "" if failed else 50 + (math.log(base * m) - optimum) ** 2,
+            ppl = "" if failed else 50 + (math.log(base * m) - optimum) ** 2
+            rows.append({"label": label, "primary_val_ppl": ppl, "final_val_ppl": ppl,
                          "error": "diverged" if failed else ""})
     return rows
 

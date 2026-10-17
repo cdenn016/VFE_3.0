@@ -1,6 +1,6 @@
 """Tiny depth regressions for projected predictive-content attention."""
 
-from tests.profiles import config_values, test_config
+from tests.profiles import config_values, launcher_values, live_config, test_config
 from dataclasses import asdict
 from pathlib import Path
 import os
@@ -21,13 +21,15 @@ def _depth_cfg(layers: int, **kwargs) -> VFE3Config:
 
 
 @pytest.mark.parametrize("layers", [2, 3])
-def test_launcher_accepts_projected_depth(layers: int, monkeypatch: pytest.MonkeyPatch) -> None:
-    import train_vfe3
-
-    monkeypatch.setattr(train_vfe3, "config", config_values(**asdict(_depth_cfg(layers))))
-    settings = dict(train_vfe3.config)
-    cfg = test_config(**settings)
+def test_launcher_accepts_projected_depth(layers: int) -> None:
+    r"""The launcher dictionary names the depth and attention keys, and its route accepts a residual
+    ``projected_predictive`` stack of this depth. Both read the real ``train_vfe3.config`` (audit 2026-10-16
+    F112: the test used to replace that dictionary with the test baseline and assert the values it had set)."""
+    assert {"n_layers", "attention_mode", "attention_residual"} <= set(launcher_values())
+    cfg = live_config(n_layers=layers, attention_mode="projected_predictive", attention_residual=True,
+                      prior_handoff_rho=1.0, prior_handoff_sigma=0.1)
     assert cfg.n_layers == layers and cfg.attention_residual
+    assert cfg.attention_mode == "projected_predictive"
 
 
 @pytest.mark.parametrize("layers", [2, 3])
@@ -82,15 +84,12 @@ def test_depth_checkpoint_and_optimizer(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_local_projected_config_training_step(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_projected_config_training_step(device: str) -> None:
     if device == "cuda" and os.environ.get("VFE3_TEST_DEVICE", "cpu").partition(":")[0] != "cuda":
         pytest.skip("CUDA lane not requested")
     if device == "cuda" and torch.cuda.device_count() == 0:
         pytest.skip("CUDA unavailable")
-    import train_vfe3
-
-    monkeypatch.setattr(train_vfe3, "config", config_values(**asdict(_depth_cfg(3))))
-    settings = dict(train_vfe3.config)
+    settings = config_values(**asdict(_depth_cfg(3)))     # the test baseline; the launcher is not read here
     settings.update(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     attention_window=4, eval_stride=1, batch_size=1,
                     block_mlp_expansion=2, n_layers=3, max_steps=2, warmup_steps=0)

@@ -5,7 +5,8 @@ is the PriorBank's prior tables, but the block also receives the opt-in learned 
 (CG coupling) as arguments and applies them; the block
 runs the attention step and the configured block norm (the default ``layernorm`` is not
 gauge-equivariant; ``none`` and ``mahalanobis`` are) on the mean, and under ``block_norm_covariance='pushforward'``
-its pushforward on the covariance (first order plus the radial second-order term). The belief handoff across blocks
+its pushforward on the covariance (first order plus the radial second-order term), or under ``'pushforward_moment'``
+the same at the effective scale of the input's expected LayerNorm variance. The belief handoff across blocks
 lives in stack.py.
 """
 
@@ -111,8 +112,8 @@ def vfe_block(
         **({"link_state": link_state} if link_state is not None else {}),
     )
     if capture is not None:
-        # The CONVERGED variational belief q* -- what the E-step's F was minimized over,
-        # BEFORE the post-inference transforms below. The manuscript's self-coupling
+        # The belief q* the E-step returns (on projected_predictive the predictive readout; no supported route
+        # minimizes F, vfe3.free_energy.free_energy), BEFORE the post-inference transforms below. The manuscript's self-coupling
         # alpha*KL(q||p) is pinned to THIS belief (audit 2026-06-09 overnight F19); the
         # M-step regularizer and the diagnostics F self-term read it from here. With the
         # transforms off (the pure path) it is the SAME object the block returns.
@@ -134,15 +135,21 @@ def vfe_block(
             mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
             out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/reflection
     mlp_delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
-    # block_norm_covariance='pushforward' (audit 2026-10-10, item 9): each norm application also carries Sigma to
-    # post-norm units; inert under a delta_full MLP, whose Jacobian composes the norm's.
-    push_norm = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward" and not mlp_delta_full
+    # block_norm_covariance='pushforward' (audit 2026-10-10, item 9) or 'pushforward_moment' (audit 2026-10-16, F3):
+    # each norm application also carries Sigma to post-norm units; inert under a delta_full MLP, whose Jacobian
+    # composes the norm's, and under a norm other than the LayerNorm, the only norm with that pushforward (the
+    # validator admits either value there and inactive_fields marks it inert; audit 2026-10-16 F5).
+    from vfe3.model.block_mlp import BLOCK_NORM_PUSHFORWARD_MODES
+    norm_covariance = getattr(cfg, "block_norm_covariance", "passthrough")
+    push_norm = (norm_covariance in BLOCK_NORM_PUSHFORWARD_MODES and not mlp_delta_full
+                 and getattr(cfg, "norm_type_block", "none") == "layernorm")
     if getattr(cfg, "block_coordinates", "local") == "reference":
         return _reference_coordinate_block(
             out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
             capture=capture, hidden_bias=hidden_bias,
             readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg),
-            push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor)
+            push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor,
+            norm_covariance=norm_covariance if push_norm else "pushforward")
     norm_linearization = norm_radial = norm_cap = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         if mlp_delta_full:
@@ -190,15 +197,15 @@ def _apply_block_norm(
     group:           GaugeGroup,
     cfg:             VFE3Config,
     *,
-    push_covariance: bool,                    # block_norm_covariance='pushforward' outside a delta_full MLP
+    push_covariance: bool,                    # a block_norm_covariance pushforward outside a delta_full MLP
 ) -> BeliefState:
     r"""The block norm on the mean, and under ``push_covariance`` its pushforward of the covariance.
 
     The pushforward is taken at the pre-norm mean :math:`u`:
     :math:`\Sigma \mapsto J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D + \rho gg^\top`,
     :math:`D = \operatorname{diag}(\gamma)/s`, :math:`f` = ``block_mlp_covariance_floor``, with the radial second-order
-    term :math:`\rho gg^\top` (:func:`norm_covariance_pushforward`). Without ``push_covariance`` the covariance object
-    passes through unchanged.
+    term :math:`\rho gg^\top` (:func:`norm_covariance_pushforward`; under ``'pushforward_moment'`` at the effective
+    scale :math:`s_{\mathrm{eff}}`). Without ``push_covariance`` the covariance object passes through unchanged.
     """
     if not push_covariance:
         return out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
@@ -213,15 +220,21 @@ def norm_covariance_pushforward(
     group: GaugeGroup,
     cfg:   VFE3Config,
 ) -> torch.Tensor:                            # sigma's layout, read by the family
-    r"""The covariance through the LayerNorm block norm under ``block_norm_covariance='pushforward'``, read by the family.
+    r"""The covariance through the LayerNorm block norm under ``block_norm_covariance`` 'pushforward' or
+    'pushforward_moment', read by the family.
 
     :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at the pre-norm mean in local coordinates; the
-    diagonal family keeps its diagonal and ``gaussian_block`` its head blocks, each the M-projection onto the family.
-    Reference coordinates run their own pushforward on :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` in
-    :func:`_reference_coordinate_block`.
+    diagonal family keeps its diagonal and ``gaussian_block`` its head blocks, each the M-projection of the pushed
+    Gaussian onto the family. The pushed Gaussian approximates the LayerNorm output's moments: under 'pushforward' by
+    the delta method, valid while :math:`\Sigma` is small against :math:`s^2` and capped at the sphere bound beyond,
+    where it keeps the delta method's radial shape (audit 2026-10-16 F3, F2); under 'pushforward_moment' by the delta
+    method at the effective scale :math:`s_{\mathrm{eff}}^2 = s^2 + \operatorname{tr}(\Pi\Sigma\Pi)/K`, which tracks the
+    Monte Carlo moments at every :math:`\Sigma/s^2`. Reference coordinates run their own pushforward on
+    :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` in :func:`_reference_coordinate_block`.
     """
     from vfe3.model.block_mlp import block_norm_covariance_pushforward
-    return block_norm_covariance_pushforward(norm, mu, sigma, cfg.block_mlp_covariance_floor, _head_dims(group, cfg))
+    return block_norm_covariance_pushforward(norm, mu, sigma, cfg.block_mlp_covariance_floor, _head_dims(group, cfg),
+                                             mode=cfg.block_norm_covariance)
 
 
 def _head_dims(group: GaugeGroup, cfg: VFE3Config) -> Optional[Sequence[int]]:
@@ -252,7 +265,7 @@ def _head_block_readout(
     r"""The family's readout of a covariance the block MLP or the block norm pushforward produced.
 
     For a head-block family (``gaussian_block``) a new covariance :math:`\Sigma'` (``delta_full``, the
-    prototype ``posterior`` or ``block_norm_covariance='pushforward'``) is read through :func:`vfe3.families.gaussian.head_block_projection`,
+    prototype ``posterior`` or a ``block_norm_covariance`` pushforward) is read through :func:`vfe3.families.gaussian.head_block_projection`,
     :math:`\bigoplus_h\Sigma'_{hh}`, the exact M-projection :math:`\arg\min_q\mathrm{KL}(\mathcal N(\mu,\Sigma')\|q)` onto
     the family over the heads ``group.irrep_dims``. Its head blocks are principal submatrices of an SPD matrix, so
     they stay SPD. A passthrough covariance (the same object) and every other family return ``pushed`` unchanged.
@@ -275,8 +288,9 @@ def _reference_coordinate_block(
     capture:     Optional[MStepCapture],
     hidden_bias: Optional[torch.Tensor],                   # (B, N, w) or None
     readout:     Callable[[torch.Tensor], torch.Tensor] = lambda pushed: pushed,   # the family's covariance readout
-    push_norm:   bool = False,                             # block_norm_covariance='pushforward' (no delta_full MLP)
+    push_norm:   bool = False,                             # a block_norm_covariance pushforward (no delta_full MLP)
     covariance_floor: float = 1e-4,                        # block_mlp_covariance_floor of the pushforwards
+    norm_covariance: str = "pushforward",                  # push_norm only: the block_norm_covariance mode
 ) -> BeliefState:
     r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
 
@@ -299,7 +313,8 @@ def _reference_coordinate_block(
 
     Covariance transport (``gaussian_full`` and ``gaussian_block``; audit 2026-10-10 round 2, #51): under
     ``push_norm`` the norm also maps the dense :math:`C_i` by
-    :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at :math:`\xi_i`, and a coordinate ``delta_full``
+    :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at :math:`\xi_i` (mode ``norm_covariance``), and a
+    coordinate ``delta_full``
     MLP pushes :math:`C_i` through the composite :math:`J_{\mathrm{MLP}}J_{\mathrm{LN}}` at :math:`\xi_i`, with the norm's
     floor scale and radial term, as in local coordinates. Either result returns as
     :math:`\Sigma_i^{(\ell+1)} = U_iC_i'U_i^\top` through the family's readout, so :math:`\Sigma^{(\ell+1)} \to
@@ -334,7 +349,7 @@ def _reference_coordinate_block(
             radial = block_norm_radial_term(block_norm, xi, C)
             cap = block_norm_trace_cap(block_norm, xi, C, covariance_floor)   # the norm's sphere-bound scale
         if push:                                                             # Sigma' = U C' U^T, C' at the pre-norm xi
-            pushed = block_norm_covariance_pushforward(block_norm, xi, C, covariance_floor)
+            pushed = block_norm_covariance_pushforward(block_norm, xi, C, covariance_floor, mode=norm_covariance)
             sigma = readout(local_covariance(out.mu, pushed, frame, diagonal=False).to(out.sigma.dtype))
     c = (C if delta_full                                                     # the composite reads the pre-norm C
          else reference_variances(out.mu, sigma, frame) if template          # diag C (of the pushed belief)

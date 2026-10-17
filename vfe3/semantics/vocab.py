@@ -11,6 +11,7 @@ case-sensitive lookup, with ``<unk>`` unresolved.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -222,13 +223,17 @@ def vocab_for_run(
     dataset:            Optional[str],
     selection_identity: Optional[dict],
     vocab_size:         int,
+
+    *,
+    cache_dir:          Optional[Path] = None,
 ) -> Vocab:
     r"""The analysis vocabulary of a run.
 
     The tokenizer is read, in priority order, from ``selection_identity["tokenizer_encoding"]``
     (the checkpoint's data identity) and from the dataset name via
     :func:`vfe3.data.datasets.tiktoken_encoding_name`. A word-level vocabulary is loaded from the
-    cache sidecar ``vocabulary_path(dataset, tag="word")``. Raises when the tokenizer cannot be
+    cache sidecar ``vocabulary_path(dataset, tag="word", cache_dir=cache_dir)``, the cache the run's
+    token streams are read from (``None``: the default cache). Raises when the tokenizer cannot be
     determined or when the vocabulary size differs from the model's ``vocab_size``.
     """
     identity = selection_identity or {}
@@ -248,7 +253,7 @@ def vocab_for_run(
             raise ValueError("a word-level vocabulary needs the dataset name to locate its sidecar")
         from vfe3.data.word_vocab import WordVocabulary, vocabulary_path
 
-        table = WordVocabulary.load(vocabulary_path(dataset, tag="word"))
+        table = WordVocabulary.load(vocabulary_path(dataset, tag="word", cache_dir=cache_dir))
         words = list(table.words)
         valid = np.asarray([w != _WORD_UNK for w in words], dtype=bool)
         vocab = Vocab("word", words, valid, english=english)
