@@ -823,10 +823,15 @@ class RelationalOperators(nn.Module):
         receive = (self._receive_runs(receive) if edges is None
                    else [edge_links.receive_heads(edges, len(self.irrep_dims))])
         with torch.autocast(device_type=mu.device.type, enabled=False):
-            coordinates = canonical.unsqueeze(-2).to(dtype)                 # (..., N, 1, K)
+            xi = canonical.to(dtype)                                        # (..., N, K)
             body = None
             for run, (T, O) in enumerate(zip(T_runs, receive)):
-                values = (T.to(dtype) @ coordinates.unsqueeze(-1)).squeeze(-1)     # (..., N, n_r, d_r)
+                # T_h xi_j as one (..., N, K) x (K, n_r d_r) GEMM. The broadcast matvec
+                # T @ xi[..., None, :, None] it replaces saved a (B N n_r, d_r, K) copy of T for
+                # backward (audit 2026-10-16 F27). IEEE fp32 keeps the forward at least as
+                # accurate as that matvec under any fp32_matmul_precision.
+                with ieee_fp32_matmul():
+                    values = torch.einsum("hsk,...nk->...nhs", T.to(dtype), xi)    # (..., N, n_r, d_r)
                 pooled = torch.einsum("...hij,...jhs->...ihs",
                                       self._head_slice(beta, run, -3).to(dtype), values)
                 if edges is not None:                                       # one run (equal heads)
