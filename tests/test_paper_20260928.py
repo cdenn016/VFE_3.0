@@ -402,7 +402,9 @@ def test_main_results_marks_heterogeneous_arm_and_missing_selection(tmp_path: Pa
     manifest = _manifest({"Mixed": [str(tmp_path / "arm")]})
     latex, markdown, rows = pt.main_results_table(manifest)
     assert "% Mixed: config differs across runs in m_p_mu_lr" in latex
-    assert "Mixed & 1 of 2" in latex
+    # The difference is also visible in the compiled table (audit 2026-10-16 F67): a marker and a note row.
+    assert "Mixed$^{\\ddagger}$ & 1 of 2" in latex
+    assert "Config differs across runs in: Mixed (m\\_p\\_mu\\_lr)." in latex.split("\\bottomrule", 1)[1]
     assert "1 of 2 runs have a test value" in markdown and "m_p_mu_lr" in markdown
 
 

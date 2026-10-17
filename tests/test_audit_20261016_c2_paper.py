@@ -186,3 +186,57 @@ def test_methods_contract_fisher_without_a_checkpoint_says_the_tables_are_unclip
     assert "Fisher" in text and "m_table_fisher_lr=0.1" in text
 
 
+# ---- F67: a shared data order and config differences are visible in M2 and the decision rule ------
+
+def _arm(label: str, ces: Sequence[float], pairs: Sequence[tuple], group: str = "g",
+         homogeneity: Dict[str, Any] = None) -> Arm:
+    runs = [RunRecord(run_dir=Path(f"{label[:8]}_{s}_{d}"), summary={"test_ce": ce, "n_steps": 10},
+                      seed=s, data_seed=d) for ce, (s, d) in zip(ces, pairs)]
+    return Arm(label=label, group=group, runs=runs, homogeneity=homogeneity or {})
+
+
+def test_main_results_marks_a_shared_data_order_and_config_differences() -> None:
+    shared = _arm("Shared", [3.0, 3.1, 3.05], [(6, 3), (54, 3), (271, 3)])
+    varied = _arm("Varied", [3.0, 3.1], [(6, 6), (54, 54)])
+    single = _arm("Single", [3.0], [(6, 3)])
+    mixed = _arm("Mixed", [3.0, 3.2], [(6, 6), (54, 54)], homogeneity={
+        "homogeneous": False, "violations": [{"field": "m_p_mu_lr", "values": {}}]})
+    manifest = Manifest(arms=[shared, varied, single, mixed], selection="final")
+    latex, markdown, rows = pt.main_results_table(manifest, read_checkpoints=False)
+    lines = latex.splitlines()
+    shared_row = next(line for line in lines if line.startswith("Shared"))
+    assert shared_row.startswith("Shared & 3$^{\\dagger}$ &")
+    assert next(line for line in lines if line.startswith("Varied")).startswith("Varied & 2 &")
+    assert next(line for line in lines if line.startswith("Single")).startswith("Single & 1 &")
+    assert next(line for line in lines if line.startswith("Mixed")).startswith("Mixed$^{\\ddagger}$ &")
+    tail = latex.split("\\bottomrule", 1)[1]
+    assert "$^{\\dagger}$" in tail and "data order" in tail
+    assert "$^{\\ddagger}$" in tail and "m\\_p\\_mu\\_lr" in tail
+    assert rows[0]["shared_data_order"] == 3 and rows[1]["shared_data_order"] is None
+    assert rows[2]["shared_data_order"] is None
+    assert "one shared data order" in markdown
+    # Without either condition the tabular ends at the rule (the manuscript layout).
+    plain, _, _ = pt.main_results_table(Manifest(arms=[varied], selection="final"), read_checkpoints=False)
+    assert plain.splitlines()[-2] == "\\bottomrule"
+
+
+def test_decision_rule_marks_pairs_that_share_one_data_order() -> None:
+    from vfe3.paper.tables import DECISION_CAPACITY, DECISION_COMPARATOR, DECISION_FROZEN
+
+    pairs = [(6, 3), (54, 3), (271, 3)]
+    manifest = Manifest(arms=[
+        _arm("Evaluated: learned frames", [3.00, 3.10, 3.05], pairs),
+        _arm(DECISION_COMPARATOR, [3.10, 3.25, 3.12], pairs),
+        _arm(DECISION_FROZEN, [3.01, 3.10, 3.07], pairs),
+        _arm(DECISION_CAPACITY, [3.2, 3.3, 3.2], [(6, 6), (54, 54), (271, 271)]),
+    ], selection="final")
+    latex, markdown, record = pt.decision_rule_table(manifest)
+    assert record["clauses"]["a"]["shared_data_order"] == 3
+    assert record["clauses"]["c"]["shared_data_order"] is None          # no pairs: capacity seeds differ
+    row_a = next(line for line in latex.splitlines() if line.startswith("(a)"))
+    assert " & 3$^{\\dagger}$ & " in row_a
+    tail = latex.split("\\bottomrule", 1)[1]
+    assert "$^{\\dagger}$" in tail and "data order" in tail
+    assert "Clause (a): the 3 pairs share one data order" in markdown
+    assert record["verdict"] in ("stands", "retracted", "undetermined",
+                                 pt.DECISION_NO_CAPACITY_VERDICT)       # the verdict rule is unchanged

@@ -188,9 +188,10 @@ def render_items(items: Sequence[Item], latex: bool) -> str:
     return "; ".join(parts)
 
 
-def _tabular(spec: str, header: str, body: Sequence[str]) -> str:
+def _tabular(spec: str, header: str, body: Sequence[str], notes: Sequence[str] = ()) -> str:
+    r"""The environment; ``notes`` (full-width rows, e.g. the legend of a row marker) follow ``\bottomrule``."""
     end = r"\end{tabularx}" if spec.startswith(r"\begin{tabularx}") else r"\end{tabular}"
-    return "\n".join([spec, r"\toprule", header, r"\midrule", *body, r"\bottomrule", end]) + "\n"
+    return "\n".join([spec, r"\toprule", header, r"\midrule", *body, r"\bottomrule", *notes, end]) + "\n"
 
 
 def _md_row(cells: Sequence[Any]) -> str:
@@ -200,6 +201,22 @@ def _md_row(cells: Sequence[Any]) -> str:
 # ----------------------------------------------------------------------------------------------
 # M2 and the per-seed table
 # ----------------------------------------------------------------------------------------------
+
+# Row markers of a seed SD (M2) or paired SE (decision rule) taken over runs that share ONE data order:
+# with train_vfe3.DATA_SEED set, every seed trains on the same batch order, so the spread is initialization
+# and optimization variance only (audit 2026-10-16 F67). The config-difference marker of M2 makes the
+# LaTeX comment above a non-homogeneous arm's row visible.
+SHARED_ORDER_MARK = r"$^{\dagger}$"
+CONFIG_DIFF_MARK = r"$^{\ddagger}$"
+
+
+def shared_data_order(data_seeds: Sequence[Optional[int]]) -> Optional[int]:
+    r"""The data-order seed that at least two runs all record and share, else None (varied or unrecorded)."""
+    seeds = list(data_seeds)
+    if len(seeds) >= 2 and all(isinstance(s, int) for s in seeds) and len(set(seeds)) == 1:
+        return seeds[0]
+    return None
+
 
 def _arm_record(arm: Arm, rule: str, *, read_checkpoints: bool) -> Dict[str, Any]:
     r"""Selection, parameters and device-hours of every run of one arm."""
@@ -237,13 +254,18 @@ def main_results_table(
     Parameters are context-processing / total (``count_short``); GPU-hours are the mean training-only
     device-hours per run (:func:`vfe3.paper.runs.train_device_hours`, evaluation excluded, the quantity
     the compute-matched arm matches), with the mean wall time beside them in the markdown. A config
-    difference within an arm is written as a LaTeX comment above its row and listed in the markdown.
-    An arm the manifest marks inapplicable and that has no runs reads ``n/a``.
+    difference within an arm is written as a LaTeX comment above its row, marks the arm label with
+    :data:`CONFIG_DIFF_MARK` (the fields in a note row under the table) and is listed in the markdown.
+    When the runs with a test value all share one data order (:func:`shared_data_order`), the seed count
+    carries :data:`SHARED_ORDER_MARK` and a note row says the SD excludes data-order variance. An arm
+    the manifest marks inapplicable and that has no runs reads ``n/a``.
     """
     body: List[str] = []
     md = [_md_row(["Model arm", "Seeds", "Parameters (context / total)", "Test CE", "Test PPL",
                    "GPU-hours per run (train / wall)", "Notes"]), _md_row(["---"] * 7)]
     rows: List[Dict[str, Any]] = []
+    shared_arms: List[str] = []
+    differing: List[str] = []                     # LaTeX note text per non-homogeneous arm
     current_group: Optional[str] = None
     for index, arm in enumerate(manifest.arms):
         if arm.group and arm.group != current_group:
@@ -286,17 +308,27 @@ def main_results_table(
             notes.append("GPU-hours are wall time (no training-step timing) for: " + ", ".join(wall_fallback))
         seeds = (str(len(ok)) if len(ok) == len(arm.runs) else f"{len(ok)} of {len(arm.runs)}") \
             if arm.runs else PENDING
+        shared = shared_data_order([r["run"].data_seed for r in ok])
+        if shared is not None:
+            shared_arms.append(arm.label)
+            notes.append(f"one shared data order (data seed {shared}) across seeds: the SD excludes "
+                         "data-order variance")
+        label_tex = arm.label + (CONFIG_DIFF_MARK if violations else "")
+        if violations:
+            differing.append(f"{arm.label} ({tex_escape(', '.join(v['field'] for v in violations))})")
         hours_mean = sum(hours) / len(hours) if hours else None
         wall_mean = sum(walls) / len(walls) if walls else None
         if violations:
             body.append("% " + arm.label.replace("\n", " ") + ": config differs across runs in "
                         + ", ".join(v["field"] for v in violations))
         body.append(" & ".join([
-            arm.label, seeds, _param_cell(params, True) if params else PENDING,
+            label_tex, seeds + (SHARED_ORDER_MARK if shared is not None else ""),
+            _param_cell(params, True) if params else PENDING,
             tex_mean_sd(ces, CE_DIGITS), tex_mean_sd(ppls, PPL_DIGITS_MAIN),
             tex_float(hours_mean, 1),
         ]) + r" \\")
-        md.append(_md_row([arm.label, seeds, _param_cell(params, False) if params else PENDING,
+        md.append(_md_row([arm.label, seeds + ("\u2020" if shared is not None else ""),
+                           _param_cell(params, False) if params else PENDING,
                            md_mean_sd(ces, CE_DIGITS), md_mean_sd(ppls, PPL_DIGITS_MAIN),
                            (f"{hours_mean:.2f}" if hours_mean is not None else PENDING) + " / "
                            + (f"{wall_mean:.2f}" if wall_mean is not None else PENDING),
@@ -305,7 +337,7 @@ def main_results_table(
             "arm": arm.label, "group": arm.group, "n_runs": len(arm.runs), "n_selected": len(ok),
             "test_ce": ces, "test_ppl": ppls, "test_ce_mean_sd": mean_sd(ces),
             "test_ppl_mean_sd": mean_sd(ppls), "device_hours": hours, "wall_device_hours": walls,
-            "parameters": params,
+            "parameters": params, "shared_data_order": shared,
             "notes": notes, "homogeneity": arm.homogeneity,
             "runs": [{"run_dir": str(r["run"].run_dir), "seed": r["run"].seed,
                       "data_seed": r["run"].data_seed, "selection": r["selection"],
@@ -317,8 +349,20 @@ def main_results_table(
                "PPL is exp(CE) per seed. Parameters: context-processing / total. GPU-hours: mean "
                "training-only device-hours per run (one device; logged optimizer-step time, evaluation "
                "excluded), the quantity the compute-matched arm matches; the LaTeX column carries it, and "
-               "the mean wall time including evaluation follows the slash here.\n")
-    return _tabular(MAIN_RESULTS_SPEC, MAIN_RESULTS_HEADER, body), "\n".join(md) + "\n" + caption, rows
+               "the mean wall time including evaluation follows the slash here."
+               + (" \u2020 One shared data order across the seeds of the arm: the SD is initialization and "
+                  "optimization variance only." if shared_arms else "") + "\n")
+    notes_tex = []
+    if shared_arms:
+        notes_tex.append(r"\multicolumn{6}{@{}>{\raggedright\arraybackslash}p{\textwidth}@{}}{\footnotesize "
+                         + SHARED_ORDER_MARK + "One shared data order across the seeds: the SD excludes "
+                         r"data-order variance.}\\")
+    if differing:
+        notes_tex.append(r"\multicolumn{6}{@{}>{\raggedright\arraybackslash}p{\textwidth}@{}}{\footnotesize "
+                         + CONFIG_DIFF_MARK + "Config differs across runs in: " + "; ".join(differing)
+                         + r".}\\")
+    return (_tabular(MAIN_RESULTS_SPEC, MAIN_RESULTS_HEADER, body, notes_tex), "\n".join(md) + "\n" + caption,
+            rows)
 
 
 def _seed_cell(run: RunRecord) -> str:
@@ -491,7 +535,9 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
     has runs listed without a config check (``reuse_verified`` False), stale complete runs, runs
     whose configs differ (``homogeneity``); its statistics are still reported. Runs trained on code other
     than the tree that wrote the manifest (``code_identity_mismatch``) are listed under
-    ``code_identity_notes`` without changing the verdict.
+    ``code_identity_notes`` without changing the verdict. ``shared_data_order`` is the one data seed all
+    pairs of a clause share (None when it varies or is unrecorded): its paired SE, and with it the margin,
+    then excludes data-order variance; it is reported and does not change the verdict.
     """
     by_label = {arm.label: arm for arm in manifest.arms}
     evaluated_label = manifest.decision.get("evaluated") or next(
@@ -527,7 +573,8 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
         holds = None if stats["margin"] is None or undetermined else (
             stats["mean"] >= stats["margin"] if clause == "b" else stats["mean"] > stats["margin"])
         out["clauses"][clause] = {"arm": labels[key], **stats, "holds": holds, "undetermined": undetermined,
-                                  "code_identity_notes": code_notes}
+                                  "code_identity_notes": code_notes,
+                                  "shared_data_order": shared_data_order([pair[1] for pair in stats["pairs"]])}
     held = [c["holds"] for c in out["clauses"].values() if not c.get("inapplicable")]
     out["verdict"] = ("retracted" if any(h is False for h in held)
                       else "stands" if held and all(h is True for h in held) else "undetermined")
@@ -567,7 +614,8 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
                              "Margin", "One-sided paired-t p", "t-based 95% CI (n - 1 df)", "Verdict"]),
                     _md_row(["---"] * 9)]
     for clause, c in record["clauses"].items():
-        body.append(" & ".join([f"({clause}) {names[clause]}", str(c.get("n", 0)),
+        pairs_cell = str(c.get("n", 0)) + (SHARED_ORDER_MARK if c.get("shared_data_order") is not None else "")
+        body.append(" & ".join([f"({clause}) {names[clause]}", pairs_cell,
                                 num(c.get("mean"), True), num(c.get("se"), True),
                                 num(c.get("margin"), True), verdict(c)]) + r" \\")
         md.append(_md_row([f"({clause}) {names[clause]}", c["arm"], c.get("n", 0), num(c.get("mean"), False),
@@ -593,11 +641,18 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
             lines.append(f"Clause ({clause}) undetermined: {reason}.")
         for note in c.get("code_identity_notes") or []:
             lines.append(f"Clause ({clause}) note: {note}.")
+        if c.get("shared_data_order") is not None:
+            lines.append(f"Clause ({clause}): the {c['n']} pairs share one data order (data seed "
+                         f"{c['shared_data_order']}); the paired SE, and with it the margin, excludes "
+                         "data-order variance.")
     if record["other_read_table_arms"]:
         lines.append("Other per-type read-table arms (reported in M2, not the registered comparator): "
                      + "; ".join(record["other_read_table_arms"]) + ".")
     lines += [f"Problem: {p}" for p in record["problems"]]
-    return _tabular(DECISION_SPEC, DECISION_HEADER, body), "\n".join(lines) + "\n", record
+    notes_tex = ([r"\multicolumn{6}{@{}l}{\footnotesize " + SHARED_ORDER_MARK + "The pairs share one data order: "
+                  r"the paired SE excludes data-order variance.}\\"]
+                 if any(c.get("shared_data_order") is not None for c in record["clauses"].values()) else [])
+    return _tabular(DECISION_SPEC, DECISION_HEADER, body, notes_tex), "\n".join(lines) + "\n", record
 
 
 # ----------------------------------------------------------------------------------------------
