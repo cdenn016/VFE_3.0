@@ -58,9 +58,9 @@ linear decoder under ``decode_logits_amp``). Rules:
 * LayerNorm and MLP in reference coordinates: ``block_coordinates='reference'`` (the decoder stays
   local; one change). On a base without a LayerNorm it conjugates the MLP alone. On a
   ``gaussian_diagonal`` base with ``block_norm_covariance='pushforward'`` it also declares
-  ``'passthrough'``: the reference-coordinate norm of the diagonal family maps the mean only (the field
-  is inert there, as the plan notes), so on that base the arm also gives up the base's covariance
-  pushforward, a declared second difference.
+  ``'passthrough'``: the reference-coordinate LayerNorm of the diagonal family has no covariance
+  pushforward, so the validator admits only ``'passthrough'`` there (the field is read, not inert), and on
+  that base the arm also gives up the base's covariance pushforward, a declared second difference.
 * Intertwiner-constrained block: ``block_mlp_mode='gauge_gate'``, the block (and final) LayerNorm
   replaced by ``'mahalanobis'`` where the base has one (``'none'`` stays), and
   ``decode_coordinates='reference'``. Where it replaces the LayerNorm it also declares
@@ -246,7 +246,8 @@ def _norm_covariance_in_reference_coordinates(base: Any) -> str:
 
     In reference coordinates the block norm pushes the dense :math:`C = U^{-1} \Sigma U^{-T}` and maps it back
     as :math:`U C' U^{T}`, which only the full and head-block families keep; on ``gaussian_diagonal`` the
-    reference-coordinate norm maps the mean only, so a recorded ``'pushforward'`` is unread there.
+    reference-coordinate LayerNorm maps the mean only and the validator admits only ``'passthrough'`` there
+    (the field is read, so the declared change is a real second difference; audit 2026-10-16 F5).
     """
     if base.family in _REFERENCE_PUSHFORWARD_FAMILIES:
         return base.block_norm_covariance
@@ -427,8 +428,9 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "Frames frozen at their random initialization": {
         "group": _RETRAINING, "slug": "frozen_frames", "vfe": {"gauge_transport": "frozen"},
         "coerced": ("m_phi_lr",), "inapplicable": _already("gauge_transport", "frozen")},
-    # On some bases both arms leave the LayerNorm covariance pushforward unread; they then declare the
-    # passthrough the validator admits (a declared difference on a pushforward base, noted as inert).
+    # On a pushforward base both arms leave the LayerNorm covariance pushforward's domain and declare the
+    # passthrough the validator admits: inert under the intertwiner's Mahalanobis norm (noted as inert), a real
+    # second difference in reference coordinates on the diagonal family (audit 2026-10-16 F5).
     "LayerNorm and MLP in reference coordinates": {
         "group": _RETRAINING, "slug": "reference_block",
         "vfe": {"block_coordinates": "reference",

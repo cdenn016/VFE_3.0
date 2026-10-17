@@ -119,12 +119,16 @@ def test_load_base_keeps_a_post_init_coercion_of_an_absent_field_as_defaulted(tm
 def test_layernorm_replacing_and_reference_arms_build_on_a_diagonal_pushforward_base(tmp_path: Path) -> None:
     base = pa.load_base("tiny", _write_base(tmp_path, _tiny_cfg(block_norm_covariance="pushforward")))
     assert (base.cfg.block_norm_covariance, base.cfg.family) == ("pushforward", "gaussian_diagonal")
+    inert = "declared block_norm_covariance='passthrough' is inert here"
     for label in (REFERENCE_ARM, INTERTWINER_ARM):
         plan = _arm(base, label)
         assert plan.status == "ready", (label, plan.reason)
         assert plan.diff["block_norm_covariance"] == ("pushforward", "passthrough"), label
-        assert any(note.startswith("declared block_norm_covariance='passthrough' is inert here")
-                   for note in plan.notes), (label, plan.notes)
+    # Under the intertwiner's Mahalanobis norm the field is inert; in reference coordinates on the diagonal family
+    # the LayerNorm reads it (only 'passthrough' is admitted there), so that arm's passthrough is a real declared
+    # change, not an inert one (the lane A1 and lane B fixes of F5 together).
+    assert any(note.startswith(inert) for note in _arm(base, INTERTWINER_ARM).notes)
+    assert not any(note.startswith(inert) for note in _arm(base, REFERENCE_ARM).notes)
     assert _arm(base, INTERTWINER_ARM).cfg.norm_type_block == "mahalanobis"
     assert _arm(base, REFERENCE_ARM).cfg.block_coordinates == "reference"
 
