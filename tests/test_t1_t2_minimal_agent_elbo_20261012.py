@@ -330,9 +330,10 @@ def test_elbo_capture_rows_and_columns_appear_only_with_the_toggle() -> None:
         expect = uncoupled if key == "relational_minimal_agent_evidence" else [True] * on.cfg.n_layers
         assert [math.isfinite(v) for v in values] == expect, key
     for row in zip(uncoupled, *(per_layer[key] for key in ma.MINIMAL_AGENT_ELBO_KEYS)):
-        exact_layer, elbo, adf, adf_gap, evidence, sampled, sampled_gap = row
+        exact_layer, elbo, adf, adf_gap, evidence, sampled, sampled_gap, sampled_ess = row
         assert adf_gap == pytest.approx(adf - elbo, rel=1e-6, abs=1e-6)
         assert sampled_gap == pytest.approx(sampled - elbo, rel=1e-6, abs=1e-6)
+        assert 1.0 / ma.MINIMAL_AGENT_IS_SAMPLES - 1e-12 <= sampled_ess <= 1.0 + 1e-12   # ESS / n (audit 2026-10-16, F47)
         if exact_layer:                                                       # ADF is exact: the gap is a true gap
             assert evidence == pytest.approx(adf, rel=1e-6, abs=1e-6) and adf_gap >= -1e-6
     assert not any(key in off.diagnostics_per_layer(windows[:1]) for key in ma.MINIMAL_AGENT_ELBO_KEYS)
@@ -347,6 +348,7 @@ def test_elbo_capture_rows_and_columns_appear_only_with_the_toggle() -> None:
             # estimate (round 2, item 12 and M1), so neither is asserted nonnegative here.
             assert set(row) == set(T.MINIMAL_AGENT_ELBO_FIELDS) and row["is_samples"] == ma.MINIMAL_AGENT_IS_SAMPLES
             assert math.isfinite(row["adf_elbo_gap"]) and math.isfinite(row["is_elbo_gap"])
+            assert 0.0 < row["is_ess"] <= 1.0 + 1e-12                         # the weights' ESS / n beside them
         for row in prototype_rows:
             assert set(row) == set(T.PROTOTYPE_ELBO_FIELDS) and row["n_tokens"] == windows.numel()
             assert row["elbo_gap"] >= -1e-9

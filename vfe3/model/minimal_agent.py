@@ -201,10 +201,12 @@ SPREAD_TILE_BYTES: int = 32 * 1024 ** 2
 # the posterior the readout returns, the ADF (assumed-density) evidence and its difference to the bound (not
 # guaranteed nonnegative with coupled heads), the exact evidence (the ADF value when every receiver's heads are
 # uncoupled, S_h C_i S_g^T = 0, where ADF is exact; NaN otherwise), and the importance-sampled log evidence under q with
-# its difference to the bound (audit 2026-10-12 round 2, item 12 and M1).
+# its difference to the bound (audit 2026-10-12 round 2, item 12 and M1), then the effective sample size fraction of
+# its weights, (sum w)^2 / (n sum w^2) in [1/n, 1], a unitless reliability reading (audit 2026-10-16, F47).
 MINIMAL_AGENT_ELBO_KEYS: Tuple[str, ...] = (
     "relational_minimal_agent_elbo", "relational_minimal_agent_adf_evidence", "relational_minimal_agent_adf_elbo_gap",
-    "relational_minimal_agent_evidence", "relational_minimal_agent_is_evidence", "relational_minimal_agent_is_elbo_gap")
+    "relational_minimal_agent_evidence", "relational_minimal_agent_is_evidence", "relational_minimal_agent_is_elbo_gap",
+    "relational_minimal_agent_is_ess")
 # Importance-sampled log evidence (minimal_agent_importance_evidence): draws per receiver, the seed of its local
 # generator (the training RNG is never touched) and the bytes of one tile of its (samples x receivers x sources x d)
 # record terms.
@@ -319,6 +321,7 @@ class MinimalAgentResult(NamedTuple):
     evidence:         Optional[torch.Tensor] = None         # (..., N) float64 exact log evidence: ADF where uncoupled, else NaN
     is_evidence:      Optional[torch.Tensor] = None         # (..., N) float64 importance-sampled log evidence (elbo only)
     channel_noise_mstep_boundary: Optional[torch.Tensor] = None   # (H,) bool: n_h^* at the n -> 0 bracket (diagnostics)
+    is_ess:           Optional[torch.Tensor] = None         # (..., N) float64 ESS / n of the importance weights (elbo only)
 
 
 def _symmetrize(X: torch.Tensor) -> torch.Tensor:          # (..., r, r) -> (..., r, r)
@@ -791,15 +794,22 @@ def channel_noise_mstep(
     inside the neighboring grid cells (bisection when a step leaves the bracket). This is the stationarity condition
     of the collapsed record.
 
+    :math:`F` is bounded below on :math:`n > 0`. A source with :math:`m_j > 0` has
+    :math:`E_j \succeq \sum_i\beta_{ij}A_i^+ \succ 0`, because :math:`A_i^+ = S_hC_i^+S_h^\top` is positive definite in
+    every state the readout accepts (its query covariances :math:`S_hC_iS_h^\top` factor, so :math:`S_h` has full row
+    rank, and :math:`C_i^+ \succ 0`); then :math:`e_{jk} > 0` and each term is at least
+    :math:`m_j(1 + \log(e_{jk}/m_j))`, its value at :math:`v_{jk} + n = e_{jk}/m_j`. A source with :math:`m_j = 0` has
+    :math:`E_j = 0`, and its terms vanish.
+
     Boundary. The minimizer sits at the :math:`n\to 0` end of the bracket in two cases. With :math:`U = 0` every term
     increases in :math:`n`: the source covariance :math:`V_j` alone already exceeds the expected mismatch
     :math:`E_j/m_j` in every direction, so the constrained minimizer is the boundary :math:`n = 0`. With :math:`U > 0`
-    and a minimizer at the lowest grid point, :math:`F` still decreases toward :math:`0`, and a direction with
-    :math:`v_{jk} = e_{jk} = 0` makes it unbounded below (:math:`m_j\log n\to -\infty`): the declared record's likelihood
-    is unbounded as :math:`n\to 0`. In neither case is the value an interior optimum. At the launcher's
-    ``sigma_init = 15`` every head sat at the bracket and the column read 0.0 as if it had been learned (audit
-    2026-10-12 round 2, M2), so such a head now returns NaN and sets its flag in the second output; :math:`n_h^*` is
-    reported only when the optimum is interior. Treating :math:`X_j` as a
+    and a minimizer at the lowest grid point, :math:`F` still decreases down to :math:`n = 10^{-12}U`, so the
+    constrained minimizer is :math:`n = 0` or lies in the lowest grid cell, within a few :math:`10^{-12}U` of it. In
+    neither case is the value an interior optimum, and :math:`\log n` has no finite representative at :math:`n = 0`.
+    At the launcher's ``sigma_init = 15`` every head sat at the bracket and the column read 0.0 as if it had been
+    learned (audit 2026-10-12 round 2, M2), so such a head now returns NaN and sets its flag in the second output;
+    :math:`n_h^*` is reported only when the optimum is interior. Treating :math:`X_j` as a
     latent at its snapshot law instead gives the closed form :math:`n = \sum\beta E\|S_hX_i - T_hX_j\|^2/(d\sum\beta)`,
     which minimizes a looser bound and is not this M-step (audit 2026-10-12, T6).
 
@@ -1135,7 +1145,8 @@ def minimal_agent_importance_evidence(
     blocks:    bool,
     rope:      Optional[torch.Tensor] = None,   # (N, d, d) comparison rotation R_i
     samples:   int = MINIMAL_AGENT_IS_SAMPLES,
-) -> torch.Tensor:                              # (..., N) float64
+    return_ess: bool = False,
+) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor]':   # (..., N) float64; with return_ess also (..., N) ESS / n
     r"""Importance-sampled log evidence of the declared record model with the readout's :math:`q(X_i)` as proposal.
 
     With the labels summed out exactly, :math:`p(X, o) = N(X; \xi_i, C_i)\prod_h\sum_j\hat\pi^h_{ij}N(R_iS_hX; b_j^h, B_j^h)`
@@ -1155,6 +1166,21 @@ def minimal_agent_importance_evidence(
     and the estimate is reproducible; ``samples`` = :data:`MINIMAL_AGENT_IS_SAMPLES` by default. Detached, float64,
     no autograd, tiled over the samples by :data:`MINIMAL_AGENT_IS_TILE_BYTES`. A receiver whose :math:`C_i` or
     :math:`C_i^+` does not factor, or a head with an utterance covariance that does not, reads NaN.
+
+    Reliability (audit 2026-10-16, F47). The target :math:`p(X\mid o)` is a mixture over label tuples :math:`J` of
+    Gaussians :math:`N(m_J, \Sigma_J)`, :math:`\Sigma_J^{-1} = C_i^{-1} + \sum_hS_h^\top(B^h_{J^h})^{-1}S_h`, while the
+    mean-field :math:`q` carries the label-averaged precision and omits the between-source spread. When the source
+    covariances differ, :math:`q` is narrower than the mixture and the weights are heavy-tailed; their variance is
+    infinite when :math:`2\Sigma_J^{-1} - (C_i^+)^{-1}` is not positive definite for some tuple of positive weight.
+    On 100 receivers of heterogeneous tiny instances with two coupled heads (:math:`N = 4`, :math:`K = 3`,
+    :math:`d = 2`, source covariances scaled by :math:`e^{2z}`, :math:`z\sim N(0, 1.5^2)`, channel noise lowered by
+    :math:`e^{-2}`) the 64-draw estimate was off the label-tuple enumeration by more than 0.1 nats on half the
+    receivers and by more than a nat on 6 percent, with a receiver mean 0.17 nats low. Single receivers are therefore
+    not reliable at the default draw count, and the logged receiver mean is biased low. With ``return_ess`` it also
+    returns Kong's effective sample size fraction :math:`(\sum_sw_s)^2/(n\sum_sw_s^2) \in [1/n, 1]` per receiver
+    (Kong, Liu and Wong, *J. Amer. Statist. Assoc.* 89, 1994). There every receiver off by more than a nat read at
+    most 0.11, but the fraction is computed from the same draws and cannot see a mode that no draw reached: with one
+    head a receiver off by more than a nat read 1.0.
     """
     f64 = torch.float64
     with torch.no_grad():
@@ -1195,9 +1221,15 @@ def minimal_agent_importance_evidence(
             cross = torch.einsum("...his,...hjs->...hij", y, P_b)
             record = torch.logsumexp(log_pi - 0.5 * quadratic + cross + source.unsqueeze(-2), dim=-1)   # (n, ..., H, N)
             log_w.append(log_ratio + record.masked_fill(no_record, 0.0).sum(dim=-2))   # (n, ..., N)
-        estimate = torch.logsumexp(torch.cat(log_w), dim=0) - math.log(samples)          # (..., N)
-        estimate = estimate.masked_fill(bad_X, math.nan)
-        return estimate.masked_fill(bad_B.any(dim=-1).any(dim=-1, keepdim=True), math.nan)
+        log_w_all = torch.cat(log_w)                                            # (samples, ..., N) log w_s
+        total = torch.logsumexp(log_w_all, dim=0)                               # (..., N) log sum_s w_s
+        bad_head = bad_B.any(dim=-1).any(dim=-1, keepdim=True)                  # (..., 1)
+        estimate = (total - math.log(samples)).masked_fill(bad_X, math.nan).masked_fill(bad_head, math.nan)
+        if not return_ess:
+            return estimate                                                     # (..., N)
+        # Kong's effective sample size over n: (sum w)^2 / (n sum w^2), in log space.
+        ess = (2.0 * total - torch.logsumexp(2.0 * log_w_all, dim=0)).exp() / samples   # (..., N)
+        return estimate, ess.masked_fill(bad_X, math.nan).masked_fill(bad_head, math.nan)
 
 
 def minimal_agent_readout(
@@ -1482,7 +1514,7 @@ def minimal_agent_readout(
             R_prime = torch.where(no_record[..., None, None], torch.zeros((), dtype=dtype, device=xi.device), R_prime)
             label_spread_out = R_prime.movedim(-4, -3)                          # (..., N, H, d, d)
             spread_gains = _spread_gains(X0, S, gains, M)                       # (..., N, H, K, d) P S_h^T
-        elbo_out = adf_evidence_out = evidence_out = is_evidence_out = None
+        elbo_out = adf_evidence_out = evidence_out = is_evidence_out = is_ess_out = None
         if elbo:
             with torch.no_grad():
                 # q(X) is the Gaussian the readout returns: P_i plus the label spread under spread_corrected.
@@ -1493,8 +1525,9 @@ def minimal_agent_readout(
                                             gains.detach().to(torch.float64), M.detach().to(torch.float64),
                                             None if spread_gains is None else spread_gains.detach(),
                                             None if label_spread_out is None else label_spread_out.detach())
-                is_evidence_out = minimal_agent_importance_evidence(
-                    xi, C, xi_plus, C_q, S, b, B, lp, no_record, blocks=blocks, rope=Rot)   # (..., N)
+                is_evidence_out, is_ess_out = minimal_agent_importance_evidence(
+                    xi, C, xi_plus, C_q, S, b, B, lp, no_record, blocks=blocks, rope=Rot,
+                    return_ess=True)                                            # (..., N) each
                 exact_cost = cost_out
                 if inference != "exact" or dtype != torch.float64:
                     # The ADF costs in float64 from the detached inputs (the exact path of this call when it already
@@ -1517,12 +1550,36 @@ def minimal_agent_readout(
     return MinimalAgentResult(xi_plus, gains, M, weights_out, cost_out, gain_fraction, V_Q, V_K, coupling,
                               failed, ill_conditioned, contraction, staleness, spread, mstep,
                               spread_gains, label_spread_out, elbo_out, adf_evidence_out, evidence_out,
-                              is_evidence_out, mstep_boundary)
+                              is_evidence_out, mstep_boundary, is_ess_out)
 
 
 # ----------------------------------------------------------------------------------------------
 # Local coordinates
 # ----------------------------------------------------------------------------------------------
+
+def local_covariance(
+    C:              torch.Tensor,               # (..., N, G, g, g) blocks (diagonal on block frames) or (..., N, K, K)
+    forward:        torch.Tensor,               # (..., N, G, g, g) compact or (..., N, K, K) dense U_i
+    block_diagonal: bool,
+    diagonal:       bool,                       # return diag(U_i C_i U_i^T) (..., N, K)
+) -> torch.Tensor:                              # (..., N, K) or (..., N, K, K)
+    r"""The local covariance :math:`U_iC_iU_i^\top` of a reference covariance, or its diagonal.
+
+    ``C`` is laid out as ``RelationalOperators._reference_covariance`` returns it: the :math:`G` diagonal blocks
+    :math:`C_{i,m}` for diagonal beliefs on block frames (then
+    :math:`[U_iC_iU_i^\top]_{kk} = \sum_{ab}U_{i,m,ka}C_{i,m,ab}U_{i,m,kb}` per block, :math:`O(NKg)`), else dense.
+    """
+    if block_diagonal and diagonal:
+        return torch.einsum("...nmab,...nmbc,...nmac->...nma", forward, C, forward).flatten(-2)   # (..., N, K)
+    U = forward
+    if block_diagonal:                                                          # compact -> dense (..., N, K, K)
+        G, g = forward.shape[-3], forward.shape[-1]
+        eye = torch.eye(G, dtype=forward.dtype, device=forward.device)
+        U = torch.einsum("...mab,mn->...manb", forward, eye).reshape(*forward.shape[:-3], G * g, G * g)
+    if diagonal:
+        return torch.einsum("...ab,...bc,...ac->...a", U, C, U)                 # (..., N, K)
+    return _symmetrize(U @ C @ U.transpose(-1, -2))                             # (..., N, K, K)
+
 
 def local_posterior_covariance(
     sigma:          torch.Tensor,               # (..., N, K) diagonal or (..., N, K, K) full input Sigma_i
@@ -1533,20 +1590,33 @@ def local_posterior_covariance(
     floor:          torch.Tensor,               # sigma's layout: f Sigma_{p,i}, the prior-anchored floor
     spread_gains:   Optional[torch.Tensor] = None,   # (..., N, H, K, d) P_i S_h^T (spread_corrected only)
     spread:         Optional[torch.Tensor] = None,   # (..., N, H, d, d) R'_i^h (spread_corrected only)
+    *,
+    reference:      Optional[torch.Tensor] = None,   # the C_i the gains used (local_covariance layout)
 ) -> torch.Tensor:                              # same layout as sigma
     r"""Local posterior covariance :math:`\Sigma_i^+ = U_iC_i^+U_i^\top + f\,\Sigma_{p,i}`.
 
     .. math::
-        \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\Sigma_{p,i},\qquad
-        Z_i^h = U_i\mathsf K_i^h\ (K\times d),
+        \Sigma_i^+ = U_iC_iU_i^\top - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\Sigma_{p,i},\qquad
+        Z_i^h = U_i\mathsf K_i^h\ (K\times d).
 
-    using :math:`\Sigma_i = U_iC_iU_i^\top` exactly, so the input covariance is not recomputed. The floor
+    With ``reference`` the first term is :math:`U_iC_iU_i^\top` recomputed from the :math:`C_i` the gains were built
+    from (:func:`local_covariance`), so the result is :math:`U_i(C_i - \sum_h\mathsf K^hM^h\mathsf K^{h\top})U_i^\top +
+    f\Sigma_{p,i}` for the stored frame pair. Without it the input :math:`\Sigma_i` is used, which equals
+    :math:`U_iC_iU_i^\top` only for an exact pair. Both are the same quantity for an exact pair, and which is more
+    accurate depends on the precisions (audit 2026-10-16, F8). A float32 pair :math:`(U_i, U_i^{-1})` is an inverse
+    pair to about :math:`\varepsilon_{32}\kappa(U_i)`; in a float64 recompute that inconsistency times a large input
+    variance exceeded a sharply contracted posterior and returned negative variances, while the float64 round trip
+    costs only :math:`\varepsilon_{64}\kappa(U_i)^2`, so ``RelationalOperators`` passes ``reference`` there. At the
+    pair's own precision the round trip costs about :math:`\varepsilon\kappa(U_i)^2` against the pair's
+    :math:`\varepsilon\kappa(U_i)`, and the input :math:`\Sigma_i` is kept (measured in float32 at
+    :math:`\kappa_2\in[10, 10^4]`: about twenty times as many nonpositive variances with ``reference``). The floor
     :math:`f\,\Sigma_{p,i}` (``floor``, formed by the caller) is the token's prior covariance in local coordinates: it
     involves no frame, so the result is exactly invariant under a common reference change and covariant under a site
     action, and it does not compound with depth (audit 2026-10-12, item 4 and T5). A diagonal input returns the
     diagonal (the moment projection onto the diagonal family),
-    :math:`\operatorname{diag}\Sigma_i - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\operatorname{diag}\Sigma_{p,i}`
-    with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a :math:`K\times K` matrix.
+    :math:`\operatorname{diag}(U_iC_iU_i^\top) - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\operatorname{diag}\Sigma_{p,i}`
+    with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a :math:`K\times K` matrix on block
+    frames.
 
     With ``spread_gains`` :math:`P_iS_h^\top` and ``spread`` :math:`R'^h_i` (``spread_corrected``, module docstring T2)
     the term :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`, is added (its row quadratic forms on
@@ -1558,6 +1628,8 @@ def local_posterior_covariance(
     if (spread_gains is None) != (spread is None):
         raise ValueError("spread_gains and spread are given together (spread_corrected) or not at all")
     H, K, d = gains.shape[-3:]
+    if reference is not None:                                                   # U_i C_i U_i^T, sigma's layout
+        sigma = local_covariance(reference, forward, block_diagonal, diagonal=sigma.dim() == gains.dim() - 2)
 
     def local(X: torch.Tensor) -> torch.Tensor:                                 # (..., N, H, K, d) -> U_i X
         if block_diagonal:
