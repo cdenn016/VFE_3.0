@@ -230,3 +230,53 @@ def test_validation_sanity_draws_the_held_out_chart_radius_and_vertex_conditioni
     titles = _titles(fig)
     assert "Held-out phi chart radius" in titles and "Held-out vertex conditioning" in titles
     figs.plt.close(fig)
+
+
+# ------------------------------------------------------------------------------------------------ F84
+
+def _report_request(tmp_path: Path, run_dir: Path) -> Path:
+    result = run_dir / "figure_result.json"
+    result.write_text("{}", encoding="utf-8")
+    request = tmp_path / "figure_request.json"
+    request.write_text(json.dumps({
+        "mode": "report", "run_dir": str(run_dir), "result_path": str(result), "split": "validation",
+        "device": "cpu", "max_sequences": None, "n_e_steps": None, "generate_embedding_figures": False,
+    }), encoding="utf-8")
+    return request
+
+
+def _history_run(tmp_path: Path, **saved: object) -> Path:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    raw = {**serialize_config(test_config()), **saved}
+    (run_dir / "config.json").write_text(json.dumps({"config": raw}), encoding="utf-8")
+    with (run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["step", "val_ppl", "grad_norm"])
+        writer.writeheader()
+        for step in range(1, 9):
+            writer.writerow({"step": step, "val_ppl": 50.0 - step, "grad_norm": 1.0 + 0.1 * step})
+    return run_dir
+
+
+def test_report_mode_rebuilds_the_history_when_the_strict_config_is_refused(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = _history_run(tmp_path, lambda_alpha_mode="constant")      # a value this build refuses
+    monkeypatch.setenv("VFE3_FIGURE_REQUEST", str(_report_request(tmp_path, run_dir)))
+    with pytest.raises(ValueError):
+        figure_worker.main()
+    assert (run_dir / "val_ppl.png").is_file()
+    assert (run_dir / "grad_norm.png").is_file()
+
+
+def test_report_mode_renders_the_history_after_a_successful_replay(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import vfe3.viz.report as report
+    run_dir = _history_run(tmp_path)
+    order: List[str] = []
+    monkeypatch.setattr(report, "generate_figures", lambda *args, **kwargs: order.append("replay") or [])
+    monkeypatch.setattr(figure_worker, "_render_persisted_run_figures",
+                        lambda *args, **kwargs: order.append("history"))
+    monkeypatch.setenv("VFE3_FIGURE_REQUEST", str(_report_request(tmp_path, run_dir)))
+    assert figure_worker.main() == 0
+    assert order == ["replay", "history"]                  # probes the replay persisted are rendered too
+    assert json.loads((run_dir / "figure_result.json").read_text(encoding="utf-8")) == {"paths": []}

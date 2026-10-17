@@ -624,22 +624,27 @@ def main() -> int:
         logger = logging.getLogger(__name__)
         from vfe3.viz.report import generate_figures
 
-        paths = generate_figures(
-            run_dir,
-            device=torch.device(device),
-            split=split,
-            max_sequences=max_sequences,
-            generate_embedding_figures=generate_embedding_figures,
-            prepare_saved_probes=True,
-            n_e_steps=n_e_steps,
-            logger=logger,
-        )
-        _render_persisted_run_figures(
-            run_dir,
-            _load_worker_config(run_dir),
-            None,
-            logger,
-        )
+        try:
+            paths = generate_figures(
+                run_dir,
+                device=torch.device(device),
+                split=split,
+                max_sequences=max_sequences,
+                generate_embedding_figures=generate_embedding_figures,
+                prepare_saved_probes=True,
+                n_e_steps=n_e_steps,
+                logger=logger,
+            )
+        finally:
+            # The history dashboards and saved probes need only metrics.csv and the lenient config, so they are
+            # rebuilt even when the strict model replay above refuses this run's saved config; after a
+            # successful replay they also render the probes it persisted (audit 2026-10-16 F84).
+            _render_persisted_run_figures(
+                run_dir,
+                _load_worker_config(run_dir),
+                None,
+                logger,
+            )
         _write_json_atomic(result_path, {"paths": [str(path.resolve()) for path in paths]})
         return 0
     if mode == "attention":
