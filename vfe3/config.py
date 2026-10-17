@@ -725,7 +725,8 @@ class VFE3Config:
 
     # "chart" | "group_log"
     # pullback_group / fisher_group only: retraction of the phi step.
-    #   chart      additive chart step with product-residual backtracking
+    #   chart      additive chart step with product-residual backtracking (fixed 1e-6 gate; it caps the step at
+    #              trained norms, see m_phi_group_trust_radius)
     #   group_log  exact right product Log(exp(phi) exp(-eta s xi)) (untied block_glk)
     m_phi_group_retraction:           str             = "chart"
 
@@ -752,7 +753,15 @@ class VFE3Config:
     # su_n; refused for block_borel and block_unipotent. None: no bound.
     phi_frame_condition_max:          Optional[float] = None
 
-    m_phi_group_trust_radius:        float           = 0.1          # pullback_group / fisher_group only: step bound
+    # pullback_group / fisher_group only: upper bound R on each row's right-factor step ||eta s xi||_F, the embedded
+    # Frobenius norm of the body generator xi (under fisher_group xi = U^{-1} W U, so R bounds a Frobenius norm, not
+    # the Fisher norm or per-step KL that m_table_fisher_trust_radius bounds). group_log realizes R exactly; so does
+    # the chart retraction whenever R is below its certificate cap. On the chart retraction the fixed 1e-6
+    # product-residual certificate is quadratic in the step and binds first away from the identity frame: it halves
+    # a trust-saturated step to a cap of about 4e-2 at ||phi||_F = 0.05, 9e-3 at 1 and 7e-3 at 1.7 (d = 6;
+    # docs/derivations/2026-09-28-phi-natgrad.tex, Table tab:cap), so values above the cap change nothing there.
+    # The optimizer reports the halvings as phi_group_backtracks_mean / phi_group_backtracks_max.
+    m_phi_group_trust_radius:        float           = 0.1
     m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: completion weight lambda on every rotation; raises Fisher-visible rotation metrics a -> a + 2 lambda
 
     # "adamw" | "fisher"

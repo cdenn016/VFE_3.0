@@ -530,6 +530,18 @@ trading the truncation error for a conditioning one, and uses the series wheneve
 eigenbasis fails its condition or imaginary-residue guard. The optimizer checkpoints the
 route, and a resumed run keeps the saved one.
 
+Under `m_phi_update_mode="pullback_group"` or `"fisher_group"`, `m_phi_group_trust_radius`
+$R$ is an upper bound on each row's right-factor step $\|\eta s\xi\|_F$, the embedded
+Frobenius norm of the body generator; under `fisher_group` it bounds that Frobenius norm,
+not the Fisher norm, so unlike `m_table_fisher_trust_radius` it does not bound the per-step
+KL. `m_phi_group_retraction="group_log"` realizes $R$ exactly. The default `"chart"`
+retraction also accepts every step only after a fixed $10^{-6}$ check of the exact right
+product, a residual quadratic in the step, so away from the identity frame it halves a
+trust-saturated step before $R$ binds: in the derivation of 2026-09-28 the certified step
+falls from about $4\times10^{-2}$ at $\|\varphi\|_F=0.05$ to $7\times10^{-3}$ at
+$\|\varphi\|_F=1.7$ ($d=6$), and a larger $R$ changes nothing there. The optimizer reports
+the halvings as `phi_group_backtracks_mean` and `phi_group_backtracks_max` on both retractions.
+
 When every covariance contract passes the covariance through
 (`predictive_covariance="passthrough"`, `block_mlp_covariance="passthrough"` and
 `block_norm_covariance="passthrough"`),

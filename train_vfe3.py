@@ -281,7 +281,7 @@ config = dict(
     m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
     phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc)
 
-    m_phi_group_trust_radius         = 0.1,
+    m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
     m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on every rotation (also damps Fisher-visible ones)
 
     m_table_update_mode              = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)

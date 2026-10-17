@@ -1778,13 +1778,16 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                 if collect and group_log:
                     fast_acc.append(candidate.fast_rows)
                     rechart_acc.append(candidate.recharted_rows)
-                    backtrack_acc.append(candidate.backtracking_reductions)
                     margin_acc.append(candidate.strip_margin)
                     frame_cond_acc.append(
                         None if candidate.frame_condition is None or candidate.fast_rows is None
                         else torch.where(candidate.fast_rows, candidate.frame_condition,
                                          float("nan")))
                 if collect:
+                    # Halvings of the factor scale, on both retractions: on the chart route the 1e-6
+                    # product-residual certificate halves a trust-saturated step away from the
+                    # identity frame (audit 2026-10-16, F14).
+                    backtrack_acc.append(candidate.backtracking_reductions)
                     cosine = torch.nn.functional.cosine_similarity(
                         candidate.direction.v_phi,
                         flat_gradient[active].to(dtype=torch.float64),
@@ -1874,6 +1877,8 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     (torch.stack(rejected_acc).sum().to(dtype=effective_scale.dtype)
                      if rejected_acc else effective_scale.new_zeros(())),
                 ]
+                all_backtracks = torch.cat(backtrack_acc).to(dtype=effective_scale.dtype)
+                statistics += [all_backtracks.mean(), all_backtracks.amax()]
                 if group_log:
                     nan = effective_scale.new_tensor(float("nan"))
                     fast = (torch.cat(fast_acc) if all(f is not None for f in fast_acc)
@@ -1882,7 +1887,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         nan if fast is None else fast.sum().to(dtype=nan.dtype),
                         nan if fast is None else (~fast).sum().to(dtype=nan.dtype),
                         torch.cat(rechart_acc).sum().to(dtype=nan.dtype),
-                        torch.cat(backtrack_acc).amax().to(dtype=nan.dtype),
+                        all_backtracks.amax(),
                         torch.cat(margin_acc).amin(),
                         (nan if any(c is None for c in frame_cond_acc)
                          else _nan_amax(torch.cat(frame_cond_acc))),
@@ -1905,9 +1910,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     "phi_effective_step_scale_mean":           values[12],
                     "phi_effective_step_scale_min":            values[13],
                     "phi_group_rejected_rows":                 values[14],
+                    "phi_group_backtracks_mean":               values[15],
+                    "phi_group_backtracks_max":                values[16],
                 })
                 if group_log:
-                    self._gauge_diag.update(dict(zip(GROUP_LOG_DIAGNOSTIC_KEYS, values[15:])))
+                    self._gauge_diag.update(dict(zip(GROUP_LOG_DIAGNOSTIC_KEYS, values[17:])))
             if fisher_acc is not None:
                 self._gauge_diag.update(_fisher_diagnostics(fisher_acc))
         return super().step()                                          # closure already rejected above
