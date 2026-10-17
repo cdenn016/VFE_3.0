@@ -544,7 +544,8 @@ def _run_once(
 
     overrides = {}
     if fully_gauge_covariant:
-        from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
+        from vfe3.gauge_covariant import (describe_fully_gauge_covariant_overrides, fully_gauge_covariant_overrides,
+                                          gauge_covariance_failures)
         overrides = fully_gauge_covariant_overrides(config)
     cfg = VFE3Config(**{**config, **overrides, "seed": seed})   # the run's seed, from SEEDS
     if fully_gauge_covariant:
@@ -552,7 +553,7 @@ def _run_once(
         if failures:
             raise ValueError(f"fully_gauge_covariant=True left these gauge flags false: {failures}")
         logger.info("fully_gauge_covariant=True: overriding %s",
-                    ", ".join(f"{key}={config.get(key)!r} -> {value!r}" for key, value in overrides.items())
+                    describe_fully_gauge_covariant_overrides(config, overrides)
                     or "nothing (the config is already fully gauge covariant)")
     # Always shown, unlike the env-gated ConfigNotice: every setting this launcher names explicitly
     # that no active path reads under the resolved config, with the structural reason.
