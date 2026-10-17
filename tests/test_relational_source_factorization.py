@@ -42,7 +42,11 @@ def test_full_rank_source_recovers_lost_gram_precision(device: torch.device, rol
     aq64, Gq64 = projected_moments(mu.double(), sigma.double(), inverse.double(), S_q.double())
     ak64, Gk64 = projected_moments(mu.double(), sigma.double(), inverse.double(), S_k.double())
     reference = projected_gaussian_kl(aq64, Gq64, ak64, Gk64)
-    torch.testing.assert_close(score.double(), reference, rtol=2e-5, atol=2e-5)
+    # The relative KL error is bounded by the whitened error of the recovered float32 factor, O(eps kappa(X)) with
+    # kappa(X) = 1e4 (4.8e-4 for this fixture). Measured: 1.0e-4 on the key role under the shift of Fukaya et al.
+    # eq. (67) (audit 2026-10-16 F42; 6.2e-6 under the former larger shift). Over 300 random orientations of these
+    # singular values the two shifts give the same error distribution (median 7e-5, p90 2.5e-4).
+    torch.testing.assert_close(score.double(), reference, rtol=3e-4, atol=2e-5)
     actual_grads = torch.autograd.grad(score.sum(), (S, sigma, inverse), retain_graph=True)
     reference_grads = torch.autograd.grad(reference.sum(), (S, sigma, inverse))
     # fp32 recovery bound on the gradients. The source root X = S Sigma^{1/2} has kappa(X) = 1e4 and its float32

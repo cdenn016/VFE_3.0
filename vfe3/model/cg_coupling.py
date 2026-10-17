@@ -56,6 +56,8 @@ def cg_moment_energy_rows(
     pre-CG value (means-only under 'passthrough', mean-and-covariance under 'delta_full'). NOT a
     second hierarchical total -- it reads only the belief (q) channel, never s/p/h. Divergence- and
     family-agnostic: ``divergence_family`` selects the functional, ``family`` the covariance kernel.
+    The block passes neither ``divergence_family`` nor ``renyi_order`` (their config fields are retired
+    and pinned to KL), so the live rows are always KL (audit 2026-10-16 F93).
     """
     from vfe3.families.base import get_family
     from vfe3.free_energy import self_divergence

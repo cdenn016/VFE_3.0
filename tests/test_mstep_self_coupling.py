@@ -1,7 +1,9 @@
 r"""Opt-in M-step self-coupling regularizer alpha_hat * sum_i KL(q_i*||p_i).
 
-Manuscript Algorithm 1 (GL(K)_attention.tex:2083): the M-step loss carries a self-
-coupling term alpha_hat * sum_i KL(q_i*||p_i) at the converged belief against the
+The M-step loss of Algorithm alg:em_loop in the original GL(K)_attention.tex (archived as
+OLD_MAgent_Model-main/Manuscripts-Theory/GL(K)_attention.tex:2118; the current
+GL(K)_attention_v2.tex carries no such term) has a self-coupling term
+alpha_hat * sum_i KL(q_i*||p_i) at the final block's returned belief against the
 per-block prior. It is wired as an OPT-IN, DEFAULT-OFF scalar coefficient
 ``cfg.mstep_self_coupling_weight`` (alpha_hat). These tests pin the two contracts:
 (1) at weight 0 the term is absent (loss == ce), and (2) at weight w the loss is

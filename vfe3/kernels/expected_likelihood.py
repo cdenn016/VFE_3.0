@@ -37,6 +37,11 @@ which is unchanged and remains the reference. None of them changes the formula.
   gradients are tile-ordered sums. The torch route sums the d^2/s and log s terms together; here they
   are summed separately and added once per pair.
 * Scaling. Logits use :math:`-c E` with :math:`c = 0.5/\tau` instead of :math:`-0.5 E / \tau`.
+* Log-sum-exp. The row state is the running maximum :math:`m_i` and :math:`\log l_i` kept apart, and the
+  softmax weight is :math:`\exp((\ell_{iv} - m_i) - \log l_i)`, as in the KL decode kernel. Storing
+  :math:`m_i + \log l_i` rounded it to the ulp of :math:`m_i`, which is large at a small tau, and made the
+  float32 gradients 2 to 33 times less accurate than the torch route's at tau = 0.1 to 0.01 (interpreter, K = 8
+  and 20; audit 2026-10-16, F48).
 * Compiled fp32 arithmetic. Division compiles to ``div.full.f32`` (at most 2 ulp), ``exp`` to
   ``ex2.approx``, and the per-pair logarithm to ``lg2.approx.f32`` times :math:`\ln 2` (absolute error
   about :math:`2^{-22}` per term). The torch route uses IEEE division and accurate ``exp``/``log``.
@@ -50,6 +55,7 @@ this route launches, so CPU-only machines never import it.
 from typing import Any, Optional, Tuple
 
 import torch
+from torch.autograd.function import once_differentiable
 
 _KERNELS: Any = None
 
@@ -77,7 +83,12 @@ def _grid_launch(kernel: Any, n_programs: int, cfg: dict, *args: Any, **constexp
 
 
 class ExpectedLikelihoodCE(torch.autograd.Function):
-    r"""Mean expected-likelihood cross-entropy over packed rows; saves only lse_i (S,) besides inputs."""
+    r"""Mean expected-likelihood cross-entropy over packed rows; saves only the row states (S,) besides inputs.
+
+    The backward is ``once_differentiable``: its gradients are Triton writes autograd does not track, so a
+    ``create_graph=True`` gradient would carry a truncated graph (the temperature gradient through tau alone) and
+    a wrong second derivative. A double backward raises instead (audit 2026-10-16, F49).
+    """
 
     @staticmethod
     def forward(
@@ -98,22 +109,29 @@ class ExpectedLikelihoodCE(torch.autograd.Function):
         has_u = u is not None
         u_arg = u if has_u else mu_v_t                                  # dummy pointer, never read
         fast_log = mu_q.dtype == torch.float32 and not tk.INTERPRETED
-        lse = torch.empty(S, dtype=mu_q.dtype, device=mu_q.device)      # (S,)
+        m = torch.empty(S, dtype=mu_q.dtype, device=mu_q.device)        # (S,) row max of the logits
+        log_l = torch.empty(S, dtype=mu_q.dtype, device=mu_q.device)    # (S,) log sum_v exp(logit - m)
         ce_rows = torch.empty(S, dtype=mu_q.dtype, device=mu_q.device)  # (S,)
         cfgs = tk.launch_config(K)
         if S > 0:
             cfg = cfgs["fwd"]
             _grid_launch(tk.el_fwd_kernel, -(-S // cfg["BI"]), cfg,
-                         mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, targets, tau, lse, ce_rows, S, V,
+                         mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, targets, tau, m, log_l, ce_rows, S, V,
                          K=K, HAS_U=has_u, FAST_LOG=fast_log)
-        ctx.save_for_backward(mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, lse)
+        # m and log_l stay separate (lse = m + log_l is never formed): at a small tau the logits are large, and
+        # rounding lse to the ulp of m put an error into every softmax weight of the row (audit 2026-10-16, F48).
+        # The second row state costs registers in the rows backward kernel: offline sm_120a ptxas (triton 3.5.1,
+        # K = 20) reports spill stores of 396 -> 460 bytes there; the cols kernel loads the row state after its
+        # energy tile and spills 0 bytes (4 before). The forward's 228 bytes predate F48. GPU time is unmeasured.
+        ctx.save_for_backward(mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l)
         ctx.has_u, ctx.fast_log = has_u, fast_log
         return ce_rows.sum() / max(S, 1)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx: Any, grad_ce: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
-        mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, lse = ctx.saved_tensors
+        mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l = ctx.saved_tensors
         S, K = mu_q.shape
         V = mu_v_t.shape[1]
         need = ctx.needs_input_grad
@@ -121,7 +139,7 @@ class ExpectedLikelihoodCE(torch.autograd.Function):
         want_cols = need[2] or need[3] or (ctx.has_u and need[4])
         cfgs = tk.launch_config(K)
         scale = (grad_ce.reshape(1) / max(S, 1)).to(mu_q.dtype).contiguous()   # (1,) g / S, on device
-        common = (mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, targets, tau, lse, scale)
+        common = (mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, targets, tau, m, log_l, scale)
         consts = dict(K=K, KP=cfgs["rows"]["KP"], HAS_U=ctx.has_u, FAST_LOG=ctx.fast_log)
 
         g_mu_q = g_sigma_q = g_mu_v = g_sigma_v = g_u = g_tau = None

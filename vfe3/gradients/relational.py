@@ -20,9 +20,17 @@ def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: 
     :math:`P(G)` is structurally diagonal when at most one coordinate of the block stays unrotated
     (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal`). The diagonal route
     (``diagonal_covariance`` of :func:`vfe3.relational_scoring.projected_gaussian_kl`) also requires the Gaussian-KL
-    cost, no GEMM error fallback (``pair_kl_gemm_tol`` None) and conditioning-triggered recovery off, whose
-    float64 rescoring it would bypass; every other case keeps the dense route with its certificate, recovery and
-    fallback (audit 2026-10-10 round 2, item 30).
+    cost, no GEMM error fallback (``pair_kl_gemm_tol`` None, since the diagonal route has none) and
+    conditioning-triggered recovery off (``projected_factorization='gram'``); every other case keeps the dense route
+    with its certificate, recovery and fallback (audit 2026-10-10 round 2, item 30).
+
+    The recovery clause keeps what the certified toggles add on the dense route, not a float64 rescoring: a commutant
+    projection has no source-root factor route, so ``cholesky_qr2_certified`` runs here as ``gram_certified``. An
+    entry failing :math:`\varepsilon_{32}\lVert G\rVert_F\lVert G^{-1}\rVert_F \le 10^{-4}` has :math:`P(XX^\top)`
+    rebuilt in the working dtype from its source root (:func:`vfe3.relational_scoring._commutant_root_factor`; float64 QR
+    only if that rebuild fails), its pairs leave the GEMM for working-dtype triangular-solve tiles, and it is counted in
+    :func:`vfe3.relational_scoring.source_recovery_elements`. On a diagonal :math:`P(G)` this moved a flagged pair by
+    at most about 2e-5 nats against the diagonal route on the audit probe (audit 2026-10-16 F9).
     """
     return (rope_commutant_is_diagonal(r, n_pairs) and operators.routing == "gaussian_kl"
             and operators.pair_kl_gemm_tol is None and not projected_condition_recovery())
@@ -65,7 +73,8 @@ def relational_score(
     :math:`P(G)`, the covariance the router scores. The scorer takes its Gram route; the source tuples carry the
     rotated maps :math:`R_iS` with ``commutant_pairs``, so a failed (or, under condition recovery, flagged)
     factorization is rebuilt as :math:`P(XX^\top)` from the source (audit 2026-10-10 round 2, item 12). When
-    :math:`P(G)` is structurally diagonal (:func:`_diagonal_comparison_route`) only diag(G) is formed and the
+    :math:`P(G)` is structurally diagonal and :func:`_diagonal_comparison_route` admits it (Gaussian-KL routing,
+    ``projected_factorization='gram'``, ``pair_kl_gemm_tol`` None) only diag(G) is formed and the
     Gaussian KL takes its diagonal route, with no Gram, factorization or source tuple.
     Under ``tie_comparison_maps`` a belief scored against itself is projected once and both roles share it.
     """
@@ -284,6 +293,9 @@ def relational_predictive_readout(
     ``link_state`` (``{"previous": ..., "current": ...}``, threaded across layers by ``vfe_stack``).
     ``floor_anchor`` is the local prior covariance :math:`\Sigma_p` whose multiple :math:`f\,\Sigma_p` floors the
     returned covariance (:meth:`RelationalOperators.floor_term`); it is required with ``return_covariance``.
+    ``capture`` receives the router ``beta_pre``, the clamped cost ``score_energy_pre`` and the boolean map
+    ``score_nonfinite_pre`` of raw costs that were NaN or infinite before the clamp mapped them to ``kl_max``
+    (audit 2026-10-16 F10).
 
     Under ``predictive_readout='minimal_agent'`` the routing, the content and the residual are replaced by the
     exact Gaussian conditioning of :meth:`RelationalOperators.minimal_agent_update`, which reads the ROUTING frame
@@ -314,10 +326,13 @@ def relational_predictive_readout(
         # Under the row_min reference the clamp and softmax read only row gaps, so the query
         # log-determinant (a row constant of the Gaussian KL) needs no autograd.
         row_invariant = operators.kl_max_reference == "row_min"
+        raw_score = relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
+                                     **({"row_invariant": True} if row_invariant else {}))   # (..., H, N, N)
+        # The clamp maps NaN and +inf to kl_max, so a capped captured cost cannot tell a failed cost from a
+        # finite one at the cap; the capture keeps which raw costs were non-finite (audit 2026-10-16 F10).
+        score_nonfinite = None if capture is None else ~torch.isfinite(raw_score.detach())   # (..., H, N, N)
         score = clamped_routing_cost(
-            relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
-                             **({"row_invariant": True} if row_invariant else {})),
-            operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
+            raw_score, operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
         beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype),
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
         if getattr(operators, "content_link_edges", "off") != "off":
@@ -338,7 +353,7 @@ def relational_predictive_readout(
                                                              **shared).to(sigma.dtype)
                       if return_covariance else None)
     if capture is not None:
-        capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
+        capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(), score_nonfinite_pre=score_nonfinite,
                        relational_mean_displacement_norm=(result-mu).norm().detach())
         if edges is not None:
             capture.update(edge_diagnostic_capture(edges, beta))

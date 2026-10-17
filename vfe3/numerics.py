@@ -617,6 +617,33 @@ def guarded_cholesky(
     return torch.linalg.cholesky_ex(torch.where(failed[..., None, None], eye, W))[0], failed
 
 
+def _gram_lambda_max_estimate(
+    W: torch.Tensor,   # (..., n, n) symmetric positive semidefinite Gram X X^T
+
+    *,
+    iterations: int = 4,
+) -> torch.Tensor:     # (...) estimate of lambda_max(W) = ||X||_2^2
+    r"""Power-iteration estimate of :math:`\lambda_{\max}(W)`, never below :math:`\operatorname{tr}(W)/n`.
+
+    Starts from the absolute row sums of W (the start of MATLAB's ``normest``) and returns the Rayleigh quotient
+    :math:`v^T W v` of the last iterate, which lies below :math:`\lambda_{\max}` and converges as
+    :math:`(\lambda_2/\lambda_1)^{2k}`. The floor :math:`\operatorname{tr}(W)/n \le \lambda_{\max}` keeps a start
+    orthogonal to the leading eigenvector within a factor n. The iteration count is fixed, so batched calls run
+    with no data-dependent control flow and no host synchronization; O(n^2) per matrix.
+    """
+    with torch.no_grad():
+        W = W.detach()
+        tiny = torch.finfo(W.dtype).tiny
+        v = W.abs().sum(dim=-1, keepdim=True)                                   # (..., n, 1)
+        for _ in range(iterations):
+            v = v / v.norm(dim=-2, keepdim=True).clamp_min(tiny)
+            v = W @ v
+        v = v / v.norm(dim=-2, keepdim=True).clamp_min(tiny)
+        rayleigh = (v * (W @ v)).sum(dim=(-2, -1))                              # (...)
+        trace_floor = torch.diagonal(W, dim1=-2, dim2=-1).sum(-1) / W.shape[-1]  # (...)
+        return torch.maximum(rayleigh, trace_floor)
+
+
 @_autocast_disabled()
 @ieee_fp32_matmul()
 def cholesky_qr2(
@@ -636,12 +663,28 @@ def cholesky_qr2(
     the first pass's squared-conditioning error: CholeskyQR2 is backward stable in X for
     :math:`\kappa(X) \lesssim \varepsilon^{-1/2}` (Fukaya et al. 2014; Yamamoto et al. 2015), so C
     carries relative error of order :math:`\varepsilon \kappa(X)`, not
-    :math:`\varepsilon \kappa(X)^2`. ``shift=True`` is shifted CholeskyQR3 (Fukaya et al. 2020):
-    the first pass factors :math:`\mathrm{fl}(X X^T) + s I` with
-    :math:`s = 11 (m r + r (r + 1)) \varepsilon \lVert X \rVert_F^2`, and CholeskyQR2 then runs on
-    :math:`C_1^{-1} X`. The shift is a preconditioner only: the product still factors
-    :math:`X X^T` exactly, and validity extends to :math:`\kappa(X) \approx \varepsilon^{-1}`.
-    No jitter enters the result.
+    :math:`\varepsilon \kappa(X)^2`. ``shift=True`` is shifted CholeskyQR3 (Fukaya et al., SIAM J. Sci.
+    Comput. 42 (2020) A477): the first pass factors :math:`\mathrm{fl}(X X^T) + s I` with
+
+    .. math::
+        s = 11 (m r + r (r + 1))\, u \lVert X \rVert_2^2, \qquad u = \varepsilon / 2,
+
+    their eq. (67), with :math:`\lVert X \rVert_2^2 = \lambda_{\max}(X X^T)` estimated by
+    :func:`_gram_lambda_max_estimate` (the norm estimator the paper suggests in place of the exact norm),
+    and CholeskyQR2 then runs on :math:`Y = C_1^{-1} X`. The shift is a preconditioner only: the product
+    still factors :math:`X X^T` exactly, so s is held constant under autograd. No jitter enters the result.
+
+    The range is :math:`O(u^{-1})` with a dimension-dependent constant, not :math:`u^{-1}`. The first pass
+    leaves :math:`\kappa_2(Y) \lesssim 2\sqrt3 \sqrt{\alpha}\, \kappa_2(X)`,
+    :math:`\alpha = s / \lVert X \rVert_2^2 = 11 (m r + r (r + 1)) u` (their eq. (58)), and the inner
+    CholeskyQR2 needs :math:`\kappa_2(Y) \lesssim u^{-1/2}`, so the factorization succeeds for roughly
+    :math:`\kappa_2(X) \lesssim 1 / (u \sqrt{11 (m r + r (r + 1))})`, about 6e4 in float32 at r = 32,
+    m = 160 (their proven sufficient condition, eq. (70), is the smaller
+    :math:`u^{-1} / (96 (m r + r (r + 1)))`). Measured at r = 32, m = 160 in float32, about 10% of log-spaced
+    spectra at :math:`\kappa_2 = 10^5` and none at :math:`3 \times 10^4` fail. The former shift used
+    :math:`\varepsilon` and :math:`\lVert X \rVert_F^2`, up to 2r times larger, and failed 76% and 48% of the
+    log-spaced and flat spectra at :math:`10^5` and :math:`3 \times 10^4` (audit 2026-10-16, F42); the
+    successful factors carry the same error either way.
 
     ``failed`` marks entries whose factorizations failed or went non-finite. Their factor is
     meaningless but finite with finite gradients (failed passes factor the identity, see
@@ -651,9 +694,10 @@ def cholesky_qr2(
     W1 = X @ X.transpose(-1, -2)
     W1 = .5 * W1 + .5 * W1.transpose(-1, -2)
     if shift:
-        scale = 11 * (m * r + r * (r + 1)) * torch.finfo(X.dtype).eps
-        W1 = W1 + (scale * X.square().sum(dim=(-2, -1)))[..., None, None] * torch.eye(
-            r, dtype=X.dtype, device=X.device)
+        with torch.no_grad():
+            unit_roundoff = .5 * torch.finfo(X.dtype).eps
+            s = 11 * (m * r + r * (r + 1)) * unit_roundoff * _gram_lambda_max_estimate(W1.detach())   # (...)
+        W1 = W1 + s[..., None, None] * torch.eye(r, dtype=X.dtype, device=X.device)
     C1, failed1 = guarded_cholesky(W1)
     Y = torch.linalg.solve_triangular(C1, X, upper=False)
     if shift:

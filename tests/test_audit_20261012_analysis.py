@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 import multiseed_analysis as ms
 from vfe3 import run_artifacts as ra
 from vfe3.data.datasets import TokenWindows
-from vfe3.metrics import spearman_rho
+from vfe3.metrics import spearman_rho, variance_guard_activity
 from vfe3.model.model import VFEModel
 from vfe3.paper import figures as paper_figures
 from vfe3.paper import tables
@@ -105,12 +105,23 @@ def _scored_target_contract(run_dir: Path, *, has_test: bool) -> Dict[str, Any]:
     return summary
 
 
+def _unmeasured_guard_columns() -> Dict[str, str]:
+    r"""Variance-guard columns the live route writes as NaN by definition, with the reason (audit 2026-10-16 F52)."""
+    floor, ceiling = variance_guard_activity(_cfg())
+    keys = ([] if floor else ["guard_sigma_floor_frac"]) + ([] if ceiling else ["guard_sigma_ceil_frac"])
+    reason = "the route applies no such clamp to the converged covariance (metrics.variance_guard_activity)"
+    return {name: reason for key in keys for name in (key, f"val_{key}")}
+
+
 def _metrics_contract(run_dir: Path) -> None:
     r"""Every metrics.csv column a reader reads exists; the geometry-health and held-out geometry columns that
-    the relational diagnostics produce carry a finite value."""
+    the relational diagnostics produce carry a finite value, except the variance guards the route does not
+    apply, which are never finite."""
     rows = _metrics_rows(run_dir)
     assert rows
     columns = set(rows[0])
+    unmeasured = _unmeasured_guard_columns()
+    assert not [key for key in unmeasured if _finite(rows, key)], unmeasured
     readers = {
         "geometry_health": figs.GEOMETRY_HEALTH_COLUMNS,
         "validation_sanity": figs.VALIDATION_SANITY_COLUMNS,
@@ -122,10 +133,10 @@ def _metrics_contract(run_dir: Path) -> None:
         missing = [key for key in keys if key not in columns and key not in _CONDITIONAL_COLUMNS]
         assert not missing, f"{reader} reads columns no run writes: {missing}"
     never_finite = [key for key in figs.GEOMETRY_HEALTH_COLUMNS
-                    if key not in _CONDITIONAL_COLUMNS and not _finite(rows, key)]
+                    if key not in _CONDITIONAL_COLUMNS and key not in unmeasured and not _finite(rows, key)]
     assert not never_finite, f"geometry-health columns never finite: {never_finite}"
     held_out = [key for key in figs.VALIDATION_SANITY_COLUMNS
-                if key.startswith("val_") and not _finite(rows, key)]
+                if key.startswith("val_") and key not in unmeasured and not _finite(rows, key)]
     assert not held_out, f"held-out geometry columns never finite: {held_out}"
     for key in ("frame_projection_count", "frame_projection_total", "skipped_updates", "attempted_updates",
                 "train_ce", "fisher_trace_mean"):

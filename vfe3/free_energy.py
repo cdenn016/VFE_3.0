@@ -8,7 +8,10 @@ the Gibbs weights ``attention_weights`` are live.
 
 F is divergence-agnostic: it assembles the scalar from per-pair energies E_ij and
 self-divergences D(q_i||p_i) supplied by the `divergence` registry, so a new
-divergence slots in by registration + config, never by editing F. Canonical (with
+divergence slots in by registration, never by editing F. No configuration selects a member:
+``divergence_family`` and ``renyi_order`` are retired fields pinned to the KL member (``renyi`` at
+alpha = 1), so the other registered functionals and the alpha != 1 kernels are reached from tests
+only (audit 2026-10-16 F93). Canonical (with
 the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
 """
@@ -342,8 +345,10 @@ def free_energy(
 # ``free_energy`` above is the pure q-only training scalar and keeps its byte-for-byte one-shot
 # ``.sum()`` reductions; it does NOT delegate to the rows below, because float32 one-shot reductions
 # are not bitwise associative with the row-then-query reductions the evaluator performs. The rows and
-# the evaluator are the SINGLE typed boundary the diagnostics route their belief assembly through, so
-# the belief rows are no longer summed into the total by hand at each call site.
+# the evaluator are test oracles like the scalar: their one caller, ``metrics.free_energy_terms``, is
+# called only by tests. The projected routes' canonical diagnostic
+# (``VFEModel._canonical_free_energy_diagnostics``) sums its own float64 rows from
+# :func:`canonical_routing_rows` and does not route through them (audit 2026-10-16 F92).
 # ===========================================================================
 
 class BeliefFreeEnergyRows(NamedTuple):
@@ -521,7 +526,12 @@ class CanonicalRoutingRows(NamedTuple):
     r"""Per-head rows of the canonical routing block (float64; heads indexed by ``irrep_dims``).
 
     ``belief_coupling`` is :math:`\sum_j\beta^*_{ij}D_{ij}` and ``attention_entropy`` is
-    :math:`\tau_h\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})`, both unweighted by :math:`\lambda_\beta`;
+    :math:`\tau_h\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})`, both unweighted by :math:`\lambda_\beta`. Their sum
+    is :math:`-\tau_h\log Z_i`, :math:`\tau_h` times the unit-temperature row free energy
+    :math:`\mathrm{KL}(\beta^*_{i\cdot}\|\pi_{i\cdot}) + \tau_h^{-1}\sum_j\beta^*_{ij}D_{ij}` of the record joint
+    (supplement, Eq. rg_bridge_row), so adding these rows to a unit-weight self term gives a tempered functional
+    rather than that joint's negative ELBO; the rows carry the joint's unit weight only at :math:`\tau_h = 1`
+    (audit 2026-10-16 F46);
     ``log_partition`` is :math:`\log Z_i`, :math:`-\infty` on a row with no admissible source (whose two
     rows are zero) and NaN on a row that reads a failed factorization, whose router and two rows are then
     NaN too (audit 2026-10-10 round 2, item 38)."""
