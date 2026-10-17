@@ -254,6 +254,31 @@ def _pullback_group_compact_blocks(group: GaugeGroup) -> bool:
     )
 
 
+def _pullback_group_local_head_blocks(
+    coordinates: torch.Tensor,               # (A, n_gen) float64 chart coordinates
+    group:       GaugeGroup,
+) -> Optional[torch.Tensor]:                 # (A, H, d, d) head blocks, or None off the block-local route
+    r"""Head blocks :math:`M_h = \sum_a \varphi_{(h,a)} L_a` of a certified block-local group, else None.
+
+    ``block_so``, ``block_co``, ``block_sl``, ``block_borel``, ``block_unipotent`` and ``block_glmc``
+    copy one (m, d, d) local basis :math:`L` into each of ``H`` equal head blocks, head-major, so the
+    coordinates of head ``h`` are the contiguous run ``[h m, (h + 1) m)``. The cached float64 cast of
+    the local basis (rounded to the stored dtype first, so it equals ``generators.to(float64)`` entry
+    for entry) replaces the dense (H m, K, K) basis, whose float64 copy the residual check used to make
+    on every backtracking attempt (audit 2026-10-16, F29).
+    """
+    local = group.certified_block_local_basis()
+    if local is None:
+        return None
+    n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
+    basis = group._local_basis_as(torch.float64, coordinates.device)          # (m, d, d)
+    return torch.einsum(
+        "ahm,mij->ahij",
+        coordinates.reshape(-1, n_blocks, basis.shape[0]),
+        basis,
+    )
+
+
 def _pullback_group_current_element(
     phi:   torch.Tensor,                     # (active, n_gen) current chart
     group: GaugeGroup,
@@ -264,10 +289,18 @@ def _pullback_group_current_element(
     change while the trust factor is halved; only ``delta`` and ``candidate_phi`` do. Recomputing
     this exponential inside the residual check cost up to ``max_backtracks`` redundant
     ``matrix_exp`` calls on the whole active batch per M-step.
+
+    The layout matches the per-block direction's ``current_element``: ``(A, H, d, d)`` head blocks
+    for the per-head ``block_glk`` basis and for a block-local group with ``H > 1``, ``(A, K, K)``
+    otherwise (a one-block block-local group is its own local basis).
     """
     if _pullback_group_compact_blocks(group):
         n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
         return torch.linalg.matrix_exp(phi.reshape(-1, n_blocks, block_dim, block_dim))
+    blocks = _pullback_group_local_head_blocks(phi, group)                    # (A, H, d, d) or None
+    if blocks is not None:
+        element = torch.linalg.matrix_exp(blocks)
+        return element if blocks.shape[-3] > 1 else element[..., 0, :, :]
     generators = group.generators.to(device=phi.device, dtype=torch.float64)
     return torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, generators))
 
@@ -278,8 +311,10 @@ def _dense_group_element(
 ) -> torch.Tensor:                           # (..., K, K)
     r"""A dense group element, assembling direct-sum blocks when the per-block direction reported them.
 
-    A group whose basis is not the elementary block basis (block_so, block_co, block_sl, block_borel, block_unipotent, block_glmc) is staged densely
-    while its per-block direction reports :math:`\exp(\varphi)` as blocks (audit 2026-10-07, F47).
+    A block-diagonal group without a blockwise residual route (a basis replaced or mutated after
+    construction, which withdraws the block-local certificate) is staged densely while its per-block
+    direction reports :math:`\exp(\varphi)` as blocks (audit 2026-10-07, F47); the collect-step frame
+    displacement also assembles both elements when their layouts differ.
     """
     if element.shape[-1] == K and element.shape[-2] == K:
         return element
@@ -288,6 +323,29 @@ def _dense_group_element(
     for h in range(element.shape[-3]):
         dense[..., h * d:(h + 1) * d, h * d:(h + 1) * d] = element[..., h, :, :]
     return dense
+
+
+def _group_element_head_blocks(
+    element:   torch.Tensor,                 # (A, H, d, d) head blocks, or (A, K, K) block-diagonal
+    n_blocks:  int,
+    block_dim: int,
+) -> torch.Tensor:                           # (A, H, d, d)
+    r"""The diagonal head blocks of a block-diagonal group element; the inverse of :func:`_dense_group_element`.
+
+    A one-block direction reports :math:`\exp(\varphi)` as ``(A, K, K)``; it is read as ``(A, 1, K, K)``.
+    """
+    if element.ndim == 4 and tuple(element.shape[-3:]) == (n_blocks, block_dim, block_dim):
+        return element
+    K = n_blocks * block_dim
+    if element.ndim != 3 or tuple(element.shape[-2:]) != (K, K):
+        raise ValueError(
+            f"expected a (A, {n_blocks}, {block_dim}, {block_dim}) or (A, {K}, {K}) group element, got "
+            f"{tuple(element.shape)}")
+    return torch.stack(
+        [element[:, h * block_dim:(h + 1) * block_dim, h * block_dim:(h + 1) * block_dim]
+         for h in range(n_blocks)],
+        dim=-3,
+    )
 
 
 def _pullback_group_product_residual(
@@ -300,16 +358,24 @@ def _pullback_group_product_residual(
 
     ``current_element`` is supplied by the caller rather than recomputed, so a backtracking loop
     pays one ``exp(phi)`` instead of one per attempt (audit 2026-08-07). Value-identical.
+
+    Block-diagonal groups compare head blocks: the per-head ``block_glk`` chart reshapes into them, a
+    block-local chart embeds through its local basis (audit 2026-10-16, F29). Off the blocks both
+    elements vanish, so the summed block Frobenius norms equal the dense ones up to roundoff.
     """
-    if _pullback_group_compact_blocks(group):
+    compact = _pullback_group_compact_blocks(group)
+    local_blocks = None if compact else _pullback_group_local_head_blocks(candidate_phi, group)
+    if compact or local_blocks is not None:
         n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
-
-        def _blocks(coordinates: torch.Tensor) -> torch.Tensor:
-            return coordinates.reshape(-1, n_blocks, block_dim, block_dim)
-
-        candidate_element = torch.linalg.matrix_exp(_blocks(candidate_phi))
-        right_element = torch.linalg.matrix_exp(_blocks(delta))
-        reference = current_element @ right_element
+        if compact:
+            candidate_blocks = candidate_phi.reshape(-1, n_blocks, block_dim, block_dim)
+            delta_blocks = delta.reshape(-1, n_blocks, block_dim, block_dim)
+        else:
+            candidate_blocks = local_blocks                                   # (A, H, d, d)
+            delta_blocks = _pullback_group_local_head_blocks(delta, group)    # (A, H, d, d)
+        candidate_element = torch.linalg.matrix_exp(candidate_blocks)
+        right_element = torch.linalg.matrix_exp(delta_blocks)
+        reference = _group_element_head_blocks(current_element, n_blocks, block_dim) @ right_element
         error_sq = (candidate_element - reference).square().sum(dim=(-3, -2, -1))
         reference_sq = reference.square().sum(dim=(-3, -2, -1))
         return error_sq.sqrt() / reference_sq.sqrt().clamp_min(torch.finfo(torch.float64).tiny)
@@ -1746,7 +1812,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     committed_element = _pullback_group_current_element(
                         candidate.candidate_phi, self._group)
                     if committed_element.shape != current_element.shape:
-                        K = self._group.generators.shape[-1]
+                        K = self._group.generator_shape[-1]           # no dense basis read
                         current_element = _dense_group_element(current_element, K)
                         committed_element = _dense_group_element(committed_element, K)
                     frame_displacement_acc.append(torch.linalg.vector_norm(
