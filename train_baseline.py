@@ -344,7 +344,9 @@ def lr_sweep(
     r"""Short runs at each peak learning rate; the winner has the lowest best validation perplexity.
 
     Every run keeps the protocol of ``cfg`` except ``lr`` and ``max_steps`` (the warmup is capped at
-    ``max_steps``); selection reads only ``summary.json`` ``best_val_ppl`` (validation).
+    ``max_steps``); selection reads only ``summary.json`` ``best_val_ppl`` (validation). ``at_grid_edge`` is True
+    when the winner is the lowest or highest swept rate, so the grid does not bracket the optimum (None without a
+    winner). The edge is that of the swept grid, so a diverged rate beyond the winner brackets it.
     """
     rows = []
     for lr in lrs:
@@ -359,8 +361,10 @@ def lr_sweep(
     finite = [row for row in rows if isinstance(row["best_val_ppl"], (int, float))
               and math.isfinite(row["best_val_ppl"])]
     best = min(finite, key=lambda row: row["best_val_ppl"]) if finite else None
+    swept_lrs = [float(lr) for lr in lrs]
+    at_grid_edge = (best["lr"] in (min(swept_lrs), max(swept_lrs))) if best else None
     return {"rows": rows, "best_lr": (best["lr"] if best else None), "selection": "best_val_ppl",
-            "max_steps": int(max_steps)}
+            "at_grid_edge": at_grid_edge, "max_steps": int(max_steps)}
 
 
 def calibrate_widths(
@@ -488,6 +492,9 @@ def main() -> None:
         if sweep["best_lr"] is not None:
             cfg = replace(cfg, lr=sweep["best_lr"])
             logger.info("lr sweep: selected lr=%g on validation", sweep["best_lr"])
+            if sweep["at_grid_edge"]:
+                logger.warning("lr sweep: the selected lr=%g is at the edge of LR_SWEEP; the optimum may lie "
+                               "outside the grid, so extend it before trusting this rate", sweep["best_lr"])
     for seed in SEEDS:
         run_baseline(cfg, dataset=DATASET, out_root=out_root, seed=int(seed), data_seed=DATA_SEED,
                      label=(f"{LABEL}_s{seed}" if LABEL else None), **run_kwargs)
