@@ -58,9 +58,13 @@ def _transport(
 ) -> 'torch.Tensor | CompactFactoredTransport | FactoredTransport':
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
-    The build is config-selected through ``get_transport(transport_mode)``; 'flat' is the
+    The build goes through ``get_transport_registration(transport_mode)``; 'flat' is the
     phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j) (byte-identical to a direct
-    ``compute_transport_operators`` call). ``gauge_mode`` is
+    ``compute_transport_operators`` call). No configuration selects another key: ``transport_mode`` is a
+    retired field pinned to 'flat', the one production registration, so the registration-metadata
+    branches below (``batch_independent``, and ``needs_mu``/``needs_sigma`` in
+    :func:`build_belief_transport`) run only for transports registered by tests (audit 2026-10-16
+    F94). ``gauge_mode`` is
     forwarded to the builder (audit 2026-06-10 F6: previously dropped, so the builders always saw
     the 'learned' default).
 
@@ -112,8 +116,8 @@ def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
     The fused factored route is valid ONLY when the connection is flat
     (its Omega is mu-independent, so it need not stay dense) AND
     the group is genuinely block-diagonal with EQUAL blocks (``len(irrep_dims) > 1`` and all blocks
-    the same size -- block_glk / tied_block_glk). Single-block (glk, so_k, cross-coupled block_glk
-    all report ``irrep_dims=[K]``) keeps the dense path.
+    the same size, e.g. block_glk or so_n with one equal irrep block per head). A single-block group
+    (``irrep_dims=[K]``, e.g. one head) or an unequal irrep tower keeps the dense path.
     """
     return (
         transport_mode == "flat"
