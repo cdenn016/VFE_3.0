@@ -1735,7 +1735,8 @@ def compute_matched_config(
         if found is not None:
             runs.append(found)
         else:
-            reason = "; ".join(f"{entry['run']}: {entry['reason']}" for entry in (*stale, *failed))                 or "no complete run"
+            reason = ("; ".join(f"{entry['run']}: {entry['reason']}" for entry in (*stale, *failed))
+                      or "no complete run")
             missing_pairs.append(f"({s}, {d}): {reason}")
     rule_path = exp_dir / plan.slug / WIDTH_RULE_FILE
     if rule_path.is_file():
