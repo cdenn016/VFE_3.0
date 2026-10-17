@@ -9,9 +9,10 @@ BASES. Each arm is a declared change of one base configuration, read from the ba
 ``config.json`` with :func:`vfe3.legacy_config.lenient_config_from_serialized`. Fields a newer code
 line retired are dropped and recorded; a field the record lacks whose default was flipped after it
 was introduced takes its introduction-time value from the loader
-(``vfe3.config._HISTORICAL_DEFAULT_PINS``, listed as pinned), so the arms never inherit a default
-flip; every other field the record lacks takes the current default and is listed. Every base is its
-own experiment with its own directory and manifest.
+(``vfe3.config._HISTORICAL_DEFAULT_PINS``, or a migration keyed on the record's era; listed as
+pinned), so the arms never inherit a default flip; a selector the loader merged from historical keys
+the record carries is listed as migrated; every other field the record lacks takes the current
+default and is listed. Every base is its own experiment with its own directory and manifest.
 
 BUDGET. ``base_protocol``: the base run's own ``max_steps`` and ``eval_interval``, with
 ``checkpoint_interval = max_steps``. ``one_epoch``:
@@ -29,7 +30,10 @@ resolved base config) and the fields the config itself coerces as a documented c
 differs from the resolved base in the declared fields and the documented coercions only, and that
 every declared value survived validation. A baseline arm declares a ``vfe3.baseline`` spec; its
 protocol fields (tokenizer, context, stride, budget, cadence, shape, prior, decoder) must equal the
-base's except where declared. Rules:
+base's except where declared. Precision is compared by its effect (:func:`effective_precision`): a base
+recorded with ``amp_dtype='bf16'`` on a route that computes in float32 is matched by a float32 baseline,
+and a bf16 baseline against it is a declared deviation, as is a VFE arm that changes the precision (the
+linear decoder under ``decode_logits_amp``). Rules:
 
 * Stored-covariance decay. "Decayed" keeps the base's ``sigma_weight_decay``; "without decay" sets
   it to 0. For a base whose decay is already 0 (``full_K64``) the row "Learned frames, stored
@@ -52,10 +56,16 @@ base's except where declared. Rules:
   reference moments (xi, C), so its frames are removable and the frame-free table arm is its equivalent.
   A base the validator does not admit these on resolves them as invalid with the validator's reason.
 * LayerNorm and MLP in reference coordinates: ``block_coordinates='reference'`` (the decoder stays
-  local; one change). On a base without a LayerNorm it conjugates the MLP alone.
+  local; one change). On a base without a LayerNorm it conjugates the MLP alone. On a
+  ``gaussian_diagonal`` base with ``block_norm_covariance='pushforward'`` it also declares
+  ``'passthrough'``: the reference-coordinate norm of the diagonal family maps the mean only (the field
+  is inert there, as the plan notes), so on that base the arm also gives up the base's covariance
+  pushforward, a declared second difference.
 * Intertwiner-constrained block: ``block_mlp_mode='gauge_gate'``, the block (and final) LayerNorm
   replaced by ``'mahalanobis'`` where the base has one (``'none'`` stays), and
-  ``decode_coordinates='reference'``.
+  ``decode_coordinates='reference'``. Where it replaces the LayerNorm it also declares
+  ``block_norm_covariance='passthrough'``: the LayerNorm Jacobian pushforward has no Mahalanobis
+  counterpart, so the field is inert under the replaced norm.
 * Word level: dataset ``wikitext-103-word-eos`` (the published stream, one ``<eos>`` per line), the
   vocabulary size from its sidecar, ``decode_ce_checkpoint='auto_aggregate'``, and the one-epoch budget over
   the word training split under either selected budget (:data:`WORD_LEVEL_BUDGET`). The conventional word arm is matched to the Gaussian word arm.
@@ -66,7 +76,9 @@ base's except where declared. Rules:
   measured train-only device-hours of those runs; every width of the pre-declared ladder
   (``width_ladder`` multiples of the matched width, whole 32-dim heads) gets a
   ``calibration_steps`` calibration run whose median train-step throughput feeds
-  ``vfe3.baseline.width_ladder_rule``, which picks the width and ``max_steps``; the rule's record is
+  ``vfe3.baseline.width_ladder_rule``, which picks the width and ``max_steps`` and transfers the
+  hidden-matrix learning rate to it as the total-matched arm does (``hidden_lr_scale`` K_0/K, recorded in
+  the row's ``changes`` and, at a width other than K_0, as "lr not tuned at this width"); the rule's record is
   written once to ``<arm dir>/width_rule.json`` and reused by every later launch (a relaunch after
   more evaluated runs complete does not change the rule under finished runs). Calibration runs are
   reused only when their config is the matched arm's at that width, and must share the evaluated
@@ -112,13 +124,19 @@ SEEDS: ``seeds`` lists ints (``data_seed = seed``) or explicit ``(seed, data_see
 by every arm so replicates are paired across arms. Under the ``base_protocol`` budget the evaluated
 arm's replicate whose pair equals the base run's own ``(seed, data_seed)`` is the base run itself: it is
 reused (skipped in training, listed in the manifest, and read by the compute-matched rule when its
-config passes :func:`reuse_mismatch`) rather than retrained; the plan notes when its recorded code
-identity is not the current tree's.
+config passes :func:`reuse_mismatch`, which ignores the base's own checkpoint cadence,
+:data:`BASE_REUSE_IGNORED_FIELDS`) rather than retrained; the plan claims the reuse only when that check
+passes, notes the reason when it does not (the launch then refuses while the base blocks the pair), and
+notes when the base's recorded code identity is not the current tree's.
 
 LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/``. An (arm,
 seed) pair whose run directory already holds a complete ``summary.json`` (finite ``test_ce``) and
 whose saved config, dataset and seeds are the plan's (:func:`reuse_mismatch`) is skipped; a complete
-run that differs is reported as stale, and a launch refuses to train while one blocks a pair. After every run the manifest ``<out_root>/<base>/<budget>/m2_manifest.json`` is rewritten
+run that differs is reported as stale, and a launch refuses to train while one blocks a pair. Several
+complete runs of one pair select none (the folder names begin with the test PPL, so their order is a
+result): each is reported as stale and blocks the launch. A finished run of the plan's config whose test
+CE is not finite (a divergence) is a recorded failure, listed under ``paper_arms.rows[label]["failed"]``
+and never retrained by a relaunch. After every run the manifest ``<out_root>/<base>/<budget>/m2_manifest.json`` is rewritten
 with every row of the table (rows without complete runs stay pending); pass it to
 ``python paper_artifacts.py <manifest>``. A listed run whose recorded code identity is not the
 current tree's (:func:`vfe3.paper.runs.code_identity_mismatch`) is kept, not rejected, and flagged
@@ -157,15 +175,18 @@ CONFIG: Dict[str, Any] = {
                                            # 3e-3 is the validation choice of the October 6 sweep
 }
 
+# Archived runs live under D:/DATA_KEEP/<date>_experiments/ (paths checked 2026-10-17); a base whose
+# directory is gone is reported unavailable by main(), which plans the other selected bases.
 BASES: Dict[str, str] = {
     # K=128 exponential chart, 6 layers, RoPE, chunked diagonal decoder, no attention residual,
     # 120,000 steps (32.65 test PPL).
-    "k128_diag_chunked": "vfe3_runs/32.65_wikitext-103_K128_diag-chunked_exp",
+    "k128_diag_chunked": "D:/DATA_KEEP/10-10-2026_experiments/32.65_wikitext-103_K128_diag-chunked_exp",
     # The earlier evaluated K=128 exponential-chart run (34.48 test PPL, linear decoder, 4 layers).
-    "k128_exp":  "vfe3_runs/34.48_wikitext-103_K128_linear-exp",
+    "k128_exp":  "D:/DATA_KEEP/10-10-2026_experiments/34.48_wikitext-103_K128_linear-exp",
     # Bases of the earlier study (not paper results).
-    "diag_K128": "D:/DATA_KEEP/39.77_wikitext-103_K128_n=128",
-    "diag_K64":  "D:/DATA_KEEP/52.91_wikitext-103_K64_n=128",
+    "diag_K128": "D:/DATA_KEEP/9-2026_Older_Experiments/39.77_wikitext-103_K128_n=128",
+    "diag_K64":  "D:/DATA_KEEP/9-2026_Older_Experiments/52.91_wikitext-103_K64_n=128_4-layers",
+    # Not found on this machine on 2026-10-17 (neither here nor under D:/DATA_KEEP).
     "full_K64":  "vfe3_runs/Full_Gaussian_mom-match_Template_routing/"
                  "55.07_wikitext-103_K64_moment_matched_noAtnnRes",
 }
@@ -204,6 +225,32 @@ def _covariant_norm(name: str) -> Callable[[Any], str]:
         current = getattr(base, name)
         return "mahalanobis" if current == "layernorm" else current
     return value
+
+
+# Families whose reference-coordinate block norm pushes the covariance (audit 2026-10-10 round 2, item 51).
+_REFERENCE_PUSHFORWARD_FAMILIES: Tuple[str, ...] = ("gaussian_full", "gaussian_block")
+
+
+def _norm_covariance_without_layernorm(base: Any) -> str:
+    r"""``'passthrough'`` where the arm replaces the base's block LayerNorm, the base value otherwise.
+
+    ``block_norm_covariance='pushforward'`` is the LayerNorm Jacobian pushforward; the Mahalanobis norm that
+    replaces the LayerNorm has none, so the recorded value is unread there and ``'passthrough'`` is the only
+    value the validator admits.
+    """
+    return "passthrough" if base.norm_type_block == "layernorm" else base.block_norm_covariance
+
+
+def _norm_covariance_in_reference_coordinates(base: Any) -> str:
+    r"""``'passthrough'`` where the base family has no reference-coordinate pushforward, the base value otherwise.
+
+    In reference coordinates the block norm pushes the dense :math:`C = U^{-1} \Sigma U^{-T}` and maps it back
+    as :math:`U C' U^{T}`, which only the full and head-block families keep; on ``gaussian_diagonal`` the
+    reference-coordinate norm maps the mean only, so a recorded ``'pushforward'`` is unread there.
+    """
+    if base.family in _REFERENCE_PUSHFORWARD_FAMILIES:
+        return base.block_norm_covariance
+    return "passthrough"
 
 
 def _word_vocab_size(base: Any) -> int:
@@ -380,15 +427,20 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "Frames frozen at their random initialization": {
         "group": _RETRAINING, "slug": "frozen_frames", "vfe": {"gauge_transport": "frozen"},
         "coerced": ("m_phi_lr",), "inapplicable": _already("gauge_transport", "frozen")},
+    # On some bases both arms leave the LayerNorm covariance pushforward unread; they then declare the
+    # passthrough the validator admits (a declared difference on a pushforward base, noted as inert).
     "LayerNorm and MLP in reference coordinates": {
-        "group": _RETRAINING, "slug": "reference_block", "vfe": {"block_coordinates": "reference"},
-        "requires": ("block_coordinates",), "inapplicable": _no_ln_or_mlp},
+        "group": _RETRAINING, "slug": "reference_block",
+        "vfe": {"block_coordinates": "reference",
+                "block_norm_covariance": _norm_covariance_in_reference_coordinates},
+        "requires": ("block_coordinates", "block_norm_covariance"), "inapplicable": _no_ln_or_mlp},
     "Intertwiner-constrained nonlinear block": {
         "group": _RETRAINING, "slug": "intertwiner_block",
         "vfe": {"block_mlp_mode": "gauge_gate",
                 "norm_type_block": _covariant_norm("norm_type_block"),
+                "block_norm_covariance": _norm_covariance_without_layernorm,
                 "decode_coordinates": "reference"},
-        "requires": ("decode_coordinates",), "inapplicable": _no_mlp_or_reference_decode},
+        "requires": ("decode_coordinates", "block_norm_covariance"), "inapplicable": _no_mlp_or_reference_decode},
     # Audit 2026-10-09 round 2 items 4 and 12: frames are pure gauge wherever every consumer reads (xi, C),
     # so there a learned-frame model equals the frame-free per-type (xi_v, C_v) table. The head-block family
     # makes the routing projection closed under block-GL congruence; the covariant stack (three declared
@@ -493,9 +545,10 @@ TIER_B: Tuple[str, ...] = (
     "Covariance-blind routing (mean distance)",
 )
 
-# Fields the compute-matched baseline changes by construction (width rule, calibrated steps, cadence).
+# Fields the compute-matched baseline changes by construction (width rule, calibrated steps, cadence, and
+# the hidden-matrix lr scale the rule transfers to the chosen width, audit 2026-10-16 F20).
 COMPUTE_MATCHED_FIELDS: Tuple[str, ...] = (
-    "embed_dim", "n_heads", "max_steps", "eval_interval", "checkpoint_interval")
+    "embed_dim", "n_heads", "max_steps", "eval_interval", "checkpoint_interval", "hidden_lr_scale")
 # Fields the total-parameter-matched baseline changes by construction (vfe3.baseline.total_parameter_width).
 TOTAL_MATCHED_FIELDS: Tuple[str, ...] = ("embed_dim", "n_heads")
 # The compute-matched arm's rule record, written once in its arm directory and reused by later launches.
@@ -510,6 +563,10 @@ class ArmDefinitionError(AssertionError):
     r"""An arm's resolved config differs from the base in an undeclared way (a defect of ARMS)."""
 
 
+class BaseUnavailableError(FileNotFoundError):
+    r"""A :data:`BASES` entry whose run directory holds no ``config.json`` (moved, renamed or deleted)."""
+
+
 @dataclass
 class Base:
     r"""One base run: its loaded config and the facts the plan reports about it."""
@@ -520,11 +577,14 @@ class Base:
     dataset:          str
     dropped:          Dict[str, Any] = field(default_factory=dict)   # retired fields dropped on load
     pinned:           Dict[str, Any] = field(default_factory=dict)   # absent fields the loader pins -> value
-    defaulted:        List[str] = field(default_factory=list)        # fields the record lacks
+    migrated:         Dict[str, Any] = field(default_factory=dict)   # selectors merged from recorded keys -> value
+    defaulted:        List[str] = field(default_factory=list)        # absent fields at the current default
     recorded_params:  Optional[int] = None                           # config.json n_params
     tokens_per_s:     Optional[float] = None                         # measured wall-clock throughput
     throughput_source: Optional[str] = None
     data_seed:        Optional[int] = None                           # provenance.json data-order seed
+    train_window_mode: str = "unknown"                               # training-window origin the base ran
+    train_window_evidence: str = ""                                  # how train_window_mode was determined
 
 
 def _quiet_config(build: Callable[[], Any]) -> Any:
@@ -533,40 +593,96 @@ def _quiet_config(build: Callable[[], Any]) -> Any:
         return build()
 
 
+def _merged_selector_sources() -> Dict[str, Tuple[str, ...]]:
+    r"""``{surviving selector: historical keys}`` for the selectors ``config_from_serialized`` merges.
+
+    A record that carries any of the historical keys had the surviving selector derived from them, whatever
+    value it took, so the selector is migrated, not defaulted.
+    """
+    from vfe3.config import _FRAME_PAIR_FIELDS, _PROJECTED_FACTORIZATION_FIELDS, _ROPE_FIELDS
+
+    return {"attention_mode": ("relational_mode", "relational_readout_mode"),
+            "projected_factorization": tuple(_PROJECTED_FACTORIZATION_FIELDS),
+            "rope_mode": tuple(_ROPE_FIELDS),
+            "frame_pair_escalation_tol": tuple(_FRAME_PAIR_FIELDS)}
+
+
+def _loader_chosen(cfg: Any, raw: Mapping[str, Any], known: Sequence[str], source: str) -> Dict[str, Any]:
+    r"""Fields ``raw`` lacks whose loaded value the loader chose instead of the current default.
+
+    This catches a conditional migration of an absent field (one keyed on the record's era, which no
+    table lists). A field whose loaded value equals its dataclass default is a default. Any other is
+    rebuilt alone at its default: a value ``VFE3Config.__post_init__`` resolves or coerces from the
+    record's own fields (``kl_max = 8 K``, the ``gauge_transport='off'`` frame fields) comes back
+    unchanged and is a default too; a value that comes back different, or a default the validator
+    refuses, was set by the loader.
+    """
+    from vfe3.config import VFE3Config, config_from_serialized, serialize_config
+
+    serialized = serialize_config(cfg)
+    chosen: Dict[str, Any] = {}
+    for spec in dataclasses.fields(VFE3Config):
+        if spec.name in raw or spec.name in known or spec.default is dataclasses.MISSING:
+            continue
+        value = getattr(cfg, spec.name)
+        if value == spec.default:
+            continue
+        probe_payload = {**serialized, spec.name: spec.default}
+        try:
+            probe = _quiet_config(lambda: config_from_serialized(probe_payload, source=source))
+        except (ValueError, TypeError):
+            chosen[spec.name] = value
+            continue
+        if getattr(probe, spec.name) != value:
+            chosen[spec.name] = value
+    return chosen
+
+
 def load_base(name: str, path: Union[str, Path]) -> Base:
     r"""Load a base run's config (lenient) and its measured throughput.
 
     A field the record lacks whose default was flipped after its introduction is pinned by the loader
-    (``vfe3.config._HISTORICAL_DEFAULT_PINS``, applied by ``config_from_serialized``) and listed in
-    ``pinned`` with its pinned value; every other absent field is listed in ``defaulted``.
+    (``vfe3.config._HISTORICAL_DEFAULT_PINS``, applied by ``config_from_serialized``), and so is one a
+    conditional migration of the loader sets from the record's era (:func:`_loader_chosen`); both are
+    listed in ``pinned`` with the value the base loads with. A selector the loader merged from historical
+    keys the record carries is listed in ``migrated``; every other absent field is listed in ``defaulted``.
     """
     from vfe3.config import _HISTORICAL_DEFAULT_PINS, VFE3Config
+    from vfe3.experiment import saved_train_window_mode
     from vfe3.legacy_config import lenient_config_from_serialized
 
     run_dir = Path(path)
     if not run_dir.is_absolute():
         run_dir = ROOT / run_dir
+    if not (run_dir / "config.json").is_file():
+        raise BaseUnavailableError(f"base {name!r}: {run_dir} holds no config.json (moved, renamed or deleted; "
+                                   "update its BASES entry)")
+    source = str(run_dir / "config.json")
     record = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     raw = dict(record.get("config", record))
-    cfg, dropped = _quiet_config(
-        lambda: lenient_config_from_serialized(raw, source=str(run_dir / "config.json")))
-    pinned = {key: value for key, value in _HISTORICAL_DEFAULT_PINS.items() if key not in raw}
-    present = set(raw) | set(pinned)
-    if present & {"relational_mode", "relational_readout_mode"}:
-        present.add("attention_mode")                     # migrated from the historical pair
+    cfg, dropped = _quiet_config(lambda: lenient_config_from_serialized(raw, source=source))
+    pinned = {key: getattr(cfg, key) for key in _HISTORICAL_DEFAULT_PINS if key not in raw}
+    migrated = {selector: getattr(cfg, selector) for selector, keys in _merged_selector_sources().items()
+                if selector not in raw and any(key in raw for key in keys)}
+    pinned.update(_loader_chosen(cfg, raw, [*pinned, *migrated], source))
+    present = set(raw) | set(pinned) | set(migrated)
     defaulted = sorted(f.name for f in dataclasses.fields(VFE3Config) if f.name not in present)
     dataset = record.get("dataset")
     if not isinstance(dataset, str) or not dataset:
         raise ValueError(f"{run_dir / 'config.json'} records no dataset")
     base = Base(name=name, run_dir=run_dir, cfg=cfg, dataset=dataset, dropped=dict(dropped),
-                pinned=pinned, defaulted=defaulted,
+                pinned=pinned, migrated=migrated, defaulted=defaulted,
                 recorded_params=record.get("n_params") if isinstance(record.get("n_params"), int) else None)
     provenance_path = run_dir / "provenance.json"
+    provenance: Any = {}
     if provenance_path.is_file():
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         seed_value = provenance.get("data_seed") if isinstance(provenance, dict) else None
         if isinstance(seed_value, int) and not isinstance(seed_value, bool):
             base.data_seed = seed_value
+    # The loaders drop the retired train_window_offset, so the protocol is read from the raw records.
+    base.train_window_mode, base.train_window_evidence = saved_train_window_mode(
+        raw, provenance if isinstance(provenance, dict) else {})
     summary_path = run_dir / "summary.json"
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -657,6 +773,33 @@ def check_vfe_arm(
     return diff
 
 
+def effective_precision(cfg: Any) -> str:
+    r"""The precision ``cfg`` computes in: its ``amp_dtype``, or ``"float32"`` without autocast.
+
+    A VFE config whose route runs every contraction in an autocast-disabled fp32 island marks
+    ``amp_dtype`` inert (:meth:`vfe3.config.VFE3Config.inactive_fields`; only the linear decode's logits
+    under ``decode_logits_amp`` and the CG coupling consume it), so a recorded ``'bf16'`` computes in
+    float32 there. A baseline's blocks run under any ``amp_dtype`` it sets.
+    """
+    amp = getattr(cfg, "amp_dtype", None)
+    if amp is None:
+        return "float32"
+    inactive = getattr(cfg, "inactive_fields", None)
+    if callable(inactive) and "amp_dtype" in inactive():
+        return "float32"
+    return str(amp)
+
+
+def _amp_consumers(cfg: Any) -> List[str]:
+    r"""What runs under ``cfg.amp_dtype`` on a VFE route that makes it live."""
+    consumers: List[str] = []
+    if getattr(cfg, "decode_mode", None) == "linear" and getattr(cfg, "decode_logits_amp", False):
+        consumers.append("decode_logits_amp=True runs the linear decode's logits matmul under it")
+    if getattr(cfg, "use_cg_coupling", False):
+        consumers.append("use_cg_coupling runs the CG coupling's moment contraction under it")
+    return consumers
+
+
 def check_baseline_arm(
     matched_cfg:  Any,
     baseline_cfg: Any,
@@ -665,13 +808,19 @@ def check_baseline_arm(
     r"""Assert the baseline's protocol fields equal the matched VFE config's except ``declared``.
 
     Returns ``{BaselineConfig field: (VFE value, baseline value)}`` of the declared differences.
+    ``amp_dtype`` is compared by :func:`effective_precision` (audit 2026-10-16 F58): a VFE base recorded
+    with ``'bf16'`` on a route that computes in float32 is matched by a float32 baseline, and a bf16
+    baseline against it is a difference ``("float32", "bf16")``.
     """
     declared = set(declared)
     diff: Dict[str, Tuple[Any, Any]] = {}
     for name, vfe_name in BASELINE_PROTOCOL_FIELDS.items():
         if not hasattr(baseline_cfg, name) or not hasattr(matched_cfg, vfe_name):
             continue
-        a, b = getattr(matched_cfg, vfe_name), getattr(baseline_cfg, name)
+        if name == "amp_dtype":
+            a, b = effective_precision(matched_cfg), effective_precision(baseline_cfg)
+        else:
+            a, b = getattr(matched_cfg, vfe_name), getattr(baseline_cfg, name)
         if a != b:
             diff[name] = (a, b)
     # The baseline's rotary positions match a VFE rope_mode other than "none".
@@ -872,6 +1021,15 @@ def resolve_arm(
         # A base value no path read becomes live under the arm (e.g. a recorded hidden-bias rate).
         plan.notes.extend(f"{key}={getattr(plan.cfg, key)!r} is inert on the base and live in this arm"
                           for key in sorted(set(base_cfg.inactive_fields()) - set(inert)))
+        precision = (effective_precision(base_cfg), effective_precision(plan.cfg))
+        if precision[0] != precision[1]:
+            # Audit 2026-10-16 F58: a changed precision is a second difference of the arm, recorded as one.
+            consumers = _amp_consumers(plan.cfg if precision[1] != "float32" else base_cfg)
+            deviation = (f"precision: the base computes in {precision[0]} and this arm in {precision[1]} "
+                         f"(amp_dtype={plan.cfg.amp_dtype!r}"
+                         + (f"; {'; '.join(consumers)}" if consumers else "") + ")")
+            plan.deviations.append(deviation)
+            plan.notes.append(f"declared difference: {deviation}")
         for seed, _ in seeds:
             _with_seed(plan.cfg, seed)                      # validates every seed's config
         if counts:
@@ -886,6 +1044,45 @@ def resolve_arm(
     if plan.kind == "vfe" and base.tokens_per_s:
         plan.est_hours = plan.tokens / base.tokens_per_s / 3600.0
     return plan
+
+
+LR_NOT_TUNED = "lr not tuned at this width"
+
+
+def _lr_transfer_deviation(unscaled: Any, cfg: Any) -> str:
+    r"""The declared deviation of a baseline widened from ``unscaled`` (width :math:`K_0`) to ``cfg`` (:math:`K`).
+
+    Both width-changed Table M2 rows (total parameters and measured compute) keep the matched width's
+    peak lr, initialization and warmup and transfer the hidden-matrix lr muP-style,
+    :math:`s = s_0 K_0 / K` (:func:`vfe3.baseline.total_parameter_width`,
+    :func:`vfe3.baseline.width_ladder_rule`); a frozen rule computed without the transfer says so.
+    """
+    k0, k = int(unscaled.embed_dim), int(cfg.embed_dim)
+    if cfg.hidden_lr_scale != unscaled.hidden_lr_scale:
+        transfer = (f"the hidden-matrix lr is scaled by {k0}/{k} (hidden_lr_scale={cfg.hidden_lr_scale:g}, "
+                    "muP-style transfer, Yang et al. 2022, arXiv:2203.03466)")
+    else:
+        transfer = f"the hidden-matrix lr is not transferred (hidden_lr_scale={cfg.hidden_lr_scale:g})"
+    return f"{LR_NOT_TUNED}: the peak lr, initialization and warmup are width {k0}'s; {transfer}"
+
+
+def _record_width_rule(plan: ArmPlan, cfg: Any) -> Any:
+    r"""Check the compute-matched config ``cfg`` against the matched VFE config and record it in ``plan``.
+
+    The applied differences (width, heads, steps, cadence, hidden-matrix lr scale) go into ``plan.diff``
+    and, when the width changed, the lr deviation into ``plan.deviations`` (once), so the manifest row's
+    ``changes`` and ``declared_deviations`` describe the arm that is trained. Returns ``cfg``.
+    """
+    diff = check_baseline_arm(plan.matched_cfg, cfg, declared=(*COMPUTE_MATCHED_FIELDS, *plan.diff))
+    plan.diff.update(diff)
+    if cfg.hidden_lr_scale != plan.cfg.hidden_lr_scale:
+        plan.diff["hidden_lr_scale"] = (plan.cfg.hidden_lr_scale, cfg.hidden_lr_scale)
+    if cfg.embed_dim != plan.cfg.embed_dim:
+        deviation = _lr_transfer_deviation(plan.cfg, cfg)
+        if deviation not in plan.deviations:
+            plan.deviations.append(deviation)
+            plan.notes.append(f"declared difference: {deviation}")
+    return cfg
 
 
 def _resolve_baseline(
@@ -935,12 +1132,21 @@ def _resolve_baseline(
                           f"({rule['config'].n_heads} heads of {rule['head_dim']}) against the base's "
                           f"{target:,} ({100 * rule['relative_error']:+.2f}%)")
         if plan.cfg.embed_dim != unscaled.embed_dim:
-            deviation = (f"lr not tuned at this width: the peak lr, initialization and warmup are width "
-                         f"{unscaled.embed_dim}'s; the hidden-matrix lr is scaled by {unscaled.embed_dim}/"
-                         f"{plan.cfg.embed_dim} (hidden_lr_scale={plan.cfg.hidden_lr_scale:g}, muP-style "
-                         "transfer, Yang et al. 2022, arXiv:2203.03466)")
+            deviation = _lr_transfer_deviation(unscaled, plan.cfg)
             plan.deviations.append(deviation)
             plan.notes.append(f"declared difference: {deviation}")
+    precision = (effective_precision(matched), effective_precision(plan.cfg))
+    if precision[0] != precision[1]:
+        # Audit 2026-10-16 F58: declared, not hidden; baseline_overrides amp_dtype=None matches a float32 base.
+        declared += ("amp_dtype",)
+        recorded = (f" (its amp_dtype={matched.amp_dtype!r} is inert there)"
+                    if matched.amp_dtype is not None and precision[0] == "float32" else "")
+        deviation = (f"precision: the matched VFE config computes in {precision[0]}{recorded}, this baseline's "
+                     + (f"blocks under {precision[1]} autocast" if precision[1] != "float32" else "blocks in float32")
+                     + (" (baseline_overrides amp_dtype=None trains it in float32)" if precision[0] == "float32"
+                        else ""))
+        plan.deviations.append(deviation)
+        plan.notes.append(f"declared difference: {deviation}")
     # A protocol field set by the arm's own overrides is a declared difference.
     plan.diff = check_baseline_arm(matched, plan.cfg, declared=declared)
     if plan.cfg.hidden_lr_scale != 1.0:
@@ -969,6 +1175,9 @@ def _resolve_baseline(
         plan.reason = ("width and max_steps are set at run time by vfe3.baseline.width_ladder_rule from the "
                        "retrained evaluated arm's measured train device-hours and one calibration run per "
                        "ladder width; shown at the matched width and budget")
+        plan.notes.append(f"the width rule transfers the hidden-matrix lr to the chosen width K "
+                          f"(hidden_lr_scale = {plan.cfg.hidden_lr_scale:g} x {plan.cfg.embed_dim}/K); a width "
+                          f"other than {plan.cfg.embed_dim} is declared '{LR_NOT_TUNED}' when the rule is computed")
     if counts:
         plan.params = _baseline_counts(plan.cfg)
 
@@ -1007,17 +1216,36 @@ def build_plan(
         evaluated.notes.append(
             f"total parameters {total:,} equal the base record" if total == base.recorded_params
             else f"total parameters {total:,} differ from the base record {base.recorded_params:,}")
-    if (evaluated is not None and budget == "base_protocol" and base.data_seed is not None
-            and (int(base.cfg.seed), base.data_seed) in evaluated.seeds and is_complete(base.run_dir)):
+    if (evaluated is not None and evaluated.status == "ready" and budget == "base_protocol"
+            and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) in evaluated.seeds
+            and is_complete(base.run_dir)):
         from vfe3.paper.runs import code_identity_mismatch, load_run
 
-        evaluated.reused = [(int(base.cfg.seed), base.data_seed)]
-        evaluated.notes.append(f"seed pair {evaluated.reused[0]} is the base run itself and is reused, "
-                               "not retrained")
-        mismatch = code_identity_mismatch(load_run(base.run_dir))
-        if mismatch is not None:
-            evaluated.notes.append(f"the reused base run's code identity is not the current tree's ({mismatch}); "
-                                   "it is kept and flagged in the manifest")
+        pair = (int(base.cfg.seed), base.data_seed)
+        # The launch's own check (completed_run's base fallback), so the plan never claims a reuse the
+        # launch then rejects as stale (audit 2026-10-16 F19).
+        rejected = reuse_mismatch(base.run_dir, evaluated.cfg, dataset=str(evaluated.dataset), seed=pair[0],
+                                  data_seed=pair[1], ignored=BASE_REUSE_IGNORED_FIELDS)
+        if rejected is None:
+            evaluated.reused = [pair]
+            evaluated.notes.append(f"seed pair {pair} is the base run itself and is reused, not retrained")
+            if int(base.cfg.checkpoint_interval) != int(evaluated.cfg.checkpoint_interval):
+                evaluated.notes.append(
+                    f"the reused base run's checkpoint_interval={int(base.cfg.checkpoint_interval)} is not the "
+                    f"budget's {int(evaluated.cfg.checkpoint_interval)}; the cadence does not change the trained "
+                    "weights and is ignored for this reuse")
+            mismatch = code_identity_mismatch(load_run(base.run_dir))
+            if mismatch is not None:
+                evaluated.notes.append(f"the reused base run's code identity is not the current tree's "
+                                       f"({mismatch}); it is kept and flagged in the manifest")
+            window = _window_protocol_mismatch(base.train_window_mode, base.train_window_evidence)
+            if window is not None:
+                evaluated.notes.append(f"the reused base run {window}, so seed pair {pair} differs from the "
+                                       "pairs and arms trained now in its training windows; it is kept and "
+                                       "flagged in the manifest")
+        else:
+            evaluated.notes.append(f"seed pair {pair} is the base run's own, but the base run is not reused: "
+                                   f"{rejected}; a launch refuses to train while it blocks the pair")
     for plan in plans:
         if plan.status == "deferred" and evaluated is not None:
             plan.est_hours = evaluated.est_hours
@@ -1036,6 +1264,19 @@ def _fmt_count(value: Optional[int]) -> str:
     return str(value)
 
 
+def _window_protocol_mismatch(mode: str, evidence: str) -> Optional[str]:
+    r"""Why a saved run's training-window origin ``mode`` (:func:`vfe3.experiment.saved_train_window_mode`)
+    is not the one every run trained now draws, or None when it is (audit 2026-10-16 F59)."""
+    from vfe3.experiment import CURRENT_TRAIN_WINDOW_MODE
+
+    if mode == CURRENT_TRAIN_WINDOW_MODE:
+        return None
+    if mode == "unknown":
+        return (f"has a training-window origin that cannot be determined ({evidence}); every run trained now "
+                f"uses {CURRENT_TRAIN_WINDOW_MODE}")
+    return f"trained with {mode} training windows ({evidence}); every run trained now uses {CURRENT_TRAIN_WINDOW_MODE}"
+
+
 def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
     r"""The plan table for one base (plain text)."""
     cfg = base.cfg
@@ -1047,12 +1288,14 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"norm={cfg.norm_type_block} affine={cfg.layernorm_affine} "
         f"mlp={cfg.block_mlp_mode if cfg.use_block_mlp else 'none'}x{cfg.block_mlp_expansion} "
         f"decode={cfg.decode_mode} batch={cfg.batch_size}x{cfg.max_seq_len} sigma_wd={cfg.sigma_weight_decay}",
-        f"  pinned (historical defaults the loader applies to absent fields): {base.pinned}",
+        f"  pinned (historical values the loader gives absent fields): {base.pinned}",
+        f"  migrated (selectors merged from recorded historical keys): {base.migrated}",
         f"  dropped retired fields: {sorted(base.dropped)}",
         f"  fields filled by current defaults: {base.defaulted}",
         f"  recorded n_params={base.recorded_params:,}" if base.recorded_params else "  recorded n_params=-",
         f"  measured throughput: {base.tokens_per_s:,.0f} tok/s ({base.throughput_source})"
         if base.tokens_per_s else "  measured throughput: unavailable",
+        f"  training windows: {base.train_window_mode} ({base.train_window_evidence})",
         f"  budget={budget}  seeds (seed, data_seed)={plans[0].seeds if plans else []}",
         "-" * 118,
         f"{'arm':56s} {'status':12s} {'total':>8s} {'train':>8s} {'context':>8s} {'steps':>7s} "
@@ -1114,24 +1357,58 @@ def is_complete(run_dir: Path) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def complete_runs(arm_dir: Path, label: str) -> List[Path]:
-    r"""Every complete run of ``label`` in ``arm_dir`` (``<prefix>_<label>`` or ``..._<label>_<n>``), sorted."""
+def failed_run_reason(run_dir: Path) -> Optional[str]:
+    r"""Why ``run_dir`` is a finished run without a test result, or None.
+
+    A run that published ``summary.json`` finished; one whose ``test_ce`` is not a finite number (NaN or
+    infinity after a divergence, or null) finished and failed. A run without a readable ``summary.json``
+    is unfinished (interrupted, or still training) and is not a failure.
+    """
+    try:
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    value = summary.get("test_ce")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return None
+    return f"finished without a finite test CE (summary.json test_ce={value!r})"
+
+
+def _label_runs(arm_dir: Path, label: str) -> List[Path]:
+    r"""Every run directory of ``label`` in ``arm_dir`` (``<prefix>_<label>`` or ``..._<label>_<n>``), sorted."""
     if not arm_dir.is_dir():
         return []
     pattern = re.compile(rf"^.+_{re.escape(label)}(_\d+)?$")
-    return [child for child in sorted(arm_dir.iterdir())
-            if child.is_dir() and pattern.match(child.name) and is_complete(child)]
+    return [child for child in sorted(arm_dir.iterdir()) if child.is_dir() and pattern.match(child.name)]
+
+
+def complete_runs(arm_dir: Path, label: str) -> List[Path]:
+    r"""Every complete run of ``label`` in ``arm_dir`` (``<prefix>_<label>`` or ``..._<label>_<n>``), sorted."""
+    return [child for child in _label_runs(arm_dir, label) if is_complete(child)]
 
 
 def find_complete_run(arm_dir: Path, label: str) -> Optional[Path]:
-    r"""The first complete run of ``label`` in ``arm_dir`` (no config check; see :func:`completed_run`)."""
+    r"""The complete run of ``label`` in ``arm_dir`` (no config check; see :func:`completed_run`).
+
+    None when there is none or more than one: the folder names begin with the test PPL, so their order
+    is a result, and no run is chosen by it (audit 2026-10-16 F60).
+    """
     found = complete_runs(arm_dir, label)
-    return found[0] if found else None
+    return found[0] if len(found) == 1 else None
 
 
 # Fields a reused run may differ in from the plan: the model seed (checked against the run's recorded
 # seed instead) and a resume path, neither of which defines the arm.
 REUSE_IGNORED_FIELDS: Tuple[str, ...] = ("seed", "resume_from")
+# The base run, reused as the evaluated arm's replicate at its own seed pair, may also differ in its
+# training-checkpoint cadence: it was trained with its own checkpoint_interval (the 36.41 base: 90,000 of
+# 120,000 steps) while every budget writes one checkpoint at the end. The cadence only decides when a
+# resumable checkpoint is written, so it does not change the trained weights (the best-model contract of
+# vfe3.run_artifacts drops it for the same reason). Runs in the experiment directory, which paper_arms
+# writes at the budget's cadence, are still compared on it (audit 2026-10-16 F19).
+BASE_REUSE_IGNORED_FIELDS: Tuple[str, ...] = (*REUSE_IGNORED_FIELDS, "checkpoint_interval")
 
 
 def _serialized(cfg: Any) -> Dict[str, Any]:
@@ -1151,12 +1428,14 @@ def reuse_mismatch(
     dataset:   str,
     seed:      int,
     data_seed: int,
+    ignored:   Sequence[str] = REUSE_IGNORED_FIELDS,
 ) -> Optional[str]:
     r"""Why the complete run ``run_dir`` is not a run of ``cfg`` at ``(seed, data_seed)`` on ``dataset``.
 
     None when it is: the run's saved config, loaded as :mod:`vfe3.paper` loads it, serializes to the
-    plan's config on every field except :data:`REUSE_IGNORED_FIELDS`, and its dataset, model seed and
-    data-order seed (when recorded) are the plan's. A label match alone never reuses a run.
+    plan's config on every field except ``ignored`` (:data:`REUSE_IGNORED_FIELDS`; the base run's
+    fallback passes :data:`BASE_REUSE_IGNORED_FIELDS`), and its dataset, model seed and data-order seed
+    (when recorded) are the plan's. A label match alone never reuses a run.
     """
     from vfe3.paper.runs import load_run
 
@@ -1172,7 +1451,7 @@ def reuse_mismatch(
     if type(record.cfg) is not type(cfg):
         return f"model family {type(record.cfg).__name__}, plan {type(cfg).__name__}"
     recorded, planned = _serialized(record.cfg), _serialized(cfg)
-    keys = sorted((set(recorded) | set(planned)) - set(REUSE_IGNORED_FIELDS))
+    keys = sorted((set(recorded) | set(planned)) - set(ignored))
     differing = [key for key in keys if _canonical(recorded.get(key)) != _canonical(planned.get(key))]
     if differing:
         return "config differs from the plan in " + ", ".join(
@@ -1193,30 +1472,54 @@ def completed_run(
     cfg:       Any = None,
     dataset:   Optional[str] = None,
     stale:     Optional[List[Dict[str, str]]] = None,
+    failed:    Optional[List[Dict[str, str]]] = None,
 ) -> Optional[Path]:
     r"""The complete run of arm ``label`` at ``(seed, data_seed)``, or None.
 
     A run in the experiment directory wins. With the plan's ``cfg`` (and ``dataset``) given, only a
     run that :func:`reuse_mismatch` accepts is returned; every rejected complete run is appended to
     ``stale`` with its reason, so a changed arm, ``baseline_overrides`` value or base is reported
-    rather than silently reused. Without ``cfg`` the first complete run is returned unchecked.
+    rather than silently reused. Without ``cfg`` every complete run is accepted unchecked. More than
+    one accepted run of the pair selects none: each is appended to ``stale`` as a duplicate, since
+    the folder names begin with the test PPL and their order is a result (audit 2026-10-16 F60). A
+    finished run without a finite test CE (:func:`failed_run_reason`) whose config is the plan's (any,
+    without ``cfg``) is appended to ``failed``: it is a recorded failure of the pair, not an absent
+    run (audit 2026-10-16 F61).
     Otherwise, under the ``base_protocol`` budget, the evaluated arm at the base run's own
     ``(seed, data_seed)`` is the base run itself when it is complete and, with ``cfg`` given,
-    :func:`reuse_mismatch` accepts it (a base recorded with another budget or cadence is stale).
+    :func:`reuse_mismatch` accepts it with :data:`BASE_REUSE_IGNORED_FIELDS` (its own checkpoint cadence
+    is not a difference; a base recorded with another budget is stale).
     """
     slug = (ARMS if arms is None else arms)[label]["slug"]
-    for found in complete_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
-        reason = (None if cfg is None else
-                  reuse_mismatch(found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
-        if reason is None:
-            return found
+    accepted: List[Path] = []
+    for found in _label_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
+        if is_complete(found):
+            reason = (None if cfg is None else
+                      reuse_mismatch(found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
+            if reason is None:
+                accepted.append(found)
+            elif stale is not None:
+                stale.append({"run": str(found), "reason": reason})
+            continue
+        failure = failed_run_reason(found) if failed is not None else None
+        if failure is not None and (cfg is None or reuse_mismatch(
+                found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed) is None):
+            failed.append({"run": str(found), "reason": failure})
+    if len(accepted) == 1:
+        return accepted[0]
+    if accepted:
         if stale is not None:
-            stale.append({"run": str(found), "reason": reason})
+            stale.extend({"run": str(run), "reason": f"one of {len(accepted)} complete runs of seed pair "
+                                                     f"({seed}, {data_seed}) that match the plan; none is "
+                                                     "selected until exactly one is kept"}
+                         for run in accepted)
+        return None
     if (base is not None and budget == "base_protocol" and label == EVALUATED
             and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) == (seed, data_seed)
             and is_complete(base.run_dir)):
         reason = (None if cfg is None else
-                  reuse_mismatch(base.run_dir, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
+                  reuse_mismatch(base.run_dir, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed,
+                                 ignored=BASE_REUSE_IGNORED_FIELDS))
         if reason is None:
             return base.run_dir
         if stale is not None:
@@ -1242,16 +1545,22 @@ def build_manifest(
     r"""The manifest :mod:`vfe3.paper` reads: every table row, with the complete runs of the plan's seeds.
 
     A selected arm lists only runs whose saved config is the plan's (:func:`reuse_mismatch`); a
-    rejected complete run is listed under ``paper_arms.rows[label]["stale"]`` with its reason. Runs of an
+    rejected complete run is listed under ``paper_arms.rows[label]["stale"]`` with its reason, and so is
+    every one of several complete runs of one seed pair (none is listed under ``runs``); a finished run
+    without a finite test CE is listed under ``paper_arms.rows[label]["failed"]`` with its reason. Runs of an
     arm this launch did not resolve (``"not selected"``), or of the compute-matched arm before its width
     rule exists, are listed unchecked and flagged ``reuse_verified: false``. Every listed run's code
     identity (:func:`vfe3.paper.runs.code_identity`) is recorded, and a run whose identity is not the
-    current tree's is listed under ``code_identity_mismatch`` with the reason (kept, not rejected).
+    current tree's is listed under ``code_identity_mismatch`` with the reason (kept, not rejected). Every
+    listed run's training-window origin (:func:`vfe3.experiment.saved_train_window_mode`) is recorded under
+    ``train_window_mode``, and a run whose origin is not the per-epoch random one every run trained now
+    draws is listed under ``window_protocol_mismatch`` with the reason (kept, not rejected).
     The evaluated row is written under :func:`evaluated_label` of the base; an inapplicable row carries
     its reason, which the tables print as ``n/a``; ``decision`` names the arms of the registered
     decision rule (evaluated, comparator, frozen, and the capacity control of the October 9, 2026
     amendment), with the comparator resolved by :func:`decision_comparator`.
     """
+    from vfe3.experiment import saved_train_window_mode
     from vfe3.paper.runs import code_identity, code_identity_mismatch, load_run
 
     arms = ARMS if arms is None else arms
@@ -1266,9 +1575,11 @@ def build_manifest(
         expected = _expected_cfg(exp_dir, plan) if plan is not None else None
         runs: List[str] = []
         stale: List[Dict[str, str]] = []
+        failed: List[Dict[str, str]] = []
         for seed, data_seed in seeds:
             found = completed_run(exp_dir, label, seed, data_seed, base=base, budget=budget, arms=arms,
-                                  cfg=expected, dataset=plan.dataset if plan else None, stale=stale)
+                                  cfg=expected, dataset=plan.dataset if plan else None, stale=stale,
+                                  failed=failed)
             if found is not None:
                 runs.append(str(found))
         shown = shown_evaluated if label == EVALUATED else label
@@ -1284,13 +1595,20 @@ def build_manifest(
                        "declared_deviations": list(plan.deviations) if plan else [],
                        "reuse_verified": expected is not None,
                        "stale": stale,
-                       "code_identity": {}, "code_identity_mismatch": []}
+                       "failed": failed,
+                       "code_identity": {}, "code_identity_mismatch": [],
+                       "train_window_mode": {}, "window_protocol_mismatch": []}
         for run in runs:
             record = load_run(run)
             rows[shown]["code_identity"][run] = code_identity(record)
             reason = code_identity_mismatch(record, current=current)
             if reason is not None:
                 rows[shown]["code_identity_mismatch"].append({"run": run, "reason": reason})
+            mode, evidence = saved_train_window_mode(record.config_raw, record.provenance)
+            rows[shown]["train_window_mode"][run] = mode
+            window = _window_protocol_mismatch(mode, evidence)
+            if window is not None:
+                rows[shown]["window_protocol_mismatch"].append({"run": run, "reason": window})
         if label == EVALUATED and runs:
             evaluated_run = runs[0]
     return {
@@ -1302,7 +1620,8 @@ def build_manifest(
         "out_dir": str(exp_dir / "paper_artifacts"),
         "paper_arms": {"base": base.name, "base_run": str(base.run_dir), "budget": budget,
                        "seeds": [list(pair) for pair in seeds], "rows": rows,
-                       "dropped_config_fields": sorted(base.dropped), "pinned": base.pinned},
+                       "dropped_config_fields": sorted(base.dropped), "pinned": base.pinned,
+                       "migrated": base.migrated},
     }
 
 
@@ -1406,7 +1725,7 @@ def _frozen_width_rule(plan: ArmPlan, path: Path, runs: Sequence[Path], logger: 
                        "evaluated runs are now %s and the rule is not recomputed", plan.label, recorded, current)
     logger.info("%s: frozen width rule %s -> width %d, max_steps %d", plan.label, path, frozen.embed_dim,
                 frozen.max_steps)
-    return frozen
+    return _record_width_rule(plan, frozen)
 
 
 def compute_matched_config(
@@ -1444,14 +1763,16 @@ def compute_matched_config(
     runs: List[Path] = []
     missing_pairs: List[str] = []
     for s, d in plan.seeds:
+        # completed_run checks every run it returns against the matched config, the reused base run too.
+        stale: List[Dict[str, str]] = []
+        failed: List[Dict[str, str]] = []
         found = completed_run(exp_dir, EVALUATED, s, d, base=base, budget=budget, cfg=plan.matched_cfg,
-                              dataset=plan.dataset)
-        # The base-run fallback of completed_run is not config-checked; check every run here.
-        reason = ("no complete run" if found is None else
-                  reuse_mismatch(found, plan.matched_cfg, dataset=str(plan.dataset), seed=s, data_seed=d))
-        if reason is None:
+                              dataset=plan.dataset, stale=stale, failed=failed)
+        if found is not None:
             runs.append(found)
         else:
+            reason = ("; ".join(f"{entry['run']}: {entry['reason']}" for entry in (*stale, *failed))
+                      or "no complete run")
             missing_pairs.append(f"({s}, {d}): {reason}")
     rule_path = exp_dir / plan.slug / WIDTH_RULE_FILE
     if rule_path.is_file():
@@ -1497,8 +1818,8 @@ def compute_matched_config(
                                  unique_train_tokens=int(cached_token_count(plan.dataset, "train")))
     chosen = rule["config"]
     steps = int(chosen.max_steps)
-    cfg = dataclasses.replace(chosen, eval_interval=max(1, steps // M3_POINTS), checkpoint_interval=steps)
-    check_baseline_arm(plan.matched_cfg, cfg, declared=COMPUTE_MATCHED_FIELDS)
+    cfg = _record_width_rule(plan, dataclasses.replace(chosen, eval_interval=max(1, steps // M3_POINTS),
+                                                       checkpoint_interval=steps))
     record = {key: value for key, value in rule.items() if key != "config"}
     record.update(config=cfg.serialize(), evaluated_runs=[str(run) for run in runs],
                   calibration_runs={w: str(run) for w, run in calibrations.items()},
@@ -1528,8 +1849,10 @@ def run_plan(
     The manifest is rewritten before the first run and after every run, so an interrupted launch
     leaves a manifest of the runs that completed. A complete run is reused only when its saved config
     is the plan's (:func:`completed_run` with the plan's config); the launch refuses to start while a
-    selected (arm, seed) pair has complete runs that are all stale, listing them, so a changed arm is
-    neither silently reused nor silently retrained beside its old runs.
+    selected (arm, seed) pair has complete runs that are all stale, or more than one complete run of the
+    plan's config, listing them, so a changed arm is neither silently reused nor silently retrained
+    beside its old runs. A pair whose only run of the plan's config finished without a finite test CE
+    is a recorded failure: it is logged and listed in the manifest, and never retrained by a relaunch.
     """
     from vfe3.experiment import run_vfe
 
@@ -1549,11 +1872,17 @@ def run_plan(
             stale: List[Dict[str, str]] = []
             if completed_run(exp_dir, plan.label, seed, data_seed, base=base, budget=budget, arms=arms,
                              cfg=expected, dataset=plan.dataset, stale=stale) is None and stale:
+                # The base run cannot be moved aside: load_base reads it.
                 blocked.extend(f"{plan.label} seed=({seed}, {data_seed}): {entry['run']}: {entry['reason']}"
+                               + (" (the base run itself, which load_base reads: leave it in place; this pair "
+                                  "cannot run until the plan's evaluated config matches the base run's, or "
+                                  "the pair is dropped from CONFIG['seeds'])"
+                                  if Path(entry["run"]) == base.run_dir else "")
                                for entry in stale)
     if blocked:
-        raise SystemExit("refusing to train: complete runs on disk do not match the plan (move them aside, or "
-                         "restore the configuration they were trained with):\n  " + "\n  ".join(blocked))
+        raise SystemExit("refusing to train: complete runs on disk do not match the plan or duplicate a seed "
+                         "pair (move them aside, or restore the configuration they were trained with):\n  "
+                         + "\n  ".join(blocked))
 
     def refresh() -> Path:
         return write_manifest(exp_dir, build_manifest(exp_dir, plans, base=base, budget=budget,
@@ -1574,10 +1903,18 @@ def run_plan(
         arm_dir = exp_dir / plan.slug
         for seed, data_seed in plan.seeds:
             label = run_label(plan.slug, seed, data_seed)
+            failed: List[Dict[str, str]] = []
             done = completed_run(exp_dir, plan.label, seed, data_seed, base=base, budget=budget, arms=arms,
-                                 cfg=cfg, dataset=plan.dataset)
+                                 cfg=cfg, dataset=plan.dataset, failed=failed)
             if done is not None:
                 logger.info("complete, skipped: %s", done)
+                continue
+            if failed:
+                # A relaunch must not re-roll a diverged replicate (audit 2026-10-16 F61).
+                logger.warning("not retrained: %s seed=(%d, %d) has a recorded failure (%s); it is listed in "
+                               "the manifest row's 'failed'; move the run aside to retrain the pair deliberately",
+                               plan.label, seed, data_seed,
+                               "; ".join(f"{entry['run']}: {entry['reason']}" for entry in failed))
                 continue
             logger.info("training %s | %s | seed=%d data_seed=%d", plan.label, plan.dataset, seed, data_seed)
             if plan.kind == "vfe":
@@ -1616,7 +1953,13 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
     status = 0
     for name in config["bases"]:
         started = time.perf_counter()
-        base = load_base(name, bases[name])
+        try:
+            base = load_base(name, bases[name])
+        except BaseUnavailableError as exc:
+            # One moved base must not stop the others (audit 2026-10-16 F63).
+            print(f"base {name}: unavailable: {exc}", flush=True)
+            status = 1
+            continue
         plans = build_plan(base, budget=budget, seeds=seeds, labels=labels,
                            baseline_overrides=config.get("baseline_overrides"))
         print(format_plan(base, plans, budget=budget), flush=True)

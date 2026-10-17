@@ -1198,7 +1198,10 @@ WIDTH_LADDER_RULE: str = (
     "2023). The chosen width is the largest d with T(d) >= D(d) (the smallest ladder width, flagged, "
     "when none qualifies). The whole budget is then spent (max_steps = floor(T(d) / tokens_per_step), "
     "tokens free), depth, head width, batch, context and schedule shape stay those of the matched arm, "
-    "and the validation-selected checkpoint is reported. The cap enters the width choice only.")
+    "and the validation-selected checkpoint is reported. The cap enters the width choice only. The "
+    "hidden-matrix learning rate is transferred to the chosen width as in the total-parameter-matched "
+    "arm (hidden_lr_scale s_0 K_0/K, muP-style, Yang et al. 2022); the peak lr, initialization and "
+    "warmup are the matched width's.")
 
 
 def width_ladder_rule(
@@ -1211,6 +1214,7 @@ def width_ladder_rule(
     tokens_per_parameter: float = TOKENS_PER_CONTEXT_PARAMETER,
     max_passes:           float = MAX_PASSES,
     head_dim:             Optional[int] = None,
+    transfer_hidden_lr:   bool = True,
 ) -> Dict[str, Any]:
     r"""The pre-declared width rule of the compute-matched arm (:data:`WIDTH_LADDER_RULE`).
 
@@ -1226,6 +1230,14 @@ def width_ladder_rule(
     the per-width table, the chosen width, whether the pass cap bound at the choice, and the chosen
     :class:`BaselineConfig` (width, heads of ``head_dim``, and ``max_steps`` from
     :func:`steps_for_device_hours`).
+
+    With ``transfer_hidden_lr`` (the default) the chosen config's hidden-matrix learning-rate scale is
+    :math:`s = s_0 K_0 / d^\star`, as :func:`total_parameter_width` sets it (muP-style transfer of Adam
+    updates of :math:`W_{Q,K,V,O}` and :math:`W_{1,2}`, Yang et al. 2022, arXiv:2203.03466; the
+    embedding, decoder, initialization and warmup are not transferred), and is returned as
+    ``hidden_lr_scale``. ``transfer_hidden_lr=False`` keeps :math:`s_0` at every width, the rule before
+    audit 2026-10-16 F20. Throughput does not depend on the learning rate, so the calibration runs stay
+    at :meth:`BaselineConfig.with_width` (:func:`calibration_mismatch`).
     """
     if not tokens_per_s:
         raise ValueError("tokens_per_s must hold at least one ladder width")
@@ -1253,12 +1265,15 @@ def width_ladder_rule(
     fitting = [row for row in rows if row["fits"]]
     chosen = fitting[-1] if fitting else rows[0]
     config = replace(base.with_width(chosen["width"], head_dim=head_dim), max_steps=chosen["max_steps"])
+    if transfer_hidden_lr:
+        config = replace(config, hidden_lr_scale=base.hidden_lr_scale * base.embed_dim / config.embed_dim)
     return {
         "rule": WIDTH_LADDER_RULE, "hours": float(hours), "unique_train_tokens": unique_train_tokens,
         "tokens_per_step": tokens_per_step, "tokens_per_parameter": float(tokens_per_parameter),
         "max_passes": float(max_passes), "candidates": rows, "chosen_width": chosen["width"],
         "chosen_fits": bool(chosen["fits"]), "cap_binds": bool(chosen["cap_binds"]),
-        "max_steps": chosen["max_steps"], "config": config,
+        "max_steps": chosen["max_steps"], "hidden_lr_scale": config.hidden_lr_scale,
+        "transfer_hidden_lr": bool(transfer_hidden_lr), "config": config,
     }
 
 

@@ -26,7 +26,7 @@ import time
 import warnings
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, fields as dataclass_fields
+from dataclasses import MISSING, asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -248,6 +248,7 @@ config: Dict[str, Any] = dict(
 
     layernorm_affine           = False,
     norm_type_block            = "none",             # "none" | "mahalanobis"
+    block_norm_covariance      = "passthrough",      # "passthrough" (the only value without a 'layernorm' block norm) | "pushforward"
 
     prior_handoff_rho          = 1,                  # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma        = 0.1,                # sigma damping in [0,1] (0.0 = frozen at embedding)
@@ -493,17 +494,35 @@ def _config_field_names() -> set[str]:
     return {field.name for field in dataclass_fields(VFE3Config)}
 
 
-def _resolved_model_config(model_config: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return the full effective config after applying ``VFE3Config`` defaults."""
+def _declared_model_config(model_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return every ``VFE3Config`` field at its declared value: the mapping's, else the field default.
+
+    The mapping is validated by building a ``VFE3Config``, but what ``__post_init__`` resolves in place
+    (``kl_max=None`` to ``8 * embed_dim``, the ``gauge_transport`` frame coercions) is not written back,
+    so a candidate or ablation cell that changes ``embed_dim`` or the gauge mode resolves its own value
+    (audit 2026-10-16 F56).
+    """
     if not isinstance(model_config, Mapping):
         raise ValueError("config must be a mapping")
     config_fields = _config_field_names()
     unknown = sorted(set(model_config) - config_fields)
     if unknown:
         raise ValueError(f"config contains unknown VFE3Config fields: {unknown}")
+    declared = {field.name: field.default for field in dataclass_fields(VFE3Config)
+                if field.default is not MISSING}
+    declared.update(copy.deepcopy(dict(model_config)))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**copy.deepcopy(dict(model_config)))
+        VFE3Config(**copy.deepcopy(declared))
+    return declared
+
+
+def _resolved_model_config(model_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the full effective config after applying ``VFE3Config`` defaults and resolution."""
+    declared = _declared_model_config(model_config)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(**declared)
     return asdict(cfg)
 
 
@@ -511,10 +530,10 @@ def _resolved_model_config(model_config: Mapping[str, Any]) -> Dict[str, Any]:
 def _ablation_baseline_scope(
     model_config: Mapping[str, Any],
 ) -> Iterator[None]:
-    """Temporarily make the local model config the ablation runner's baseline."""
-    resolved = _resolved_model_config(model_config)
+    """Temporarily make the local model config, as declared, the ablation runner's baseline."""
+    declared = _declared_model_config(model_config)
     original = ablation.BASELINE_CONFIG
-    ablation.BASELINE_CONFIG = resolved
+    ablation.BASELINE_CONFIG = declared
     try:
         yield
     finally:
@@ -667,7 +686,7 @@ def _candidate_config(
     max_steps: Optional[int],
 ) -> Dict[str, Any]:
     """Return a validated full VFE3Config mapping for one candidate."""
-    candidate = _resolved_model_config(model_config)
+    candidate = _declared_model_config(model_config)
     candidate.update(overrides)
     candidate["checkpoint_interval"] = 0
     candidate["seed"] = seed
@@ -725,9 +744,10 @@ def generate_candidates(
     model_config:  Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Generate a deterministic, validated, semantically unique joint Sobol design."""
-    local_model_config = _resolved_model_config(
+    local_model_config = _declared_model_config(
         config if model_config is None else model_config
     )
+    resolved_model_config = _resolved_model_config(local_model_config)
     parameters = search_config.get("parameters")
     _validate_parameter_catalog(parameters)
     enabled_specs = _enabled_parameter_specs(parameters)
@@ -746,7 +766,7 @@ def generate_candidates(
     changed_requirements = {
         field: value
         for field, value in requirements.items()
-        if local_model_config.get(field) != value
+        if resolved_model_config.get(field) != value
     }
     _refuse_inert_parameters(enabled_specs, local_model_config, changed_requirements)
     anchors: List[Dict[str, Any]] = [{"label": "baseline", "overrides": {}}]
@@ -1574,7 +1594,7 @@ def _manifest(
     ]
     baseline = _candidate_config(
         {},
-        effective_model_config,
+        model_config,
         seed=seeds[0],
         max_steps=search_config.get("max_steps"),
     )
@@ -1602,7 +1622,8 @@ def _manifest(
 def main() -> int:
     """Generate the joint design, run it through ablation.py, and publish a leaderboard."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    model_config = _resolved_model_config(config)
+    # Declared, not resolved: each candidate and ablation cell resolves kl_max = 8 K at its own width.
+    model_config = _declared_model_config(config)
     parameters = SEARCH_CONFIG.get("parameters")
     _validate_parameter_catalog(parameters)
     if SEARCH_CONFIG.get("list_only") is True:
@@ -1677,7 +1698,7 @@ def main() -> int:
         [row for row in rows if row["status"] == "complete"],
         candidates,
         SEARCH_CONFIG,
-        model_config,
+        _resolved_model_config(model_config),
     )
     ablation._write_json_atomic(output_dir / "optimization_status.json", {
         "schema_version":   4,
