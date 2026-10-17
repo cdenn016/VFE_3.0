@@ -204,3 +204,24 @@ def test_enabled_scaler_status_request_leaves_the_update_unchanged() -> None:
     silent, _, _, _ = _scaled_step(None, scaler_on=True, with_status=False)
     for (name, p), (_, q) in zip(with_status.named_parameters(), silent.named_parameters()):
         assert torch.equal(p, q), name
+
+
+# ----------------------------------------------------------------------------------------------- F110
+
+def test_parameter_report_lists_zero_gradient_parameters_beside_the_dead_ones() -> None:
+    from tests.profiles import test_config
+    from vfe3.model.model import VFEModel
+    cfg = test_config(block_mlp_mode="gauge_gate", use_block_mlp=True, family="gaussian_full")
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    rep = T.parameter_report(model)
+    assert rep["probed"] and rep["dead_names"] == []
+    # The gate's second layer starts at zero, so its first layer is reached by autograd with a zero gradient.
+    assert rep["zero_grad_names"] == ["block_mlps.0.fc1.weight", "block_mlps.0.fc1.bias"]
+    assert rep["live"] == rep["trainable"]                       # still counted live: the contract is grad-not-None
+    assert all(p.grad is None for p in model.parameters())       # the probe leaves no gradients behind
+    banner = T._banner(model, cfg, "synthetic", torch.device("cpu"), n_steps=1)
+    assert "zero gradient at the init probe" in banner and "block_mlps.0.fc1.weight" in banner
+    plain = VFEModel(test_config())
+    assert T.parameter_report(plain)["zero_grad_names"] == []
+    assert "zero gradient at the init probe" not in T._banner(plain, plain.cfg, "synthetic", torch.device("cpu"), 1)

@@ -5595,6 +5595,12 @@ def parameter_report(
     toggles change. The synthetic ids come from a LOCAL generator (the global RNG is untouched) and
     ``.grad`` is cleared afterward, so the probe is side-effect-free. Best-effort: any failure (e.g. a
     config whose loss does not require grad) falls back to ``live = trainable`` with ``probed=False``.
+
+    ``zero_grad_names`` lists the live parameters whose probe gradient is identically zero: autograd
+    reaches them but their contribution vanishes at this point, as for the first layer of a block whose
+    second layer starts at zero, or a path whose terms cancel. They stay counted as live, since a zero
+    gradient at init need not persist; the list only keeps them from passing as ordinary live parameters
+    (audit 2026-10-16, F110).
     """
     named     = list(model.named_parameters())
     total     = sum(p.numel() for _, p in named)
@@ -5607,6 +5613,7 @@ def parameter_report(
         "live": trainable,
         "dead": 0,
         "dead_names": [],
+        "zero_grad_names": [],
         "probed": False,
     }
     try:
@@ -5629,8 +5636,13 @@ def parameter_report(
             _prior_bank._WARNED_UNIGRAM_UNSET = unigram_warned
         dead_names = [name for name, p in named if p.requires_grad and p.grad is None]
         live = sum(p.numel() for _, p in named if p.requires_grad and p.grad is not None)
+        reached = [(name, p.grad) for name, p in named if p.requires_grad and p.grad is not None]
+        nonzero = (torch.stack([grad.detach().ne(0).any().to(device) for _, grad in reached]).cpu().tolist()
+                   if reached else [])                             # one host transfer for every flag
+        zero_grad_names = [name for (name, _), flag in zip(reached, nonzero) if not flag]
         model.zero_grad(set_to_none=True)                          # leave no grads for training
-        rep.update(live=live, dead=trainable - live, dead_names=dead_names, probed=True)
+        rep.update(live=live, dead=trainable - live, dead_names=dead_names,
+                   zero_grad_names=zero_grad_names, probed=True)
     except Exception as exc:
         rep["probe_error"] = repr(exc)                             # surfaced, not swallowed; live/dead stay unknown
     return rep
@@ -5738,6 +5750,9 @@ def _banner(
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
+    zero_line = ([" zero gradient at the init probe (counted live): "
+                  + ", ".join(n.replace("prior_bank.", "") for n in rep["zero_grad_names"])]
+                 if rep["probed"] and rep["zero_grad_names"] else [])
     return "\n".join([
         bar,
         f" Gauge VFE Transformer | {rep['total']:,} params{live_note}{probe_note} | {device}",
@@ -5747,6 +5762,7 @@ def _banner(
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
+        *zero_line,
         f" M-LRs: {_fmt_table_lrs(cfg)}  phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
