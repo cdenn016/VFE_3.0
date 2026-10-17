@@ -583,6 +583,8 @@ class Base:
     tokens_per_s:     Optional[float] = None                         # measured wall-clock throughput
     throughput_source: Optional[str] = None
     data_seed:        Optional[int] = None                           # provenance.json data-order seed
+    train_window_mode: str = "unknown"                               # training-window origin the base ran
+    train_window_evidence: str = ""                                  # how train_window_mode was determined
 
 
 def _quiet_config(build: Callable[[], Any]) -> Any:
@@ -646,6 +648,7 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     keys the record carries is listed in ``migrated``; every other absent field is listed in ``defaulted``.
     """
     from vfe3.config import _HISTORICAL_DEFAULT_PINS, VFE3Config
+    from vfe3.experiment import saved_train_window_mode
     from vfe3.legacy_config import lenient_config_from_serialized
 
     run_dir = Path(path)
@@ -671,11 +674,15 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
                 pinned=pinned, migrated=migrated, defaulted=defaulted,
                 recorded_params=record.get("n_params") if isinstance(record.get("n_params"), int) else None)
     provenance_path = run_dir / "provenance.json"
+    provenance: Any = {}
     if provenance_path.is_file():
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         seed_value = provenance.get("data_seed") if isinstance(provenance, dict) else None
         if isinstance(seed_value, int) and not isinstance(seed_value, bool):
             base.data_seed = seed_value
+    # The loaders drop the retired train_window_offset, so the protocol is read from the raw records.
+    base.train_window_mode, base.train_window_evidence = saved_train_window_mode(
+        raw, provenance if isinstance(provenance, dict) else {})
     summary_path = run_dir / "summary.json"
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -1231,6 +1238,11 @@ def build_plan(
             if mismatch is not None:
                 evaluated.notes.append(f"the reused base run's code identity is not the current tree's "
                                        f"({mismatch}); it is kept and flagged in the manifest")
+            window = _window_protocol_mismatch(base.train_window_mode, base.train_window_evidence)
+            if window is not None:
+                evaluated.notes.append(f"the reused base run {window}, so seed pair {pair} differs from the "
+                                       "pairs and arms trained now in its training windows; it is kept and "
+                                       "flagged in the manifest")
         else:
             evaluated.notes.append(f"seed pair {pair} is the base run's own, but the base run is not reused: "
                                    f"{rejected}; a launch refuses to train while it blocks the pair")
@@ -1252,6 +1264,19 @@ def _fmt_count(value: Optional[int]) -> str:
     return str(value)
 
 
+def _window_protocol_mismatch(mode: str, evidence: str) -> Optional[str]:
+    r"""Why a saved run's training-window origin ``mode`` (:func:`vfe3.experiment.saved_train_window_mode`)
+    is not the one every run trained now draws, or None when it is (audit 2026-10-16 F59)."""
+    from vfe3.experiment import CURRENT_TRAIN_WINDOW_MODE
+
+    if mode == CURRENT_TRAIN_WINDOW_MODE:
+        return None
+    if mode == "unknown":
+        return (f"has a training-window origin that cannot be determined ({evidence}); every run trained now "
+                f"uses {CURRENT_TRAIN_WINDOW_MODE}")
+    return f"trained with {mode} training windows ({evidence}); every run trained now uses {CURRENT_TRAIN_WINDOW_MODE}"
+
+
 def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
     r"""The plan table for one base (plain text)."""
     cfg = base.cfg
@@ -1270,6 +1295,7 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"  recorded n_params={base.recorded_params:,}" if base.recorded_params else "  recorded n_params=-",
         f"  measured throughput: {base.tokens_per_s:,.0f} tok/s ({base.throughput_source})"
         if base.tokens_per_s else "  measured throughput: unavailable",
+        f"  training windows: {base.train_window_mode} ({base.train_window_evidence})",
         f"  budget={budget}  seeds (seed, data_seed)={plans[0].seeds if plans else []}",
         "-" * 118,
         f"{'arm':56s} {'status':12s} {'total':>8s} {'train':>8s} {'context':>8s} {'steps':>7s} "
@@ -1525,12 +1551,16 @@ def build_manifest(
     arm this launch did not resolve (``"not selected"``), or of the compute-matched arm before its width
     rule exists, are listed unchecked and flagged ``reuse_verified: false``. Every listed run's code
     identity (:func:`vfe3.paper.runs.code_identity`) is recorded, and a run whose identity is not the
-    current tree's is listed under ``code_identity_mismatch`` with the reason (kept, not rejected).
+    current tree's is listed under ``code_identity_mismatch`` with the reason (kept, not rejected). Every
+    listed run's training-window origin (:func:`vfe3.experiment.saved_train_window_mode`) is recorded under
+    ``train_window_mode``, and a run whose origin is not the per-epoch random one every run trained now
+    draws is listed under ``window_protocol_mismatch`` with the reason (kept, not rejected).
     The evaluated row is written under :func:`evaluated_label` of the base; an inapplicable row carries
     its reason, which the tables print as ``n/a``; ``decision`` names the arms of the registered
     decision rule (evaluated, comparator, frozen, and the capacity control of the October 9, 2026
     amendment), with the comparator resolved by :func:`decision_comparator`.
     """
+    from vfe3.experiment import saved_train_window_mode
     from vfe3.paper.runs import code_identity, code_identity_mismatch, load_run
 
     arms = ARMS if arms is None else arms
@@ -1566,13 +1596,19 @@ def build_manifest(
                        "reuse_verified": expected is not None,
                        "stale": stale,
                        "failed": failed,
-                       "code_identity": {}, "code_identity_mismatch": []}
+                       "code_identity": {}, "code_identity_mismatch": [],
+                       "train_window_mode": {}, "window_protocol_mismatch": []}
         for run in runs:
             record = load_run(run)
             rows[shown]["code_identity"][run] = code_identity(record)
             reason = code_identity_mismatch(record, current=current)
             if reason is not None:
                 rows[shown]["code_identity_mismatch"].append({"run": run, "reason": reason})
+            mode, evidence = saved_train_window_mode(record.config_raw, record.provenance)
+            rows[shown]["train_window_mode"][run] = mode
+            window = _window_protocol_mismatch(mode, evidence)
+            if window is not None:
+                rows[shown]["window_protocol_mismatch"].append({"run": run, "reason": window})
         if label == EVALUATED and runs:
             evaluated_run = runs[0]
     return {

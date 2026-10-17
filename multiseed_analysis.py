@@ -485,6 +485,18 @@ _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
 _DATA_ORDER_KEYS = ("data_seed",)
 
 
+def _train_window_mode(run_dir: Path) -> tuple[str, str]:
+    r"""The training-window origin ``run_dir`` trained with (:func:`vfe3.experiment.saved_train_window_mode`),
+    read from its raw ``config.json`` and ``provenance.json``: the loaders drop ``train_window_offset``."""
+    from vfe3.experiment import saved_train_window_mode
+
+    serialized = _read_json(run_dir / "config.json")
+    raw = serialized.get("config", serialized) if isinstance(serialized, dict) else {}
+    provenance = _read_json(run_dir / "provenance.json")
+    return saved_train_window_mode(raw if isinstance(raw, dict) else {},
+                                   provenance if isinstance(provenance, dict) else {})
+
+
 def _mixed_code_identity_allowed() -> bool:
     r"""``CONFIG["allow_mixed_code_identity"]`` (default False), validated as a bool."""
     allowed = CONFIG.get("allow_mixed_code_identity", False)
@@ -566,12 +578,23 @@ def _requested_seed_design(
         [contract.get("data_seed") for contract in provenance_contracts.values()],
         seeds=list(provenance_contracts),
     )
+    # The training-window origin is part of the data contract, but the config loaders drop the retired
+    # train_window_offset, so it is read from the raw records; seeds whose known origins differ are not
+    # replicates of one protocol (audit 2026-10-16 F59). An origin that cannot be placed blocks nothing.
+    window_modes = {
+        cell["seed"]: _train_window_mode(Path(cell["run_dir"]))
+        for cell in cells
+        if cell["status"] == "complete" and cell.get("run_dir") is not None
+    }
+    known_window_modes = sorted({mode for mode, _evidence in window_modes.values() if mode != "unknown"})
+    mixed_window_modes = len(known_window_modes) > 1
     provenance_verified = (
         bool(cells)
         and len(provenance_contracts) == len(cells)
         and len(fingerprints) == 1
+        and not mixed_window_modes
     )
-    if manifest["request_verified"] and len(fingerprints) > 1:
+    if manifest["request_verified"] and (len(fingerprints) > 1 or mixed_window_modes):
         for cell in cells:
             if cell["status"] == "complete":
                 cell["status"] = "unverifiable"
@@ -614,6 +637,12 @@ def _requested_seed_design(
         "manifest_status": manifest["manifest_status"],
         "provenance_verified": provenance_verified,
         "data_order": data_order,
+        "train_window_mode": {
+            "modes": known_window_modes,
+            "mixed": mixed_window_modes,
+            "per_seed": {str(seed): mode for seed, (mode, _evidence) in sorted(window_modes.items())},
+            "evidence": {str(seed): evidence for seed, (_mode, evidence) in sorted(window_modes.items())},
+        },
         "code_identity": {
             "mixed_allowed": mixed_code_allowed,
             "n_distinct": n_code_identities,
@@ -1338,6 +1367,9 @@ def main() -> int:
               f"(allow_mixed_code_identity=True); the across-seed SD includes any code effect")
     data_order = request_design["data_order"]
     print(f"\nseed data order: {data_order['status']}. {data_order.get('caveat', '')}")
+    if request_design["train_window_mode"]["mixed"]:
+        print("WARNING: the seeds trained with different training-window origins "
+              f"{request_design['train_window_mode']['per_seed']}; they are not one protocol")
     print(f"NOTE: {CAVEAT}\n")
 
     accepted_config_dirs = [
@@ -1368,6 +1400,7 @@ def main() -> int:
             "request_verified": request_design["request_verified"],
             "manifest_status": request_design["manifest_status"],
             "data_order": request_design["data_order"],
+            "train_window_mode": request_design["train_window_mode"],
             "code_identity": request_design["code_identity"],
             "status": "complete" if publication_complete else "incomplete",
             "complete": publication_complete,
