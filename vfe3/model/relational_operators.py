@@ -108,7 +108,8 @@ _FP64_ESCALATION_FAILURE = ("the moment-matched covariance update is not positiv
                             "float32 update failed first and was recomputed in float64); no repair applied")
 
 # Tokens of moment-matched covariance updates recomputed in float64, per device, counted on the device
-# (its own counter, separate from the projected source-factor recoveries; audit 2026-10-15, finding 8).
+# (its own counter, separate from the projected source-factor recoveries; audit 2026-10-15, finding 8): the kernel
+# readout's escalated sequences and the minimal agent's output-screen recomputes (audit 2026-10-16, F8).
 _COVARIANCE_ESCALATION_COUNTS: Dict[str, torch.Tensor] = {}
 
 
@@ -120,7 +121,8 @@ def _count_covariance_escalation(tokens: int, device: torch.device) -> None:
 
 
 def covariance_escalation_elements() -> int:
-    r"""Tokens of moment-matched covariance updates recomputed in float64 since the last reset. Host-syncs."""
+    r"""Tokens of moment-matched covariance updates recomputed in float64 since the last reset (kernel readout and
+    minimal-agent output screen). Host-syncs."""
     return int(sum(int(count) for count in _COVARIANCE_ESCALATION_COUNTS.values()))
 
 
@@ -129,17 +131,32 @@ def reset_covariance_escalation_elements() -> None:
     _COVARIANCE_ESCALATION_COUNTS.clear()
 
 
+_MINIMAL_AGENT_COVARIANCE_FAILURE = (
+    "the minimal-agent posterior covariance Sigma_i^+ = U_i (C_i - sum_h K_i^h M_i^h K_i^hT) U_i^T + f Sigma_p,i has "
+    "a nonpositive or non-finite variance or fails a Cholesky factorization; no repair applied")
+_MINIMAL_AGENT_COVARIANCE_RECOMPUTED = (
+    "; the float32 output failed first and was recomputed in float64 from the float32 frame pair (U_i, U_i^{-1}), "
+    "so C_i or the gains are degenerate at float64 precision (an ill-conditioned frame: frame_pair_escalation_tol "
+    "moves an ill-conditioned frame producer call to float64)")
+
+
+def _covariance_failure(
+    sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
+    diagonal: bool,
+) -> torch.Tensor:            # () bool on sigma's device, no host sync
+    r"""Whether some variance is nonpositive or non-finite (diagonal) or some matrix fails a Cholesky factorization."""
+    with torch.no_grad():
+        if diagonal:
+            return ~(torch.isfinite(sigma) & (sigma > 0)).all()
+        return (torch.linalg.cholesky_ex(sigma.detach())[1] != 0).any()
+
+
 def _covariance_positive(
     sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
     diagonal: bool,
 ) -> bool:
     r"""Whether every variance is finite and positive (diagonal) or every matrix factors by Cholesky. Host-syncs."""
-    with torch.no_grad():
-        if diagonal:
-            healthy = (torch.isfinite(sigma) & (sigma > 0)).all()
-        else:
-            healthy = (torch.linalg.cholesky_ex(sigma.detach())[1] == 0).all()
-    return bool(host_read(healthy.reshape(1))[0])
+    return not bool(host_read(_covariance_failure(sigma, diagonal).reshape(1))[0])
 
 
 def _receiver_mask(
@@ -1056,13 +1073,22 @@ class RelationalOperators(nn.Module):
         (:func:`vfe3.model.minimal_agent.local_posterior_covariance`), with the same floor.
 
         One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
-        :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
-        a certified ``projected_factorization``, a query certificate (module docstring of
-        :mod:`vfe3.model.minimal_agent`) is recomputed whole in float64 from the local beliefs, frame and prior, and
-        its outputs and capture are cast back to the input dtypes. The float32 attempt is discarded, so backward
-        never runs through its failed factorizations. Every query and key entry of the call (:math:`2BNH`) is then
-        counted as recovered in the source-recovery counter that the training loop reads
-        (``relational_covariance_repair_count``). A float64 failure raises ``ValueError``; nothing is repaired.
+        :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...), under
+        a certified ``projected_factorization`` a query certificate (module docstring of
+        :mod:`vfe3.model.minimal_agent`), or, with ``return_covariance``, a floored output that fails the covariance
+        screen (a nonpositive or non-finite variance, or a failed Cholesky factorization of a full covariance;
+        checked on the device before the ceiling, audit 2026-10-16 F8) is recomputed whole in float64 from the local
+        beliefs, frame and prior, and its outputs and capture are cast back to the input dtypes. The output is a Kalman
+        downdate computed by cancellation, so in float32 it can lose positivity with every factorization healthy. The
+        float32 attempt is discarded, so backward never runs through its failed factorizations. A factorization or
+        certificate recompute counts every query and key entry of the call (:math:`2BNH`) as recovered in the
+        source-recovery counter that the training loop reads (``relational_covariance_repair_count``); an output-screen
+        recompute counts the call's :math:`BN` tokens in ``covariance_escalation_elements``, as the kernel route does.
+        The float64 recompute keeps the float32 frame pair, so its output takes the first term :math:`U_iC_iU_i^\top`
+        from the :math:`C_i` the gains used (``reference`` of
+        :func:`vfe3.model.minimal_agent.local_posterior_covariance`) and the pair's :math:`\varepsilon_{32}\kappa`
+        inconsistency does not enter it; a call at the frame's own precision keeps the input :math:`\Sigma_i`. A
+        float64 failure of a factorization or of the screen raises ``ValueError``; nothing is repaired.
         """
         if self.predictive_readout != "minimal_agent":
             raise ValueError("minimal_agent_update needs predictive_readout='minimal_agent'")
@@ -1077,28 +1103,35 @@ class RelationalOperators(nn.Module):
             mu, sigma, frame, log_prior, return_covariance, capture is not None, floor)
         # The one host read of a healthy call; it also resolves raise-only checks queued by
         # vfe3.contracts.deferred_host_checks (earlier frame certificates and prototype-agent checks) first.
-        failed, ill_conditioned = host_read(status)
-        if failed and dtype == torch.float64:
-            raise ValueError(minimal_agent.readout_failure_message(dtype))
-        if failed or ill_conditioned:
+        failed, ill_conditioned, covariance_failed = host_read(status)
+        if dtype == torch.float64 and (failed or covariance_failed):
+            raise ValueError(minimal_agent.readout_failure_message(dtype) if failed
+                             else _MINIMAL_AGENT_COVARIANCE_FAILURE)
+        if failed or ill_conditioned or covariance_failed:
             # float64 beliefs make the body compute in float64; it casts the frame factors itself, so the float32
             # frame is passed unchanged (a float64 CanonicalFrameContext would re-validate a float32 inverse pair
             # against the float64 residual tolerance).
             mu_plus, sigma_plus, record, status = self._minimal_agent_call(
                 mu.double(), sigma.double(), frame, None if log_prior is None else log_prior.double(),
                 return_covariance, capture is not None, None if floor is None else floor.double())
-            if bool(status[0]):
+            failed_wide, _, covariance_failed_wide = host_read(status)
+            if failed_wide:
                 raise ValueError(minimal_agent.readout_failure_message(torch.float64)
                                  + "; the float32 call failed first and was recomputed in float64")
+            if covariance_failed_wide:
+                raise ValueError(_MINIMAL_AGENT_COVARIANCE_FAILURE + _MINIMAL_AGENT_COVARIANCE_RECOMPUTED)
             mu_plus = mu_plus.to(mu.dtype)
             sigma_plus = None if sigma_plus is None else sigma_plus.to(sigma.dtype)
             record = {key: (value.to(mu.dtype) if torch.is_tensor(value) and value.is_floating_point() else value)
                       for key, value in record.items()}
-            entries = torch.full((), 2 * math.prod(mu.shape[:-1]) * len(self.irrep_dims), dtype=torch.long,
-                                 device=mu.device)                     # every query and key entry, 2 B N H
-            if before is not None:
-                entries = entries - (source_recovery_counter(mu.device) - before)
-            _count_source_recovery(entries)
+            if failed or ill_conditioned:
+                entries = torch.full((), 2 * math.prod(mu.shape[:-1]) * len(self.irrep_dims), dtype=torch.long,
+                                     device=mu.device)                 # every query and key entry, 2 B N H
+                if before is not None:
+                    entries = entries - (source_recovery_counter(mu.device) - before)
+                _count_source_recovery(entries)
+            if covariance_failed:
+                _count_covariance_escalation(math.prod(mu.shape[:-1]), mu.device)   # the call's B N tokens
         if capture is not None:
             capture.update(record)
             capture["relational_mean_displacement_norm"] = (mu_plus - mu).norm().detach()
@@ -1127,8 +1160,9 @@ class RelationalOperators(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor]:
         r"""Body of :meth:`minimal_agent_update`: autocast off, IEEE fp32 GEMMs, float64 under an escalated frame.
 
-        Returns the local outputs, the capture record and the readout's status ``(failed, ill_conditioned)``
-        ``(2,)`` bool, unchecked (the caller makes the host check)."""
+        Returns the local outputs, the capture record and the status ``(failed, ill_conditioned, covariance_failed)``
+        ``(3,)`` bool, unchecked (the caller makes the host check): the readout's factorization and certificate flags
+        and the device-side screen of the floored covariance (False without ``return_covariance``)."""
         H, K = len(self.irrep_dims), self.input_dim
         S, T, log_noise = self.raw_score_q, self.T, self.channel_log_noise
         dtype = _compute_dtype(mu, sigma, S, T, log_noise, frame.forward)
@@ -1151,10 +1185,17 @@ class RelationalOperators(nn.Module):
             forward = frame.forward.to(dtype)
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None
+            covariance_failed = torch.zeros((), dtype=torch.bool, device=mu.device)
             if return_covariance:
+                # A float64 recompute of a float32 call keeps the float32 frame pair, an inverse pair only to about
+                # eps_32 kappa(U_i), so its first term is U_i C_i U_i^T rebuilt from the C_i the gains used (audit
+                # 2026-10-16, F8). At the pair's own precision the input Sigma_i is the more accurate first term:
+                # the round trip through U_i^{-1} and U_i costs about eps kappa(U_i)^2 there.
+                coarse_pair = torch.finfo(frame.forward.dtype).eps > torch.finfo(dtype).eps
                 sigma_plus = minimal_agent.local_posterior_covariance(
                     sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype),
-                    result.spread_gains, result.label_spread)
+                    result.spread_gains, result.label_spread, reference=C if coarse_pair else None)
+                covariance_failed = _covariance_failure(sigma_plus, diagonal=sigma.dim() == mu.dim())   # () bool
         record: dict = {}
         if diagnostics:
             with torch.no_grad():
@@ -1184,7 +1225,7 @@ class RelationalOperators(nn.Module):
                         result.elbo.nanmean(), result.adf_evidence.nanmean(),
                         (result.adf_evidence - result.elbo).nanmean(), result.evidence.mean(),
                         result.is_evidence.nanmean(), (result.is_evidence - result.elbo).nanmean())))   # () float64
-        status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
+        status = torch.stack((result.failed, result.ill_conditioned, covariance_failed))      # (3,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
 
     def _receive_runs(

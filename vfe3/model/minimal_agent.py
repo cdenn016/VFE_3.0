@@ -1524,6 +1524,30 @@ def minimal_agent_readout(
 # Local coordinates
 # ----------------------------------------------------------------------------------------------
 
+def local_covariance(
+    C:              torch.Tensor,               # (..., N, G, g, g) blocks (diagonal on block frames) or (..., N, K, K)
+    forward:        torch.Tensor,               # (..., N, G, g, g) compact or (..., N, K, K) dense U_i
+    block_diagonal: bool,
+    diagonal:       bool,                       # return diag(U_i C_i U_i^T) (..., N, K)
+) -> torch.Tensor:                              # (..., N, K) or (..., N, K, K)
+    r"""The local covariance :math:`U_iC_iU_i^\top` of a reference covariance, or its diagonal.
+
+    ``C`` is laid out as ``RelationalOperators._reference_covariance`` returns it: the :math:`G` diagonal blocks
+    :math:`C_{i,m}` for diagonal beliefs on block frames (then
+    :math:`[U_iC_iU_i^\top]_{kk} = \sum_{ab}U_{i,m,ka}C_{i,m,ab}U_{i,m,kb}` per block, :math:`O(NKg)`), else dense.
+    """
+    if block_diagonal and diagonal:
+        return torch.einsum("...nmab,...nmbc,...nmac->...nma", forward, C, forward).flatten(-2)   # (..., N, K)
+    U = forward
+    if block_diagonal:                                                          # compact -> dense (..., N, K, K)
+        G, g = forward.shape[-3], forward.shape[-1]
+        eye = torch.eye(G, dtype=forward.dtype, device=forward.device)
+        U = torch.einsum("...mab,mn->...manb", forward, eye).reshape(*forward.shape[:-3], G * g, G * g)
+    if diagonal:
+        return torch.einsum("...ab,...bc,...ac->...a", U, C, U)                 # (..., N, K)
+    return _symmetrize(U @ C @ U.transpose(-1, -2))                             # (..., N, K, K)
+
+
 def local_posterior_covariance(
     sigma:          torch.Tensor,               # (..., N, K) diagonal or (..., N, K, K) full input Sigma_i
     forward:        torch.Tensor,               # (..., N, G, g, g) compact or (..., N, K, K) dense U_i
@@ -1533,20 +1557,33 @@ def local_posterior_covariance(
     floor:          torch.Tensor,               # sigma's layout: f Sigma_{p,i}, the prior-anchored floor
     spread_gains:   Optional[torch.Tensor] = None,   # (..., N, H, K, d) P_i S_h^T (spread_corrected only)
     spread:         Optional[torch.Tensor] = None,   # (..., N, H, d, d) R'_i^h (spread_corrected only)
+    *,
+    reference:      Optional[torch.Tensor] = None,   # the C_i the gains used (local_covariance layout)
 ) -> torch.Tensor:                              # same layout as sigma
     r"""Local posterior covariance :math:`\Sigma_i^+ = U_iC_i^+U_i^\top + f\,\Sigma_{p,i}`.
 
     .. math::
-        \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\Sigma_{p,i},\qquad
-        Z_i^h = U_i\mathsf K_i^h\ (K\times d),
+        \Sigma_i^+ = U_iC_iU_i^\top - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\Sigma_{p,i},\qquad
+        Z_i^h = U_i\mathsf K_i^h\ (K\times d).
 
-    using :math:`\Sigma_i = U_iC_iU_i^\top` exactly, so the input covariance is not recomputed. The floor
+    With ``reference`` the first term is :math:`U_iC_iU_i^\top` recomputed from the :math:`C_i` the gains were built
+    from (:func:`local_covariance`), so the result is :math:`U_i(C_i - \sum_h\mathsf K^hM^h\mathsf K^{h\top})U_i^\top +
+    f\Sigma_{p,i}` for the stored frame pair. Without it the input :math:`\Sigma_i` is used, which equals
+    :math:`U_iC_iU_i^\top` only for an exact pair. Both are the same quantity for an exact pair, and which is more
+    accurate depends on the precisions (audit 2026-10-16, F8). A float32 pair :math:`(U_i, U_i^{-1})` is an inverse
+    pair to about :math:`\varepsilon_{32}\kappa(U_i)`; in a float64 recompute that inconsistency times a large input
+    variance exceeded a sharply contracted posterior and returned negative variances, while the float64 round trip
+    costs only :math:`\varepsilon_{64}\kappa(U_i)^2`, so ``RelationalOperators`` passes ``reference`` there. At the
+    pair's own precision the round trip costs about :math:`\varepsilon\kappa(U_i)^2` against the pair's
+    :math:`\varepsilon\kappa(U_i)`, and the input :math:`\Sigma_i` is kept (measured in float32 at
+    :math:`\kappa_2\in[10, 10^4]`: about twenty times as many nonpositive variances with ``reference``). The floor
     :math:`f\,\Sigma_{p,i}` (``floor``, formed by the caller) is the token's prior covariance in local coordinates: it
     involves no frame, so the result is exactly invariant under a common reference change and covariant under a site
     action, and it does not compound with depth (audit 2026-10-12, item 4 and T5). A diagonal input returns the
     diagonal (the moment projection onto the diagonal family),
-    :math:`\operatorname{diag}\Sigma_i - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\operatorname{diag}\Sigma_{p,i}`
-    with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a :math:`K\times K` matrix.
+    :math:`\operatorname{diag}(U_iC_iU_i^\top) - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\operatorname{diag}\Sigma_{p,i}`
+    with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a :math:`K\times K` matrix on block
+    frames.
 
     With ``spread_gains`` :math:`P_iS_h^\top` and ``spread`` :math:`R'^h_i` (``spread_corrected``, module docstring T2)
     the term :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`, is added (its row quadratic forms on
@@ -1558,6 +1595,8 @@ def local_posterior_covariance(
     if (spread_gains is None) != (spread is None):
         raise ValueError("spread_gains and spread are given together (spread_corrected) or not at all")
     H, K, d = gains.shape[-3:]
+    if reference is not None:                                                   # U_i C_i U_i^T, sigma's layout
+        sigma = local_covariance(reference, forward, block_diagonal, diagonal=sigma.dim() == gains.dim() - 2)
 
     def local(X: torch.Tensor) -> torch.Tensor:                                 # (..., N, H, K, d) -> U_i X
         if block_diagonal:
