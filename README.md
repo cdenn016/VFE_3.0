@@ -697,11 +697,15 @@ $O'$ and is kept for charts too ill-conditioned for the inverse's float64 certif
 the entropy $\alpha+\sum_h\lambda_h$ times) and the `relational_receiver_law` field were
 removed on 2026-10-12. `relational_receiver_update="closed_form"` (default) applies the exact frozen-context
 natural-parameter update with damping `relational_receiver_damping` in $(0,1]$
-($1$ is the minimizer; then extra E-steps change nothing). Under
+($1$ is the minimizer of the energy with $\alpha$ frozen at the current iterate). Every accepted
+`lambda_alpha_mode` recomputes $\alpha$ from the receiver at each E-step, so under
 `lambda_alpha_mode="state_dependent"` that update is one majorize-minimize step on the profiled
-energy $c_0\log(b_0+D)+G$; `"closed_form_profiled"` returns the limit of those steps, the
-fixed point $\alpha=c_0/(b_0+D(q^\star(\alpha)))$ reached from the current state, in one
-scalar root solve per receiver with implicit gradients (not available per coordinate). `"euler"` is the explicit
+energy $c_0\log(b_0+D)+G$ and further E-steps continue the iteration;
+`"closed_form_profiled"` returns the limit of those steps, the fixed point
+$\alpha=c_0/(b_0+D(q^\star(\alpha)))$ reached from the current state, in one scalar root
+solve per receiver with implicit gradients (not available per coordinate). Only
+`closed_form_profiled` at $\rho=1$ makes extra E-steps leave the belief unchanged, up to the
+root solve's tolerance. `"euler"` is the explicit
 Fisher step governed by `e_q_mu_lr`, `e_q_sigma_lr` and the trust radii; it is stable
 only for `e_q_mu_lr` below $2/\lambda_{\max}(\Sigma\Lambda)$. Serialized configs that
 predate `relational_receiver_update` reload with `euler`; a `projected_gradient` config that

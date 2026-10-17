@@ -597,7 +597,10 @@ class VFE3Config:
     #                         receiver (not per_coord)
     #   euler                 explicit Fisher step with e_q_mu_lr / e_q_sigma_lr and the trust regions
     relational_receiver_update:       str             = "closed_form"
-    relational_receiver_damping:      float           = 1.0          # closed_form(_profiled) only: rho in (0, 1]; 1 = the minimizer
+    # closed_form(_profiled) only: rho in (0, 1]; rho = 1 takes the full step. Under closed_form that is the
+    # minimizer with alpha frozen at the current iterate, one MM step, so extra E-steps keep moving the belief;
+    # under closed_form_profiled it is the profiled fixed point, which extra E-steps leave unchanged.
+    relational_receiver_damping:      float           = 1.0
     relational_receiver_noise:        float           = 1.0          # channel floor nu I_d, nu > 0
 
     ##################################################
