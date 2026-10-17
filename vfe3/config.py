@@ -461,7 +461,7 @@ class VFE3Config:
     # Learn the routing temperature per layer and head: tau_{l,h} = kappa_h sqrt(d_h) exp(3 tanh(delta_{l,h} / 3))
     # with delta = 0 at init (routing_log_temperature, (H,) per layer; no weight decay, score learning rate).
     # The KL cost is invariant under (S_Q, S_K) -> (A S_Q, A S_K), so no map can set the sharpness. Cools only
-    # below the kl_max cap: a fully capped absolute-reference row stays uniform. Not with minimal_agent.
+    # below the kl_max cap: a fully capped absolute-reference row stays at the prior pi. Not with minimal_agent.
     learn_attention_temperature:      bool            = False
 
     # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
@@ -471,7 +471,9 @@ class VFE3Config:
     #   causal_windowed    -inf more than attention_window keys back
     beta_attention_prior:             str             = "causal"
     
-    # alibi priors only: BASE multiplier; the realized head slopes are alibi_slope * 2^(-8h/H), so an
+    # alibi priors only: BASE multiplier on the Press et al. (ICLR 2022) head slopes: alibi_slope * 2^(-8h/H),
+    # h = 1..H, for a power-of-two H; otherwise the 2^(-8h/H') schedule of the largest power of two H' < H, then the
+    # first H - H' slopes 2^(-8h/(2H')) at odd h (H = 5: 1/4, 1/16, 1/64, 1/256, 1/2; vfe3.attention_prior). An
     # n_heads sweep at fixed alibi_slope rescales the prior.
     alibi_slope:                      float           = 1.0
     attention_window:                 int             = 128          # causal_windowed only: band width
@@ -860,7 +862,8 @@ class VFE3Config:
     kl_max:                           Optional[float] = None
     # "absolute" | "row_min": what kl_max clamps in the kernel router, projected_predictive and
     # projected_gradient (audit 2026-10-08 P1-4)
-    #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes uniformly with zero gradient
+    #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
+    #             (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
     #   row_min   D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
     routing_kl_max_reference:         str             = "absolute"
     # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
