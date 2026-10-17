@@ -347,7 +347,8 @@ def test_bank_copy_keeps_the_compact_frame_layout() -> None:
     assert dense.block_diagonal is False
     decoded: Dict[str, Any] = {}
 
-    def decode(mu: torch.Tensor, sigma: torch.Tensor, *, canonical_frame: Any) -> torch.Tensor:
+    def decode(mu: torch.Tensor, sigma: torch.Tensor, *, canonical_frame: Any,
+               encoded_sigma: Any = None) -> torch.Tensor:          # the record's encoded covariance (F64)
         decoded["frame"] = canonical_frame
         return mu
 
