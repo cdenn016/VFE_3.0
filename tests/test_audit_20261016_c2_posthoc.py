@@ -10,6 +10,9 @@ Synthetic strings and tiny models only (single-digit dimensions, CPU, one thread
   matmul policy are the run's; an IEEE fp32 replay of a TF32 run gets the fp32-replay tolerance.
 * F69: the M5 table marks a row scored on the aligned subset of the baseline's targets and prints the
   baseline CE on that subset; the forest plot names the resampling unit the intervals used.
+* F120: under a comparison ``rope_mode`` M5 rows 6 and 10 score through the trained router (its
+  comparison-space rotation and commutant projection included) on substituted reference moments, and
+  the M4 decomposition rebuilds the rotated moments under ``rope_mode='comparison_invariant'``.
 """
 
 from __future__ import annotations
@@ -193,3 +196,115 @@ def test_interventions_plot_names_the_bootstrap_unit(tmp_path: Path, monkeypatch
     fg.plot_interventions(_m5_rows(), tmp_path, unit="article")
     assert "4096-token block" in labels[0] and "article" not in labels[0]
     assert "article-bootstrap" in labels[1]
+
+
+# ----------------------------------------------------------------------------------------------
+# F120: rows 6 and 10 and the M4 decomposition under a comparison rope_mode
+# ----------------------------------------------------------------------------------------------
+
+# (rope_mode, embed_dim, rope_fraction): heads of 2 rotate every pair (the diagonal P(G) route of
+# comparison_invariant); heads of 4 at p = 0.5 keep a two-coordinate block (the dense P(G) route).
+ROPE_MODES = [("none", 4, 1.0), ("comparison", 4, 1.0), ("comparison_invariant", 4, 1.0),
+              ("comparison", 8, 0.5), ("comparison_invariant", 8, 0.5)]
+
+
+def _scorer_inputs(rope_mode: str, embed_dim: int, fraction: float, seed: int = 1) -> Any:
+    r"""Float64 operators of a tiny two-head model and a random compact frame U_i."""
+    import copy
+
+    from vfe3.contracts import CanonicalFrameContext
+
+    model = _model(_cfg(rope_mode=rope_mode, embed_dim=embed_dim, rope_fraction=fraction))
+    ops = copy.deepcopy(model.relational_operators_by_layer[0]).double()
+    g = torch.Generator().manual_seed(seed)
+    B, N, H, d = 2, 5, 2, embed_dim // 2
+    K = H * d
+    mu = torch.randn(B, N, K, generator=g, dtype=torch.float64)
+    source_mu = torch.randn(B, N, K, generator=g, dtype=torch.float64)
+    sigma = torch.rand(B, N, K, generator=g, dtype=torch.float64) + 0.5          # (B, N, K) diagonal
+    source_sigma = torch.rand(B, N, K, generator=g, dtype=torch.float64) + 0.5
+    A = torch.eye(d, dtype=torch.float64) + 0.3 * torch.randn(B, N, H, d, d, generator=g, dtype=torch.float64)
+    frame = CanonicalFrameContext(forward=A, inverse=torch.linalg.inv(A), block_diagonal=True)
+    U = torch.zeros(B, N, K, K, dtype=torch.float64)                             # (B, N, K, K) blockdiag U_i
+    for h in range(H):
+        U[..., h * d:(h + 1) * d, h * d:(h + 1) * d] = A[..., h, :, :]
+    return ops, frame, U, mu, source_mu, sigma, source_sigma
+
+
+@pytest.mark.parametrize("rope_mode, embed_dim, fraction", ROPE_MODES)
+def test_identity_covariance_score_is_the_trained_router_at_reference_covariance_identity(
+        rope_mode: str, embed_dim: int, fraction: float) -> None:
+    r"""Row 6 sets :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top} = I`, i.e. :math:`\Sigma_i = U_iU_i^\top` in the trained router."""
+    from vfe3.gradients.relational import relational_score
+
+    ops, frame, U, mu, source_mu, sigma, source_sigma = _scorer_inputs(rope_mode, embed_dim, fraction)
+    UU = U @ U.transpose(-1, -2)                                                 # (B, N, K, K) C_i = I
+    for q, k in ((mu, mu), (mu, source_mu)):
+        trained = relational_score(q, UU, k, UU, frame, ops)
+        got = iv._identity_covariance_score(q, sigma, k, source_sigma, frame, ops)
+        torch.testing.assert_close(got, trained, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("rope_mode, embed_dim, fraction", ROPE_MODES)
+def test_frame_free_covariance_score_is_the_trained_router_at_reference_covariance_sigma(
+        rope_mode: str, embed_dim: int, fraction: float) -> None:
+    r"""Row 10 sets :math:`C_i = \Sigma_i`, i.e. the trained router fed :math:`U_i\Sigma_iU_i^\top`."""
+    from vfe3.gradients.relational import relational_score
+
+    ops, frame, U, mu, source_mu, sigma, source_sigma = _scorer_inputs(rope_mode, embed_dim, fraction, seed=2)
+
+    def pushed(s: torch.Tensor) -> torch.Tensor:                                # (B, N, K, K) U diag(s) U^T
+        return U @ torch.diag_embed(s) @ U.transpose(-1, -2)
+
+    trained = relational_score(mu, pushed(sigma), source_mu, pushed(source_sigma), frame, ops)
+    got = iv._frame_free_covariance_score(mu, sigma, source_mu, source_sigma, frame, ops)
+    torch.testing.assert_close(got, trained, rtol=1e-9, atol=1e-9)
+    self_scored = iv._frame_free_covariance_score(mu, sigma, mu, sigma, frame, ops)
+    torch.testing.assert_close(self_scored, relational_score(mu, pushed(sigma), mu, pushed(sigma), frame, ops),
+                               rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("rope_mode", ["comparison", "comparison_invariant"])
+def test_routing_covariances_identity_runs_under_comparison_rope(rope_mode: str) -> None:
+    r"""Identity prior covariances and frames give :math:`C_i = I` already, so row 6 is a no-op there."""
+    model = _model(_cfg(rope_mode=rope_mode))
+    with torch.no_grad():
+        model.prior_bank.sigma_log_embed.zero_()
+        model.prior_bank.phi_embed.zero_()
+        model.pos_phi_free.zero_()
+    dataset = st.eval_windows(_stream(61, 4), 8, 4)
+    indices = np.arange(len(dataset))
+    base = ev.nll_pass(model, dataset, indices, batch_size=2, device=DEVICE)
+    with iv.routing_covariances_identity(model) as record:
+        arm = ev.nll_pass(model, dataset, indices, batch_size=2, device=DEVICE)
+    assert record["intercepted_calls"] > 0
+    np.testing.assert_allclose(arm.nll, base.nll, rtol=0, atol=1e-5)
+    moved = _model(_cfg(rope_mode=rope_mode))
+    with iv.routing_covariances_identity(moved):
+        changed = ev.nll_pass(moved, dataset, indices, batch_size=2, device=DEVICE)
+    assert np.abs(changed.nll - ev.nll_pass(moved, dataset, indices, batch_size=2, device=DEVICE).nll).max() > 1e-6
+
+
+@pytest.mark.parametrize("embed_dim, fraction", [(4, 1.0), (8, 0.5)], ids=["diagonal_P", "dense_P"])
+def test_routing_decomposition_is_exact_under_comparison_invariant_rope(embed_dim: int, fraction: float) -> None:
+    from tests.test_posthoc_routing_20260928 import _cfg as routing_cfg
+    from tests.test_posthoc_routing_20260928 import _model as routing_model
+    from tests.test_posthoc_routing_20260928 import _run
+
+    result = _run(routing_model(routing_cfg(rope_mode="comparison_invariant", embed_dim=embed_dim,
+                                            rope_fraction=fraction)))
+    assert result["status"] == "ok", result.get("reason")
+    worst = result["checks_worst"]
+    assert worst["identity_max_rel_error"] < 1e-12
+    assert worst["model_cost_max_abs_error"] < 1e-10
+    assert worst["model_logit_max_abs_error"] < 1e-10
+    assert worst["model_beta_max_abs_error"] < 1e-12
+
+
+def test_routing_decomposition_still_refuses_the_full_rotated_comparison_covariance() -> None:
+    from tests.test_posthoc_routing_20260928 import _cfg as routing_cfg
+    from tests.test_posthoc_routing_20260928 import _model as routing_model
+    from vfe3.posthoc import routing as rt
+
+    reason = rt.not_applicable_reason(routing_model(routing_cfg(rope_mode="comparison")))
+    assert reason is not None and "rope_mode='comparison'" in reason
