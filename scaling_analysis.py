@@ -1104,7 +1104,8 @@ def _collapse_identical_points(
     is ``width_depth`` K160_L{d}, trained with the same seeds, data order and deterministic kernels.
     Two points whose per-seed effective-run identities (config with float fields normalized,
     dataset, data seed, token cap, source and code identity) coincide are one set of observations,
-    so the pooled fit, the lack-of-fit test and the bootstrap must count them once. Returns the
+    so the pooled fit, the lack-of-fit test, the bootstrap and the frontier-collapse test must count
+    them once. Returns the
     retained points (first in (route, label) order) and a report of every collapsed group.
     Points without a recorded identity are kept as they are, and points must also record the same
     parameter count to collapse.
@@ -1310,7 +1311,18 @@ def ancova_frontier_collapse(
     distinct sizes per route and a converged offset fit for every route and for the pool;
     otherwise it is not testable. A significant F means the routes do NOT collapse. Non-rejection
     does not establish equivalence. Returns the F statistic, dof, p-value, rejection status, and
-    per-route point counts."""
+    per-route point counts.
+
+    Every training run enters the test once. The nested standard routes share cells (``width`` K{k}
+    is ``width_depth`` K{k}_L6 and ``depth`` L{d} is ``width_depth`` K160_L{d}), so a set of identical
+    runs (:func:`_collapse_identical_points`) is kept under the first route in (route, label) order
+    and dropped from the others; ``n_identical_points_dropped`` counts the copies. Counting a copy
+    under each route doubled its residual: under one shared offset law (5 widths x 4 depths, 3 seeds)
+    the duplicated design rejected 0 of 150 replicates (audit 2026-10-16 F55). Any partition of the
+    distinct runs into routes gives the F law under the null."""
+    points, collapsed = _collapse_identical_points(
+        sorted(points, key=lambda p: (str(p["route"]), str(p.get("label", "")))))
+    n_dropped = sum(len(group["dropped_as_identical"]) for group in collapsed)
     by_route: Dict[str, List[Dict[str, Any]]] = {}
     for p in points:
         n_params = _as_float(p.get("n_params"))
@@ -1322,6 +1334,7 @@ def ancova_frontier_collapse(
     out: Dict[str, Any] = {
         "routes": {r: len(ps) for r, ps in routes.items()},
         "distinct_sizes": {r: len(route_sizes[r]) for r in routes},
+        "n_identical_points_dropped": n_dropped,
         "testable": False,
     }
     if len(routes) < 2:
@@ -1519,7 +1532,8 @@ def analyze() -> None:
     pooled_ids = {id(p) for p in pooled_param_points}
     pooled_mask = np.array([id(p) in pooled_ids for p in fit_param_points], dtype=bool)
     for group in collapsed_cells:
-        logger.warning("identical training runs %s counted once in the pooled fit (kept %s)",
+        logger.warning("identical training runs %s counted once in the pooled fit and the frontier "
+                       "test (kept %s)",
                        ", ".join(group["dropped_as_identical"]), group["kept"])
     frontier = (
         ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"],
@@ -1874,7 +1888,7 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     collapsed = summary.get("collapsed_identical_cells") or []
     budget = summary.get("budget_points_excluded_from_fit") or []
     if collapsed or budget:
-        L += ["## Points not counted separately in the pooled fit", ""]
+        L += ["## Points not counted separately in the pooled fit and the frontier test", ""]
         L += [f"- identical runs: kept `{group['kept']}`, counted once with "
               f"{', '.join(f'`{label}`' for label in group['dropped_as_identical'])}"
               for group in collapsed]

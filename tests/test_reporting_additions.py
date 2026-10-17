@@ -586,7 +586,10 @@ def _write_scaling_analysis_run(
 def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
     # Two routes, four sizes each, and two seeds per cell give every table and
     # overlay enough sizes for the requested offset estimator.  With symmetric
-    # seed values mean +/- 0.05, SEM is exactly 0.05 at every point.
+    # seed values mean +/- 0.05, SEM is exactly 0.05 at every point.  The routes differ in
+    # n_e_steps: the fixture config does not depend on the size, so equal configs would make the
+    # two routes' cells identical training runs, which the frontier test counts once (audit
+    # 2026-10-16 F55).
     import pytest
     pytest.importorskip("scipy")
 
@@ -601,6 +604,7 @@ def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
                     seed=seed,
                     n_params=n_params,
                     test_ce=mean + delta,
+                    n_e_steps=1 + route_i,
                 )
 
     real_fit = figs._fit_power_law
