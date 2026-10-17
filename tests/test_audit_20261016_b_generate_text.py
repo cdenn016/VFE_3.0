@@ -1,13 +1,18 @@
-r"""Audit 2026-10-16 F17: the ``generate_text`` GPT-2 control decodes with the run's own sampler.
+r"""Audit 2026-10-16 F17, F54: the ``generate_text`` self-CE diagnostic compares like with like.
 
-``HuggingFaceBaseline.generate`` took the argmax at every step while the VFE continuation was sampled, so the
+F17. ``HuggingFaceBaseline.generate`` took the argmax at every step while the VFE continuation was sampled, so the
 self-CE deltas of the two rows compared different samplers (greedy text sits at the mode and scores a lower
 self-CE). The control now applies :func:`generate_text.sample_next_token`, the map ``VFEModel.generate`` applies to
 its last-position logits, and is reseeded per prompt like :func:`generate_text.generate_for_prompts`. The per-prompt
 baseline delta is taken against the baseline's own held-out reference. Tiny CPU stand-ins replace GPT-2, which the
 CPU interpreter does not have; the method body is model-agnostic.
+
+F54. The held-out reference draws were scored after a full-window warmup while a continuation's first tokens see
+only the prompt, and CE falls with context, so the delta was biased upward. Each draw is now scored with a prefix
+as long as the prompt it is compared with, and the scorer applies the same windows to both streams.
 """
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -93,6 +98,7 @@ def test_sampled_control_depends_on_the_seed() -> None:
 
 class _StubBaseline:
     calls: List[Dict[str, Any]] = []
+    warmups: List[int] = []
 
     def __init__(self, name: str, device: str) -> None:
         self.name = name
@@ -116,6 +122,7 @@ def _stub_main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, json_output: 
     for name, value in settings.items():
         monkeypatch.setattr(generate_text, name, value)
     _StubBaseline.calls = []
+    _StubBaseline.warmups = []
     monkeypatch.setattr(generate_text, "HuggingFaceBaseline", _StubBaseline)
     monkeypatch.setattr(generate_text, "validated_run_dir", lambda path: path)
     monkeypatch.setattr(generate_text, "load_run", lambda run_dir, device: loaded)
@@ -123,13 +130,16 @@ def _stub_main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, json_output: 
                         lambda *args, **kwargs: [generate_text.Generation("p", "text", [1, 2, 3])])
     monkeypatch.setattr(generate_text, "prompt_token_ids", lambda text, dataset: [0, 1])
     monkeypatch.setattr(generate_text, "decode_ids", lambda ids, dataset: "decoded")
-    monkeypatch.setattr(generate_text, "held_out_token_ids",
-                        lambda *args, **kwargs: [torch.zeros(10, dtype=torch.long)] * 2)
+    def held_out_token_ids(*args: Any, warmup: int) -> List[torch.Tensor]:
+        _StubBaseline.warmups.append(warmup)
+        return [torch.zeros(10, dtype=torch.long)] * 2
+
+    monkeypatch.setattr(generate_text, "held_out_token_ids", held_out_token_ids)
 
     def score_streams(forward: Any, *args: Any, **kwargs: Any) -> generate_text.SelfCEScore:
         if isinstance(forward, _StubBaseline):
-            return generate_text.SelfCEScore(generated=[2.0], reference=[1.5, 1.7])
-        return generate_text.SelfCEScore(generated=[3.0], reference=[2.5, 2.7])
+            return generate_text.SelfCEScore(generated=[2.0], reference=[[1.5, 1.7]])
+        return generate_text.SelfCEScore(generated=[3.0], reference=[[2.5, 2.7]])
 
     monkeypatch.setattr(generate_text, "score_streams", score_streams)
 
@@ -141,6 +151,7 @@ def test_main_passes_the_sampler_and_reports_the_baseline_against_its_own_refere
     assert _StubBaseline.calls == [dict(greedy=False, temperature=0.7, top_k=3, top_p=0.9, seed=5)]
     out = capsys.readouterr().out
     assert "gpt2    2.000  (delta +0.400," in out                             # 2.0 - 1.6, not 2.0 - 2.6
+    assert _StubBaseline.warmups == [2]                                     # the prompt's length, not a window
 
 
 def test_json_labels_the_baseline_sampler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -158,3 +169,47 @@ def test_greedy_main_passes_no_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setattr(generate_text, "GREEDY", True)
     generate_text.main()
     assert _StubBaseline.calls[0]["greedy"] is True and _StubBaseline.calls[0]["seed"] is None
+
+
+# ---------------------------------------------------------------------------------------------- F54
+
+class _NeedsContext(torch.nn.Module):
+    r"""Predicts token 0 sharply only at window positions with at least ``need`` tokens of context."""
+
+    def __init__(self, need: int) -> None:
+        super().__init__()
+        self.need = need
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        logits = torch.zeros(*inputs.shape, 5)
+        context = torch.arange(1, inputs.shape[-1] + 1)                     # tokens seen at each position
+        logits[..., 0] = torch.where(context >= self.need, 30.0, 0.0)
+        return logits
+
+
+def test_identical_text_scores_identically_as_continuation_and_reference() -> None:
+    seq_len, stride, n_new = 8, 2, 12
+    model = _NeedsContext(seq_len - stride + 1)
+    draw = torch.zeros(seq_len + n_new, dtype=torch.long)                   # a full-window warmup is available
+    scores = generate_text.score_streams(model, [[0, 0]], [[0] * n_new], [draw, draw], n_new, seq_len,
+                                         stride=stride)
+    background = math.log(1.0 + 4.0 * math.exp(-30.0))
+    assert scores.generated[0] > background + 0.5                           # the first targets see only the prompt
+    assert scores.summary()[0] == pytest.approx(scores.generated[0], rel=1e-6)
+
+
+def test_each_prompt_is_matched_to_a_reference_at_its_own_context_length() -> None:
+    seq_len, stride, n_new = 8, 2, 10
+    model = _NeedsContext(seq_len - stride + 1)
+    draws = [torch.zeros(5 + n_new, dtype=torch.long)] * 3
+    prompts = [[0], [0, 0, 0, 0, 0], [0]]
+    scores = generate_text.score_streams(model, prompts, [[0] * n_new] * 3, draws, n_new, seq_len, stride=stride)
+    assert [len(row) for row in scores.reference] == [3, 3, 3]
+    for index in range(3):
+        assert scores.prompt_reference(index) == pytest.approx(scores.generated[index], rel=1e-6)
+    assert scores.prompt_reference(0) > scores.prompt_reference(1)          # less context, higher CE
+    pooled = [value for row in scores.reference for value in row]
+    assert scores.summary() == pytest.approx((sum(pooled) / 9, min(pooled), max(pooled)))
+    with pytest.raises(ValueError, match="prefix"):
+        generate_text.score_streams(model, [[0] * 6], [[0] * n_new], draws, n_new, seq_len, stride=stride)

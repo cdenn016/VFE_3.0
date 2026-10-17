@@ -22,17 +22,21 @@ no dtype knob here to set.
 
 ``SELF_CE`` adds the diagnostic that separates a sampler artifact from a model property. Each
 generated continuation is scored teacher-forced against its own prompt, and compared with held-out
-corpus slices of the same length that carry an equal window of preceding text. Both go through the
-identical scorer, which slides ``max_seq_len`` windows back from the end of the stream by the run's
-``eval_stride`` (a quarter of the window when unset) and scores only each window's last ``stride``
-targets, so every tail token is counted exactly once with at least ``max_seq_len - stride`` tokens of
-context (disjoint blocks would give the first target of each block one token). A self-CE well below
-the held-out CE means the model has a sharp mode its own sampler keeps falling into; a self-CE at or
-above it means the loop is not a preferred mode at all, and the decoder (greedy or sampled) is walking a
-flat, uninformative distribution. Note that the held-out reference is the model's own, not a ceiling:
-this script scores one model against itself, and says nothing about how its held-out CE compares to
-another model's. The ``BASELINE`` control decodes its continuation with the same sampler settings and
-per-prompt seed, so its row differs from the run's by model, not by sampler.
+corpus slices of the same length, each scored after a prefix as long as that prompt. The two streams
+then have one length and the scorer applies the same windows to both, so the tail token at offset
+``j`` sees ``len(prompt) + j`` tokens of context in either until the window fills; CE falls with
+context, and a full-window prefix on the reference alone would bias the delta upward. The identical
+scorer slides ``max_seq_len`` windows back from the end of the stream by the run's ``eval_stride`` (a
+quarter of the window when unset) and scores only each window's last ``stride`` targets, so every tail
+token is counted exactly once, with at least ``max_seq_len - stride`` tokens of context once the
+window has filled (disjoint blocks would give the first target of each block one token). A self-CE
+well below the held-out CE means the model has a sharp mode its own sampler keeps falling into; a
+self-CE at or above it means the loop is not a preferred mode at all, and the decoder (greedy or
+sampled) is walking a flat, uninformative distribution. Note that the held-out reference is the
+model's own, not a ceiling: this script scores one model against itself, and says nothing about how
+its held-out CE compares to another model's. The ``BASELINE`` control decodes its continuation with
+the same sampler settings and per-prompt seed, so its row differs from the run's by model, not by
+sampler.
 
 Usage
 -----
@@ -47,7 +51,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -100,15 +104,28 @@ class Generation(NamedTuple):
 
 
 class SelfCEScore(NamedTuple):
-    """Teacher-forced cross-entropy of each continuation against a length-matched corpus reference."""
+    r"""Teacher-forced cross-entropy of each continuation against a context-matched corpus reference.
 
-    generated: List[float]      # one nats/token per prompt
-    reference: List[float]      # one nats/token per held-out draw
+    ``reference[i]`` holds one value per held-out draw, each scored after a prefix as long as prompt
+    ``i``, so it is the reference ``generated[i]`` is compared with.
+    """
+
+    generated: List[float]          # one nats/token per prompt
+    reference: List[List[float]]    # per prompt: one nats/token per held-out draw
+
+    def prompt_reference(self, index: int) -> float:
+        r"""Mean reference CE of prompt ``index``, the value its delta subtracts."""
+        row = self.reference[index]
+        return sum(row) / len(row)
 
     def summary(self) -> "tuple[float, float, float]":
-        r"""Reference mean and (min, max), so the draw-to-draw spread stays visible."""
-        return (sum(self.reference) / len(self.reference),
-                min(self.reference), max(self.reference))
+        r"""Reference mean over prompts and draws, and its (min, max) so the draw spread stays visible.
+
+        Every prompt is scored against the same draws, so the mean is the mean of the per-prompt
+        references, and the mean self-CE minus it is the mean per-prompt delta.
+        """
+        pooled = [value for row in self.reference for value in row]
+        return sum(pooled) / len(pooled), min(pooled), max(pooled)
 
 
 def newest_run_dir(root: 'str | Path') -> Path:
@@ -339,9 +356,9 @@ def held_out_token_ids(
     r"""``draws`` disjoint corpus slices of ``n_tokens`` scored tokens plus ``warmup`` of context.
 
     Tail positions are FIXED (spaced across the whole stream) and the warmup extends *backwards*
-    from them, so changing the block length changes only how much context each scored token sees,
-    never WHICH text is scored. That is what makes two block lengths comparable: any difference
-    between them is context, not a different sample of corpus.
+    from them, so changing the warmup (the longest prompt, see :func:`score_streams`) changes only how
+    much context is available before each tail, never WHICH text is scored: any difference between two
+    warmups is context, not a different sample of corpus.
     """
     from vfe3.data.datasets import load_cached_tokens
 
@@ -358,7 +375,7 @@ def held_out_token_ids(
     if step < max(0, warmup):
         raise ValueError(
             f"{dataset}/{split} ({total} tokens) is too short to place {draws} reference tails "
-            f"with {warmup} tokens of warmup each; reduce REFERENCE_DRAWS or BLOCK_TOKENS")
+            f"with {warmup} tokens of warmup each; reduce REFERENCE_DRAWS or shorten the prompts")
     # Fewer tails than requested is a coverage cap, so it is reported rather than silently
     # absorbed: the caller prints len(reference) back.
     available = min(draws, max(0, (total - n_tokens) // step))
@@ -386,19 +403,33 @@ def score_streams(
     r"""Score each continuation and the SHARED held-out draws through one scorer (window ``seq_len``,
     ``stride`` scored targets per window; :func:`stream_ce`).
 
-    ``draws`` is passed in rather than fetched here so a baseline scores the identical corpus
-    slices, which is what makes two models' numbers comparable at all.
+    Each draw's last ``max_new_tokens`` tokens are scored after the ``len(prompt)`` tokens before them,
+    so a reference stream has its continuation's length and every tail offset sees the same context in
+    both. A prompt length is scored once and shared by the prompts that have it. ``draws`` is passed in
+    rather than fetched here so a baseline scores the identical corpus slices, which is what makes two
+    models' numbers comparable at all.
     """
     generated = [
         stream_ce(forward, torch.tensor(prefix, dtype=torch.long),
                   torch.tensor(tail, dtype=torch.long), seq_len, stride=stride)
         for prefix, tail in zip(prompt_ids, continuation_ids)
     ]
-    reference = [
-        stream_ce(forward, draw[:-max_new_tokens], draw[-max_new_tokens:], seq_len, stride=stride)
-        for draw in draws
-    ]
-    return SelfCEScore(generated=generated, reference=reference)
+    by_length: Dict[int, List[float]] = {}
+    for prefix in prompt_ids:
+        n_prefix = len(prefix)
+        if n_prefix in by_length:
+            continue
+        if any(int(draw.shape[0]) < max_new_tokens + n_prefix for draw in draws):
+            raise ValueError(
+                f"a held-out draw is shorter than its {n_prefix}-token prefix plus {max_new_tokens} "
+                "scored tokens; fetch the draws with warmup >= the longest prompt")
+        by_length[n_prefix] = [
+            stream_ce(forward, draw[-(max_new_tokens + n_prefix):-max_new_tokens],
+                      draw[-max_new_tokens:], seq_len, stride=stride)
+            for draw in draws
+        ]
+    return SelfCEScore(generated=generated,
+                       reference=[by_length[len(prefix)] for prefix in prompt_ids])
 
 
 def sample_next_token(
@@ -560,9 +591,9 @@ def main() -> None:
             baseline_seq_len = (BLOCK_TOKENS if BLOCK_TOKENS is not None
                                 else baseline.context)
             baseline_stride = scoring_stride(baseline_seq_len)
-        # Drawn once and shared, so both models score the identical corpus slices. Warming to the
-        # LARGER block keeps the longer-block model supplied; the shorter-block one ignores the rest.
-        warmup = max(seq_len, baseline_seq_len)
+        # Drawn once and shared, so both models score the identical corpus slices. The warmup covers
+        # the longest prompt: each draw is scored after a prefix as long as its prompt (score_streams).
+        warmup = max(len(ids) for ids in prompt_ids)
         draws = held_out_token_ids(
             loaded.dataset, SPLIT, MAX_NEW_TOKENS, REFERENCE_DRAWS, warmup=warmup)
         scores = score_streams(
@@ -605,11 +636,13 @@ def main() -> None:
                 "reference_min":      low,
                 "reference_max":      high,
                 "reference_ppl_mean": math.exp(mean),
-                "reference_draws":    len(scores.reference),
+                "reference_draws":    len(scores.reference[0]),
+                "reference_prefix_tokens": [len(ids) for ids in prompt_ids],
                 "block_tokens":       seq_len,
                 "stride_tokens":      stride,
                 "generated":          scores.generated,
-                "generated_delta":    [value - mean for value in scores.generated],
+                "generated_delta":    [value - scores.prompt_reference(index)
+                                       for index, value in enumerate(scores.generated)],
             }
             if baseline_scores is not None:
                 base_mean, base_low, base_high = baseline_scores.summary()
@@ -624,8 +657,8 @@ def main() -> None:
                     "reference_max":      base_high,
                     "reference_ppl_mean": math.exp(base_mean),
                     "generated":          baseline_scores.generated,
-                    "generated_delta":    [value - base_mean
-                                           for value in baseline_scores.generated],
+                    "generated_delta":    [value - baseline_scores.prompt_reference(index)
+                                           for index, value in enumerate(baseline_scores.generated)],
                     "continuations":      baseline_texts,
                 }
         json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
@@ -639,10 +672,10 @@ def main() -> None:
           f"   max_new_tokens: {MAX_NEW_TOKENS}\n")
     if scores is not None:
         mean, low, high = scores.summary()
-        print("self-CE (teacher-forced nats/token; one scorer and one shared held-out reference; "
-              f"window {seq_len}, stride {stride})")
+        print("self-CE (teacher-forced nats/token; one scorer and one shared held-out reference "
+              f"scored after a prompt-length prefix; window {seq_len}, stride {stride})")
         print(f"  held-out {SPLIT}: {mean:.3f}  [{low:.3f}, {high:.3f}] over "
-              f"{len(scores.reference)} x {MAX_NEW_TOKENS} tokens   ppl {math.exp(mean):.2f}")
+              f"{len(scores.reference[0])} x {MAX_NEW_TOKENS} tokens   ppl {math.exp(mean):.2f}")
         print("  delta < 0 means the model finds its own output less surprising than real text")
         # Each model gets its own held-out number: they score the same draws but are different
         # models, and the delta is only interpretable against a model's own baseline.
@@ -663,12 +696,12 @@ def main() -> None:
         print(f"--- prompt: {generation.prompt!r}")
         print(render(generation.prompt, generation.text))
         if scores is not None:
-            mean = scores.summary()[0]
+            mean = scores.prompt_reference(index)
             value = scores.generated[index]
             print(f"  self-CE {value:.3f}  (delta {value - mean:+.3f}, ppl {math.exp(value):.2f})")
             if baseline_scores is not None:
                 base_value = baseline_scores.generated[index]
-                base_ref = baseline_scores.summary()[0]
+                base_ref = baseline_scores.prompt_reference(index)
                 print(f"  {BASELINE:<7} {base_value:.3f}  (delta {base_value - base_ref:+.3f}, "
                       f"ppl {math.exp(base_value):.2f})")
                 # Printed because the loop-vs-no-loop question is the whole point of the control:
