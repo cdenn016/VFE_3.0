@@ -10,7 +10,8 @@ A training run produces a self-contained directory::
       best_model.pt      {model_state, config, config_fingerprint} at the lowest validation PPL
       test_results.json  end-of-run TEST-split eval on the reloaded best checkpoint
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
-      loss_curve.png     training cross-entropy trajectory
+      loss_curve.png     per-step training-loss trajectory (the optimizer objective, metrics.csv's
+                         train_loss) at the absolute training step
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
       free_energy_relationship.png     final-iterate objective vs validation CE
@@ -899,6 +900,33 @@ def _snapshot_report_batches(
     return batches
 
 
+def _losses_start_step(
+    artifacts: 'RunArtifacts',
+    losses:    Optional[List[float]],
+    logger:    logging.Logger,
+) -> int:
+    r"""Absolute optimizer steps completed before ``losses[0]``.
+
+    ``train`` appends one loss per step of ``range(start_step, n_steps)`` and records
+    ``final_step = n_steps``, so a resumed run's continuation list satisfies
+    ``start_step = final_step - len(losses)`` and ``losses[k]`` belongs to the 1-based step
+    ``start_step + k + 1`` (the ``step`` column of ``metrics.csv``). A caller without a recorded
+    ``final_step`` (or an inconsistent one) falls back to 0, the from-scratch axis.
+    """
+    if not losses:
+        return 0
+    final_step = getattr(artifacts, "final_step", None)
+    if type(final_step) is not int:
+        return 0
+    start_step = final_step - len(losses)
+    if start_step < 0:
+        logger.warning(
+            "final_step %d is shorter than the %d-step loss history; loss_curve.png uses steps 1..n",
+            final_step, len(losses))
+        return 0
+    return start_step
+
+
 def _run_figures_isolated(
     model:     torch.nn.Module,
     artifacts: 'RunArtifacts',
@@ -947,6 +975,7 @@ def _run_figures_isolated(
                 request = {
                     "run_dir":             str(run_dir),
                     "losses":              ([float(value) for value in losses] if losses else None),
+                    "losses_start_step":   _losses_start_step(artifacts, losses, logger),
                     "generate_publication": bool(generate_publication),
                     "report_batches_path": (str(batches_path) if report_batches is not None else None),
                     "model_bundle_path":   live_model_path,
@@ -5332,8 +5361,16 @@ def _save_figures(
     artifacts: RunArtifacts,
     losses:    Optional[List[float]],
     logger:    logging.Logger,
+
+    *,
+    losses_start_step: int = 0,
 ) -> None:
-    r"""Best-effort publication figures from the logged history (no model re-run)."""
+    r"""Best-effort publication figures from the logged history (no model re-run).
+
+    ``losses_start_step`` is the absolute number of optimizer steps completed before ``losses[0]``
+    (nonzero on a resumed run, whose list holds only the continuation), so ``loss_curve.png`` shares
+    the absolute ``step`` axis of every history trajectory.
+    """
     try:
         from vfe3.viz import figures as raw_figs
 
@@ -5442,8 +5479,10 @@ def _save_figures(
                 figs.plt.close(fig)
 
         if losses:
-            # losses is one entry per optimizer step, so the 1-based step index IS the x-axis.
+            # losses is one entry per optimizer step from losses_start_step on, so losses[k] belongs to
+            # the 1-based absolute step losses_start_step + k + 1 (metrics.csv's step column).
             n = len(losses)
+            first = int(losses_start_step)
             steps_per_epoch = next(
                 (
                     int(r["steps_per_epoch"])
@@ -5454,14 +5493,17 @@ def _save_figures(
                 ),
                 0,
             )
-            epoch_boundaries = (
-                list(range(steps_per_epoch, n + 1, steps_per_epoch))
+            epoch_boundaries = (                               # absolute multiples inside (first, first + n]
+                list(range(steps_per_epoch * (first // steps_per_epoch + 1), first + n + 1,
+                           steps_per_epoch))
                 if steps_per_epoch
                 else None
             )
+            # The series is the optimizer objective (train_loss): CE plus any active second-order decode,
+            # self-coupling, CG-energy or EM term, so it is labelled as the loss rather than as CE.
             fig = figs.plot_trajectory(
-                losses, list(range(1, n + 1)), ylabel="train CE (nats/token)",
-                title="Training cross-entropy", color=figs._CB[0],
+                losses, list(range(first + 1, first + n + 1)), ylabel="train loss (nats/token)",
+                title="Training loss", color=figs._CB[0],
                 smooth=max(25, n // 240), annotate_final=True,
                 epoch_boundaries=epoch_boundaries,
                 path=str(run / "loss_curve.png"))

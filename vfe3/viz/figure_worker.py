@@ -35,6 +35,7 @@ from vfe3.run_artifacts import (
 _FINALIZE_REQUEST_FIELDS = (
     "run_dir",
     "losses",
+    "losses_start_step",
     "generate_publication",
     "report_batches_path",
     "model_bundle_path",
@@ -73,7 +74,7 @@ def _nullable_finalize_string(request: Mapping[str, object], field: str) -> str 
 
 def _validated_finalize_request(
     request: Mapping[str, object],
-) -> tuple[str, List[float] | None, bool, str | None, str | None, str, int, bool]:
+) -> tuple[str, List[float] | None, int, bool, str | None, str | None, str, int, bool]:
     """Validate the exact JSON fields emitted by ``_run_figures_isolated``."""
     _require_finalize_fields(request)
     run_dir = _required_finalize_string(request, "run_dir")
@@ -87,6 +88,10 @@ def _validated_finalize_request(
         losses = losses_value
     else:
         raise ValueError("finalize figure losses must be a list of floats or null")
+    # Absolute optimizer steps before losses[0]; a resumed run's list holds only the continuation.
+    losses_start_step = request.get("losses_start_step")
+    if type(losses_start_step) is not int or losses_start_step < 0:
+        raise ValueError("finalize figure losses_start_step must be an exact nonnegative integer")
 
     generate_publication = request.get("generate_publication")
     if type(generate_publication) is not bool:
@@ -104,6 +109,7 @@ def _validated_finalize_request(
     return (
         run_dir,
         losses,
+        losses_start_step,
         generate_publication,
         report_batches_path,
         model_bundle_path,
@@ -218,18 +224,22 @@ def _render_persisted_run_figures(
     cfg:     'VFE3Config | SimpleNamespace',
     losses:  'List[float] | None',
     logger:  logging.Logger,
+
+    *,
+    losses_start_step: int = 0,
 ) -> None:
     r"""Rebuild history dashboards and saved probes from durable run artifacts.
 
     ``losses`` is available during end-of-training finalization. On-demand report mode passes
     ``None`` because historical strict-opt-out runs persist only cadence-sampled ``train_loss`` rows,
     not the original full-resolution per-step loss list; every other history dashboard remains
-    reproducible from ``metrics.csv``.
+    reproducible from ``metrics.csv``. ``losses_start_step`` is the absolute step count before
+    ``losses[0]`` (nonzero on a resumed run), so the loss curve shares the history's step axis.
     """
     history = _history_from_csv(run_dir / "metrics.csv")
     artifacts = SimpleNamespace(run_dir=run_dir, cfg=cfg, history=history)
     _render_saved_probe_figures(run_dir, logger)
-    _save_figures(artifacts, losses, logger)
+    _save_figures(artifacts, losses, logger, losses_start_step=losses_start_step)
 
 
 def _distance_profile(beta: "torch.Tensor") -> "torch.Tensor":
@@ -546,6 +556,7 @@ def main() -> int:
         (
             run_dir_value,
             losses,
+            losses_start_step,
             generate_publication,
             batches_path,
             model_bundle_path,
@@ -558,7 +569,8 @@ def main() -> int:
 
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         logger = logging.getLogger(__name__)
-        _render_persisted_run_figures(run_dir, cfg, losses, logger)
+        _render_persisted_run_figures(
+            run_dir, cfg, losses, logger, losses_start_step=losses_start_step)
 
         if generate_publication:
             from vfe3.viz.report import generate_figures
