@@ -19,8 +19,32 @@ from vfe3.numerics import (
 )
 
 
-# Budget for one projected map L; its covariance product can require a second.
+# Byte budget of one scorer tile, set by set_projection_tile_bytes: a token tile of the projected maps in
+# projected_moments and _projected_root_factor (one map L, whose covariance product can require a second), a
+# GEMM-fallback direct pair tile, and a mean-distance query-row tile. Larger tiles dispatch fewer kernels and hold
+# more transient memory; the values change only by float32 reduction order (audit 2026-10-16 F26). The factor-route
+# recovery tiles and the noisy-query pair tiles keep their own fixed budgets.
 _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
+
+# A tile loop whose whole transient exceeds this is checkpointed under autograd also when a raised
+# _PROJECTION_TILE_BYTES leaves it a single tile: the budget sets the tile count, never what autograd saves.
+# It equals the default budget, so at the default every loop tiles and checkpoints exactly as before the knob.
+_CHECKPOINT_BYTES = 32 * 1024 ** 2
+
+
+def set_projection_tile_bytes(nbytes: int) -> int:
+    r"""Set the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes; returns the previous value."""
+    if type(nbytes) is not int or nbytes < 1:
+        raise ValueError(f"projection tile budget must be a positive int of bytes, got {nbytes!r}")
+    global _PROJECTION_TILE_BYTES
+    previous = _PROJECTION_TILE_BYTES
+    _PROJECTION_TILE_BYTES = nbytes
+    return previous
+
+
+def projection_tile_bytes() -> int:
+    r"""Return the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes."""
+    return _PROJECTION_TILE_BYTES
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float32 shifted CholeskyQR3, or float64 QR where the float32 retry fails, the input is
@@ -230,7 +254,7 @@ def projected_moments(
     bytes_per_token = math.prod(batch) * roles * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.
-    if tokens * bytes_per_token > _PROJECTION_TILE_BYTES:
+    if tokens * bytes_per_token > min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
         step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
         means, covariances = [], []
         for start in range(0, tokens, step):
@@ -624,7 +648,7 @@ def _projected_root_factor(
         raise ValueError("source covariance shape does not match projected token/head dimensions")
     tokens = batch[-2]
     bytes_per_token = math.prod(batch[:-2]) * batch[-1] * r * width * (torch.finfo(dtype).bits // 8)
-    if tokens * bytes_per_token <= _PROJECTION_TILE_BYTES:
+    if tokens * bytes_per_token <= min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
         return _projected_root_factor_tile(Sigma, inverse, S, dtype, diagonal)
     step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
     factors, failures = [], []
@@ -1198,9 +1222,11 @@ def projected_gaussian_kl(
             selected = (_select(aq_healthy, 2), _select(ak_healthy, 2), _select(q_cov_healthy, 3),
                         _select(k_prec_healthy, 3), _select(logdet_q_healthy, 1), _select(logdet_k_healthy, 1))
             # A direct tile holds three (n, I, J, r) pair tensors (delta, P delta, their product).
-            pair_budget = max(1, _PROJECTION_TILE_BYTES // (aq_healthy.element_size() * len(fallback_slices) * 3 * r))
+            per_pair = aq_healthy.element_size() * len(fallback_slices) * 3 * r
+            pair_budget = max(1, _PROJECTION_TILE_BYTES // per_pair)
             q_step = max(1, min(nq, 32, pair_budget))
             k_step = max(1, min(nk, pair_budget // q_step))
+            checkpointed = nq > q_step or nk > k_step or nq * nk * per_pair > _CHECKPOINT_BYTES
             rows = []
             for i in range(0, nq, q_step):
                 columns = []
@@ -1208,7 +1234,7 @@ def projected_gaussian_kl(
                     tile_args = (selected[0][:, i:i+q_step], selected[1][:, j:j+k_step],
                                  selected[2][:, i:i+q_step], selected[3][:, j:j+k_step],
                                  selected[4][:, i:i+q_step], selected[5][:, j:j+k_step])
-                    if (torch.is_grad_enabled() and (nq > q_step or nk > k_step)
+                    if (torch.is_grad_enabled() and checkpointed
                             and any(x.requires_grad for x in tile_args)):
                         columns.append(checkpoint(_projected_kl_direct_tile, *tile_args,
                                                   use_reentrant=False, preserve_rng_state=False))
@@ -1754,10 +1780,11 @@ def projected_mean_distance_cost(
         nq = aq.shape[-2]
         per_row = ak.numel() * ak.element_size()                              # one query row's (..., H, Nk, r)
         step = max(1, min(nq, _PROJECTION_TILE_BYTES // max(1, per_row)))
+        checkpointed = step < nq or nq * per_row > _CHECKPOINT_BYTES
         rows = []
         for i in range(0, nq, step):
             tile = aq[..., i:i + step, :]
-            if torch.is_grad_enabled() and step < nq and (tile.requires_grad or ak.requires_grad):
+            if torch.is_grad_enabled() and checkpointed and (tile.requires_grad or ak.requires_grad):
                 rows.append(checkpoint(_mean_distance_tile, tile, ak, use_reentrant=False, preserve_rng_state=False))
             else:
                 rows.append(_mean_distance_tile(tile, ak))
