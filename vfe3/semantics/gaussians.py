@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from vfe3.semantics.common import (
+    GAUSSIAN_BANK_DECODE_KINDS,
     OKABE_ITO,
     AnalysisContext,
     SectionResult,
@@ -1386,7 +1387,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     if run.decode_kind == "linear":
         result.notes.append("decode is linear (logits = μ Wᵀ + b + κ log π): Σ never reaches the "
                             "logits and enters only through the attention routing")
-    elif run.decode_kind != "gaussian":
+    elif run.decode_kind not in GAUSSIAN_BANK_DECODE_KINDS:
         result.notes.append(f"decode kind {run.decode_kind!r}: no decode-bank covariance analysis")
 
     m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, rng, bank="Prior bank",
@@ -1401,7 +1402,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     result.headline.update(_attempt(failed, result.notes, "Prior bank: headline",
                                     lambda: _headline(m, ""), {}))
 
-    if run.decode_kind == "gaussian":
+    if run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
         def decode_bank() -> Dict[str, Any]:
             tied = (np.array_equal(run.decode_mu(ids), run.mu(ids))
                     and np.array_equal(run.decode_log_var(ids), run.log_var(ids)))

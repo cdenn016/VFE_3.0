@@ -51,6 +51,7 @@ import torch
 
 from vfe3.semantics import stats, vectors
 from vfe3.semantics.common import (
+    GAUSSIAN_BANK_DECODE_KINDS,
     OKABE_ITO,
     AnalysisContext,
     SectionResult,
@@ -775,7 +776,7 @@ def layer_cka(bank: ContextualBank, run: Any, ctx: AnalysisContext) -> Dict[str,
     valid = tgt >= 0
     if run.decode_kind == "linear":
         decode_rows, label = run.decode_W(tgt[valid]), "linear decode row w_y (output_proj_weight)"
-    elif run.decode_kind == "gaussian":
+    elif run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
         decode_rows, label = run.decode_mu(tgt[valid]), "Gaussian decode mean m_y"
     else:
         decode_rows, label = None, None
@@ -1214,7 +1215,7 @@ def layerwise_semantics(occ: Dict[str, Any], run: Any, ctx: AnalysisContext) -> 
         ctx, _rng(ctx, "semantics"), n_boot)
     layer0 = np.stack([occ["vectors"][int(w)][0].astype(np.float64).mean(axis=0) for w in words])
     out["layer0_minus_static_max_abs"] = float(np.abs(layer0 - static).max())
-    if run.decode_kind in ("linear", "gaussian"):
+    if run.decode_kind == "linear" or run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
         table = run.decode_W(words) if run.decode_kind == "linear" else run.decode_mu(words)
         label = "linear decode rows" if run.decode_kind == "linear" else "Gaussian decode means"
         out["decode"] = {"label": label, **_battery_summary(

@@ -61,6 +61,7 @@ import numpy as np
 import torch
 
 from vfe3.semantics.common import (
+    GAUSSIAN_BANK_DECODE_KINDS,
     AnalysisContext,
     SectionResult,
     VectorView,
@@ -408,11 +409,12 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
                       "linear reparameterization of μ up to an orthogonal map."))
 
         attempt("decode_W_causal", w_causal)
-    elif run.decode_kind == "gaussian":
+    elif run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
+        readout = "KL-decode" if run.decode_kind == "gaussian" else "expected-likelihood decode"
         attempt("decode_mu", lambda: VectorView(
             name="decode_mu", label="decode m (raw)", ids=ids, X=run.decode_mu(ids), metric="cosine",
             group="decode",
-            note=("KL-decode means m_v (the untied decode bank when present). Raw cosine is not invariant under "
+            note=(f"{readout} means m_v (the untied decode bank when present). Raw cosine is not invariant under "
                   "the global diagonal rescaling m → Dm.")))
 
         def natural_causal() -> Optional[VectorView]:
@@ -426,10 +428,17 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
                       f"candidates)^(−1/2) (causal inner product), rank {rank}/{eta.shape[1]}. Invariant under "
                       "the global diagonal rescaling up to an orthogonal map."))
 
-        attempt("decode_natural_causal", natural_causal)
+        if run.decode_kind == "gaussian":
+            attempt("decode_natural_causal", natural_causal)
+        elif "decode_natural_causal" in wanted:
+            # The expected-likelihood logit -1/(2 tau_eff) sum_k [(mu - m_v)^2/(sigma + t_v) + log(sigma + t_v)]
+            # couples the belief and bank variances, so no row eta_v pairs linearly with a lift of q.
+            notes.append(f"view decode_natural_causal skipped: the {run.cfg.decode_mode!r} logits "
+                         "log N(μ; m_v, diag(Σ + t_v))/τ_eff are not linear in λ(q) = (μ, μ² + diag Σ), so the "
+                         "natural parameters η_v are not decode rows")
     else:
         notes.append(f"decode views skipped: decode_mode={run.cfg.decode_mode!r} is neither linear nor a "
-                     "Gaussian KL decode")
+                     "Gaussian decode-bank readout")
     if requested is not None:
         for name in VIEW_NAMES:
             if name in wanted and name not in views and name not in errors and not any(
@@ -654,7 +663,8 @@ def preset_views(preset: str, decode_kind: str) -> Optional[Tuple[str, ...]]:
     r"""The views a preset selects for a run of the given decode kind (``None``: every view).
 
     ``"quick"`` keeps the headline decode view of the decode kind (``decode_W_causal`` for a
-    linear decode, ``decode_natural_causal`` for a Gaussian KL decode, none otherwise) and
+    linear decode, ``decode_natural_causal`` for a Gaussian KL decode, none otherwise: the
+    expected-likelihood decode has no reparameterization-invariant decode view) and
     :data:`QUICK_VIEWS`.
     """
     if preset not in PRESETS:
