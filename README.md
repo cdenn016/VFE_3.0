@@ -716,7 +716,8 @@ layer. There are no configurable input/output scope fields or identity-content a
 
 `projected_gradient` takes `lambda_alpha_mode` `state_dependent` or
 `state_dependent_per_coord` (the last on `gaussian_diagonal` only), `n_e_steps>=1`, `relational_routing="gaussian_kl"`,
-`family` in {`gaussian_diagonal`, `gaussian_full`, `gaussian_block`}, at least two heads,
+`family` in {`gaussian_diagonal`, `gaussian_full`} (`gaussian_block` is refused: it is defined on the
+projected-predictive kernel readout only), at least two heads,
 filtering, and unrolled updates. `predictive_covariance` and `attention_residual` are
 predictive-readout fields: under `projected_gradient` they are inert (listed by
 `inactive_fields()`), not refused. Under `euler` its inner mean and covariance learning
