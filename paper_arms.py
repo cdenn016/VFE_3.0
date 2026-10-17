@@ -9,8 +9,8 @@ BASES. Each arm is a declared change of one base configuration, read from the ba
 ``config.json`` with :func:`vfe3.legacy_config.lenient_config_from_serialized`. Fields a newer code
 line retired are dropped and recorded; a field the record lacks whose default was flipped after it
 was introduced takes its introduction-time value from the loader
-(``vfe3.config._HISTORICAL_DEFAULT_PINS``, or a migration keyed on the record's era; listed as
-pinned), so the arms never inherit a default flip; a selector the loader merged from historical keys
+(:func:`vfe3.config.historical_default_pins`, the pin table plus the migrations keyed on the record's
+era; listed as pinned), so the arms never inherit a default flip; a selector the loader merged from historical keys
 the record carries is listed as migrated; every other field the record lacks takes the current
 default and is listed. Every base is its own experiment with its own directory and manifest.
 
@@ -235,8 +235,8 @@ def _norm_covariance_without_layernorm(base: Any) -> str:
     r"""``'passthrough'`` where the arm replaces the base's block LayerNorm, the base value otherwise.
 
     ``block_norm_covariance='pushforward'`` is the LayerNorm Jacobian pushforward; the Mahalanobis norm that
-    replaces the LayerNorm has none, so the recorded value is unread there and ``'passthrough'`` is the only
-    value the validator admits.
+    replaces the LayerNorm has none, so the recorded value is unread there (the validator admits it as inert, audit
+    2026-10-16 F5) and the arm declares ``'passthrough'``.
     """
     return "passthrough" if base.norm_type_block == "layernorm" else base.block_norm_covariance
 
@@ -641,13 +641,13 @@ def _loader_chosen(cfg: Any, raw: Mapping[str, Any], known: Sequence[str], sourc
 def load_base(name: str, path: Union[str, Path]) -> Base:
     r"""Load a base run's config (lenient) and its measured throughput.
 
-    A field the record lacks whose default was flipped after its introduction is pinned by the loader
-    (``vfe3.config._HISTORICAL_DEFAULT_PINS``, applied by ``config_from_serialized``), and so is one a
-    conditional migration of the loader sets from the record's era (:func:`_loader_chosen`); both are
+    A field the record lacks whose default was flipped after its introduction is pinned by the loader, and so
+    is one an era-keyed migration sets (:func:`vfe3.config.historical_default_pins`, applied by
+    ``config_from_serialized``); a conditional migration no helper lists is found by :func:`_loader_chosen`. All are
     listed in ``pinned`` with the value the base loads with. A selector the loader merged from historical
     keys the record carries is listed in ``migrated``; every other absent field is listed in ``defaulted``.
     """
-    from vfe3.config import _HISTORICAL_DEFAULT_PINS, VFE3Config
+    from vfe3.config import VFE3Config, historical_default_pins
     from vfe3.experiment import saved_train_window_mode
     from vfe3.legacy_config import lenient_config_from_serialized
 
@@ -661,7 +661,7 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     record = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     raw = dict(record.get("config", record))
     cfg, dropped = _quiet_config(lambda: lenient_config_from_serialized(raw, source=source))
-    pinned = {key: getattr(cfg, key) for key in _HISTORICAL_DEFAULT_PINS if key not in raw}
+    pinned = {key: getattr(cfg, key) for key in historical_default_pins(raw)}
     migrated = {selector: getattr(cfg, selector) for selector, keys in _merged_selector_sources().items()
                 if selector not in raw and any(key in raw for key in keys)}
     pinned.update(_loader_chosen(cfg, raw, [*pinned, *migrated], source))

@@ -21,8 +21,9 @@ is built. A manifest declares
 
 An arm mapping may also carry ``"inapplicable": "<reason>"`` (written by ``paper_arms.py`` for a row
 that does not apply to its base); the tables then print ``n/a`` for it instead of ``pending``. A
-``paper_arms.py`` manifest also holds ``paper_arms.rows[label]``; its ``reuse_verified``, ``stale`` and
-``code_identity_mismatch`` records are carried onto the :class:`Arm` (the decision rule reads them).
+``paper_arms.py`` manifest also holds ``paper_arms.rows[label]``; its ``reuse_verified``, ``stale``, ``failed``
+(finished runs without a finite test CE), ``code_identity_mismatch`` and ``window_protocol_mismatch`` records are
+carried onto the :class:`Arm` (the decision rule reads them).
 
 :func:`load_run` reads ``config.json`` (strictly, then, for configs written by older code lines,
 through :func:`vfe3.legacy_config.lenient_config_from_serialized`, recording the dropped retired
@@ -165,7 +166,10 @@ class Arm:
     # paper_arms manifest records (paper_arms.rows[label]); None / empty when the manifest has none.
     reuse_verified: Optional[bool] = None                      # False: runs listed without a config check
     stale:        List[Dict[str, Any]] = field(default_factory=list)          # rejected complete runs
+    failed:       List[Dict[str, Any]] = field(default_factory=list)  # finished runs without a finite test CE (F61)
     code_identity_mismatch: List[Dict[str, Any]] = field(default_factory=list)   # runs on other code
+    # reused runs trained under another training-window protocol (paper_arms audit 2026-10-16 F59)
+    window_protocol_mismatch: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -403,7 +407,9 @@ def resolve_manifest(
             if isinstance(row.get("reuse_verified"), bool):
                 arm.reuse_verified = row["reuse_verified"]
             arm.stale = list(row.get("stale") or [])
+            arm.failed = list(row.get("failed") or [])
             arm.code_identity_mismatch = list(row.get("code_identity_mismatch") or [])
+            arm.window_protocol_mismatch = list(row.get("window_protocol_mismatch") or [])
         arm.homogeneity = check_homogeneity(arm.runs)
         for entry in unresolved:
             out.problems.append(f"arm {label!r}: {entry!r} matched no run directory")
@@ -546,6 +552,11 @@ def check_homogeneity(
     "data_seed_varied"}``. A violation is reported, not raised: the assemblers still aggregate the arm
     and mark it. ``allowed`` names fields a scaling grid varies on purpose; their differences are
     listed under ``allowed_differences``.
+
+    The training-window protocol (``train_window_mode``, :func:`vfe3.experiment.saved_train_window_mode`) is
+    compared too: the loaders drop a saved ``train_window_offset`` silently, and fixed-window and per-epoch-random
+    runs present different training windows, so they are not replicates (audit 2026-10-16 F59). Only known modes
+    are compared; a run whose protocol is ``"unknown"`` blocks nothing.
     """
     ignore_set, allowed_set = set(ignore), set(allowed)
     per_run = [(run.name, _comparable_fields(run)) for run in runs]
@@ -557,6 +568,13 @@ def check_homogeneity(
         if len({_canonical(v) for v in seen.values()}) > 1:
             (allowed_differences if key in allowed_set else violations).append(
                 {"field": key, "values": seen})
+    if "train_window_mode" not in ignore_set:
+        from vfe3.experiment import saved_train_window_mode
+
+        modes = {run.name: saved_train_window_mode(run.config_raw, run.provenance)[0] for run in runs}
+        if len({mode for mode in modes.values() if mode != "unknown"}) > 1:
+            (allowed_differences if "train_window_mode" in allowed_set else violations).append(
+                {"field": "train_window_mode", "values": modes})
     pairs = [(run.seed, run.data_seed) for run in runs]
     duplicates = sorted({pair for pair in pairs if pairs.count(pair) > 1}, key=str)
     seeds = [run.seed for run in runs]

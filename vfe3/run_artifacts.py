@@ -3258,6 +3258,9 @@ def _write_provenance(
         "cuda_version":        torch.version.cuda,
         **_execution_device_fields(model),
         "data_seed":           (int(data_seed) if data_seed is not None else None),
+        # The training-window origin ('per_epoch_random' for every TokenWindows run trained now), so
+        # vfe3.experiment.saved_train_window_mode reads it without the repository history (audit 2026-10-16 F59).
+        "train_window_mode":   getattr(getattr(train_loader, "dataset", None), "window_offset_mode", None),
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
         "code_identity_sha256":       artifacts.code_identity_sha256,
@@ -5108,11 +5111,11 @@ def _pure_path_report(
     if runtime_exactness_key is None:
         # No runtime exactness certificate is registered for this transport: the flat cocycle is
         # exact by construction (no edge factor to approximate), so there is nothing to observe.
-        regime_ii_covariant_exact = True
-        regime_ii_covariant_exactness = "not_applicable"
+        transport_runtime_exact = True
+        transport_runtime_exactness = "not_applicable"
     elif not family_group_invariant:
-        regime_ii_covariant_exact = False
-        regime_ii_covariant_exactness = "diagonal_projection_approximation"
+        transport_runtime_exact = False
+        transport_runtime_exactness = "diagonal_projection_approximation"
     else:
         observations = [row.get(runtime_exactness_key) for row in history]
         finite_observations = [
@@ -5123,9 +5126,9 @@ def _pure_path_report(
             isinstance(value, (int, float)) and math.isfinite(value)
             for value in observations
         )
-        regime_ii_covariant_exact = complete and all(value >= 0.5 for value in observations)
-        regime_ii_covariant_exactness = (
-            "exact_valid_spd_factorization" if regime_ii_covariant_exact else
+        transport_runtime_exact = complete and all(value >= 0.5 for value in observations)
+        transport_runtime_exactness = (
+            "exact_valid_spd_factorization" if transport_runtime_exact else
             "jitter_recovered_approximation" if any(value < 0.5 for value in finite_observations) else
             "unknown_missing_runtime_evidence"
         )
@@ -5133,10 +5136,10 @@ def _pure_path_report(
         transport_exactness_status = "not_applicable"
     elif not transport_registration.gauge_equivariant or not family_group_invariant:
         transport_exactness_status = "approximate"
-    elif regime_ii_covariant_exactness == "unknown_missing_runtime_evidence":
+    elif transport_runtime_exactness == "unknown_missing_runtime_evidence":
         transport_exactness_status = "unknown"
     else:
-        transport_exactness_status = "exact" if regime_ii_covariant_exact else "approximate"
+        transport_exactness_status = "exact" if transport_runtime_exact else "approximate"
 
     # Predictive attention assigns its configured readout covariance; projected_gradient
     # executes Fisher receiver updates unless its covariance update is disabled.
@@ -5345,11 +5348,13 @@ def _pure_path_report(
             # as under skip_belief_sigma_update.
             "fixed_covariance_surrogate":   not covariance_updated,
             "attention_mode":               attention_mode,
-            # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
-            # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
-            # so a diagonal covariant run is never reported as exact Route B.
-            "regime_ii_covariant_exact":    regime_ii_covariant_exact,
-            "regime_ii_covariant_exactness": regime_ii_covariant_exactness,
+            # The transport's runtime exactness certificate: not_applicable for the flat transport (no
+            # registered runtime_exactness_key, exact by construction). A registered certificate under
+            # gaussian_diagonal is a CONTROLLED APPROXIMATION (the diagonal cone is not closed under GL
+            # congruence Omega Sigma Omega^T -- audit C5), so such a run is never reported as exact. Named
+            # after the transport, not a retired regime (audit 2026-10-16 F94).
+            "transport_runtime_exact":      transport_runtime_exact,
+            "transport_runtime_exactness":  transport_runtime_exactness,
             "spd_retraction_route":         spd_retraction_route,
             "spd_retraction_exact":         spd_retraction_exact,
             "spd_retraction_trust_projection_active": spd_retraction_trust_projection_active,

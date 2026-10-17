@@ -12,7 +12,8 @@ carries the same cells plus the source of every number; ``rows`` is the machine-
 * :func:`decision_rule_table`: the registered decision rule of the frame claim, from seed-paired
   test-CE differences (mean, paired standard error and the margin :math:`\max(2\,\mathrm{SE}, 0.03)`,
   with the one-sided paired-t p-value and the t-based 95% interval reported beside it); a clause whose
-  arms the manifest flags (unverified, stale, non-homogeneous, other code) is undetermined. Clause (c),
+  arms the manifest flags (unverified, stale, failed, non-homogeneous) is undetermined; runs on other code or
+  another training-window protocol are noted beside it. Clause (c),
   the equal-size per-type table, is the dated amendment of October 9, 2026.
 * :func:`per_seed_table`: ``tab:placeholder_per_seed``. Per run: model and data-order seed, selected
   step, validation CE, test CE and PPL under the declared selection rule.
@@ -492,6 +493,9 @@ def _unverified_reasons(arm: Arm) -> List[str]:
                        "(reuse_verified false)")
     if arm.stale:
         reasons.append(f"{arm.label!r}: {len(arm.stale)} stale complete run(s) whose config is not the plan's")
+    if arm.failed:
+        reasons.append(f"{arm.label!r}: {len(arm.failed)} seed pair run(s) finished without a finite test CE "
+                       "(failed); deciding on the surviving pairs would select over seeds")
     if arm.homogeneity and not arm.homogeneity.get("homogeneous", True):
         fields = [v["field"] for v in arm.homogeneity.get("violations") or []]
         duplicates = arm.homogeneity.get("duplicate_seed_pairs") or []
@@ -510,6 +514,18 @@ def _code_identity_notes(arm: Arm) -> List[str]:
         return []
     return [f"{arm.label!r}: {len(arm.code_identity_mismatch)} run(s) trained on code other than the "
             "current tree (code_identity_mismatch)"]
+
+
+def _window_protocol_notes(arm: Arm) -> List[str]:
+    r"""Reused runs of ``arm`` trained under another training-window protocol: reported, never decisive.
+
+    ``paper_arms.py`` reuses such a run with a flag (audit 2026-10-16 F59); the note names it so a reader can weigh
+    a fixed-window replicate beside per-epoch-random ones.
+    """
+    if not arm.window_protocol_mismatch:
+        return []
+    return [f"{arm.label!r}: {len(arm.window_protocol_mismatch)} run(s) trained under another training-window "
+            "protocol (window_protocol_mismatch)"]
 
 
 def decision_rule(manifest: Manifest) -> Dict[str, Any]:
@@ -532,10 +548,11 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
     are reported, not decided on.
 
     A clause is undetermined (``holds`` None, the reasons under ``undetermined``) when an arm it reads
-    has runs listed without a config check (``reuse_verified`` False), stale complete runs, runs
-    whose configs differ (``homogeneity``); its statistics are still reported. Runs trained on code other
-    than the tree that wrote the manifest (``code_identity_mismatch``) are listed under
-    ``code_identity_notes`` without changing the verdict. ``shared_data_order`` is the one data seed all
+    has runs listed without a config check (``reuse_verified`` False), stale complete runs, finished runs
+    without a finite test CE (``failed``), runs whose configs differ (``homogeneity``); its statistics are still
+    reported. Runs trained on code other than the tree that wrote the manifest (``code_identity_mismatch``) are
+    listed under ``code_identity_notes``, and reused runs trained under another training-window protocol
+    (``window_protocol_mismatch``) under ``window_protocol_notes``, without changing the verdict. ``shared_data_order`` is the one data seed all
     pairs of a clause share (None when it varies or is unrecorded): its paired SE, and with it the margin,
     then excludes data-order variance; it is reported and does not change the verdict.
     """
@@ -570,10 +587,11 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
         stats = paired_difference(evaluated, other, manifest.selection)
         undetermined = [reason for arm in (evaluated, other) for reason in _unverified_reasons(arm)]
         code_notes = [note for arm in (evaluated, other) for note in _code_identity_notes(arm)]
+        window_notes = [note for arm in (evaluated, other) for note in _window_protocol_notes(arm)]
         holds = None if stats["margin"] is None or undetermined else (
             stats["mean"] >= stats["margin"] if clause == "b" else stats["mean"] > stats["margin"])
         out["clauses"][clause] = {"arm": labels[key], **stats, "holds": holds, "undetermined": undetermined,
-                                  "code_identity_notes": code_notes,
+                                  "code_identity_notes": code_notes, "window_protocol_notes": window_notes,
                                   "shared_data_order": shared_data_order([pair[1] for pair in stats["pairs"]])}
     held = [c["holds"] for c in out["clauses"].values() if not c.get("inapplicable")]
     out["verdict"] = ("retracted" if any(h is False for h in held)
@@ -639,7 +657,7 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
                          f"runs without a selected test value or seed pair {c['unpaired_runs']}.")
         for reason in c.get("undetermined") or []:
             lines.append(f"Clause ({clause}) undetermined: {reason}.")
-        for note in c.get("code_identity_notes") or []:
+        for note in [*(c.get("code_identity_notes") or []), *(c.get("window_protocol_notes") or [])]:
             lines.append(f"Clause ({clause}) note: {note}.")
         if c.get("shared_data_order") is not None:
             lines.append(f"Clause ({clause}): the {c['n']} pairs share one data order (data seed "

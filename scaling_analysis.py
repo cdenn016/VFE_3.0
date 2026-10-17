@@ -64,7 +64,6 @@ from vfe3.config import config_from_serialized, serialize_config
 from vfe3.metric_contracts import (  # noqa: E402
     scaling_min_testable_sizes,
     perplexity_matches_ce,
-    target_blind_objective_interpretation,
 )
 from vfe3.path_utils import portable_path_component_key
 
@@ -75,8 +74,6 @@ def _min_testable_sizes() -> int:
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
 
-
-F_CE_RELATIONSHIP_FILENAME = "f_ce_relationship.png"
 
 logger = logging.getLogger("scaling_analysis")
 
@@ -115,7 +112,7 @@ _CSV_COLUMNS = [
     "data_seed", "tokens_seen", "est_flops_6ND",
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
-    "estep_final_f_per_token", "best_val_ppl",
+    "best_val_ppl",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
     "git_sha", "code_identity_forced",
     "cell_git_dirty", "cell_git_dirty_fingerprint",
@@ -557,7 +554,6 @@ def harvest(
             "test_ppl":    verified["test_ppl"],
             "test_bits_per_token": verified["test_bits_per_token"],
             "test_bpc": verified["test_bpc"],
-            "estep_final_f_per_token": summ.get("estep_final_f_per_token"),
             "best_val_ppl": summ.get("best_val_ppl"),
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
             "data_sha256": prov.get("data_sha256") or prov.get("test_data_sha256"),
@@ -843,25 +839,6 @@ def _as_float(x: Any) -> float:
     except (TypeError, ValueError):
         return float("nan")
 
-def _pearson_correlation(left: Sequence[float], right: Sequence[float]) -> float:
-    """Compute Pearson correlation without NumPy's unstable native corrcoef path."""
-    left_values = [float(value) for value in left]
-    right_values = [float(value) for value in right]
-    if (len(left_values) != len(right_values) or len(left_values) < 2
-            or any(not math.isfinite(value) for value in (*left_values, *right_values))):
-        return float("nan")
-    left_mean = math.fsum(left_values) / len(left_values)
-    right_mean = math.fsum(right_values) / len(right_values)
-    left_centered = [value - left_mean for value in left_values]
-    right_centered = [value - right_mean for value in right_values]
-    denominator = math.sqrt(
-        math.fsum(value * value for value in left_centered)
-        * math.fsum(value * value for value in right_centered))
-    if denominator == 0.0:
-        return float("nan")
-    return math.fsum(a * b for a, b in zip(left_centered, right_centered)) / denominator
-
-
 
 def _sorted_strings(rows: List[Dict[str, Any]], key: str) -> List[str]:
     return sorted({str(r[key]) for r in rows if r.get(key)})
@@ -1127,8 +1104,8 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
         non_embedding = {_as_float(g.get("n_non_embedding_params")) for g in grp}
-        # C2/EXP-5: per-seed converged final E-step F/token and named bit metrics.
-        f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
+        # Named bit metrics. No run records a final E-step free energy per token: the projected routes define
+        # no shared free energy, so the E-step structural-EM check has no input (audit 2026-10-16 F86).
         bits_per_token = [
             value for value in (_as_float(g.get("test_bits_per_token")) for g in grp)
             if np.isfinite(value)
@@ -1157,8 +1134,6 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 str(g["effective_run_key"]) for g in grp if g.get("effective_run_key"))),
             "ce_mean": float(np.mean(ce)),
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
-            "f_seeds": f_seeds,
-            "f_mean": float(np.mean(f_seeds)) if f_seeds else float("nan"),
             "bits_per_token_seeds": bits_per_token,
             "bits_per_token_mean": (
                 float(np.mean(bits_per_token)) if bits_per_token else float("nan")),
@@ -1620,8 +1595,8 @@ def analyze() -> None:
     route_notes = {route: _ROUTE_NOTES[route] for route in routes if route in _ROUTE_NOTES}
 
     # Accumulate the printed fits / tests into a persisted summary (scaling_summary.json plus the
-    # SCALING_ANALYSIS.md report): the pooled fit, bootstrap CI, per-route exponents, the
-    # frontier-collapse F-test, and the E-step structural-EM correlations were console-only.
+    # SCALING_ANALYSIS.md report): the pooled fit, bootstrap CI, per-route exponents and the
+    # frontier-collapse F-test were console-only.
     summary: Dict[str, Any] = {
         "input_dir": str(input_dir), "n_runs": len(rows), "with_offset": CONFIG["with_offset"],
         "n_param_points": len(param_points), "n_inference_points": len(infer_points),
@@ -1634,7 +1609,7 @@ def analyze() -> None:
         "provenance": provenance, "data_order": data_order, "pooled_fit": None, "pooled_fit_status": "not_fitted",
         "pooled_fit_confounds": [], "pooled_fit_lack_of_fit": None,
         "pooled_fit_non_embedding": None, "per_route": {}, "frontier_collapse": frontier,
-        "route_notes": route_notes, "estep_structural": None,
+        "route_notes": route_notes,
     }
 
     weights_by_route: Dict[str, np.ndarray] = {}
@@ -1798,28 +1773,6 @@ def analyze() -> None:
         detail = f" ({', '.join(confounds)})" if confounds else ""
         print(f"pooled fit status: {status.upper()}{detail}")
 
-    # ---- C2/EXP-5: structural non-Neal-Hinton EM -- F-vs-CE decorrelation across the n_e_steps arms ----
-    estep_pts = sorted([p for p in fit_infer_points if p["scale_knob"] == "n_e_steps"
-                        and np.isfinite(p.get("f_mean", float("nan")))],
-                       key=lambda q: q["n_e_steps"])
-    if len(estep_pts) >= 2:
-        ne = np.array([p["n_e_steps"] for p in estep_pts])
-        ff = np.array([p["f_mean"] for p in estep_pts])
-        ce = np.array([p["ce_mean"] for p in estep_pts])
-
-        pearson_ne_f = _pearson_correlation(ne, ff)
-        pearson_f_ce = _pearson_correlation(ff, ce)
-        interpretation = target_blind_objective_interpretation()
-        print(f"\nE-step structural-EM check ({len(estep_pts)} n_e_steps arms):"
-              f"\n  Pearson(n_e_steps, final F/token) = {pearson_ne_f:+.4f}"
-              f"\n  Pearson(final F/token, test CE)   = {pearson_f_ce:+.4f}"
-              f"\n  Interpretation: {interpretation}")
-        summary["estep_structural"] = {
-            "n_arms": len(estep_pts), "pearson_ne_final_f": pearson_ne_f,
-            "pearson_final_f_test_ce": pearson_f_ce,
-            "interpretation": interpretation,
-        }
-
     # ---- persist the analysis summary (json + a human-readable markdown report); best-effort so a
     # serialization/render error never suppresses the figure pass below ----
     try:
@@ -1841,7 +1794,7 @@ def analyze() -> None:
 
 def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     r"""Render ``summary`` as a readable SCALING_ANALYSIS.md (the pooled fit, per-route exponents,
-    persisted provenance/confounds, frontier test, and E-step structural-EM correlations)."""
+    persisted provenance/confounds and the frontier test)."""
     L = ["# VFE_3.0 scaling analysis", "",
          f"- input: `{summary.get('input_dir')}`",
          f"- runs: {summary.get('n_runs')}  (parameter points: {summary.get('n_param_points')}, "
@@ -1974,13 +1927,6 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
               for group in collapsed]
         L += [f"- training-budget cell (fixed N; tokens axis only): `{label}`" for label in budget]
         L.append("")
-    es = summary.get("estep_structural")
-    if es:
-        L += ["## E-step structural-EM check", "",
-              f"- arms: {es['n_arms']}",
-              f"- Pearson(n_e_steps, final F/token) = {es['pearson_ne_final_f']:+.4f}",
-              f"- Pearson(final F/token, test CE) = {es['pearson_final_f_test_ce']:+.4f}",
-              f"- interpretation: {es.get('interpretation', target_blind_objective_interpretation())}", ""]
     path.write_text("\n".join(L), encoding="utf-8")
 
 
@@ -2093,30 +2039,6 @@ def _make_figures(
         n_flat = int(infer_points[0]["n_params"]) if np.isfinite(infer_points[0]["n_params"]) else None
         _try("inference_capacity.png", lambda: figs.plot_inference_capacity(
             series, n_params=n_flat, path=str(fig_dir / "inference_capacity.png")))
-
-        # C2/EXP-5: the n_e_steps arms -> the final-iterate objective/CE relationship
-        # (needs f_mean + ce_mean) and E-step-as-capacity (BPC + final-iterate F vs T; additionally
-        # needs bpc_mean, gated separately, so a heterogeneous run set missing test_bpc still gets
-        # the relationship figure rather than a NaN BPC point).
-        estep = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
-                        and np.isfinite(p.get("f_mean", float("nan")))],
-                       key=lambda q: q["n_e_steps"])
-        if len(estep) >= 2:
-            arms = [{"n_e_steps": p["n_e_steps"], "final_f": p["f_mean"], "ce": p["ce_mean"]}
-                    for p in estep]
-            # The projected routes fix the divergence to KL, the registered "renyi" functional at
-            # order 1; the retired divergence_family field is no longer serialized (audit 2026-10-07 F16).
-            divergence_family = "renyi"
-            _try(F_CE_RELATIONSHIP_FILENAME, lambda: figs.plot_f_ce_relationship(
-                arms, divergence_family=divergence_family,
-                path=str(fig_dir / F_CE_RELATIONSHIP_FILENAME)))
-            cap = [p for p in estep if np.isfinite(p.get("bpc_mean", float("nan")))]
-            if len(cap) >= 2:
-                _try("estep_capacity.png", lambda: figs.plot_estep_capacity(
-                    [p["n_e_steps"] for p in cap], [p["bpc_mean"] for p in cap],
-                    [p["f_mean"] for p in cap], n_params=n_flat,
-                    divergence_family=divergence_family,
-                    path=str(fig_dir / "estep_capacity.png")))
 
 
 def main() -> int:

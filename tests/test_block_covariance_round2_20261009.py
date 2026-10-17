@@ -291,7 +291,7 @@ def test_run_artifacts_label_the_block_family_and_book_its_dense_layout() -> Non
     report = _pure_path_report(cfg, [], executable_build=model.executable_build)
     contract = find(report, "block_mlp_covariance_contract")
     assert contract == "head_block_projection_of_delta_full_through_layernorm_plus_post_norm_scaled_floor"
-    assert find(report, "regime_ii_covariant_exactness") != "diagonal_projection_approximation"
+    assert find(report, "transport_runtime_exactness") != "diagonal_projection_approximation"
     record = _relational_artifact_fields(cfg)["relational_operators"]
     assert record["content_covariance_contract"] == \
         "head_block_moment_projection_of_predictive_kernel_plus_covariant_floor"
