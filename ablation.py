@@ -1201,7 +1201,12 @@ def _lr_width_transfer_arms(
     r"""One arm per (width, rate, multiplier): ``embed_dim``, ``n_heads`` and that rate times the multiplier.
 
     The sweep is registered at import with ``strict`` set to ``LR_WIDTH_TRANSFER["enabled"]``, so a listed rate the
-    baseline leaves unset refuses the transfer run but does not break importing the module for other sweeps."""
+    baseline leaves unset refuses the transfer run but does not break importing the module for other sweeps.
+
+    At multiplier 1 every rate's arm is the same configuration, the width's baseline, so a width with :math:`R`
+    rates carries :math:`R` copies of its x1 cell (:math:`R - 1` extra runs per width): identical runs under
+    ``deterministic=True``, otherwise independent replicates of the baseline cell, and each rate's best multiplier
+    is chosen against its own replicate."""
     arms: List[Dict[str, Any]] = []
     for embed_dim, n_heads in settings["widths"]:
         if embed_dim % n_heads:
