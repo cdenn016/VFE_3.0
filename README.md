@@ -288,8 +288,11 @@ persistence term, and the prior-anchored floor $f\Sigma_{p,i}$, with $f$ =
 `predictive_covariance_floor` and $\Sigma_{p,i}$ the token's local prior covariance (the layer
 prior, the embedding prior under `prior_handoff_sigma=0`). The floor involves no frame, so a
 common reference change leaves the covariance unchanged. It replaced the floor
-$f(\mathrm{tr}C_i/K)I$ in reference coordinates on 2026-10-12; a run saved before then replays
-with the new floor, and its saved configuration does not record which floor it trained under.
+$f(\mathrm{tr}C_i/K)I$ in reference coordinates on 2026-10-12, which remains selectable as
+`predictive_covariance_floor_mode="relative"`. A configuration saved before then records no floor
+mode and no `phi_frame_condition_max` (added the same day), and `config_from_serialized` reloads
+it with `"relative"`, the floor it trained under; one saved between 2026-10-12 and the
+floor-mode field (2026-10-16) carries `phi_frame_condition_max` and reloads with `"prior"`.
 Neither is a routed population
 joint law. Subsequent block transforms and
 stack handoff have separate covariance policies, and neither contract is exact Gaussian

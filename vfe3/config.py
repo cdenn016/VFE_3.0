@@ -1759,12 +1759,12 @@ class VFE3Config:
             raise ValueError("block_mlp_mode='gauge_gate' with block_mlp_covariance='delta_full' needs the "
                              "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
         _require(self.block_norm_covariance, ("passthrough", "pushforward"), "block_norm_covariance")
-        if self.block_norm_covariance == "pushforward":
+        if self.block_norm_covariance == "pushforward" and self.norm_type_block == "layernorm":
             # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
             # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
+            # Only a LayerNorm block norm reads the field: under 'none' or 'mahalanobis' it is inert (inactive_fields)
+            # and either value is accepted (audit 2026-10-16 F5).
             problems = []
-            if self.norm_type_block != "layernorm":
-                problems.append(f"norm_type_block='layernorm' (got {self.norm_type_block!r})")
             if self.block_coordinates != "local" and self.family not in ("gaussian_full", "gaussian_block"):
                 problems.append(f"block_coordinates='local', or 'reference' with family 'gaussian_full' or "
                                 f"'gaussian_block' (got {self.block_coordinates!r} with {self.family!r})")
@@ -2252,10 +2252,10 @@ class VFE3Config:
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
         if self.norm_type_block != "layernorm":
             mark(("layernorm_affine",), "only read by a 'layernorm' block norm")
-        if self.norm_type_block != "layernorm" or (self.block_coordinates != "local"
-                                                   and self.family not in ("gaussian_full", "gaussian_block")):
-            mark(("block_norm_covariance",), "only read by a 'layernorm' block norm, in local coordinates or in "
-                 "reference coordinates on gaussian_full / gaussian_block")
+        if self.norm_type_block != "layernorm":
+            # Under a LayerNorm in reference coordinates on gaussian_diagonal the field is read, and only
+            # 'passthrough' is supported there, so it is not inert (audit 2026-10-16 F5).
+            mark(("block_norm_covariance",), "only read by a 'layernorm' block norm")
         if not (self.layernorm_affine and self.norm_type_block == "layernorm"):
             mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm block norm")
         if not self.decode_unigram_prior:
@@ -3023,6 +3023,7 @@ def _migrate_projected_factorization(
 #   rope_space                        "frame" from eaa3a21 (2026-10-07); merged into rope_mode on 2026-10-12,
 #                                     whose migration treats an absent rope_space as "frame"
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
+#   block_norm_covariance             "passthrough" at 89eedfb (2026-10-10): a record without it ran the mean-only norm
 #   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
 #   decode_logits_amp                 False at 46a3a6c (2026-10-07)
 #   decode_ce_triton                  False at 5e5a118 (2026-10-12)
@@ -3037,7 +3038,27 @@ _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "decode_logits_amp":                False,
     "decode_ce_triton":                 False,
     "routing_kl_max_reference":         "absolute",
+    "block_norm_covariance":            "passthrough",
 }
+
+
+def historical_default_pins(
+    payload: Mapping[str, Any],    # a serialized config, before migration
+) -> dict[str, Any]:               # field -> the value config_from_serialized fills in for it
+    r"""The values :func:`config_from_serialized` gives the fields ``payload`` lacks, other than today's defaults.
+
+    Every row of ``_HISTORICAL_DEFAULT_PINS`` whose field is absent, and one era-keyed value. The field
+    ``predictive_covariance_floor_mode`` (322843b, 2026-10-16, default ``"prior"``) selects a floor that had already
+    changed at 5f5d484 (2026-10-12): before then the moment-matched readouts used the relative floor
+    :math:`f\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` (``"relative"``), after it :math:`f\Sigma_{p,i}`
+    (``"prior"``). A record without the field is from either era, so no fixed pin is right. 5f5d484 also added
+    ``phi_frame_condition_max``, which every later record carries (as ``null`` when off), so a record lacking both
+    ran ``"relative"``, and one carrying ``phi_frame_condition_max`` keeps the default ``"prior"``.
+    """
+    pins = {name: value for name, value in _HISTORICAL_DEFAULT_PINS.items() if name not in payload}
+    if "predictive_covariance_floor_mode" not in payload and "phi_frame_condition_max" not in payload:
+        pins["predictive_covariance_floor_mode"] = "relative"
+    return pins
 
 
 def _migrate_receiver_law_and_alpha(
@@ -3141,9 +3162,9 @@ def config_from_serialized(
     _migrate_receiver_law_and_alpha(payload, source=source)
     payload.setdefault("relational_receiver_update", "euler")
     # Fields whose default changed after they were introduced: a config saved before the field existed
-    # ran the introduction-time value, not today's default (audit 2026-10-08 P2-3).
-    for name, historical in _HISTORICAL_DEFAULT_PINS.items():
-        payload.setdefault(name, historical)
+    # ran the introduction-time value, not today's default (audit 2026-10-08 P2-3), and the floor mode
+    # follows its era marker (audit 2026-10-16 F1).
+    payload.update(historical_default_pins(payload))
     _migrate_retired_fields(payload, source=source)
     config_fields = {field.name: field for field in fields(VFE3Config)}
     unknown = sorted(str(key) for key in payload if key not in config_fields)
