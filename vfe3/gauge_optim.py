@@ -1592,7 +1592,10 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         r"""Cumulative count of pullback-group row updates rejected since construction.
 
         Counts rows rejected by the direction's conditioning certificate or by the chart bound
-        (audit 2026-09-23 #10). Reading it synchronizes with the device.
+        (audit 2026-09-23 #10) on every step, logged or not; the per-step ``phi_group_rejected_rows``
+        diagnostic covers only the gated log/eval steps. It is not part of :meth:`state_dict`, so it
+        counts from 0 again after a resume, and a whole-run total adds the count the checkpoint
+        carried (audit 2026-10-16, F126). Reading it synchronizes with the device.
         """
         return 0 if self._phi_rejected_rows is None else int(self._phi_rejected_rows)
 
