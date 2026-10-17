@@ -21,7 +21,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -29,6 +29,12 @@ import numpy as np
 OKABE_ITO: Tuple[str, ...] = (
     "#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#000000",
 )
+
+# Decode kinds (``SemanticRun.decode_kind``) whose logits score the belief against the Gaussian decode
+# bank N(m_v, diag t_v) at tau_eff: "gaussian" is the -KL decode (logits linear in the natural parameters
+# eta_v), "gaussian_likelihood" the expected-likelihood decode log N(mu_q; m_v, diag(sigma_q + t_v)), which
+# reads the same tables but is not linear in eta_v (audit 2026-10-16 F70).
+GAUSSIAN_BANK_DECODE_KINDS: FrozenSet[str] = frozenset(("gaussian", "gaussian_likelihood"))
 
 
 class AnalogyQuestion(NamedTuple):

@@ -785,8 +785,10 @@ def optimizer_groups(run: RunRecord) -> Optional[Dict[str, Any]]:
     r"""The executed optimizer groups from the latest training checkpoint (metadata only, mmap).
 
     Returns ``{"checkpoint", "step", "groups": [{"names", "role", "aux_role", "initial_lr", "lr",
-    "weight_decay", "decoupled_weight_decay", "successful_updates"}]}`` or None when the run kept no
-    training checkpoint (``save_model_artifacts=False`` or deleted) or it cannot be read.
+    "weight_decay", "decoupled_weight_decay", "successful_updates", "table_fisher"}]}`` or None when the
+    run kept no training checkpoint (``save_model_artifacts=False`` or deleted) or it cannot be read.
+    ``table_fisher`` is the executed marker (``"mu"``/``"sigma"``) of a group the natural-gradient table
+    step of :mod:`vfe3.table_optim` moves under ``m_table_update_mode='fisher'``, else None.
     """
     if "optimizer_groups" in run._cache:
         return run._cache["optimizer_groups"]
@@ -812,6 +814,7 @@ def optimizer_groups(run: RunRecord) -> Optional[Dict[str, Any]]:
                     "weight_decay": finite_float(group.get("weight_decay")),
                     "decoupled_weight_decay": group.get("decoupled_weight_decay"),
                     "successful_updates": group.get("successful_updates"),
+                    "table_fisher": group.get("table_fisher"),
                 })
             step = bundle.get("step")
             result = {"checkpoint": str(path), "step": int(step) if _is_int(step) else None,

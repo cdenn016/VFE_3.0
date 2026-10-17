@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from vfe3.semantics.common import (
+    GAUSSIAN_BANK_DECODE_KINDS,
     OKABE_ITO,
     AnalysisContext,
     SectionResult,
@@ -48,6 +49,7 @@ from vfe3.semantics.common import (
     save_figure,
     write_table,
 )
+from vfe3.semantics.stats import holm_adjust
 
 
 _SECTION = "sigma"
@@ -62,6 +64,13 @@ _MIN_ENTAILMENT = 5                 # minimum resolved (hyponym, hypernym) pairs
 _N_BOOT_CLUSTER = 2000              # cluster-bootstrap resamples (entailment, over hypernym groups)
 _HEADLINE_SCORER = "neg_jeffreys"   # pre-registered headline Gaussian scorer (symmetric)
 _FAILED_STEP: Dict[str, Any] = {"status": "failed", "reason": "raised; see metrics['failed_steps']"}
+# Stable per-(bank, step) streams np.random.default_rng([seed, _SIGMA_STREAM, bank, step]), so each
+# stochastic step draws the same numbers whichever other steps and banks ran or failed (as in
+# vectors._STEP_STREAM; audit 2026-10-16 F73). Ids are nonzero (a trailing zero word does not change
+# a SeedSequence pool).
+_SIGMA_STREAM = 0x516A
+_BANK_STREAM: Dict[str, int] = {"Prior bank": 1, "Decode bank": 2}
+_STEP_STREAM: Dict[str, int] = {"frequency": 1, "entailment": 2, "similarity": 3}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -702,7 +711,9 @@ def _similarity(ctx: AnalysisContext, row_of: Dict[int, int], mu: np.ndarray, mu
     Identical-word pairs (e.g. WordSim's "tiger tiger") are dropped, as in the vector battery, so
     both score the same pairs. The headline scorer is pre-registered (:data:`_HEADLINE_SCORER`,
     the symmetric :math:`-J`); ``best_gaussian`` is the post-hoc maximum over the Sigma-using
-    scorers and is labeled as not adjusted for selection.
+    scorers and is labeled as not adjusted for selection. Each paired comparison also carries
+    ``p_holm``, its bootstrap ``p`` Holm-adjusted over the scorers of that comparison on the same
+    benchmark (:func:`vfe3.semantics.stats.holm_adjust`).
     """
     out: Dict[str, Any] = {}
     for bench, triples in ctx.similarity.items():
@@ -728,6 +739,10 @@ def _similarity(ctx: AnalysisContext, row_of: Dict[int, int], mu: np.ndarray, mu
                 entry["delta_vs_euclid_mu"] = _paired_spearman_delta(
                     scores[key], scores["neg_euclid_mu"], human, rng=rng)
             per[key] = entry
+        for field in ("delta_vs_cos_mu", "delta_vs_euclid_mu"):         # one family per comparison and benchmark
+            keys = [k for k, _ in _SCORERS if field in per[k]]
+            for k, p_holm in zip(keys, holm_adjust([per[k][field]["p"] for k in keys])):
+                per[k][field]["p_holm"] = p_holm
         gaussian = [k for k, _ in _SCORERS if k not in _REFERENCE_SCORERS
                     and per[k].get("rho") is not None and np.isfinite(per[k]["rho"])]
         best = max(gaussian, key=lambda k: per[k]["rho"]) if gaussian else None
@@ -796,7 +811,7 @@ def _fields(ctx: AnalysisContext, row_of: Dict[int, int], logdet: np.ndarray,
 
 def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], np.ndarray],
                   lv_fn: Callable[[np.ndarray], np.ndarray], lv_init: float,
-                  rng: np.random.Generator, *, bank: str, failed: List[Dict[str, str]],
+                  *, bank: str, failed: List[Dict[str, str]],
                   notes: List[str],
                   logdet_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -805,8 +820,14 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     Loading the tables and the dispersion summary are required; every later item that raises is
     recorded in ``failed`` (step ``"<bank>: <item>"``) and replaced by a failed-status entry.
     ``logdet_fn`` gives (n,) :math:`\log\det\Sigma_v` for a covariance that is not diagonal (the
-    per-head ``block_cholesky`` blocks); None takes the row sum of ``lv_fn``.
+    per-head ``block_cholesky`` blocks); None takes the row sum of ``lv_fn``. The frequency,
+    entailment and similarity bootstraps each draw from their own stream
+    ``[ctx.seed, _SIGMA_STREAM, _BANK_STREAM[bank], _STEP_STREAM[step]]``.
     """
+    def rng(step_name: str) -> np.random.Generator:
+        return np.random.default_rng(
+            [int(ctx.seed), _SIGMA_STREAM, _BANK_STREAM[bank], _STEP_STREAM[step_name]])
+
     ids = np.asarray(ctx.candidate_ids, dtype=np.int64)
     row_of = {int(t): r for r, t in enumerate(ids)}
     V = int(run.vocab.size)
@@ -833,11 +854,13 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     binned: List[Dict[str, Any]] = []
     if log_count is not None:
         binned = step("binned log det medians", lambda: _binned_medians(log_count, logdet), [])
-        metrics["frequency"] = step("frequency", lambda: {
-            "logdet_vs_log_count": _spearman(logdet, log_count, rng),
-            "trace_vs_log_count": _spearman(np.exp(lv).sum(axis=1), log_count, rng),
-            "binned_medians": binned,
-        }, dict(_FAILED_STEP))
+        def frequency() -> Dict[str, Any]:
+            gen = rng("frequency")
+            return {"logdet_vs_log_count": _spearman(logdet, log_count, gen),
+                    "trace_vs_log_count": _spearman(np.exp(lv).sum(axis=1), log_count, gen),
+                    "binned_medians": binned}
+
+        metrics["frequency"] = step("frequency", frequency, dict(_FAILED_STEP))
     else:
         metrics["frequency"] = {"status": "skipped", "reason": "training counts unavailable"}
     metrics["classes"], class_groups = step(
@@ -848,9 +871,9 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
         "variance-sorted neighbors",
         lambda: _variance_sorted_neighbors(ctx, ids, row_of, mu, lv, mu_d0, logdet), [])
     metrics["entailment"] = step(
-        "entailment", lambda: _entailment(ctx, row_of, mu, lv, logdet, rng), dict(_FAILED_STEP))
+        "entailment", lambda: _entailment(ctx, row_of, mu, lv, logdet, rng("entailment")), dict(_FAILED_STEP))
     metrics["similarity"] = step(
-        "similarity", lambda: _similarity(ctx, row_of, mu, mu_d0, lv_d0, rng), dict(_FAILED_STEP))
+        "similarity", lambda: _similarity(ctx, row_of, mu, mu_d0, lv_d0, rng("similarity")), dict(_FAILED_STEP))
     metrics["table_geometry"] = step(
         "table geometry", lambda: _table_geometry(mu_d0, lv), dict(_FAILED_STEP))
     arrays = {"lv": lv, "logdet": logdet, "log_count": log_count, "binned": binned,
@@ -1041,6 +1064,8 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
         per = sim[bench]["scorers"]
         keys = [k for k, _ in _SCORERS]
         y = np.arange(len(keys))[::-1]
+        # Holm over the panel's scorers, recomputed from the bootstrap p (equal to the stored p_holm)
+        p_holm = dict(zip(keys, holm_adjust([per[k].get("delta_vs_cos_mu", {}).get("p") for k in keys])))
         for yi, key in zip(y, keys):
             e = per[key]
             rho = e.get("rho")
@@ -1048,10 +1073,12 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
                 continue
             d = e.get("delta_vs_cos_mu", {})
             sig = (d.get("ci_lo") is not None and (d["ci_lo"] > 0 or d["ci_hi"] < 0))
+            holm = sig and p_holm[key] is not None and p_holm[key] < 0.05
             color = OKABE_ITO[7] if key in _REFERENCE_SCORERS else OKABE_ITO[0]
             # a percentile bootstrap interval need not contain the point estimate; clip the bars
             ax.errorbar(rho, yi, xerr=[[max(rho - e["ci_lo"], 0.0)], [max(e["ci_hi"] - rho, 0.0)]], fmt="o",
                         color=color, mfc=color if (sig or key == "cos_mu") else "white", ms=4,
+                        fillstyle="full" if (holm or key == "cos_mu" or not sig) else "left",
                         capsize=2)
         if per["cos_mu"].get("rho") is not None and np.isfinite(per["cos_mu"]["rho"]):
             ax.axvline(per["cos_mu"]["rho"], color="0.5", ls="--", lw=0.8)
@@ -1063,8 +1090,9 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
         ax.set_xlabel("Spearman ρ with human ratings")
         ax.set_title(f"{bench} (n = {sim[bench]['n']})", fontsize=8)
         panel_label(ax, "abcdefgh"[j])
-    fig.suptitle(title + "\n(filled: paired Δρ vs cos(μ) CI excludes 0; bold: pre-registered "
-                 "headline scorer)", fontsize=8)
+    fig.suptitle(title + "\n(filled: paired Δρ vs cos(μ) CI excludes 0 and Holm-adjusted p < 0.05 over the "
+                 "panel's scorers; half-filled: unadjusted only; bold: pre-registered headline scorer)",
+                 fontsize=8)
     fig.tight_layout()
     return save_figure(fig, ctx, _SECTION, name)
 
@@ -1124,11 +1152,13 @@ def _similarity_table(sim: Dict[str, Any]) -> str:
             rows.append({"benchmark": bench, "scorer": label, "role": role, "n": e.get("n"),
                          "rho": e.get("rho"), "ci_lo": e.get("ci_lo"), "ci_hi": e.get("ci_hi"),
                          "Δρ vs cos(μ)": d.get("delta"), "Δ ci_lo": d.get("ci_lo"),
-                         "Δ ci_hi": d.get("ci_hi"), "Δρ vs −‖Δμ‖": de.get("delta"),
-                         "Δ' ci_lo": de.get("ci_lo"), "Δ' ci_hi": de.get("ci_hi")})
+                         "Δ ci_hi": d.get("ci_hi"), "Δ p (Holm)": d.get("p_holm"),
+                         "Δρ vs −‖Δμ‖": de.get("delta"),
+                         "Δ' ci_lo": de.get("ci_lo"), "Δ' ci_hi": de.get("ci_hi"),
+                         "Δ' p (Holm)": de.get("p_holm")})
     return markdown_table(rows, columns=["benchmark", "scorer", "role", "n", "rho", "ci_lo", "ci_hi",
-                                         "Δρ vs cos(μ)", "Δ ci_lo", "Δ ci_hi", "Δρ vs −‖Δμ‖",
-                                         "Δ' ci_lo", "Δ' ci_hi"])
+                                         "Δρ vs cos(μ)", "Δ ci_lo", "Δ ci_hi", "Δ p (Holm)", "Δρ vs −‖Δμ‖",
+                                         "Δ' ci_lo", "Δ' ci_hi", "Δ' p (Holm)"])
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1333,7 +1363,6 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         result.status = "skipped"
         result.notes.append(f"only {ids.size} candidate tokens; the Sigma section needs at least 3")
         return result
-    rng = np.random.default_rng(ctx.seed)
     cfg = run.cfg
     family = str(cfg.family)
     lv_init = _init_log_var(cfg)
@@ -1386,10 +1415,10 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     if run.decode_kind == "linear":
         result.notes.append("decode is linear (logits = μ Wᵀ + b + κ log π): Σ never reaches the "
                             "logits and enters only through the attention routing")
-    elif run.decode_kind != "gaussian":
+    elif run.decode_kind not in GAUSSIAN_BANK_DECODE_KINDS:
         result.notes.append(f"decode kind {run.decode_kind!r}: no decode-bank covariance analysis")
 
-    m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, rng, bank="Prior bank",
+    m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, bank="Prior bank",
                            failed=failed, notes=result.notes, logdet_fn=run.log_det if blocks else None)
     metrics["banks"]["prior"] = m
     disp = m["dispersion"]
@@ -1401,7 +1430,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     result.headline.update(_attempt(failed, result.notes, "Prior bank: headline",
                                     lambda: _headline(m, ""), {}))
 
-    if run.decode_kind == "gaussian":
+    if run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
         def decode_bank() -> Dict[str, Any]:
             tied = (np.array_equal(run.decode_mu(ids), run.mu(ids))
                     and np.array_equal(run.decode_log_var(ids), run.log_var(ids)))
@@ -1409,7 +1438,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                 result.notes.append("the Gaussian decode bank equals the prior bank on the candidates "
                                     "(tied); its battery would repeat the prior bank's and is skipped")
                 return {"status": "skipped", "reason": "tied to the prior bank"}
-            md, arrd = _bank_battery(run, ctx, run.decode_mu, run.decode_log_var, lv_init, rng,
+            md, arrd = _bank_battery(run, ctx, run.decode_mu, run.decode_log_var, lv_init,
                                      bank="Decode bank", failed=failed, notes=result.notes)
             md["tau_eff"] = float(run.tau_eff())
             _bank_outputs(run, ctx, result, md, arrd, "Decode bank", "decode_", failed)

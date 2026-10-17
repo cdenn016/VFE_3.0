@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 from vfe3.config import VFE3Config, config_from_serialized
-from vfe3.semantics.common import AnalogyQuestion, AnalysisContext
+from vfe3.semantics.common import GAUSSIAN_BANK_DECODE_KINDS, AnalogyQuestion, AnalysisContext
 from vfe3.semantics.resources import (
     SIMILARITY_FILES,
     load_fields,
@@ -55,8 +55,17 @@ OUTPUT_B_KEY = "prior_bank.output_proj_bias"
 UNIGRAM_KEY = "prior_bank.unigram_log_prior"
 POS_PHI_KEY = "pos_phi_free"
 
-# Decoders whose logits are -KL(q || N(m_v, diag t_v)) / tau_eff (+ kappa log pi_v).
-_KL_DECODE_MODES = frozenset(("diagonal", "diagonal_chunked", "full", "full_chunked"))
+# Decode kind of each registered decode_mode (the retired dense 'diagonal'/'full' spellings migrate to the
+# chunked names when the config is loaded). "gaussian": logits -KL(q || N(m_v, diag t_v)) / tau_eff;
+# "gaussian_likelihood": the expected-likelihood marginal
+# -1/(2 tau_eff) sum_k [(mu_q - m_v)^2 / (sigma_q + t_v) + log(sigma_q + t_v)], which reads the same decode
+# bank (m_v, t_v) and tau_eff. Every kind adds kappa log pi_v; a mode missing here is "unsupported".
+_DECODE_KINDS: Dict[str, str] = {
+    "linear":                      "linear",
+    "diagonal_chunked":            "gaussian",
+    "full_chunked":                "gaussian",
+    "expected_likelihood_chunked": "gaussian_likelihood",
+}
 
 CORE_DEFAULT_OPTIONS: Dict[str, Any] = {
     "min_count":      100,
@@ -171,7 +180,7 @@ class SemanticRun:
     n_gen:              int
     block_slices:       List[slice]                     # coordinate range each frame block acts on
     frames_active:      bool
-    decode_kind:        str                             # "linear" | "gaussian" | "unsupported"
+    decode_kind:        str                             # "linear" | "gaussian" | "gaussian_likelihood" | "unsupported"
     sigma_frozen:       Optional[bool]
     phi_frozen:         bool
     counts_diagnostics: Dict[str, Any] = field(default_factory=dict)
@@ -198,10 +207,10 @@ class SemanticRun:
     def _rows(self, key: str, ids: Sequence[int]) -> torch.Tensor:
         return self._table(key)[self._index(ids)].to(torch.float64)      # (n, ...) float64
 
-    def _require_decode(self, kind: str) -> None:
-        if self.decode_kind != kind:
+    def _require_decode(self, *kinds: str) -> None:
+        if self.decode_kind not in kinds:
             raise ValueError(
-                f"this accessor needs decode_kind={kind!r}; the run decodes with "
+                f"this accessor needs decode_kind in {sorted(kinds)}; the run decodes with "
                 f"decode_mode={self.cfg.decode_mode!r} (decode_kind={self.decode_kind!r})")
 
     def _coords_to_blocks(self, coords: torch.Tensor) -> List[np.ndarray]:
@@ -362,22 +371,22 @@ class SemanticRun:
         return untied
 
     def decode_mu(self, ids: Sequence[int]) -> np.ndarray:
-        r"""(n, K) KL-decode means $m_v$ (untied ``decode_mu_embed`` when present, else ``mu_embed``)."""
-        self._require_decode("gaussian")
+        r"""(n, K) Gaussian decode-bank means $m_v$ (untied ``decode_mu_embed`` when present, else ``mu_embed``)."""
+        self._require_decode(*GAUSSIAN_BANK_DECODE_KINDS)
         return self._rows(DECODE_MU_KEY if self._decode_untied() else MU_KEY, ids).numpy()
 
     def decode_log_var(self, ids: Sequence[int]) -> np.ndarray:
-        r"""(n, K) KL-decode log-variances $\log t_v$, $t_v = \max(\exp(\min(s, 80)), \epsilon)$."""
+        r"""(n, K) Gaussian decode-bank log-variances $\log t_v$, $t_v = \max(\exp(\min(s, 80)), \epsilon)$."""
         from vfe3.numerics import bounded_variance_from_log
 
-        self._require_decode("gaussian")
+        self._require_decode(*GAUSSIAN_BANK_DECODE_KINDS)
         s = self._rows(DECODE_SIGMA_LOG_KEY if self._decode_untied() else SIGMA_LOG_KEY, ids)
         return torch.log(bounded_variance_from_log(s, eps=self.cfg.eps)).numpy()
 
     def tau_eff(self) -> float:
-        r"""KL-decode temperature $\tau_\mathrm{eff} = \tau\,\exp(-\operatorname{clamp}(\ell, -3, 3))$,
+        r"""Gaussian-decode temperature $\tau_\mathrm{eff} = \tau\,\exp(-\operatorname{clamp}(\ell, -3, 3))$,
         $\ell$ = ``decode_log_scale``."""
-        self._require_decode("gaussian")
+        self._require_decode(*GAUSSIAN_BANK_DECODE_KINDS)
         log_scale = self._table(DECODE_LOG_SCALE_KEY).to(torch.float64).reshape(-1)[0]
         return float(self.cfg.decode_tau * torch.exp(-log_scale.clamp(-3.0, 3.0)))
 
@@ -465,11 +474,7 @@ def _block_slices(group: "GaugeGroup", K: int) -> Tuple[List[slice], Optional[st
 
 
 def _decode_kind(cfg: VFE3Config) -> str:
-    if cfg.decode_mode == "linear":
-        return "linear"
-    if cfg.decode_mode in _KL_DECODE_MODES:
-        return "gaussian"
-    return "unsupported"
+    return _DECODE_KINDS.get(cfg.decode_mode, "unsupported")
 
 
 def _dataset_from_config_json(run_dir: Path) -> Optional[str]:
@@ -498,7 +503,8 @@ def load_semantic_run(
     checkpoint's ``unigram_log_prior`` (:func:`counts_from_unigram_log_prior`) when present and
     set, else from a bincount of the cached training stream, else they are unavailable; the choice
     and any reason for it are recorded in ``notes``. ``cache_dir`` overrides the token-cache
-    directory (default ``~/.cache/tokenized_cache``). ``drop_unknown_config_fields`` reopens a run
+    directory (default ``~/.cache/tokenized_cache``) for the token streams, the counts and a
+    word-level run's vocabulary sidecar alike. ``drop_unknown_config_fields`` reopens a run
     trained by an older code line: config fields this build no longer declares (retired toggles)
     are dropped by :func:`vfe3.legacy_config.lenient_config_from_serialized` and listed in ``notes``.
     """
@@ -543,7 +549,7 @@ def load_semantic_run(
         raise ValueError(f"mu_embed shape {(V, K)} disagrees with the config "
                          f"(vocab_size={cfg.vocab_size}, embed_dim={cfg.embed_dim})")
     if vocab is None:
-        vocab = vocab_for_run(dataset, selection_identity, V)
+        vocab = vocab_for_run(dataset, selection_identity, V, cache_dir=cache_dir)
     elif vocab.size != V:
         raise ValueError(f"supplied vocabulary has {vocab.size} ids; the model has {V}")
 
@@ -558,7 +564,7 @@ def load_semantic_run(
     decode_kind = _decode_kind(cfg)
     if decode_kind == "unsupported":
         notes.append(f"decode_mode={cfg.decode_mode!r} (family={cfg.family!r}) is neither linear nor "
-                     f"a Gaussian KL decode: decode-table analyses do not apply")
+                     f"a Gaussian decode-bank readout: decode-table analyses do not apply")
     if cfg.encode_mode != "per_token":
         notes.append(f"encode_mode={cfg.encode_mode!r}: the tables are read as stored; the encoder "
                      f"transforms them before the first layer")

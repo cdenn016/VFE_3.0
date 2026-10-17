@@ -19,8 +19,8 @@ Views (:func:`build_views`). Every view holds the rows of ``ctx.candidate_ids`` 
 view drops frames without a real principal logarithm). The unit normalization ``D0`` of the
 ``mu_sigma_units`` and ``w2_chart`` views is :math:`\log d_{0,k} = -\tfrac12\,\mathrm{mean}_{v}
 \log\sigma^2_{vk}` over all candidates, the same reference set the ``sigma`` section uses; the
-``phi_log`` chart takes its ``D0`` and barycenter from the ``frame_ref_count`` most frequent
-candidates, as the ``phi`` section does.
+``phi_log`` chart takes its ``D0`` and barycenter from the first ``frame_ref_count`` candidates (the
+most frequent, or the lowest token ids when training counts are unavailable), as the ``phi`` section does.
 
 Presets (:data:`PRESETS`, option ``"preset"``). ``"full"`` keeps :data:`DEFAULT_OPTIONS`.
 ``"quick"`` is the lean per-seed battery of a multi-seed study: the views are the run's headline
@@ -61,6 +61,7 @@ import numpy as np
 import torch
 
 from vfe3.semantics.common import (
+    GAUSSIAN_BANK_DECODE_KINDS,
     AnalysisContext,
     SectionResult,
     VectorView,
@@ -384,7 +385,8 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
         return VectorView(
             name="phi_log", label="log Û (canonical)", ids=ids_ok, X=L, metric="cosine", group="phi",
             note=("Flattened principal logs L_v = log Û_v of the gauge-fixed frames Û_v = D0 e^(X_v) m^(−1) D0^(−1) "
-                  f"(m: bi-invariant barycenter of the {cf.ref_ids.size} most frequent candidate frames, D0 from "
+                  f"(m: bi-invariant barycenter of "
+                  f"{frames.reference_set_phrase(cf.ref_ids.size, by_count=ctx.counts is not None)}, D0 from "
                   "their mean log-variance): invariant under the split redundancy and the global diagonal "
                   f"rescaling{_invariance_qualifier(cf.diagnostics)}; the rescaling is {d_clause}"
                   + (f"; {n_bad} rows without a real principal log are excluded." if n_bad else ".")))
@@ -408,11 +410,12 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
                       "linear reparameterization of μ up to an orthogonal map."))
 
         attempt("decode_W_causal", w_causal)
-    elif run.decode_kind == "gaussian":
+    elif run.decode_kind in GAUSSIAN_BANK_DECODE_KINDS:
+        readout = "KL-decode" if run.decode_kind == "gaussian" else "expected-likelihood decode"
         attempt("decode_mu", lambda: VectorView(
             name="decode_mu", label="decode m (raw)", ids=ids, X=run.decode_mu(ids), metric="cosine",
             group="decode",
-            note=("KL-decode means m_v (the untied decode bank when present). Raw cosine is not invariant under "
+            note=(f"{readout} means m_v (the untied decode bank when present). Raw cosine is not invariant under "
                   "the global diagonal rescaling m → Dm.")))
 
         def natural_causal() -> Optional[VectorView]:
@@ -426,10 +429,17 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
                       f"candidates)^(−1/2) (causal inner product), rank {rank}/{eta.shape[1]}. Invariant under "
                       "the global diagonal rescaling up to an orthogonal map."))
 
-        attempt("decode_natural_causal", natural_causal)
+        if run.decode_kind == "gaussian":
+            attempt("decode_natural_causal", natural_causal)
+        elif "decode_natural_causal" in wanted:
+            # The expected-likelihood logit -1/(2 tau_eff) sum_k [(mu - m_v)^2/(sigma + t_v) + log(sigma + t_v)]
+            # couples the belief and bank variances, so no row eta_v pairs linearly with a lift of q.
+            notes.append(f"view decode_natural_causal skipped: the {run.cfg.decode_mode!r} logits "
+                         "log N(μ; m_v, diag(Σ + t_v))/τ_eff are not linear in λ(q) = (μ, μ² + diag Σ), so the "
+                         "natural parameters η_v are not decode rows")
     else:
         notes.append(f"decode views skipped: decode_mode={run.cfg.decode_mode!r} is neither linear nor a "
-                     "Gaussian KL decode")
+                     "Gaussian decode-bank readout")
     if requested is not None:
         for name in VIEW_NAMES:
             if name in wanted and name not in views and name not in errors and not any(
@@ -654,7 +664,8 @@ def preset_views(preset: str, decode_kind: str) -> Optional[Tuple[str, ...]]:
     r"""The views a preset selects for a run of the given decode kind (``None``: every view).
 
     ``"quick"`` keeps the headline decode view of the decode kind (``decode_W_causal`` for a
-    linear decode, ``decode_natural_causal`` for a Gaussian KL decode, none otherwise) and
+    linear decode, ``decode_natural_causal`` for a Gaussian KL decode, none otherwise: the
+    expected-likelihood decode has no reparameterization-invariant decode view) and
     :data:`QUICK_VIEWS`.
     """
     if preset not in PRESETS:
@@ -1091,6 +1102,8 @@ def _gauge_paragraph(run: Any, chart: Any = None) -> str:
     assumed and (iii) as broken (with the reason) or assumed. ``chart`` (``CanonicalFrames``
     diagnostics) qualifies the chart invariance by the barycenter residual when it did not converge.
     """
+    from vfe3.semantics import frames
+
     cfg = run.cfg
     status, reason = diagonal_redundancy_status(cfg)
     s = []
@@ -1133,11 +1146,27 @@ def _gauge_paragraph(run: Any, chart: Any = None) -> str:
     if run.phi_frozen:
         extra.append("φ is not updated in context, so the realized frame at position p is e^(X_v) e^(Y_p)")
     if run.frames_active:
-        extra.append("with the flat transport Ω_ij = U_i U_j⁻¹ telescopes, so holonomy is "
+        extra.append("the flat frame transport Ω_ij = U_i U_j⁻¹ telescopes, so its loop holonomy is "
                      "identically the identity and is not reported")
     if extra:
         text = "; ".join(extra)
         s.append(text[0].upper() + text[1:] + ".")
+    if run.frames_active and frames.minimal_agent_readout_route(cfg):
+        # Audit 2026-10-16 F74: no content map O on this route, so no head-sum link; the receiving map is derived.
+        s.append("The minimal-agent content transport is a separate connection: head h carries the message T_h ξ_j "
+                 "into receiver i through G_ij = C_i S_hᵀ W_ij⁻¹, which depends on the edge and on the beliefs, so "
+                 "the transport around a loop is not the identity in general; this report does not measure it.")
+    elif run.frames_active:
+        # Audit 2026-10-16 F74: the identity statement is about Ω only, not about the content links.
+        edges = getattr(cfg, "content_link_edges", "off")
+        s.append("The relational content links are a separate connection: the head-sum link "
+                 "L_ij = U_i Ô B_ij T̂ U_j⁻¹ has triangle holonomy L_ik⁻¹ L_ij L_jk, which for tiled invertible maps "
+                 "is conjugate to R_ijk T̂ Ô with "
+                 "R_ijk the head-wise routing ratios β_ij β_jk / β_ik, so it is not the identity in general"
+                 + ("" if edges in (None, "off") else
+                    f", and the edge links G_ij of content_link_edges={edges!r} add per-edge factors")
+                 + "; this report does not measure it (during training, diagnostics/routing_holonomy.csv records "
+                   "the path-weighted mean and RMS of log ρ_ijk).")
     return " ".join(s)
 
 
@@ -1290,6 +1319,8 @@ def _sigma_summary(res: SectionResult, run: Any) -> str:
 
 
 def _phi_summary(res: SectionResult) -> str:
+    from vfe3.semantics import frames
+
     m = res.metrics
     if not m:
         return ""
@@ -1297,9 +1328,12 @@ def _phi_summary(res: SectionResult) -> str:
     chart = m.get("chart", {})
     if chart:
         converged, residual = _barycenter_status(chart)
+        order = m.get("ref_order")                 # absent in metrics written before audit 2026-10-16 F76
+        ref = (f"the {chart.get('n_ref')} reference frames" if order not in ("frequency", "token_id") else
+               frames.reference_set_phrase(chart.get("n_ref"), by_count=order == "frequency"))
         s.append(f"The gauge-fixed chart covers {chart.get('n')} candidate frames, a fraction "
                  f"{_f(chart.get('ok_fraction'))} of which have a real principal logarithm; the barycenter over "
-                 f"the {chart.get('n_ref')} most frequent frames "
+                 f"{ref} "
                  + ("converged in every block." if converged is not False else
                     "did not converge in every block (best iterate used"
                     + (f", largest residual {residual:.1e}" if residual is not None else "")
@@ -1326,9 +1360,12 @@ def _phi_summary(res: SectionResult) -> str:
     ok_rel = {k: v for k, v in rel.items() if isinstance(v, Mapping) and v.get("status") == "ok"}
     if ok_rel:
         sig = [k for k, v in ok_rel.items() if _num(v.get("p")) is not None and v["p"] < 0.01]
+        holm = [_num(v.get("p_holm")) for v in ok_rel.values() if _num(v.get("p_holm")) is not None]
         cons = [v["consistency"] for v in ok_rel.values() if _num(v.get("consistency")) is not None]
         s.append(f"{len(sig)} of {len(ok_rel)} relations have relation transports Û_(a*_i) Û_(a_i)⁻¹ more consistent "
-                 f"than their re-pairing null at p < 0.01"
+                 f"than their re-pairing null at p < 0.01 (unadjusted"
+                 + (f"; {sum(1 for p in holm if p < 0.01)} after the Holm adjustment over the {len(holm)} relations"
+                    if holm else "") + ")"
                  + (f", with absolute consistencies between {min(cons):.3f} and {max(cons):.3f}." if cons else "."))
     pos = m.get("positional")
     if isinstance(pos, Mapping) and _num(pos.get("r2_offset")) is not None:

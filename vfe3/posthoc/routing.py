@@ -106,9 +106,22 @@ factors. Also reported for the trained keys: the mean squared affine-invariant d
 covariance, :math:`\frac1n\sum_j\|\log(V_*^{-1/2}V_{K,j}V_*^{-1/2})\|_F^2` (congruence invariant), and
 the condition number of :math:`V_*`.
 
+**Comparison-space RoPE.** Under ``rope_mode='comparison_invariant'`` the router scores the rotated means
+:math:`R_ia_i`, :math:`R_jb_j` and the commutant projections :math:`P(V_{Q,i})`, :math:`P(V_{K,j})`
+(:func:`vfe3.geometry.rope.rope_commutant_projection`, position-free since :math:`R_iP(V)R_i^\top = P(V)`), so
+every quantity above is computed from these scored moments: :math:`a_i \to R_ia_i`, :math:`b_j \to R_jb_j` and
+:math:`V \to P(V)` in all three panels (audit 2026-10-16 F120; the decomposition refused every comparison
+``rope_mode`` before). :math:`V_*` is then a mean of commutant elements, so :math:`V_*^{-1/2}` commutes with every
+:math:`R_i`, the cross term is :math:`\mathsf q_i^\top\mathsf k_j = a_i^\top V_*^{-1/2}R_{j-i}V_*^{-1/2}b_j`, a
+relative-position dot product, and the key norm :math:`\|V_*^{-1/2}b_j\|^2` is position-free. Panel C measures
+the dispersion of the scored :math:`P(V_{K,j})`; with the comparison basis pinned by the rotation planes its
+congruence invariance holds for maps :math:`A` commuting with the torus (:math:`P(AVA^\top) = AP(V)A^\top`).
+``rope_mode='comparison'`` rotates the covariances, :math:`R_jV_{K,j}R_j^\top`, which would put the positional
+rotation into :math:`V_*` and the dispersion, and stays a skip.
+
 Skips (``status='skipped'`` with ``reason``): any route whose router is not this Gaussian KL
 (``attention_mode`` other than ``projected_predictive``, ``relational_routing='noisy_query'``, no
-E-step iteration, or no intercepted routing call).
+E-step iteration, or no intercepted routing call), and ``rope_mode='comparison'``.
 """
 
 from __future__ import annotations
@@ -176,9 +189,13 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
         return f"readout_mode={readouts}: routing is not the predictive-content readout"
     if int(getattr(cfg, "n_e_steps", 1)) < 1:
         return "n_e_steps=0: no E-step iteration, so the router is never evaluated"
-    if any(getattr(op, "comparison_rope_base", None) is not None for op in operators):
-        return ("comparison rope_mode: the router scores the R_i-rotated projected moments, which this "
-                "decomposition does not rebuild (it would decompose the unrotated cost)")
+    if any(getattr(op, "comparison_rope_base", None) is not None
+           and getattr(op, "rope_comparison_covariance", "full") != "rotation_invariant" for op in operators):
+        return ("comparison rope_mode (rope_mode='comparison'): the router scores R_i a_i with the rotated "
+                "covariances R_i V_i R_i^T, so the "
+                "pooled V_* and the panel-C dispersion would mix the positional rotation into the covariance "
+                "spread; the decomposition rebuilds the comparison-space RoPE only under "
+                "rope_mode='comparison_invariant', whose scored covariances P(V) are position-free")
     if any(getattr(op, "routing_log_temperature", None) is not None for op in operators):
         return ("learn_attention_temperature=True: the routing temperature is learned per layer, and this "
                 "decomposition uses one configured temperature per head for every layer")
@@ -210,10 +227,12 @@ def _record_routing_inputs() -> Iterator[List[Dict[str, Any]]]:
     active: List[Dict[str, Any]] = []
 
     def moments(mu_h: torch.Tensor, Sigma_h: torch.Tensor, inverse_blocks: torch.Tensor,
-                S: torch.Tensor, *, head_dims: Optional[Tuple[int, ...]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                S: torch.Tensor, **options: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        # options: head_dims, and diagonal_only on the diagonal comparison-invariant route; the recorded
+        # inputs are the same either way (the analysis recomputes the full projected covariance).
         if active:
             active[-1]["moments"].append(tuple(x.detach() for x in (mu_h, Sigma_h, inverse_blocks, S)))
-        return original_moments(mu_h, Sigma_h, inverse_blocks, S, head_dims=head_dims)
+        return original_moments(mu_h, Sigma_h, inverse_blocks, S, **options)
 
     def score(*args: Any, **kwargs: Any) -> torch.Tensor:
         record: Dict[str, Any] = {"moments": []}
@@ -281,6 +300,24 @@ def _moments64(
     mu_h, sigma_h, inv, S = inputs
     return projected_moments(mu_h.double(), (sigma_h if sigma is None else sigma).double(),
                              (inv if inverse is None else inverse).double(), S.double())
+
+
+def _comparison_mean(a: torch.Tensor, operators: Any) -> torch.Tensor:      # (B, N, H, r)
+    r"""The scored projected mean: :math:`R_i a_i` under a comparison ``rope_mode``, else ``a`` (float64)."""
+    if getattr(operators, "comparison_rope_base", None) is None:
+        return a
+    R = operators.comparison_rope_rotation(a.shape[-3], a.shape[-1], a.device, torch.float64)   # (N, r, r)
+    return torch.einsum("nst,...nht->...nhs", R, a.double())
+
+
+def _comparison_covariance(V: torch.Tensor, operators: Any) -> torch.Tensor:   # (B, N, H, r, r)
+    r"""The scored projected covariance: the RoPE-commutant projection :math:`P(V)` under
+    ``rope_mode='comparison_invariant'`` (position-free, :math:`R_iP(V)R_i^\top = P(V)`), else ``V``."""
+    if getattr(operators, "comparison_rope_base", None) is None:
+        return V
+    from vfe3.geometry.rope import rope_commutant_projection, rope_rotated_pairs
+
+    return rope_commutant_projection(V, rope_rotated_pairs(V.shape[-1], operators.comparison_rope_fraction))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -583,6 +620,7 @@ def routing_decomposition(
     L = int(cfg.n_layers)
     kl_max = float(cfg.kl_max)
     references = _kl_max_references(model)                                     # per layer
+    layer_ops = list(model.relational_operators_by_layer)                        # comparison-space RoPE per layer
     n_batches = math.ceil(indices.size / batch_size)
 
     # Pass 1: pooled projected key covariance V_* and layer-input covariance Sigma-bar.
@@ -592,7 +630,7 @@ def routing_decomposition(
             layers, _ = _forward(model, inputs.to(device))
             valid = _batch_masks(dataset, windows, inputs.shape[1], device)
             for layer, record in enumerate(layers):
-                _, V_k = _moments64(record["key"])                                  # (B, N, H, r, r)
+                V_k = _comparison_covariance(_moments64(record["key"])[1], layer_ops[layer])   # (B, N, H, r, r)
                 sigma_h = record["key"][1]
                 acc = pooled[layer]
                 if not acc:
@@ -640,6 +678,9 @@ def routing_decomposition(
                 else:
                     a_q, V_q = _moments64(record["query"])
                     a_k, V_k = _moments64(record["key"])
+                ops = layer_ops[layer]                                               # the scored moments
+                a_q, a_k = _comparison_mean(a_q, ops), _comparison_mean(a_k, ops)
+                V_q, V_k = _comparison_covariance(V_q, ops), _comparison_covariance(V_k, ops)
                 beta_model = capture["beta_pre"].double()                            # (B, H, N, N)
                 neg_inf = torch.full_like(beta_model, -math.inf)
                 support = _support(log_prior, beta_model)                            # (B, H, N, N)
@@ -685,9 +726,9 @@ def routing_decomposition(
                                   else torch.eye(key[1].shape[-1], dtype=torch.float64,
                                                  device=key[1].device).expand(key[1].shape))
                 variants = {"model": V_k,
-                            "sigma_mean": _moments64(key, sigma=sigma_mean)[1],
-                            "sigma_identity": _moments64(key, sigma=sigma_identity)[1],
-                            "frames_identity": _moments64(key, inverse=eye_inverse)[1]}
+                            "sigma_mean": _comparison_covariance(_moments64(key, sigma=sigma_mean)[1], ops),
+                            "sigma_identity": _comparison_covariance(_moments64(key, sigma=sigma_identity)[1], ops),
+                            "frames_identity": _comparison_covariance(_moments64(key, inverse=eye_inverse)[1], ops)}
                 for name, V_var in variants.items():
                     for field, value in _masked_logdet(V_var, valid).items():
                         acc.c[name][field] += value.cpu()
@@ -812,6 +853,9 @@ def _assemble(
             "tau": [float(x) for x in tau.cpu()], "kl_max": float(cfg.kl_max),
             "kl_max_reference": (lambda refs: refs[0] if len(set(refs)) == 1 else refs)(_kl_max_references(model)),
             "attention_prior": getattr(cfg, "beta_attention_prior", None),
+            "rope_mode": getattr(cfg, "rope_mode", "none"),
+            "scored_moments": ("R_i a_i, R_j b_j and P(V) (comparison-space RoPE)"
+                               if getattr(cfg, "rope_mode", "none") == "comparison_invariant" else "a_i, b_j and V"),
             "input_scope": "full",
             "predictive_covariance": getattr(cfg, "predictive_covariance", None),
             "family": getattr(cfg, "family", None),

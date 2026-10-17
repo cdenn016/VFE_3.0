@@ -13,9 +13,12 @@ row   key                                    modification
 2     ``routing_costs_removed``              :math:`\beta = \operatorname{softmax}_j(\log\pi_{ij})`: costs zeroed, prior kept
 3     ``prior_flattened``                    :math:`\log\pi_{ij} \to 0` on the causal support (the ``-inf`` mask is kept)
 4     ``residual_removed``                   :math:`\mu_i + m_i \mapsto m_i` at every layer
-5     ``stored_covariances_identity``        :math:`\Sigma_{p,v} \to I` (``sigma_log_embed`` :math:`\to 0`)
+5     ``stored_covariances_identity``        :math:`\Sigma_{p,v} \to I` in every stored table (``sigma_log_embed``
+                                             or ``sigma_chol_embed``, and an untied ``decode_sigma_log_embed``,
+                                             :math:`\to 0`)
 6     ``routing_covariances_identity``       :math:`C_i \to I` for every query and key: projected covariances
-                                             :math:`S C_i S^\top \to S S^\top`, projected means unchanged
+                                             :math:`S C_i S^\top \to S S^\top`, projected means unchanged (a
+                                             comparison-space RoPE applied after, as trained)
 7     ``token_frames_identity``              :math:`\exp(X_v) \to I` (``phi_embed`` :math:`\to 0`), in every role
 8     ``positional_frames_identity``         :math:`\exp(Y_i) \to I` (``pos_phi_free`` :math:`\to 0`, and a
                                              frame-space RoPE fold removed), in every role
@@ -248,13 +251,44 @@ def residual_removed(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
 # ----------------------------------------------------------------------------------------------
 
 @contextmanager
-def stored_covariances_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
-    r"""Row 5: ``sigma_log_embed`` :math:`\to 0`, so every stored :math:`\Sigma_{p,v} = I`."""
-    table = getattr(model.prior_bank, "sigma_log_embed", None)
-    if table is None:
-        raise NotApplicable("the prior bank has no sigma_log_embed table")
-    with swap_parameter_data(table, zeros_view(table)):
-        yield {"table": "prior_bank.sigma_log_embed"}
+def stored_covariances_identity(
+    model:  torch.nn.Module,
+
+    *,
+    decode: bool = True,
+) -> Iterator[Dict[str, Any]]:
+    r"""Row 5: every stored covariance table :math:`\to I`, so :math:`\Sigma_{p,v} = I` in every role that reads one.
+
+    The token prior table (encode, the self-coupling target and a tied Gaussian decode) is the diagonal
+    log-variance ``sigma_log_embed`` :math:`\to 0` (:math:`\Sigma_{p,v} = I`), or under
+    ``prior_covariance_table='block_cholesky'`` the packed factor ``sigma_chol_embed`` :math:`\to 0`
+    (:math:`\ell = 0` and :math:`N = 0`, so :math:`L = I` and :math:`C_v = I + \epsilon I` with the table's
+    eigenvalue floor kept). An untied Gaussian decode bank (``untie_decode_bank=True``) scores
+    :math:`-\mathrm{KL}(q\|p_v)/\tau` against its own ``decode_sigma_log_embed``, which is set to zero as well
+    (audit 2026-10-16 F66: the row zeroed the encode table only, so on an untied bank the decode kept its
+    trained covariances). ``decode=False`` keeps the decode bank, the encode-side-only arm the row computed
+    before; on a tied bank one table serves both sides and the flag changes nothing. The record lists the
+    tables set to zero.
+    """
+    pb = model.prior_bank
+    tables: List[Tuple[str, torch.Tensor]] = []
+    for name in ("sigma_log_embed", "sigma_chol_embed"):
+        table = getattr(pb, name, None)
+        if table is not None:
+            tables.append((f"prior_bank.{name}", table))
+    untied = bool(getattr(pb, "untie_decode_bank", False))
+    decode_table = getattr(pb, "decode_sigma_log_embed", None) if untied else None
+    if decode and decode_table is not None:
+        tables.append(("prior_bank.decode_sigma_log_embed", decode_table))
+    if not tables:
+        raise NotApplicable("the prior bank has no stored covariance table")
+    bank = ("linear (no decode covariance)" if getattr(pb, "decode_mode", None) == "linear"
+            else "untied" if untied else "tied")
+    with ExitStack() as stack:
+        for _, table in tables:
+            stack.enter_context(swap_parameter_data(table, zeros_view(table)))
+        yield {"table": ", ".join(name for name, _ in tables), "tables": [name for name, _ in tables],
+               "decode_bank": bank, "decode_bank_kept": bool(decode_table is not None and not decode)}
 
 
 @contextmanager
@@ -310,6 +344,94 @@ def positional_frames_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any
 # Row 6: routing covariances
 # ----------------------------------------------------------------------------------------------
 
+def _unpatched_relational_score() -> Callable[..., torch.Tensor]:
+    r"""The router's ``relational_score`` as bound in :mod:`vfe3.gradients.relational` (read before patching it)."""
+    from vfe3.gradients import relational
+
+    return relational.relational_score
+
+
+def _identity_frame(frame: Any, operators: Any, dtype: torch.dtype) -> Any:
+    r"""The identity frame :math:`U_i = I` on ``frame``'s token axes, compact and validated on one unique row.
+
+    A compact ``frame`` keeps its (..., N, G, d, d) block layout; a dense one becomes (..., N, H, d, d) in the
+    head blocks the router reads (equal heads; the callers refuse a mixed tower). No (..., N) copy is made.
+    """
+    from vfe3.contracts import CanonicalFrameContext, mark_gathered_frame_pair
+
+    inverse = frame.inverse
+    if frame.block_diagonal:
+        batch, blocks = tuple(inverse.shape[:-3]), tuple(inverse.shape[-3:])    # (..., N), (G, d, d)
+    else:
+        H, d = len(operators.irrep_dims), operators.irrep_dims[0]
+        batch, blocks = tuple(inverse.shape[:-2]), (H, d, d)
+    unique = torch.eye(blocks[-1], dtype=dtype, device=inverse.device).expand(1, *blocks)   # (1, G, d, d)
+    eye = unique.expand(*batch, *blocks)                                         # (..., N, G, d, d)
+    mark_gathered_frame_pair(eye, eye, unique, unique)                           # every row is the unique row
+    return CanonicalFrameContext(forward=eye, inverse=eye, block_diagonal=True)
+
+
+def _reference_coordinate_score(
+    mu:            torch.Tensor,                     # (..., N, K) local receiver means
+    C:             torch.Tensor,                     # (..., N, K) or (..., N, K, K) substituted reference covariance
+    source_mu:     torch.Tensor,                     # (..., N, K) local source means
+    source_C:      torch.Tensor,                     # C's layout; the same object as C when self-scored
+    frame:         Any,                              # CanonicalFrameContext of the realized U_i
+    operators:     Any,
+    capture:       Optional[Dict[str, Any]],
+
+    *,
+    row_invariant: bool,
+    scorer:        Optional[Callable[..., torch.Tensor]],
+    public:        torch.dtype,                      # the dtype the trained call on the original inputs returns
+) -> torch.Tensor:                                   # (..., H, N, N)
+    r"""The trained router scored on reference moments: :math:`\xi_i = U_i^{-1}\mu_i`, covariance ``C``, frame :math:`I`.
+
+    The unpatched ``relational_score`` (``scorer``) then projects :math:`a_i = S_Q\xi_i`, :math:`b_j = S_K\xi_j`,
+    the trained means, and :math:`G_{Q,i} = S_Q C_i S_Q^\top`, :math:`G_{K,j} = S_K C_j S_K^\top`, and runs every later
+    step of the trained route on them: under a comparison ``rope_mode`` the rotation :math:`a \to R_i a` with
+    :math:`G \to R_i G R_i^\top`, or the commutant projection :math:`P(G)` (``'comparison_invariant'``), and its
+    diagonal route; the key noise; and the source tuples :math:`(C, I, R_i S, \xi)` from which a factor or
+    recovery route rebuilds :math:`G` (audit 2026-10-16 F120: the counterfactual scorers rebuilt the cost
+    themselves without the rotation and refused a comparison ``rope_mode``). The reference means are
+    formed at the frame's precision under the IEEE-fp32 pin of the trained projection; a dense frame that
+    couples heads is refused as the router refuses it.
+    """
+    from vfe3.runtime import ieee_fp32_matmul
+
+    if not frame.block_diagonal and len(operators.irrep_dims) > 1:
+        dims = operators.irrep_dims
+        with torch.no_grad():
+            mask = torch.block_diag(*(torch.ones(d, d, dtype=torch.bool, device=frame.inverse.device) for d in dims))
+            if bool((frame.inverse.detach()[..., ~mask] != 0).any()):
+                raise ValueError("relational_score requires a head-block-diagonal frame")
+    dtype = C.dtype
+    with ieee_fp32_matmul():
+        xi = _frame_matvec(frame.inverse, mu.to(dtype), frame.block_diagonal)            # (..., N, K) U_i^{-1} mu_i
+        source_xi = xi if source_mu is mu else _frame_matvec(frame.inverse, source_mu.to(dtype), frame.block_diagonal)
+    score = (scorer or _unpatched_relational_score())(
+        xi, C, source_xi, source_C, _identity_frame(frame, operators, dtype), operators, capture,
+        row_invariant=row_invariant)
+    if capture is not None:
+        for key in ("projected_covariance_pre", "projected_key_covariance_pre"):
+            if isinstance(capture.get(key), torch.Tensor):
+                capture[key] = capture[key].to(public)
+    return score.to(public)
+
+
+def _scoring_dtypes(
+    mu: torch.Tensor, sigma: torch.Tensor, source_mu: torch.Tensor, source_sigma: torch.Tensor,
+    frame: Any, operators: Any,
+) -> Tuple[torch.dtype, torch.dtype]:
+    r"""``(work, public)``: the substituted moments' dtype (float64 for an escalated frame) and the dtype the
+    trained ``relational_score`` returns on the original inputs."""
+    from vfe3.relational_scoring import _compute_dtype
+
+    maps = [S for pair in operators.comparison_runs() for S in pair]
+    return (_compute_dtype(mu, sigma, source_mu, source_sigma, frame.inverse, *maps),
+            _compute_dtype(mu, sigma, source_mu, source_sigma, *maps))
+
+
 def _identity_covariance_score(
     mu:           torch.Tensor,
     sigma:        torch.Tensor,
@@ -321,48 +443,25 @@ def _identity_covariance_score(
 
     *,
     row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
+    scorer:        Optional[Callable[..., torch.Tensor]] = None,   # the unpatched relational_score
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with every reference covariance :math:`C_i` replaced by :math:`I`.
 
     The projected means :math:`a = S U_i^{-1}\mu_i` are the trained ones; the projected covariances
-    become :math:`G_Q = S_Q S_Q^\top`, :math:`G_K = S_K S_K^\top` for every token. The source tuples
-    handed to the KL are ``(1, I, S)``, so a factor or recovery route rebuilds exactly these
-    covariances (:math:`X = S \cdot I \cdot 1^{1/2}`) and never re-projects the means.
+    become :math:`G_Q = S_Q S_Q^\top`, :math:`G_K = S_K S_K^\top` for every token, then rotated (or projected
+    onto the RoPE commutant) under a comparison ``rope_mode`` exactly as the trained router treats them
+    (:func:`_reference_coordinate_score`). The source tuples carry ``(I, I, S)`` (``R_i S`` when rotated), so
+    a factor or recovery route rebuilds exactly these covariances.
     """
-    from vfe3.relational_scoring import (
-        _compute_dtype, projected_moments, routing_cost)
-
-    if getattr(operators, "comparison_rope_base", None) is not None:
-        raise NotApplicable("comparison rope_mode: this counterfactual scorer does not apply the comparison-space "
-                            "rotation, so it would not match the trained router")
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
-    H, d = len(operators.irrep_dims), operators.irrep_dims[0]
-    inverse = frame.inverse
-    if not frame.block_diagonal:
-        inverse = torch.stack([inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)
-    mu_h, source_mu_h = (x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d) for x in (mu, source_mu))
-    sigma_h = (sigma.unsqueeze(-3).expand(*sigma.shape[:-2], H, H * d, H * d)
-               if sigma.ndim == mu.ndim + 1 else sigma.unsqueeze(-2).expand(*sigma.shape[:-1], H, H * d))
-    S_q, S_k = operators.comparison_pair()                                    # (H, r, w)
-    a, _ = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)))  # (2, ..., N, H, r)
-    if mu is not source_mu:
-        a_k, _ = projected_moments(source_mu_h, sigma_h, inverse, S_k)
-        a = torch.stack((a[0], a_k))
-    public = _compute_dtype(mu, sigma, source_mu, source_sigma, S_q, S_k)
-    dtype = a.dtype
-    batch, r = a.shape[1:-1], a.shape[-1]                                     # (..., N, H), rank
-    G_q = (S_q.to(dtype) @ S_q.to(dtype).transpose(-1, -2)).expand(*batch, r, r).contiguous()   # (..., N, H, r, r)
-    G_k = (S_k.to(dtype) @ S_k.to(dtype).transpose(-1, -2)).expand(*batch, r, r).contiguous()
-    ones = torch.ones(mu_h.shape, dtype=dtype, device=mu.device)              # unit diagonal source covariance
-    eye = torch.eye(inverse.shape[-1], dtype=dtype, device=mu.device).expand(inverse.shape)
-    if capture is not None:
-        capture["projected_covariance_pre"] = G_q.detach().to(public)
-        capture["projected_key_covariance_pre"] = G_k.detach().to(public)
-    score = routing_cost(operators.routing)
-    return score(a[0], G_q, a[1], G_k,
-                 projection_q=(ones, eye, S_q), projection_k=(ones, eye, S_k),
-                 **_key_noise_options(operators)).to(public)
+    work, public = _scoring_dtypes(mu, sigma, source_mu, source_sigma, frame, operators)
+    if sigma.ndim == mu.ndim + 1:                                                  # (..., N, K, K) full layout
+        C = torch.eye(sigma.shape[-1], dtype=work, device=mu.device).expand(sigma.shape)
+    else:                                                                          # (..., N, K) diagonal layout
+        C = torch.ones((), dtype=work, device=mu.device).expand(sigma.shape)
+    return _reference_coordinate_score(mu, C, source_mu, C, frame, operators, capture,
+                                       row_invariant=row_invariant, scorer=scorer, public=public)
 
 
 @contextmanager
@@ -370,10 +469,11 @@ def routing_covariances_identity(model: torch.nn.Module) -> Iterator[Dict[str, A
     r"""Row 6: every routing covariance :math:`C_i \to I` (projected covariances :math:`S S^\top`)."""
     _refuse_minimal_agent(model, "the routing-covariance arm")
     record: Dict[str, Any] = {"intercepted_calls": 0}
+    scorer = _unpatched_relational_score()
 
     def patched(*args: Any, **kwargs: Any) -> torch.Tensor:
         record["intercepted_calls"] += 1
-        return _identity_covariance_score(*args, **kwargs)
+        return _identity_covariance_score(*args, scorer=scorer, **kwargs)
 
     with patch_bindings(_relational_score_modules(), "relational_score", patched):
         yield record
@@ -579,59 +679,24 @@ def _frame_free_covariance_score(
 
     *,
     row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
+    scorer:        Optional[Callable[..., torch.Tensor]] = None,   # the unpatched relational_score
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with the frame removed from the routing covariance only (row 10).
 
     The projected means keep the trained frames, :math:`a_i = S_Q U_i^{-1}\mu_i`,
-    :math:`b_j = S_K U_j^{-1}\mu_j` (computed exactly as ``relational_score`` computes them); the projected
-    covariances become :math:`V_{Q,i} = S_Q\Sigma_i S_Q^\top` and :math:`V_{K,j} = S_K\Sigma_j S_K^\top`,
-    i.e. :math:`C_i \to \Sigma_i` in :math:`S C_i S^\top`. The source tuples handed to the KL are
-    :math:`(\Sigma, I, S)`, so a factor or recovery route rebuilds exactly these covariances and never
-    re-projects the means (a recovered pair reads the working-precision means, as in row 6).
+    :math:`b_j = S_K U_j^{-1}\mu_j`; the projected covariances become :math:`V_{Q,i} = S_Q\Sigma_i S_Q^\top` and
+    :math:`V_{K,j} = S_K\Sigma_j S_K^\top`, i.e. :math:`C_i \to \Sigma_i` in :math:`S C_i S^\top`, then rotated (or
+    projected onto the RoPE commutant) under a comparison ``rope_mode`` exactly as the trained router treats
+    them (:func:`_reference_coordinate_score`). The source tuples carry :math:`(\Sigma, I, S)` (``R_i S`` when
+    rotated), so a factor or recovery route rebuilds exactly these covariances.
     """
-    from vfe3.relational_scoring import (
-        _compute_dtype, projected_moments, routing_cost)
-
-    if getattr(operators, "comparison_rope_base", None) is not None:
-        raise NotApplicable("comparison rope_mode: this counterfactual scorer does not apply the comparison-space "
-                            "rotation, so it would not match the trained router")
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
-    H, d = len(operators.irrep_dims), operators.irrep_dims[0]
-    inverse = frame.inverse
-    if not frame.block_diagonal:
-        if H > 1:
-            with torch.no_grad():
-                mask = torch.block_diag(*(torch.ones(d, d, dtype=torch.bool, device=inverse.device)
-                                          for _ in range(H)))
-                if bool((inverse.detach()[..., ~mask] != 0).any()):
-                    raise ValueError("relational_score requires a head-block-diagonal frame")
-        inverse = torch.stack([inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)  # (..., N, H, d, d)
-    mu_h, source_mu_h = (x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d) for x in (mu, source_mu))
-    sigma_h, source_sigma_h = (
-        x.unsqueeze(-3).expand(*x.shape[:-2], H, H * d, H * d)
-        if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d)
-        for x in (sigma, source_sigma))
-    eye = torch.eye(inverse.shape[-1], dtype=inverse.dtype, device=inverse.device).expand(inverse.shape)
-    S_q, S_k = operators.comparison_pair()                                              # (H, r, w)
-    if mu is source_mu and sigma is source_sigma:
-        S = torch.stack((S_q, S_k))
-        a, _ = projected_moments(mu_h, sigma_h, inverse, S)                             # (2, ..., N, H, r)
-        _, G = projected_moments(mu_h, sigma_h, eye, S)                                 # (2, ..., N, H, r, r)
-        a_q, a_k, G_q, G_k = a[0], a[1], G[0], G[1]
-    else:
-        a_q, _ = projected_moments(mu_h, sigma_h, inverse, S_q)
-        _, G_q = projected_moments(mu_h, sigma_h, eye, S_q)
-        a_k, _ = projected_moments(source_mu_h, source_sigma_h, inverse, S_k)
-        _, G_k = projected_moments(source_mu_h, source_sigma_h, eye, S_k)
-    public = _compute_dtype(mu, sigma, source_mu, source_sigma, S_q, S_k)
-    if capture is not None:
-        capture["projected_covariance_pre"] = G_q.detach().to(public)
-        capture["projected_key_covariance_pre"] = G_k.detach().to(public)
-    score = routing_cost(operators.routing)
-    return score(a_q, G_q, a_k, G_k,
-                 projection_q=(sigma_h, eye, S_q), projection_k=(source_sigma_h, eye, S_k),
-                 **_key_noise_options(operators)).to(public)
+    work, public = _scoring_dtypes(mu, sigma, source_mu, source_sigma, frame, operators)
+    C = sigma.to(work)                                                             # (..., N, K[, K]) C_i = Sigma_i
+    source_C = C if source_sigma is sigma else source_sigma.to(work)
+    return _reference_coordinate_score(mu, C, source_mu, source_C, frame, operators, capture,
+                                       row_invariant=row_invariant, scorer=scorer, public=public)
 
 
 def _key_noise_options(operators: Any) -> Dict[str, torch.Tensor]:
@@ -716,7 +781,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     (:func:`frames_inactive_reason`), where it would report a measured zero. Outside the normal form each
     row raises :class:`NotApplicable` with the reason: no relational
     predictive content on every layer, frame-space RoPE (``rope_mode`` ``'frame'`` or ``'frame_value'``; a comparison-space RoPE
-    leaves the frames alone, and row 10's scorer refuses it), frame-intrinsic beliefs, a non-``per_token`` encoder, a head
+    leaves the frames alone, and row 10's scorer applies it as the trained router does), frame-intrinsic beliefs, a non-``per_token`` encoder, a head
     mixer or CG coupling; row 10 also needs covariance passthrough in attention and MLP, row 11 a mean-only
     normalization or MLP acting in local coordinates, row 12 the linear decoder. A model trained with
     ``block_coordinates='reference'`` (row 11) or ``decode_coordinates='reference'`` (row 12) carries no
@@ -790,9 +855,11 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
                     for m, plan in zip(mlps, mlp_plans)]
         return original_stack(belief, mu_p, sigma_p, group, stack_cfg, **kwargs)
 
+    scorer = _unpatched_relational_score()
+
     def scored(*args: Any, **kwargs: Any) -> torch.Tensor:
         record["intercepted_calls"] += 1
-        return _frame_free_covariance_score(*args, **kwargs)
+        return _frame_free_covariance_score(*args, scorer=scorer, **kwargs)
 
     bound_decode = model._decode_belief_with_context
 

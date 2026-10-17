@@ -811,7 +811,8 @@ def test_offsets_figure_tables_and_comparison(world: tuple, monkeypatch: pytest.
             rec = results[v]["offsets"]["relations"][name]
             assert shown[r, c] == pytest.approx(rec["effect_size"])
             n_dots += int(rec["p"] < vectors.OFFSET_ALPHA)
-    assert len(ax.lines[0].get_xdata()) == n_dots > 0
+    # filled (Holm-adjusted) and open (unadjusted only) dots together mark every p < 0.05 (audit 2026-10-16 F71)
+    assert sum(len(line.get_xdata()) for line in ax.lines) == n_dots > 0
     # (c) directions: observed minus null mean, masked (grey) where |z| < 2
     ax = figures["directions"].axes[0]
     by_label = {views[v].label: v for v in order}
