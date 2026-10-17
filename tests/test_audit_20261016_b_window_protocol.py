@@ -66,6 +66,14 @@ def test_an_unrecorded_offset_is_placed_by_the_run_commit():
     assert experiment.CURRENT_TRAIN_WINDOW_MODE == "per_epoch_random"
 
 
+def test_a_recorded_provenance_mode_decides_before_the_commit():
+    mode, evidence = experiment.saved_train_window_mode({}, {"train_window_mode": "fixed", "git_sha": "f" * 40})
+    assert mode == "fixed" and "provenance.json" in evidence
+    # the saved config field still decides first
+    assert experiment.saved_train_window_mode({"train_window_offset": "per_epoch_random"},
+                                              {"train_window_mode": "fixed"})[0] == "per_epoch_random"
+
+
 def test_an_unplaceable_run_is_unknown():
     assert experiment.saved_train_window_mode({}, {})[0] == "unknown"
     assert experiment.saved_train_window_mode({}, {"git_sha": "f" * 40})[0] == "unknown"

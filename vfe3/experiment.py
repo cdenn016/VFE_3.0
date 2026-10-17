@@ -80,16 +80,20 @@ def saved_train_window_mode(
     ``mode`` is ``"fixed"`` (window :math:`i` starts at :math:`i s` in every epoch), ``"per_epoch_random"``
     (at :math:`o + i s` with an origin :math:`o` drawn per epoch) or ``"unknown"``. The two protocols present
     different training windows, so their runs are not replicates of one configuration. The saved
-    ``train_window_offset`` (``config_raw``, the run's serialized config) decides when present. Otherwise the
-    run trained before the option existed or after its retirement, and the run's commit
-    (``provenance["git_sha"]``) decides: a commit containing :data:`TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT`
-    trained with per-epoch random origins, any other with fixed windows.
+    ``train_window_offset`` (``config_raw``, the run's serialized config) decides when present, then a
+    ``provenance["train_window_mode"]`` record. Otherwise the run trained before the option existed or after
+    its retirement, and the run's commit (``provenance["git_sha"]``) decides: a commit containing
+    :data:`TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT` trained with per-epoch random origins, any other with
+    fixed windows.
     """
     if "train_window_offset" in config_raw:
         value = config_raw["train_window_offset"]
         if value in _TRAIN_WINDOW_MODES:
             return str(value), "config.json records train_window_offset"
         return "unknown", f"config.json records train_window_offset={value!r}"
+    recorded = provenance.get("train_window_mode")
+    if recorded in _TRAIN_WINDOW_MODES:
+        return str(recorded), "provenance.json records train_window_mode"
     git_sha = provenance.get("git_sha")
     if not isinstance(git_sha, str) or re.fullmatch(r"[0-9a-fA-F]{7,64}", git_sha) is None:
         return "unknown", "config.json records no train_window_offset and provenance.json no git_sha"
