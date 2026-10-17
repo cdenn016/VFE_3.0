@@ -806,7 +806,10 @@ def train_step(
     the clip sets of a role combined in quadrature; empty when no norm was transferred) and
     ``"clip_coefs"`` (per role, the smallest realized clip coefficient of its clipped sets; empty
     when no clip was applied). Asking for ``status_out`` also computes the set norms when clipping
-    is off, so they join the same transfer (audit 2026-10-10 round 2, item 1).
+    is off, so they join the same transfer (audit 2026-10-10 round 2, item 1). On a step that reaches
+    ``optimizer.step``, ``status_out["grads"]`` holds references, keyed by ``id``, to the gradients the
+    step consumed (after unscale and clip; no copy and no synchronization), because the table Fisher step
+    and the manifold phi step clear ``.grad`` inside ``step()`` (audit 2026-10-16, F4).
 
     ``frame_projection_out`` (S1 panel D counters): a ``(2,)`` int64 tensor on the generator
     device. When given and the post-update frame projection runs, the rows it rescales and the rows
@@ -1173,6 +1176,12 @@ def train_step(
         _table_provider = getattr(optimizer, "table_statistics_provider", None)
         if _table_provider is not None:
             _table_provider.set_batch(tokens, _scored_det)
+        if status_out is not None:
+            # References (no copy, no host sync) to the gradients that reach the step: the table Fisher step
+            # and the manifold phi step set .grad = None inside step(), so a post-step reader of .grad (the spike
+            # attribution, the known-dead set) would miss those tables (audit 2026-10-16, F4).
+            status_out["grads"] = {id(p): p.grad for group in optimizer.param_groups
+                                   for p in group["params"] if p.grad is not None}
         _scaler.step(optimizer)
         _scaler.update()
         if _fisher_provider is not None:
@@ -3925,7 +3934,9 @@ def _spike_attribution(
 ) -> Dict[str, Any]:
     r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and why.
 
-    Reads the live gradients after the step (``train_step`` zeroes them on entry) and undoes each parameter's clip
+    Reads the gradients that reached ``optimizer.step``: the references ``train_step`` keeps in ``status["grads"]``,
+    since the table Fisher step and the manifold phi step clear ``.grad`` inside ``step()``, else the live
+    gradients (``train_step`` zeroes them on entry, not on exit). It undoes each parameter's clip
     coefficient (``status["clip_scales"]``), so :math:`\|g_p\|` is the pre-clip norm and a role's norm is
     :math:`(\sum_{p\in r}\|g_p\|^2)^{1/2}`. Shares are of the squared role norm. For the token and positional tables
     among the top parameters, the rows with the largest gradient are reported with their share of the table's
@@ -3934,16 +3945,20 @@ def _spike_attribution(
     the norm, and groups far above their last logged norm. One host transfer for the norms.
     """
     scales: Mapping[int, float] = status.get("clip_scales") or {}
+    stashed: Mapping[int, torch.Tensor] = status.get("grads") or {}
     role_of = {id(p): group.get("role", "other") for group in optimizer.param_groups for p in group["params"]}
     wanted = set(roles)
     entries: List[Tuple[str, torch.nn.Parameter, str, str]] = []
+    grad_of: Dict[str, torch.Tensor] = {}                          # the gradient each entry is read from
     norms: List[torch.Tensor] = []
     for name, parameter in model.named_parameters():
         role = role_of.get(id(parameter))
-        if parameter.grad is None or role is None:
+        grad = stashed.get(id(parameter), parameter.grad)
+        if grad is None or role is None:
             continue
         entries.append((name, parameter, role, _parameter_group(name)))
-        norms.append(torch.linalg.vector_norm(parameter.grad.detach()).to(torch.float64))
+        grad_of[name] = grad
+        norms.append(torch.linalg.vector_norm(grad.detach()).to(torch.float64))
     values = torch.stack(norms).cpu().tolist() if norms else []
     pre = [value / scales.get(id(parameter), 1.0) for value, (_, parameter, _, _) in zip(values, entries)]
     report: Dict[str, Any] = {"roles": {}, "top_parameters": [], "table_rows": {}, "group_norms": {}, "causes": []}
@@ -3971,10 +3986,11 @@ def _spike_attribution(
         index = _SPIKE_TABLE_INDEX.get(group)
         if index is None and targets is not None and name.rsplit(".", 1)[-1] in _SPIKE_DECODE_TABLES:
             index = "target"
-        if index is None or parameter.grad.dim() < 2:
+        grad = grad_of[name]
+        if index is None or grad.dim() < 2:
             continue
         with torch.no_grad():
-            rows = parameter.grad.detach().flatten(1).to(torch.float64).square().sum(dim=1)    # (rows,)
+            rows = grad.detach().flatten(1).to(torch.float64).square().sum(dim=1)              # (rows,)
             k = min(_SPIKE_TOP_ROWS, rows.numel())
             top_sq, top_rows = rows.topk(k)
             entry: Dict[str, Any] = {"indexed_by": index, "rows": top_rows.cpu().tolist(),
@@ -4401,7 +4417,8 @@ def train(
                        else None)
     # Which parameters never even receive a gradient is read off the FIRST REAL STEP below rather
     # than from a synthetic parameter_report probe here: train_step zeroes grads on entry and not on
-    # exit, so the real .grad is still live when it returns. That costs no extra forward/backward,
+    # exit, so the real .grad is still live when it returns, and it keeps references to the gradients
+    # an optimizer clears inside step() (status_out["grads"]). That costs no extra forward/backward,
     # and it reports the graph the run actually trains through instead of a probe's approximation of
     # it. The end-of-run warning subtracts this set, so it fires only on a parameter that DID get a
     # gradient and still never moved -- the case no existing check covers.
@@ -4813,8 +4830,7 @@ def train(
             # Nothing was collected before the step: the pre-step diagnostics are blank on this row.
             d = {key: float("nan") for key in (diag_keys or _TRAIN_DIAGNOSTIC_FALLBACK_KEYS)}
         if motion_snapshot is not None and not motion_dead_captured and step_status["did_step"]:
-            motion_known_dead = tuple(name for name, p in model.named_parameters()
-                                      if p.requires_grad and p.grad is None)
+            motion_known_dead = _known_dead_parameters(model, step_status)
             motion_dead_captured = True
         if do_log or do_csv or forced_row:                   # diagnostics (off graph), ONCE
             # train_ce is the PRE-step CE captured inside train_step (matches train_loss); the old
@@ -5599,6 +5615,22 @@ def snapshot_parameters(
     reported is motion since the resume point, not since the original init.
     """
     return {name: p.detach().to("cpu", copy=True) for name, p in model.named_parameters()}
+
+
+def _known_dead_parameters(
+    model:  torch.nn.Module,
+    status: Mapping[str, Any],                  # train_step status_out of an accepted step
+) -> Tuple[str, ...]:
+    r"""Names of the trainable parameters that received no gradient on an accepted step.
+
+    A parameter is live when it holds a gradient after the step or one reached ``optimizer.step``
+    (``status["grads"]``): the table Fisher step and the manifold phi step clear ``.grad`` inside
+    ``step()``, so ``p.grad is None`` alone would class those tables as dead and move a frozen one to
+    the unwarned ``frozen_known_dead`` list (audit 2026-10-16, F4).
+    """
+    stashed: Mapping[int, torch.Tensor] = status.get("grads") or {}
+    return tuple(name for name, p in model.named_parameters()
+                 if p.requires_grad and p.grad is None and id(p) not in stashed)
 
 
 def parameter_motion_report(
