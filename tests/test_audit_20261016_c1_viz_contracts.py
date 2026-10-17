@@ -280,3 +280,33 @@ def test_report_mode_renders_the_history_after_a_successful_replay(
     assert figure_worker.main() == 0
     assert order == ["replay", "history"]                  # probes the replay persisted are rendered too
     assert json.loads((run_dir / "figure_result.json").read_text(encoding="utf-8")) == {"paths": []}
+
+
+# ------------------------------------------------------------------------------------------------ F85
+
+def _scaling_points(sizes: List[float], seeds: int = 3) -> List[Dict[str, Any]]:
+    rng = np.random.default_rng(0)
+    points = []
+    for n_params in sizes:
+        mean = 3.0 + 40.0 * n_params ** -0.25
+        points.append({"n_params": float(n_params), "route": "embed", "label": f"N{int(n_params)}",
+                       "ce_seeds": list(mean * (1.0 + 0.002 * rng.standard_normal(seeds)))})
+    return points
+
+
+def _fit_label(fig: Any) -> str:
+    labels = [text.get_text() for text in fig.axes[0].get_legend().get_texts()]
+    return next(label for label in labels if label.startswith("fit"))
+
+
+@pytest.mark.parametrize("n_sizes, with_offset, testable", [(4, True, False), (5, True, True), (4, False, True)])
+def test_scaling_law_gates_r2_on_the_fitted_form(n_sizes: int, with_offset: bool, testable: bool) -> None:
+    sizes = list(np.geomspace(1e5, 1e8, n_sizes))
+    fig = figs.plot_scaling_law(_scaling_points(sizes), with_offset=with_offset)
+    label = _fit_label(fig)
+    figs.plt.close(fig)
+    if with_offset:
+        assert "offset power law" in label                     # the three-parameter law was fitted
+    assert ("$R^2$=" in label) is testable, label
+    if not testable:
+        assert f"not testable (<{scaling_min_testable_sizes(with_offset)} sizes)" in label

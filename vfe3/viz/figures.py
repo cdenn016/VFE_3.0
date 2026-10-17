@@ -25,7 +25,7 @@ import matplotlib.figure
 import matplotlib.pyplot as plt
 
 from vfe3.families.base import get_functional_display
-from vfe3.metric_contracts import SCALING_MIN_TESTABLE_SIZES
+from vfe3.metric_contracts import scaling_min_testable_sizes
 from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
 from matplotlib.collections import PathCollection, QuadMesh
@@ -4804,7 +4804,8 @@ def plot_scaling_law(
 
     The fit is a (SEM-weighted) log-log least squares ``L = A N^{-alpha}`` (or the Chinchilla
     ``E + A N^{-alpha}`` when ``with_offset``); the exponent ``alpha`` is annotated, and ``R^2`` only
-    from ``SCALING_MIN_TESTABLE_SIZES`` distinct sizes (fewer are labeled "not testable").
+    from :func:`~vfe3.metric_contracts.scaling_min_testable_sizes` distinct sizes of the fitted form (four for
+    the two-parameter law, five for the offset law; fewer are labeled "not testable").
     The residual panel plots ``log(mean / fit)`` against ``log N`` -- systematic curvature there is
     the signature of a pre-asymptotic (not-yet-power-law) regime. The point count is annotated so a
     two-or-three-size fit is never read as more precise than it is."""
@@ -4823,12 +4824,15 @@ def plot_scaling_law(
         fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
         xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
         yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
-        # Below SCALING_MIN_TESTABLE_SIZES distinct sizes the curve has <= 1 residual dof, so R^2
-        # (exactly 1 at two sizes) tests nothing: annotate "not testable" instead of printing it.
-        testable = int(fit["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+        # Below scaling_min_testable_sizes distinct sizes the fitted law keeps <= 1 residual dof, so R^2
+        # (exactly 1 at two sizes) tests nothing: annotate "not testable" instead of printing it. The gate is
+        # the fitted form's (a with_offset fit that fell back to the plain law has two parameters), as in
+        # scaling_analysis (audit 2026-10-16 F85).
+        min_sizes = scaling_min_testable_sizes(fit["form"] == "offset_power_law")
+        testable = int(fit["n_distinct_sizes"]) >= min_sizes
         lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, "
                + (rf"$R^2$={fit['r2']:.3f}" if testable
-                  else f"not testable (<{SCALING_MIN_TESTABLE_SIZES} sizes)")
+                  else f"not testable (<{min_sizes} sizes)")
                + (f", E={fit['E']:.3f}" if fit["form"] == "offset_power_law" else "")
                + f", {_scaling_fit_form_label(fit['form'])}")
         ax.plot(xx, yy, "--", color="#444444", lw=1.6, label=lbl, zorder=4)
