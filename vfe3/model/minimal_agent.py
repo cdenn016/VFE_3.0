@@ -201,10 +201,12 @@ SPREAD_TILE_BYTES: int = 32 * 1024 ** 2
 # the posterior the readout returns, the ADF (assumed-density) evidence and its difference to the bound (not
 # guaranteed nonnegative with coupled heads), the exact evidence (the ADF value when every receiver's heads are
 # uncoupled, S_h C_i S_g^T = 0, where ADF is exact; NaN otherwise), and the importance-sampled log evidence under q with
-# its difference to the bound (audit 2026-10-12 round 2, item 12 and M1).
+# its difference to the bound (audit 2026-10-12 round 2, item 12 and M1), then the effective sample size fraction of
+# its weights, (sum w)^2 / (n sum w^2) in [1/n, 1], a unitless reliability reading (audit 2026-10-16, F47).
 MINIMAL_AGENT_ELBO_KEYS: Tuple[str, ...] = (
     "relational_minimal_agent_elbo", "relational_minimal_agent_adf_evidence", "relational_minimal_agent_adf_elbo_gap",
-    "relational_minimal_agent_evidence", "relational_minimal_agent_is_evidence", "relational_minimal_agent_is_elbo_gap")
+    "relational_minimal_agent_evidence", "relational_minimal_agent_is_evidence", "relational_minimal_agent_is_elbo_gap",
+    "relational_minimal_agent_is_ess")
 # Importance-sampled log evidence (minimal_agent_importance_evidence): draws per receiver, the seed of its local
 # generator (the training RNG is never touched) and the bytes of one tile of its (samples x receivers x sources x d)
 # record terms.
@@ -319,6 +321,7 @@ class MinimalAgentResult(NamedTuple):
     evidence:         Optional[torch.Tensor] = None         # (..., N) float64 exact log evidence: ADF where uncoupled, else NaN
     is_evidence:      Optional[torch.Tensor] = None         # (..., N) float64 importance-sampled log evidence (elbo only)
     channel_noise_mstep_boundary: Optional[torch.Tensor] = None   # (H,) bool: n_h^* at the n -> 0 bracket (diagnostics)
+    is_ess:           Optional[torch.Tensor] = None         # (..., N) float64 ESS / n of the importance weights (elbo only)
 
 
 def _symmetrize(X: torch.Tensor) -> torch.Tensor:          # (..., r, r) -> (..., r, r)
@@ -1142,7 +1145,8 @@ def minimal_agent_importance_evidence(
     blocks:    bool,
     rope:      Optional[torch.Tensor] = None,   # (N, d, d) comparison rotation R_i
     samples:   int = MINIMAL_AGENT_IS_SAMPLES,
-) -> torch.Tensor:                              # (..., N) float64
+    return_ess: bool = False,
+) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor]':   # (..., N) float64; with return_ess also (..., N) ESS / n
     r"""Importance-sampled log evidence of the declared record model with the readout's :math:`q(X_i)` as proposal.
 
     With the labels summed out exactly, :math:`p(X, o) = N(X; \xi_i, C_i)\prod_h\sum_j\hat\pi^h_{ij}N(R_iS_hX; b_j^h, B_j^h)`
@@ -1162,6 +1166,21 @@ def minimal_agent_importance_evidence(
     and the estimate is reproducible; ``samples`` = :data:`MINIMAL_AGENT_IS_SAMPLES` by default. Detached, float64,
     no autograd, tiled over the samples by :data:`MINIMAL_AGENT_IS_TILE_BYTES`. A receiver whose :math:`C_i` or
     :math:`C_i^+` does not factor, or a head with an utterance covariance that does not, reads NaN.
+
+    Reliability (audit 2026-10-16, F47). The target :math:`p(X\mid o)` is a mixture over label tuples :math:`J` of
+    Gaussians :math:`N(m_J, \Sigma_J)`, :math:`\Sigma_J^{-1} = C_i^{-1} + \sum_hS_h^\top(B^h_{J^h})^{-1}S_h`, while the
+    mean-field :math:`q` carries the label-averaged precision and omits the between-source spread. When the source
+    covariances differ, :math:`q` is narrower than the mixture and the weights are heavy-tailed; their variance is
+    infinite when :math:`2\Sigma_J^{-1} - (C_i^+)^{-1}` is not positive definite for some tuple of positive weight.
+    On 100 receivers of heterogeneous tiny instances with two coupled heads (:math:`N = 4`, :math:`K = 3`,
+    :math:`d = 2`, source covariances scaled by :math:`e^{2z}`, :math:`z\sim N(0, 1.5^2)`, channel noise lowered by
+    :math:`e^{-2}`) the 64-draw estimate was off the label-tuple enumeration by more than 0.1 nats on half the
+    receivers and by more than a nat on 6 percent, with a receiver mean 0.17 nats low. Single receivers are therefore
+    not reliable at the default draw count, and the logged receiver mean is biased low. With ``return_ess`` it also
+    returns Kong's effective sample size fraction :math:`(\sum_sw_s)^2/(n\sum_sw_s^2) \in [1/n, 1]` per receiver
+    (Kong, Liu and Wong, *J. Amer. Statist. Assoc.* 89, 1994). There every receiver off by more than a nat read at
+    most 0.11, but the fraction is computed from the same draws and cannot see a mode that no draw reached: with one
+    head a receiver off by more than a nat read 1.0.
     """
     f64 = torch.float64
     with torch.no_grad():
@@ -1202,9 +1221,15 @@ def minimal_agent_importance_evidence(
             cross = torch.einsum("...his,...hjs->...hij", y, P_b)
             record = torch.logsumexp(log_pi - 0.5 * quadratic + cross + source.unsqueeze(-2), dim=-1)   # (n, ..., H, N)
             log_w.append(log_ratio + record.masked_fill(no_record, 0.0).sum(dim=-2))   # (n, ..., N)
-        estimate = torch.logsumexp(torch.cat(log_w), dim=0) - math.log(samples)          # (..., N)
-        estimate = estimate.masked_fill(bad_X, math.nan)
-        return estimate.masked_fill(bad_B.any(dim=-1).any(dim=-1, keepdim=True), math.nan)
+        log_w_all = torch.cat(log_w)                                            # (samples, ..., N) log w_s
+        total = torch.logsumexp(log_w_all, dim=0)                               # (..., N) log sum_s w_s
+        bad_head = bad_B.any(dim=-1).any(dim=-1, keepdim=True)                  # (..., 1)
+        estimate = (total - math.log(samples)).masked_fill(bad_X, math.nan).masked_fill(bad_head, math.nan)
+        if not return_ess:
+            return estimate                                                     # (..., N)
+        # Kong's effective sample size over n: (sum w)^2 / (n sum w^2), in log space.
+        ess = (2.0 * total - torch.logsumexp(2.0 * log_w_all, dim=0)).exp() / samples   # (..., N)
+        return estimate, ess.masked_fill(bad_X, math.nan).masked_fill(bad_head, math.nan)
 
 
 def minimal_agent_readout(
@@ -1489,7 +1514,7 @@ def minimal_agent_readout(
             R_prime = torch.where(no_record[..., None, None], torch.zeros((), dtype=dtype, device=xi.device), R_prime)
             label_spread_out = R_prime.movedim(-4, -3)                          # (..., N, H, d, d)
             spread_gains = _spread_gains(X0, S, gains, M)                       # (..., N, H, K, d) P S_h^T
-        elbo_out = adf_evidence_out = evidence_out = is_evidence_out = None
+        elbo_out = adf_evidence_out = evidence_out = is_evidence_out = is_ess_out = None
         if elbo:
             with torch.no_grad():
                 # q(X) is the Gaussian the readout returns: P_i plus the label spread under spread_corrected.
@@ -1500,8 +1525,9 @@ def minimal_agent_readout(
                                             gains.detach().to(torch.float64), M.detach().to(torch.float64),
                                             None if spread_gains is None else spread_gains.detach(),
                                             None if label_spread_out is None else label_spread_out.detach())
-                is_evidence_out = minimal_agent_importance_evidence(
-                    xi, C, xi_plus, C_q, S, b, B, lp, no_record, blocks=blocks, rope=Rot)   # (..., N)
+                is_evidence_out, is_ess_out = minimal_agent_importance_evidence(
+                    xi, C, xi_plus, C_q, S, b, B, lp, no_record, blocks=blocks, rope=Rot,
+                    return_ess=True)                                            # (..., N) each
                 exact_cost = cost_out
                 if inference != "exact" or dtype != torch.float64:
                     # The ADF costs in float64 from the detached inputs (the exact path of this call when it already
@@ -1524,7 +1550,7 @@ def minimal_agent_readout(
     return MinimalAgentResult(xi_plus, gains, M, weights_out, cost_out, gain_fraction, V_Q, V_K, coupling,
                               failed, ill_conditioned, contraction, staleness, spread, mstep,
                               spread_gains, label_spread_out, elbo_out, adf_evidence_out, evidence_out,
-                              is_evidence_out, mstep_boundary)
+                              is_evidence_out, mstep_boundary, is_ess_out)
 
 
 # ----------------------------------------------------------------------------------------------

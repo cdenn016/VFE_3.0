@@ -1225,11 +1225,13 @@ class RelationalOperators(nn.Module):
                         else torch.full((H,), math.nan, dtype=dtype, device=mu.device)),
                 }
                 if result.elbo is not None:                                              # elbo_diagnostic: nats
-                    # The exact evidence is reported only when every receiver's heads are uncoupled (else NaN).
+                    # The exact evidence is reported only when every receiver's heads are uncoupled (else NaN); the
+                    # last value is the receiver mean of the importance weights' ESS / n (unitless).
                     record.update(zip(minimal_agent.MINIMAL_AGENT_ELBO_KEYS, (
                         result.elbo.nanmean(), result.adf_evidence.nanmean(),
                         (result.adf_evidence - result.elbo).nanmean(), result.evidence.mean(),
-                        result.is_evidence.nanmean(), (result.is_evidence - result.elbo).nanmean())))   # () float64
+                        result.is_evidence.nanmean(), (result.is_evidence - result.elbo).nanmean(),
+                        result.is_ess.nanmean())))                                          # () float64 each
         status = torch.stack((result.failed, result.ill_conditioned, covariance_failed))      # (3,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
 
