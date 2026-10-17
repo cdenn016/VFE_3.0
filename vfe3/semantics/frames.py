@@ -1277,17 +1277,33 @@ def _frame_holonomy_note(cfg: Any) -> str:
     :math:`R_{ijk} = \bigoplus_h \rho^h_{ijk} I_d`, :math:`\rho^h_{ijk} = \beta^h_{ij}\beta^h_{jk}/\beta^h_{ik}`
     (:func:`vfe3.metrics.routing_triangle_defect_sums`), which is not the identity in general even with
     ``content_link_edges="off"`` (audit 2026-10-16 F74); edge links add per-edge factors.
+
+    The minimal-agent readout (:func:`minimal_agent_readout_route`) has no content map :math:`O`: head
+    :math:`h` carries the message :math:`T_h\xi_j` into the receiver through
+    :math:`G^h_{ij} = C_iS_h^\top W_{ij}^{-1}`, :math:`W_{ij} = A_i + B_j`, which depends on the edge and on
+    the beliefs, so the content transport around a loop is not the identity in general either.
     """
+    frame = ("flat frame transport: Omega_ij = U_i U_j^-1 telescopes, so its loop holonomy is identically the "
+             "identity; no frame holonomy is computed or plotted. ")
+    if minimal_agent_readout_route(cfg):
+        return frame + ("The minimal-agent content transport is a separate connection: head h carries the message "
+                        "T_h xi_j into receiver i through G_ij = C_i S_h^T W_ij^-1, which depends on the edge and on "
+                        "the beliefs, so the transport around a loop is not the identity in general; this section "
+                        "does not measure it.")
     edges = getattr(cfg, "content_link_edges", "off")
     edge_clause = ("" if edges in (None, "off") else
                    f", and the edge links G_ij of content_link_edges={edges!r} add per-edge factors")
-    return ("flat frame transport: Omega_ij = U_i U_j^-1 telescopes, so its loop holonomy is identically the "
-            "identity; no frame holonomy is computed or plotted. The relational content links are a separate "
-            "connection: the head-sum link L_ij = U_i O B_ij T U_j^-1 has triangle holonomy L_ik^-1 L_ij L_jk, "
-            "which for tiled invertible maps is conjugate to R_ijk T O with R_ijk the head-wise routing ratios "
-            "beta_ij beta_jk / beta_ik, so it is "
-            f"not the identity in general{edge_clause}; this section does not measure it (during training, "
-            "diagnostics/routing_holonomy.csv records the path-weighted mean and RMS of log rho_ijk).")
+    return frame + ("The relational content links are a separate connection: the head-sum link "
+                    "L_ij = U_i O B_ij T U_j^-1 has triangle holonomy L_ik^-1 L_ij L_jk, which for tiled invertible "
+                    "maps is conjugate to R_ijk T O with R_ijk the head-wise routing ratios beta_ij beta_jk / beta_ik, "
+                    f"so it is not the identity in general{edge_clause}; this section does not measure it (during "
+                    "training, diagnostics/routing_holonomy.csv records the path-weighted mean and RMS of "
+                    "log rho_ijk).")
+
+
+def minimal_agent_readout_route(cfg: Any) -> bool:
+    r"""Whether the run's readout is the minimal agent, which has no content map ``O`` (no head-sum link)."""
+    return getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
 
 
 def reference_set_phrase(n_ref: int, *, by_count: bool) -> str:

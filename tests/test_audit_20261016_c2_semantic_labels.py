@@ -6,7 +6,8 @@ two layers); nothing is trained, everything runs on the CPU.
 * F74: only the flat frame transport :math:`\Omega_{ij} = U_iU_j^{-1}` has identity loop holonomy. The
   REPORT.md gauge paragraph and the phi-section note say so, and name the relational content links as a
   separate connection whose triangle holonomy is not the identity in general, whatever
-  ``content_link_edges`` is.
+  ``content_link_edges`` is. The minimal-agent readout has no content map O, so its sentence names the
+  derived receiving map instead of the head-sum link.
 * F75: a scored word that is also a pole word of the antonym axis is scored on the axis built from the
   pairs that do not contain it (dropped when every pair contains it), so no word is ranked on an axis it
   defines.
@@ -75,6 +76,21 @@ def test_phi_holonomy_note_adds_the_edge_factors_when_edges_are_on() -> None:
     on = F._frame_holonomy_note(SimpleNamespace(content_link_edges="pure_gauge"))
     assert "not the identity in general" in off and "content_link_edges" not in off
     assert "content_link_edges='pure_gauge'" in on and on.startswith(off.split(";")[0])
+
+
+def test_minimal_agent_route_does_not_claim_the_head_sum_link() -> None:
+    # The minimal-agent readout has no content map O: its receiving maps G_ij = C_i S^T W_ij^-1 depend on the
+    # edge and the beliefs, so the head-sum link L_ij = U_i O B_ij T U_j^-1 is not this route's connection.
+    note = F._frame_holonomy_note(SimpleNamespace(content_link_edges="off", predictive_readout="minimal_agent"))
+    assert note.startswith("flat frame transport: Omega_ij = U_i U_j^-1 telescopes")
+    assert "L_ij" not in note and "R_ijk" not in note and "routing_holonomy.csv" not in note
+    assert "G_ij = C_i S_h^T W_ij^-1" in note and "not the identity in general" in note
+    text = R._gauge_paragraph(_gauge_run(predictive_readout="minimal_agent"))
+    assert "its loop holonomy is identically the identity" in text
+    assert "L_ij" not in text and "R_ijk" not in text and "routing_holonomy.csv" not in text
+    assert "G_ij = C_i S_hᵀ W_ij⁻¹" in text and "not the identity in general" in text
+    # the kernel readout keeps the head-sum link sentence
+    assert "L_ij = U_i Ô B_ij T̂ U_j⁻¹" in R._gauge_paragraph(_gauge_run(predictive_readout="kernel"))
 
 
 # ----------------------------------------------------------------------------------------------

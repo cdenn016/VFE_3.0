@@ -1102,6 +1102,8 @@ def _gauge_paragraph(run: Any, chart: Any = None) -> str:
     assumed and (iii) as broken (with the reason) or assumed. ``chart`` (``CanonicalFrames``
     diagnostics) qualifies the chart invariance by the barycenter residual when it did not converge.
     """
+    from vfe3.semantics import frames
+
     cfg = run.cfg
     status, reason = diagonal_redundancy_status(cfg)
     s = []
@@ -1149,7 +1151,12 @@ def _gauge_paragraph(run: Any, chart: Any = None) -> str:
     if extra:
         text = "; ".join(extra)
         s.append(text[0].upper() + text[1:] + ".")
-    if run.frames_active:
+    if run.frames_active and frames.minimal_agent_readout_route(cfg):
+        # Audit 2026-10-16 F74: no content map O on this route, so no head-sum link; the receiving map is derived.
+        s.append("The minimal-agent content transport is a separate connection: head h carries the message T_h ξ_j "
+                 "into receiver i through G_ij = C_i S_hᵀ W_ij⁻¹, which depends on the edge and on the beliefs, so "
+                 "the transport around a loop is not the identity in general; this report does not measure it.")
+    elif run.frames_active:
         # Audit 2026-10-16 F74: the identity statement is about Ω only, not about the content links.
         edges = getattr(cfg, "content_link_edges", "off")
         s.append("The relational content links are a separate connection: the head-sum link "
