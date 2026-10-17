@@ -4491,11 +4491,13 @@ def fit_lr_width_transfer(
     """
     cells: Dict[Tuple[str, int, int, float], List[float]] = {}
     for row in rows:
-        match = _LR_WIDTH_TRANSFER_LABEL.match(str(row.get("label", "")).split("|")[0].strip())
+        # _base_label strips the __s<seed> suffix of a seeded sweep, so the seeds of a cell meet in one key.
+        match = _LR_WIDTH_TRANSFER_LABEL.match(_base_label(str(row.get("label", "")).split("|")[0].strip()))
         if match is None:
             continue
         embed_dim, n_heads, field, multiplier = int(match[1]), int(match[2]), match[3], float(match[4])
-        ppl = _as_float(row.get("primary_val_ppl"))
+        # The final PPL, not primary_val_ppl: that keeps the best periodic evaluation of a cell that blew up later.
+        ppl = _as_float(row.get("final_val_ppl"))
         failed = bool(str(row.get("error", "") or "").strip()) or not math.isfinite(ppl)
         cells.setdefault((field, embed_dim, n_heads, multiplier), []).append(float("inf") if failed else ppl)
     fields: Dict[str, Any] = {}
