@@ -20,7 +20,9 @@ computed in the gauge-fixed chart
 with ``m`` the bi-invariant (exponential) barycenter of the reference frames. ``U_hat`` is invariant
 under (i) and (iii) when ``m`` is the fixed point (up to the barycenter residual otherwise); statistics of the raw coordinates are labeled as statements about the trained
 trivialization. For ``transport_mode="flat"`` the transport :math:`\Omega_{ij} = U_i U_j^{-1}`
-telescopes, so holonomy is identically the identity and is never plotted.
+telescopes, so its loop holonomy is identically the identity and is never plotted; the relational content
+links are a separate connection whose triangle holonomy is not the identity in general and is not measured
+here (:func:`_frame_holonomy_note`).
 
 All matrix work is float64 torch on the CPU, batched over tokens and chunked over rows.
 """
@@ -63,7 +65,7 @@ _PAR_MIN_ROWS = 64           # smallest per-worker share of a batch worth a thre
 
 # run_phi_section budgets; every key is overridable through ctx.options
 PHI_DEFAULTS: Dict[str, Any] = {
-    "frame_ref_count":          4096,   # reference set for the barycenter and D0 (top frequency)
+    "frame_ref_count":          4096,   # barycenter and D0 reference set (top frequency; id order without counts)
     "frame_rerank":             100,    # group-analogy rerank pool
     "frame_rerank_questions":   500,    # benchmark questions reranked (seeded sample; curated: all)
     "frame_null":               500,    # relation-transport permutation-null draws
@@ -1265,6 +1267,40 @@ def _barycenter_qualifier(cf: CanonicalFrames) -> str:
     return f" only up to O(r), r = {cf.diagnostics['barycenter_residual_max']:.1e},"
 
 
+def _frame_holonomy_note(cfg: Any) -> str:
+    r"""Report sentence on holonomy: identity for the frame transport only, not for the content links.
+
+    The flat transport :math:`\Omega_{ij} = U_iU_j^{-1}` telescopes, so its loop holonomy is the identity.
+    The head-sum content link :math:`L_{ij} = U_i\hat O B_{ij}\hat T U_j^{-1}` is a separate connection:
+    for tiled heads (:math:`Hd = K`) and invertible maps its triangle holonomy :math:`L_{ik}^{-1}L_{ij}L_{jk}`
+    is conjugate to :math:`R_{ijk}\hat T\hat O` with
+    :math:`R_{ijk} = \bigoplus_h \rho^h_{ijk} I_d`, :math:`\rho^h_{ijk} = \beta^h_{ij}\beta^h_{jk}/\beta^h_{ik}`
+    (:func:`vfe3.metrics.routing_triangle_defect_sums`), which is not the identity in general even with
+    ``content_link_edges="off"`` (audit 2026-10-16 F74); edge links add per-edge factors.
+    """
+    edges = getattr(cfg, "content_link_edges", "off")
+    edge_clause = ("" if edges in (None, "off") else
+                   f", and the edge links G_ij of content_link_edges={edges!r} add per-edge factors")
+    return ("flat frame transport: Omega_ij = U_i U_j^-1 telescopes, so its loop holonomy is identically the "
+            "identity; no frame holonomy is computed or plotted. The relational content links are a separate "
+            "connection: the head-sum link L_ij = U_i O B_ij T U_j^-1 has triangle holonomy L_ik^-1 L_ij L_jk, "
+            "which for tiled invertible maps is conjugate to R_ijk T O with R_ijk the head-wise routing ratios "
+            "beta_ij beta_jk / beta_ik, so it is "
+            f"not the identity in general{edge_clause}; this section does not measure it (during training, "
+            "diagnostics/routing_holonomy.csv records the path-weighted mean and RMS of log rho_ijk).")
+
+
+def reference_set_phrase(n_ref: int, *, by_count: bool) -> str:
+    r"""How the ``n_ref`` reference frames of the barycenter and ``D0`` were chosen.
+
+    They are the first ``n_ref`` candidates, which :func:`vfe3.semantics.run.prepare_context` orders by
+    descending training count, or by token id when counts are unavailable (audit 2026-10-16 F76).
+    """
+    if by_count:
+        return f"the {int(n_ref)} most frequent candidate frames"
+    return f"the first {int(n_ref)} candidate frames in token-id order (training counts unavailable)"
+
+
 def _rerank_rank_text(q: Mapping[str, Any], pool: int) -> str:
     r"""Log-rerank rank of one question's answer, or why it has none."""
     if q["rank_rerank"] is not None:
@@ -1724,7 +1760,8 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         return np.random.default_rng([int(ctx.seed), _PHI_STREAM, _PHI_STEP_STREAM[step_name]])
 
     n_ref = int(min(int(_opt(ctx, "frame_ref_count")), ids.size))
-    ref_ids = ids[:n_ref]
+    ref_ids = ids[:n_ref]                    # candidates are in count order, or id order without counts
+    ref_by_count = ctx.counts is not None
     cfg = run.cfg
     d_status, d_reason = diagonal_redundancy_status(cfg)
 
@@ -1734,7 +1771,8 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         qual = _barycenter_qualifier(cf)
         res.notes.append(
             f"Per-token frame statistics use the gauge-fixed chart U_hat = D0 e^X m^-1 D0^-1 (m = bi-invariant "
-            f"barycenter of the {n_ref} most frequent candidate frames, D0 from their mean log-variance), which is "
+            f"barycenter of {reference_set_phrase(n_ref, by_count=ref_by_count)}, D0 from their mean "
+            f"log-variance), which is "
             f"invariant{qual} under the split redundancy e^X -> e^X k and the global positive-diagonal rescaling. "
             "Norms, commutators and BCH gaps of the raw coordinates describe the trained trivialization only.")
         if qual:
@@ -1748,11 +1786,7 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                              "log (eigenvalue on the closed negative real axis) and are excluded from log-chart "
                              "statistics.")
     res.notes.append(_diagonal_note(d_status, d_reason))
-    res.notes.append("flat frame transport: Omega_ij = U_i U_j^-1 telescopes, so its loop holonomy is identically "
-                     "the identity; no frame holonomy is computed or plotted."
-                     + ("" if getattr(cfg, "content_link_edges", "off") in (None, "off") else
-                        f" The content links G_ij of content_link_edges={cfg.content_link_edges!r} are a separate "
-                        "connection whose triangle holonomy is not the identity; this report does not measure it."))
+    res.notes.append(_frame_holonomy_note(cfg))
     if getattr(run, "phi_frozen", False):
         res.notes.append("phi is not updated in context: each realized frame is the token's lookup frame "
                          "times the positional right factor e^{Y_p}.")
@@ -1860,7 +1894,7 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         positional["y_norm"] = _summary(pos["y_norm"])
     res.metrics = {
         "chart": cf.diagnostics if cf is not None else None,
-        "n_tokens": int(ids.size), "n_ref": n_ref,
+        "n_tokens": int(ids.size), "n_ref": n_ref, "ref_order": "frequency" if ref_by_count else "token_id",
         "diagonal_redundancy": {"status": d_status, "reason": d_reason},
         "invariants": ({k: {"summary": _summary(scalars[k]),
                             "spearman_log_count": None if spear is None else spear[k]}

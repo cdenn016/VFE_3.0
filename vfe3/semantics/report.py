@@ -19,8 +19,8 @@ Views (:func:`build_views`). Every view holds the rows of ``ctx.candidate_ids`` 
 view drops frames without a real principal logarithm). The unit normalization ``D0`` of the
 ``mu_sigma_units`` and ``w2_chart`` views is :math:`\log d_{0,k} = -\tfrac12\,\mathrm{mean}_{v}
 \log\sigma^2_{vk}` over all candidates, the same reference set the ``sigma`` section uses; the
-``phi_log`` chart takes its ``D0`` and barycenter from the ``frame_ref_count`` most frequent
-candidates, as the ``phi`` section does.
+``phi_log`` chart takes its ``D0`` and barycenter from the first ``frame_ref_count`` candidates (the
+most frequent, or the lowest token ids when training counts are unavailable), as the ``phi`` section does.
 
 Presets (:data:`PRESETS`, option ``"preset"``). ``"full"`` keeps :data:`DEFAULT_OPTIONS`.
 ``"quick"`` is the lean per-seed battery of a multi-seed study: the views are the run's headline
@@ -385,7 +385,8 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
         return VectorView(
             name="phi_log", label="log Û (canonical)", ids=ids_ok, X=L, metric="cosine", group="phi",
             note=("Flattened principal logs L_v = log Û_v of the gauge-fixed frames Û_v = D0 e^(X_v) m^(−1) D0^(−1) "
-                  f"(m: bi-invariant barycenter of the {cf.ref_ids.size} most frequent candidate frames, D0 from "
+                  f"(m: bi-invariant barycenter of "
+                  f"{frames.reference_set_phrase(cf.ref_ids.size, by_count=ctx.counts is not None)}, D0 from "
                   "their mean log-variance): invariant under the split redundancy and the global diagonal "
                   f"rescaling{_invariance_qualifier(cf.diagnostics)}; the rescaling is {d_clause}"
                   + (f"; {n_bad} rows without a real principal log are excluded." if n_bad else ".")))
@@ -1143,11 +1144,22 @@ def _gauge_paragraph(run: Any, chart: Any = None) -> str:
     if run.phi_frozen:
         extra.append("φ is not updated in context, so the realized frame at position p is e^(X_v) e^(Y_p)")
     if run.frames_active:
-        extra.append("with the flat transport Ω_ij = U_i U_j⁻¹ telescopes, so holonomy is "
+        extra.append("the flat frame transport Ω_ij = U_i U_j⁻¹ telescopes, so its loop holonomy is "
                      "identically the identity and is not reported")
     if extra:
         text = "; ".join(extra)
         s.append(text[0].upper() + text[1:] + ".")
+    if run.frames_active:
+        # Audit 2026-10-16 F74: the identity statement is about Ω only, not about the content links.
+        edges = getattr(cfg, "content_link_edges", "off")
+        s.append("The relational content links are a separate connection: the head-sum link "
+                 "L_ij = U_i Ô B_ij T̂ U_j⁻¹ has triangle holonomy L_ik⁻¹ L_ij L_jk, which for tiled invertible maps "
+                 "is conjugate to R_ijk T̂ Ô with "
+                 "R_ijk the head-wise routing ratios β_ij β_jk / β_ik, so it is not the identity in general"
+                 + ("" if edges in (None, "off") else
+                    f", and the edge links G_ij of content_link_edges={edges!r} add per-edge factors")
+                 + "; this report does not measure it (during training, diagnostics/routing_holonomy.csv records "
+                   "the path-weighted mean and RMS of log ρ_ijk).")
     return " ".join(s)
 
 
@@ -1300,6 +1312,8 @@ def _sigma_summary(res: SectionResult, run: Any) -> str:
 
 
 def _phi_summary(res: SectionResult) -> str:
+    from vfe3.semantics import frames
+
     m = res.metrics
     if not m:
         return ""
@@ -1307,9 +1321,12 @@ def _phi_summary(res: SectionResult) -> str:
     chart = m.get("chart", {})
     if chart:
         converged, residual = _barycenter_status(chart)
+        order = m.get("ref_order")                 # absent in metrics written before audit 2026-10-16 F76
+        ref = (f"the {chart.get('n_ref')} reference frames" if order not in ("frequency", "token_id") else
+               frames.reference_set_phrase(chart.get("n_ref"), by_count=order == "frequency"))
         s.append(f"The gauge-fixed chart covers {chart.get('n')} candidate frames, a fraction "
                  f"{_f(chart.get('ok_fraction'))} of which have a real principal logarithm; the barycenter over "
-                 f"the {chart.get('n_ref')} most frequent frames "
+                 f"{ref} "
                  + ("converged in every block." if converged is not False else
                     "did not converge in every block (best iterate used"
                     + (f", largest residual {residual:.1e}" if residual is not None else "")
