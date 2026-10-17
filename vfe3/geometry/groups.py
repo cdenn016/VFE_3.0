@@ -320,9 +320,19 @@ class GaugeGroup:
         r"""Per-block trace functionals :math:`V_{ha} = \operatorname{tr}(G_a|_{\text{block }h})`.
 
         A block-local group reads them from its local basis (generator (h, a) has trace tr L_a on block h only),
-        without the dense basis; every other group takes the blocks of ``generators``.
+        and the canonical elementary block_glk basis from its layout (generator (h, i, j) is E_ij on block h, so
+        :math:`V_{h,(h,i,j)} = \delta_{ij}`, as in :meth:`generator_traces`; audit 2026-10-16, F87), both without
+        the dense basis; every other group takes the blocks of ``generators``.
         """
         from vfe3.geometry.lie_ops import _block_trace_vectors
+        layout = self.elementary_block_shape
+        if layout is not None:
+            H, d = layout
+            V = torch.zeros(H, H * d * d, device=self.generator_device, dtype=self.generator_dtype)
+            identity = torch.eye(d, device=self.generator_device, dtype=self.generator_dtype).reshape(-1)
+            for h in range(H):
+                V[h, h * d * d:(h + 1) * d * d] = identity
+            return V
         if self.certified_block_local_basis() is not None:
             H = len(self.irrep_dims)
             local = self._local_basis_as(self.generator_dtype, self.generator_device)
