@@ -31,6 +31,10 @@ _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
 # It equals the default budget, so at the default every loop tiles and checkpoints exactly as before the knob.
 _CHECKPOINT_BYTES = 32 * 1024 ** 2
 
+# Byte budget of one factor-route recovery pair tile of projected_gaussian_kl: one r x r triangular-solve operand
+# per pair in each gathered (batch, head) slice that holds a recovered entry (audit 2026-10-16 F28).
+_RECOVERY_PAIR_TILE_BYTES = 32 * 1024 ** 2
+
 
 def set_projection_tile_bytes(nbytes: int) -> int:
     r"""Set the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes; returns the previous value."""
@@ -980,7 +984,8 @@ def projected_gaussian_kl(
     (:class:`_IEEEFP32Recompute`). With ``gemm_expansion_tol`` set (default None: off), a (batch, head)
     slice whose GEMM error estimate (:func:`_gemm_expansion_error`) exceeds it in nats is scored instead
     by the direct-difference tiles at IEEE fp32 and counted in :func:`gemm_fallback_slices`; the verdict
-    joins the existing decision read. Recovered factors use bounded checkpointed pair tiles of triangular solves
+    joins the existing decision read. Recovered factors use bounded checkpointed pair tiles of triangular solves,
+    over only the (batch, head) slices that hold a recovered entry (``_RECOVERY_PAIR_TILE_BYTES`` per tile),
     instead of cancelling covariance/precision products, in the working dtype, or in float64 where the
     recovery fell back to float64 (:func:`_strict_cholesky`). No floor, cap, symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
     source tuples allow inaccurate rounded covariances and projected means to
@@ -1167,8 +1172,14 @@ def projected_gaussian_kl(
                      else torch.zeros(nq_flags, dtype=torch.bool, device=Gq.device))
             k_tok = (_token_recover_flags(rec_k, nk_flags) if rec_k is not None
                      else torch.zeros(nk_flags, dtype=torch.bool, device=Gk.device))
-            flags = torch.cat((q_tok, k_tok)).tolist()
-            q_needs, k_needs = flags[:nq_flags], flags[nq_flags:]
+            # (batch, head) slices holding a recovered entry: only they enter the factor-route tiles.
+            slice_rec = torch.zeros(slice_shape, dtype=torch.bool, device=Gq.device)       # (..., H)
+            for rec in (rec_q, rec_k):
+                if rec is not None:
+                    slice_rec = slice_rec | rec.any(dim=-2)
+            flags = torch.cat((q_tok, k_tok, slice_rec.reshape(-1))).tolist()
+            q_needs, k_needs = flags[:nq_flags], flags[nq_flags:nq_flags + nk_flags]
+            recovered_slices = [s for s, flag in enumerate(flags[nq_flags + nk_flags:]) if flag]
         else:
             # Healthy path: chol_k is the prepared factor, so this is its precision bit for bit.
             q_cov_healthy, k_prec_healthy = Gq, k_prec_prepared
@@ -1191,10 +1202,9 @@ def projected_gaussian_kl(
         else:
             logdet_q_healthy, logdet_k_healthy = logdet_q, logdet_k
         nq, nk = aq.shape[-2], ak.shape[-2]
-        batch_heads = aq.numel() // (nq * r)
 
-        def _tile_steps(element_size: int, per_pair: int) -> Tuple[int, int]:
-            pair_budget = max(1, (32 * 1024 ** 2) // (element_size * batch_heads * per_pair))
+        def _tile_steps(element_size: int, per_pair: int, slices: int) -> Tuple[int, int]:
+            pair_budget = max(1, _RECOVERY_PAIR_TILE_BYTES // (element_size * slices * per_pair))
             q_step = max(1, min(nq, 32, pair_budget))
             return q_step, max(1, min(nk, pair_budget // q_step))
 
@@ -1244,32 +1254,45 @@ def projected_gaussian_kl(
             direct = torch.cat(rows, dim=-2)                                    # (n_fallback, Nq, Nk)
             healthy = (healthy.reshape(-1, nq, nk)
                        .index_copy(0, index, direct.to(healthy.dtype)).reshape(grid))
-        if not factor_trace_any:
+        if not factor_trace_any or not recovered_slices:
             return healthy.to(dtype)
-        # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j).
+        # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j). Only the (batch, head)
+        # slices holding one are gathered, and the tile size follows their count (audit 2026-10-16 F28); every
+        # triangular solve is per matrix, so a recovered slice scores as in a batch that holds it alone.
         q_rec = (rec_q.movedim(-1, -2) if rec_q is not None                       # (..., H, Nq)
                  else torch.zeros(Gq.shape[:-4] + (Gq.shape[-3], Gq.shape[-4]),
                                   dtype=torch.bool, device=Gq.device))
         k_rec = (rec_k.movedim(-1, -2) if rec_k is not None                       # (..., H, Nk)
                  else torch.zeros(Gk.shape[:-4] + (Gk.shape[-3], Gk.shape[-4]),
                                   dtype=torch.bool, device=Gk.device))
-        pair_rec = q_rec.unsqueeze(-1) | k_rec.unsqueeze(-2)                      # (..., H, Nq, Nk)
-        q_step, k_step = _tile_steps(aq.element_size(), r * r)
+        grid = healthy.shape                                                      # (..., H, Nq, Nk)
+        index = torch.unravel_index(torch.tensor(recovered_slices, dtype=torch.long, device=healthy.device),
+                                    grid[:-2])
+
+        def _gather(t: torch.Tensor, tail: int) -> torch.Tensor:                 # (n_recovered, *tail)
+            trailing = t.shape[t.ndim - tail:]
+            return t.expand(*grid[:-2], *trailing)[index]
+
+        pair_rec = _gather(q_rec, 1).unsqueeze(-1) | _gather(k_rec, 1).unsqueeze(-2)   # (n, Nq, Nk)
+        route = (_gather(aq, 2), _gather(ak, 2), _gather(q_factor, 3), _gather(k_factor, 3),
+                 _gather(logdet_q, 1), _gather(logdet_k, 1))
+        current = _gather(healthy, 2)                                             # (n, Nq, Nk)
+        q_step, k_step = _tile_steps(aq.element_size(), r * r, len(recovered_slices))
         rows = []
         for i in range(0, nq, q_step):
             columns = []
             i_rec = any(q_needs[i:i+q_step])
             for j in range(0, nk, k_step):
-                value = healthy[..., i:i+q_step, j:j+k_step]
+                value = current[:, i:i+q_step, j:j+k_step]
                 if i_rec or any(k_needs[j:j+k_step]):
-                    args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
-                            q_factor[..., i:i+q_step, :, :], k_factor[..., j:j+k_step, :, :],
-                            logdet_q[..., i:i+q_step], logdet_k[..., j:j+k_step])
+                    args = (route[0][:, i:i+q_step], route[1][:, j:j+k_step],
+                            route[2][:, i:i+q_step], route[3][:, j:j+k_step],
+                            route[4][:, i:i+q_step], route[5][:, j:j+k_step])
                     factor_value = _tile(args, True, q_step, k_step).to(dtype)
-                    value = torch.where(pair_rec[..., i:i+q_step, j:j+k_step], factor_value, value)
+                    value = torch.where(pair_rec[:, i:i+q_step, j:j+k_step], factor_value, value)
                 columns.append(value)
             rows.append(torch.cat(columns, dim=-1))
-        return torch.cat(rows, dim=-2).to(dtype)
+        return healthy.index_put(index, torch.cat(rows, dim=-2).to(healthy.dtype)).to(dtype)
 
 
 def _healthy_kl_verdict(host: List[bool]) -> None:
