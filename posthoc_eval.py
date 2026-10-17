@@ -13,7 +13,8 @@ the checkpoint config) on the run's identity-checked token streams:
   cross-checked against ``vfe3.train.evaluate`` and, on a full split, against ``summary.json``
   (``tab:relational_run``);
 * the M5 frozen interventions, rows 1-12 (rows 9-12 remove the frames one role at a time), on the
-  validation split with paired article-bootstrap intervals;
+  validation split with paired article-bootstrap intervals (4096-token blocks when the stream has no
+  article headings);
 * the beta-weighted KL-cap activation per layer and head (validation and test);
 * per-head attention statistics on the validation split (S2 panel B);
 * the relational-map invariants and head-by-block norms (S1 panel B, S2 panel A);

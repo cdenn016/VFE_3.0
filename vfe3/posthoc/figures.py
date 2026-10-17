@@ -289,15 +289,27 @@ def plot_attention_stats(
 # M5
 # ----------------------------------------------------------------------------------------------
 
+def _bootstrap_unit_text(unit: str) -> str:
+    r"""Axis wording of a resampling unit: ``'article'``, or ``'block_<n>'`` as an ``n``-token block."""
+    if unit.startswith("block_") and unit[len("block_"):].isdigit():
+        return f"{int(unit[len('block_'):])}-token block"
+    return unit.replace("_", " ")
+
+
 def plot_interventions(
     rows:    Sequence[Mapping[str, Any]],
     out_dir: Path,
     name:    str = "m5_interventions",
+
+    *,
+    unit:    str = "article",
 ) -> List[Path]:
     r"""Forest plot of :math:`\Delta\mathrm{CE}` (nats) per M5 row with its 95% bootstrap interval.
 
     A symmetric-log axis keeps effects from :math:`10^{-3}` to several nats readable; rows without a
-    number carry their status as text.
+    number carry their status as text. ``unit`` is the resampling unit of the paired bootstrap (the
+    interventions report's ``unit``: the article, or a fixed token block when no article headings are
+    found), named on the axis.
     """
     import matplotlib.pyplot as plt
 
@@ -327,7 +339,7 @@ def plot_interventions(
     ax.set_ylim(-0.7, len(rows) - 0.3)
     ax.set_yticks(y)
     ax.set_yticklabels([f"{int(r['row'])}. {r['label']}" for r in rows], fontsize=MIN_FONT_PT + 0.5)
-    ax.set_xlabel(r"$\Delta$CE (nats per target), 95% article-bootstrap interval")
+    ax.set_xlabel(r"$\Delta$CE (nats per target), 95% " + f"{_bootstrap_unit_text(unit)}-bootstrap interval")
     return _save(fig, out_dir, name)
 
 

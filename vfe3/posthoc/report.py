@@ -424,22 +424,38 @@ def _fmt(value: Any, digits: int = 4) -> str:
 
 def interventions_table(rows: Sequence[Mapping[str, Any]], *, n_units: Optional[int], unit: str,
                         n_targets: Optional[int], subset: bool) -> str:
-    r"""Markdown of Table M5 (``tab:placeholder_interventions``), rows 1-12."""
+    r"""Markdown of Table M5 (``tab:placeholder_interventions``), rows 1-12.
+
+    An arm that scored a different target set than the baseline (a full-covariance decode can exclude
+    degenerate positions per pass) is paired on the targets both passes scored: its CE and
+    :math:`\Delta\mathrm{CE}` are over that aligned subset, so :math:`\mathrm{CE}_{\mathrm{arm}} -
+    \mathrm{CE}_{\mathrm{base}}` with the baseline row's all-target CE need not equal the printed
+    :math:`\Delta\mathrm{CE}`. Such a row's CE carries a dagger, and a note gives its target count and the
+    baseline CE on the aligned subset (audit 2026-10-16 F69).
+    """
     lines = ["| Frozen intervention on every validation target | CE | $\\Delta$CE | 95% interval |",
              "|---|---|---|---|"]
+    aligned: List[str] = []
     for r in sorted(rows, key=lambda r: int(r["row"])):
         if r.get("status") == "ok":
             interval = (f"[{_fmt(r.get('lo'))}, {_fmt(r.get('hi'))}]" if r["row"] != 1
                         else f"[{_fmt(r.get('ce_lo'))}, {_fmt(r.get('ce_hi'))}] (CE)")
             delta = "0" if r["row"] == 1 else _fmt(r.get("delta_ce"))
-            lines.append(f"| {r['label']} | {_fmt(r.get('ce'))} | {delta} | {interval} |")
+            dropped = int(r.get("n_targets_dropped") or 0)
+            mark = "†" if dropped else ""
+            lines.append(f"| {r['label']} | {_fmt(r.get('ce'))}{mark} | {delta} | {interval} |")
+            if dropped:
+                aligned.append(f"† Row {r['row']}: scored on {r.get('n_targets')} of the baseline's {n_targets} "
+                               f"targets ({dropped} dropped: scored by only one of the two passes); its CE and "
+                               f"$\\Delta$CE are on these aligned targets, where the baseline CE is "
+                               f"{_fmt(r.get('ce_base_aligned'))}.")
         else:
             lines.append(f"| {r['label']} | {r.get('status')} | {r.get('status')} | {r.get('status')} |")
     note = (f"\nCE in nats per scored target over {n_targets} targets; intervals are 2.5/97.5 percentiles of a "
             f"paired {unit} bootstrap over {n_units} {unit}s")
     if subset:
         note += "; SUBSET of the validation split (not the manuscript number)"
-    return "\n".join(lines) + note + ".\n"
+    return "\n".join(lines) + note + ".\n" + "".join(f"\n{line}\n" for line in aligned)
 
 
 def relational_run_table(passes: Sequence[Mapping[str, Any]], info: st.RunInfo) -> str:
@@ -922,7 +938,7 @@ def _run_interventions(
             interval = ev.paired_delta_interval(arm_nll, base_nll, units[i_base], n_resamples=n_resamples)
             row.update(status="ok", ce=float(arm_nll.mean()), delta_ce=interval["point"], lo=interval["lo"],
                        hi=interval["hi"], se=interval["se"], n_targets=int(arm_nll.size),
-                       n_targets_dropped=dropped, record=dict(record))
+                       n_targets_dropped=dropped, ce_base_aligned=float(base_nll.mean()), record=dict(record))
             if dropped == 0:
                 arrays[intervention.key] = arm.nll
         except iv.NotApplicable as exc:
@@ -1215,7 +1231,8 @@ def _write_outputs(report: Dict[str, Any], info: st.RunInfo, out: Path, options:
             subset=iv_report["subset"])
         _write_csv(out / "csv" / "interventions.csv", iv_report["rows"])
         if options.figures:
-            report["figures"] += [str(p) for p in fg.plot_interventions(rows, out / "figures")]
+            report["figures"] += [str(p) for p in fg.plot_interventions(rows, out / "figures",
+                                                                        unit=iv_report["unit"])]
     if report["passes"]:
         tables["relational_run"] = relational_run_table(report["passes"], info)
         _write_csv(out / "csv" / "passes.csv", [

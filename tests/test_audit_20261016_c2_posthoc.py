@@ -8,10 +8,13 @@ Synthetic strings and tiny models only (single-digit dimensions, CPU, one thread
   ``decode_sigma_log_embed`` included; ``decode=False`` keeps the earlier encode-side-only arm.
 * F68: the reproduction check calls a replay matched arithmetic only when its amp dtype and its fp32
   matmul policy are the run's; an IEEE fp32 replay of a TF32 run gets the fp32-replay tolerance.
+* F69: the M5 table marks a row scored on the aligned subset of the baseline's targets and prints the
+  baseline CE on that subset; the forest plot names the resampling unit the intervals used.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -155,3 +158,38 @@ def test_reproduction_check_uses_the_replay_tolerance_and_label_when_not_matched
     loose = rp._reproduction(result, reference, full=True, matched=False)
     assert loose["arithmetic"] == "fp32 replay" and loose["tolerance"] == rp.REPRODUCTION_TOL_FP32_REPLAY
     assert loose["status"] == "ok"
+
+
+# ----------------------------------------------------------------------------------------------
+# F69: aligned-subset rows and the bootstrap unit
+# ----------------------------------------------------------------------------------------------
+
+def _m5_rows() -> list:
+    return [
+        {"row": 1, "key": "baseline", "label": "None (final weights)", "status": "ok", "ce": 3.0,
+         "delta_ce": 0.0, "lo": 0.0, "hi": 0.0, "ce_lo": 2.9, "ce_hi": 3.1, "n_targets": 100},
+        {"row": 5, "key": "stored_covariances_identity", "label": "Stored covariances", "status": "ok",
+         "ce": 3.5, "delta_ce": 0.4, "lo": 0.3, "hi": 0.5, "n_targets": 96, "n_targets_dropped": 4,
+         "ce_base_aligned": 3.1},
+        {"row": 7, "key": "token_frames_identity", "label": "Token frames", "status": "ok",
+         "ce": 3.2, "delta_ce": 0.2, "lo": 0.1, "hi": 0.3, "n_targets": 100, "n_targets_dropped": 0},
+    ]
+
+
+def test_interventions_table_marks_rows_scored_on_an_aligned_subset() -> None:
+    text = rp.interventions_table(_m5_rows(), n_units=8, unit="article", n_targets=100, subset=False)
+    lines = {line.split(" |")[0].lstrip("| "): line for line in text.splitlines() if line.startswith("| ")}
+    assert "†" in lines["Stored covariances"] and "†" not in lines["Token frames"]
+    assert "96 of the baseline's 100 targets" in text and "4 dropped" in text
+    assert "3.1" in text.split("†", 2)[-1]                                    # the aligned baseline CE
+
+
+def test_interventions_plot_names_the_bootstrap_unit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vfe3.posthoc import figures as fg
+
+    labels: list = []
+    monkeypatch.setattr(fg, "_save", lambda fig, out_dir, name: labels.append(fig.axes[0].get_xlabel()) or [])
+    fg.plot_interventions(_m5_rows(), tmp_path, unit="block_4096")
+    fg.plot_interventions(_m5_rows(), tmp_path, unit="article")
+    assert "4096-token block" in labels[0] and "article" not in labels[0]
+    assert "article-bootstrap" in labels[1]
