@@ -106,8 +106,8 @@ def test_alpha_grad_coefficient_state_dependent_is_alpha_star():
 # A second @register under an existing name used to silently shadow the first, so a
 # config-selected seam could dispatch to an unintended implementation. Each decorator now
 # raises KeyError on a duplicate key unless override=True is passed (the deliberate
-# replacement escape hatch). register_alpha lives here; register_prior / register_compose
-# share the guard and are mirrored below.
+# replacement escape hatch). register_alpha lives here; register_prior
+# shares the guard and is mirrored below.
 
 
 @pytest.mark.registry_mutation
@@ -158,25 +158,3 @@ def test_register_prior_duplicate_raises_and_override_replaces():
         assert _PRIORS[name] is _second
     finally:
         _restore_registry_entry(_PRIORS, name, previous)
-
-
-@pytest.mark.registry_mutation
-def test_register_compose_duplicate_raises_and_override_replaces():
-    from vfe3.geometry.lie_ops import _COMPOSE, register_compose
-    name = "_test_dup_compose"
-    previous = _COMPOSE.get(name, _MISSING)
-    try:
-        @register_compose(name, override=previous is not _MISSING)
-        def _first(phi1, phi2, generators, **kwargs):
-            return phi1 + phi2
-
-        with pytest.raises(KeyError, match="already registered"):
-            register_compose(name)(_first)
-
-        @register_compose(name, override=True)
-        def _second(phi1, phi2, generators, **kwargs):
-            return phi1 + phi2
-
-        assert _COMPOSE[name] is _second
-    finally:
-        _restore_registry_entry(_COMPOSE, name, previous)

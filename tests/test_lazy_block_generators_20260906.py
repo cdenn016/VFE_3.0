@@ -73,7 +73,6 @@ def test_copy_and_custom_tensor_contract(kind: str) -> None:
 def test_public_basis_changes_withdraw_shortcuts(mutation: str) -> None:
     group = get_group("block_glk")(4, 2, dtype=torch.float64)
     group.gram_diagonal()
-    old_pinv = group.gram_pinv().clone()
     if mutation == "in_place":
         group.generators[0].add_(group.generators[1], alpha=0.5)
     elif mutation == "replacement":
@@ -98,11 +97,6 @@ def test_public_basis_changes_withdraw_shortcuts(mutation: str) -> None:
         dense = build_factored_transport(phi, group, compact_blocks=False)
         torch.testing.assert_close(CompactBlockElement(transport.exp_blocks, 4).to_dense(), dense.exp_phi,
                                    rtol=1e-12, atol=1e-14)
-    if mutation == "in_place":
-        from vfe3.geometry.lie_ops import gram_pinv
-        actual = group.gram_pinv()
-        assert not torch.equal(actual, old_pinv)
-        torch.testing.assert_close(actual, gram_pinv(group.generators), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

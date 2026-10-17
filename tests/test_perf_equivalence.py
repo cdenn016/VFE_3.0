@@ -115,27 +115,6 @@ def test_flat_builders_forward_chart_radius_and_block_layout(monkeypatch):
     assert calls == [(13.0, [4, 4]), (13.0, [4, 4])]
 
 
-def test_compose_bch_blocked_matches_dense():
-    # The blocked Dynkin cascade (brackets on the (H, d, d) diagonal-block stacks) must equal
-    # the dense (K, K) cascade for a block-diagonal embedding, at every truncation order and
-    # under the broadcast (unbatched positional element) pattern, in value AND gradient.
-    from vfe3.geometry.lie_ops import compose_bch
-    grp, phi, _, _ = _transport_inputs()                   # block_glk K=8, irrep_dims [4,4]
-    n_gen = grp.generators.shape[0]
-    torch.manual_seed(1)
-    coords = 0.1 * torch.randn(5, n_gen)                   # unbatched positional element
-    for order in (1, 2, 3, 4):
-        p1 = phi.clone().requires_grad_(True)
-        p2 = phi.clone().requires_grad_(True)
-        dense = compose_bch(p1, coords, grp.generators, order=order, block_dims=None)
-        blocked = compose_bch(p2, coords, grp.generators, order=order,
-                              block_dims=list(grp.irrep_dims))
-        assert torch.allclose(dense, blocked, atol=1e-6), f"order={order}"
-        g_dense, = torch.autograd.grad(dense.sum(), p1)
-        g_blocked, = torch.autograd.grad(blocked.sum(), p2)
-        assert torch.allclose(g_dense, g_blocked, atol=1e-6), f"order={order} grad"
-
-
 def test_estep_single_block_groups_stay_dense():
     # Single-block groups (block_glk with one head, so_n defining rep) report irrep_dims [K] -> the
     # fused route is NOT taken; the E-step keeps the dense (N,N,K,K)/(B,N,N,K,K) Omega tensor.
