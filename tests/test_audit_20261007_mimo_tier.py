@@ -134,24 +134,13 @@ def test_indexed_bounded_variance_equals_the_gathered_rows() -> None:
     assert torch.equal(bounded_variance_from_log(table, index=ids), bounded_variance_from_log(table[ids]))
 
 
-# ---------------------------------------------------------------- items 41, 66: banner and BCH guard
+# ---------------------------------------------------------------- item 41: banner
 
 def test_banner_tau_names_the_minimal_agent_temperature() -> None:
     from vfe3.train import _fmt_tau
 
     cfg = types.SimpleNamespace(attention_mode="projected_predictive", predictive_readout="minimal_agent")
     assert _fmt_tau(cfg, None).startswith("1 ")
-
-
-def test_bch_composition_refuses_a_basis_that_is_not_bracket_closed() -> None:
-    from vfe3.geometry.lie_ops import compose_bch
-
-    generators = torch.zeros(2, 2, 2, dtype=torch.float64)
-    generators[0, 0, 1] = 1.0                                   # E12
-    generators[1, 1, 0] = 1.0                                   # E21; [E12, E21] = diag(1, -1) is outside
-    phi = torch.tensor([0.1, 0.2], dtype=torch.float64)
-    with pytest.raises(ValueError, match="not closed under the Lie bracket"):
-        compose_bch(phi, phi, generators)
 
 
 # ---------------------------------------------------------------- item 19: inert search parameters

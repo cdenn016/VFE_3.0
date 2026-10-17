@@ -792,8 +792,8 @@ class PriorBank(nn.Module):
         # -D_configured(q||p_v)/tau_eff scored through get_functional(divergence_family) at
         # alpha=renyi_order. The fast Gaussian kernels hardcode alpha=1 KL. The defaults are the KL
         # readout every projected route uses: VFEModel passes neither argument, because both config
-        # fields are retired and pinned to renyi at alpha=1, so other values come from tests only
-        # (audit 2026-10-16 F93).
+        # fields are retired and pinned to renyi at alpha=1, and the divergence seam now implements
+        # only the KL, so any other order raises (audit 2026-10-16 F93).
         self.divergence_family = divergence_family
         self.renyi_order = renyi_order
         self.encode_mode = encode_mode

@@ -78,20 +78,6 @@ def test_full_cov_kl_closed_form_preserves_float64():
     torch.testing.assert_close(out.reshape(()), expected, rtol=0.0, atol=1e-12)
 
 
-def test_full_cov_renyi_closed_form_preserves_float64():
-    """alpha=0.5 branch (blend + logdet quotient): same policy on the non-KL arm."""
-    alpha = 0.5
-    q, t, mu_q, mu_t, sq, st = _diag_full_gaussians(torch.float64)
-    out = q.renyi_closed_form(t, alpha=alpha, kl_max=1e12)
-    dmu = mu_t - mu_q
-    blend = (1.0 - alpha) * sq + alpha * st
-    mahal = alpha * (dmu * dmu / blend).sum()
-    logdet = ((1.0 - alpha) * torch.log(sq) + alpha * torch.log(st) - torch.log(blend)).sum() / (alpha - 1.0)
-    expected = 0.5 * (mahal + logdet)
-    assert out.dtype == torch.float64
-    torch.testing.assert_close(out.reshape(()), expected, rtol=0.0, atol=1e-12)
-
-
 def test_full_cov_divergence_fp64_keyed_on_any_operand():
     """Review follow-up: the fp64 key must consider the COVARIANCES too (the sibling policies
     key on the metric/covariance tensor) -- an fp64 sigma with fp32 means still selects fp64."""

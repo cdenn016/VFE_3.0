@@ -47,7 +47,7 @@ def test_coordinate_kl_weighted_gradient_check() -> None:
 
 def test_full_coordinate_non_kl_renyi_fails_explicitly() -> None:
     q = FullGaussian(torch.zeros(2), torch.eye(2))
-    with pytest.raises(ValueError, match=r"KL \(alpha=1\)"):
+    with pytest.raises(ValueError, match=r"only the KL divergence \(alpha = 1\)"):
         q.renyi_per_coord(q, alpha=.5)
 
 

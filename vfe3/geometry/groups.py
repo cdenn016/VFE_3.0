@@ -133,9 +133,7 @@ class GaugeGroup:
     # None = no such master; replacing ``generators`` drops it.
     float64_generators:   Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
 
-    # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
-    _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
-    _gram_pinv_key:       Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
+    # Cached basis invariants (computed once, off __init__/eq/repr).
     _gram_diagonal_cache: Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
     _gram_diagonal_key:   Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
     _gram_uniform_cache:  Optional[float]        = field(default=None, init=False, repr=False, compare=False)
@@ -398,26 +396,6 @@ class GaugeGroup:
                 and not (self._elementary_layout is not None and self.elementary_block_shape is None)
                 else "dense_fallback")
 
-    def gram_pinv(self) -> torch.Tensor:
-        r"""Cached ``gram_pinv(generators)`` -- the Gram pseudo-inverse ``extract_phi`` projects with.
-
-        ``extract_phi`` recovers algebra coordinates by solving ``Gram c = g`` with
-        ``c = Gram^+ g``; ``Gram_ab = <G_a, G_b>_F`` depends ONLY on the fixed generator basis.
-        No production path calls it: it served the BCH positional composition
-        (``compose_bch -> extract_phi``), which the exact right-factor product ``exp(X) exp(Y)`` has
-        replaced, and it is kept for the test and diagnostic composition utilities of
-        :mod:`vfe3.geometry.lie_ops` (audit 2026-10-16, F91). Caching is value-identical -- the
-        returned tensor equals ``gram_pinv(self.generators)`` -- and recomputed after device/dtype
-        moves, replacement, or an in-place basis mutation.
-        """
-        if (self._gram_pinv_cache is None
-                or self._gram_pinv_key != self._generator_cache_key()):
-            from vfe3.geometry.lie_ops import gram_pinv as _gram_pinv
-            with torch.no_grad():
-                self._gram_pinv_cache = _gram_pinv(self.generators)
-            self._gram_pinv_key = self._generator_cache_key()
-        return self._gram_pinv_cache
-
     def __post_init__(self) -> None:
         K = self.generator_shape[-1]
         if sum(self.irrep_dims) != K:
@@ -635,7 +613,7 @@ def check_admissible(
     Draws ``n_samples`` random group elements ``g = exp(sum_a c_a G_a)`` (coefficients ~ ``scale`` *
     N(0,1)) and a random Gaussian belief PAIR, pushes the pair forward by the family's representation,
     and asserts ``D(rho(g) q || rho(g) p) == D(q || p)`` to tolerance, where ``D`` is the registered
-    divergence ``functional`` (renyi/squared_hellinger). Returns ``True`` iff invariant for every
+    divergence ``functional`` (``renyi``, the KL at ``alpha`` = 1). Returns ``True`` iff invariant for every
     sample, else ``False`` -- so it turns ``GaugeGroup.invariant_for``'s string declaration into a
     verified invariant and catches a wrongly-declared ``invariant_families``.
 

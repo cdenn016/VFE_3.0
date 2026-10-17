@@ -162,9 +162,9 @@ def _family_reference_logits(pb, mu_q, sigma_q, tau_eff):
     return -energy / tau_eff
 
 
-# --- dense reference: diagonal Gaussian at alpha 0.5 / 1.0 / 1.5 ----------------------------
+# --- dense reference: diagonal Gaussian at alpha 1.0 (the KL) --------------------------------
 
-@pytest.mark.parametrize("alpha", [0.5, 1.0, 1.5])
+@pytest.mark.parametrize("alpha", [1.0])
 def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
     torch.manual_seed(0)
     V, K, n_gen = 7, 3, 4
@@ -184,29 +184,9 @@ def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
         assert torch.allclose(got, diag, atol=1e-4)
 
 
-def test_noncanonical_family_decode_ranking_differs_from_gaussian_kl():
-    # A Renyi-0.5 decode over a table with a WIDE spread of prior variances ranks the vocabulary
-    # differently from the alpha=1 KL readout (the alpha blend reweights the tight-vs-loose priors).
-    torch.manual_seed(1)
-    V, K, n_gen = 7, 3, 4
-    pb_kl = PriorBank(V, K, n_gen, family="gaussian_diagonal", decode_mode="diagonal_chunked")
-    pb_renyi = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=0.5, decode_mode="diagonal_chunked")
-    with torch.no_grad():
-        mu = torch.randn(V, K)
-        sig_log = torch.linspace(-3.0, 3.0, V).unsqueeze(-1).expand(V, K).contiguous()
-        for pb in (pb_kl, pb_renyi):
-            pb.mu_embed.copy_(mu)
-            pb.sigma_log_embed.copy_(sig_log)
-    mu_q = torch.randn(1, 6, K); sigma_q = torch.rand(1, 6, K) + 0.3
-    tau_eff = pb_kl._tau_eff()
-    kl_logits = _decode_family(pb_kl, mu_q, sigma_q, tau_eff)
-    renyi_logits = _decode_family(pb_renyi, mu_q, sigma_q, tau_eff)
-    assert not torch.equal(kl_logits.argmax(-1), renyi_logits.argmax(-1))   # ranking genuinely flips
-
-
 # --- reference_decode dispatches through the configured family/divergence -------------------
 
-@pytest.mark.parametrize("alpha", [0.5, 1.0])
+@pytest.mark.parametrize("alpha", [1.0])
 def test_reference_decode_dispatches_configured_divergence(alpha):
     torch.manual_seed(2)
     V, K, n_gen = 7, 3, 4

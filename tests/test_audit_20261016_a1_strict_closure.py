@@ -1,7 +1,7 @@
 r"""Bracket-closure certificates measured on the bilinear scale (audit 2026-10-16, F6).
 
-``_strict_structure_constants`` (the strict pullback_group preparation) and ``require_basis_closed`` (the BCH
-guard) used to divide each bracket's out-of-span residual by that bracket's own norm. In so(N) with N >= 4,
+``_strict_structure_constants`` (the strict pullback_group preparation) used to divide each bracket's
+out-of-span residual by that bracket's own norm. In so(N) with N >= 4,
 generators on disjoint index pairs commute, and in the Gram-Schmidt basis of a tensor-power irrep ('l<p>',
 p >= 2) those brackets are about 1e-16 of rounding with no component in the span, so the ratio was O(1) and a
 closed tower was refused: pullback_group raised at the first M-step. The residual is now divided by the bound
@@ -58,13 +58,6 @@ def test_strict_structure_constants_accept_closed_tensor_power_towers(
     assert gram.shape == (G.shape[0], G.shape[0])
 
 
-@pytest.mark.parametrize("N,label,K", [(4, "l2", 9), (5, "l2", 14)])
-def test_require_basis_closed_accepts_closed_tensor_power_towers(N: int, label: str, K: int) -> None:
-    from vfe3.geometry.lie_ops import require_basis_closed
-
-    require_basis_closed(_son_basis(N, label, K), where="test")
-
-
 # Non-closed bases are still refused -------------------------------------------------------------------
 
 def _non_closed_bases() -> dict[str, torch.Tensor]:
@@ -81,14 +74,6 @@ def test_strict_structure_constants_still_refuse_non_closed_bases(name: str) -> 
 
     with pytest.raises(ValueError, match="bracket-closed generator span"):
         _strict_structure_constants(_non_closed_bases()[name])
-
-
-@pytest.mark.parametrize("name", ["so4_l2_without_L01", "E12_E23", "scaled_E12_E23"])
-def test_require_basis_closed_still_refuses_non_closed_bases(name: str) -> None:
-    from vfe3.geometry.lie_ops import require_basis_closed
-
-    with pytest.raises(ValueError, match="not closed under the Lie bracket"):
-        require_basis_closed(_non_closed_bases()[name], where="test")
 
 
 # The pullback_group M-step on a so(4) tower with an 'l2' block ----------------------------------------

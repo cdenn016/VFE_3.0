@@ -8,10 +8,10 @@ the Gibbs weights ``attention_weights`` are live.
 
 F is divergence-agnostic: it assembles the scalar from per-pair energies E_ij and
 self-divergences D(q_i||p_i) supplied by the `divergence` registry, so a new
-divergence slots in by registration, never by editing F. No configuration selects a member:
-``divergence_family`` and ``renyi_order`` are retired fields pinned to the KL member (``renyi`` at
-alpha = 1), so the other registered functionals and the alpha != 1 kernels are reached from tests
-only (audit 2026-10-16 F93). Canonical (with
+divergence slots in by registration, never by editing F. The only registered member is the KL
+(``renyi`` at alpha = 1): ``divergence_family`` and ``renyi_order`` are retired fields, and the
+squared Hellinger, Bhattacharyya and Jeffreys functionals and the alpha != 1 kernels were removed
+(audit 2026-10-16 F93). Canonical (with
 the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
 """
@@ -140,9 +140,8 @@ def self_divergence_per_coord(
     r"""Per-coordinate self-divergence, unsummed over the coordinate axis.
 
     Diagonal families use their coordinate decomposition. Full Gaussians use
-    ordered conditional KL contributions, retaining correlations. The full-family
-    method rejects Renyi orders other than one; Jeffreys sums both KL directions.
-    Non-additive functionals such as squared Hellinger remain unsupported.
+    ordered conditional KL contributions, retaining correlations. Renyi orders
+    other than one are refused (only the KL is implemented).
     """
     if not callable(getattr(q, "renyi_per_coord", None)):
         raise ValueError(f"{type(q).__name__} has no per-coordinate self-divergence")
@@ -150,10 +149,8 @@ def self_divergence_per_coord(
         raise ValueError(
             f"self_divergence_per_coord has no per-coordinate form for "
             f"divergence_family={divergence_family!r}: only divergences that decompose "
-            f"coordinate-wise on a diagonal Gaussian are registered "
-            f"({divergence_functionals_per_coord()}). 'squared_hellinger' is excluded (H^2 = "
-            f"1 - exp(-D_{{1/2}}/2) is a nonlinear transform of the summed divergence). Use a "
-            f"decomposable divergence or a per-position lambda_alpha_mode."
+            f"coordinate-wise are registered ({divergence_functionals_per_coord()}). Use "
+            f"'renyi' (the KL) or a per-position lambda_alpha_mode."
         )
     return get_functional_per_coord(divergence_family)(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
 
