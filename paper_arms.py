@@ -175,15 +175,18 @@ CONFIG: Dict[str, Any] = {
                                            # 3e-3 is the validation choice of the October 6 sweep
 }
 
+# Archived runs live under D:/DATA_KEEP/<date>_experiments/ (paths checked 2026-10-17); a base whose
+# directory is gone is reported unavailable by main(), which plans the other selected bases.
 BASES: Dict[str, str] = {
     # K=128 exponential chart, 6 layers, RoPE, chunked diagonal decoder, no attention residual,
     # 120,000 steps (32.65 test PPL).
-    "k128_diag_chunked": "vfe3_runs/32.65_wikitext-103_K128_diag-chunked_exp",
+    "k128_diag_chunked": "D:/DATA_KEEP/10-10-2026_experiments/32.65_wikitext-103_K128_diag-chunked_exp",
     # The earlier evaluated K=128 exponential-chart run (34.48 test PPL, linear decoder, 4 layers).
-    "k128_exp":  "vfe3_runs/34.48_wikitext-103_K128_linear-exp",
+    "k128_exp":  "D:/DATA_KEEP/10-10-2026_experiments/34.48_wikitext-103_K128_linear-exp",
     # Bases of the earlier study (not paper results).
-    "diag_K128": "D:/DATA_KEEP/39.77_wikitext-103_K128_n=128",
-    "diag_K64":  "D:/DATA_KEEP/52.91_wikitext-103_K64_n=128",
+    "diag_K128": "D:/DATA_KEEP/9-2026_Older_Experiments/39.77_wikitext-103_K128_n=128",
+    "diag_K64":  "D:/DATA_KEEP/9-2026_Older_Experiments/52.91_wikitext-103_K64_n=128_4-layers",
+    # Not found on this machine on 2026-10-17 (neither here nor under D:/DATA_KEEP).
     "full_K64":  "vfe3_runs/Full_Gaussian_mom-match_Template_routing/"
                  "55.07_wikitext-103_K64_moment_matched_noAtnnRes",
 }
@@ -560,6 +563,10 @@ class ArmDefinitionError(AssertionError):
     r"""An arm's resolved config differs from the base in an undeclared way (a defect of ARMS)."""
 
 
+class BaseUnavailableError(FileNotFoundError):
+    r"""A :data:`BASES` entry whose run directory holds no ``config.json`` (moved, renamed or deleted)."""
+
+
 @dataclass
 class Base:
     r"""One base run: its loaded config and the facts the plan reports about it."""
@@ -644,6 +651,9 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     run_dir = Path(path)
     if not run_dir.is_absolute():
         run_dir = ROOT / run_dir
+    if not (run_dir / "config.json").is_file():
+        raise BaseUnavailableError(f"base {name!r}: {run_dir} holds no config.json (moved, renamed or deleted; "
+                                   "update its BASES entry)")
     source = str(run_dir / "config.json")
     record = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     raw = dict(record.get("config", record))
@@ -1906,7 +1916,13 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
     status = 0
     for name in config["bases"]:
         started = time.perf_counter()
-        base = load_base(name, bases[name])
+        try:
+            base = load_base(name, bases[name])
+        except BaseUnavailableError as exc:
+            # One moved base must not stop the others (audit 2026-10-16 F63).
+            print(f"base {name}: unavailable: {exc}", flush=True)
+            status = 1
+            continue
         plans = build_plan(base, budget=budget, seeds=seeds, labels=labels,
                            baseline_overrides=config.get("baseline_overrides"))
         print(format_plan(base, plans, budget=budget), flush=True)

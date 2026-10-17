@@ -10,6 +10,9 @@ was selected and the duplicates never reached the decision rule; now no run is s
 reported as stale (the decision rule then reports the clause undetermined) and a launch refuses to start.
 F61: a finished run whose test CE is not finite counted as never run, so a relaunch silently re-rolled the
 seed pair; now it is a recorded failure: listed under the manifest row's ``failed``, never retrained.
+F63: a ``BASES`` entry whose run directory moved crashed the whole launch in ``load_base`` with a bare
+``FileNotFoundError`` before any plan printed; now ``load_base`` names the base and its path, and ``main``
+reports that base as unavailable and plans the others.
 
 Every config is tiny (K = 4, two heads, two layers, vocabulary 7); nothing is trained (``run_vfe`` is
 replaced by a recorder).
@@ -219,3 +222,20 @@ def test_an_unfinished_run_or_a_failure_of_another_config_does_not_block_trainin
     trained = _recorder(monkeypatch)
     pa.run_plan(base, plans, budget="base_protocol", out_root=tmp_path / "out", device="cpu", logger=LOGGER)
     assert trained == [(23, 23)]
+
+
+# ---- F63: a base whose run directory is gone ---------------------------------------------------
+
+def test_a_missing_base_is_reported_unavailable_and_the_other_bases_still_plan(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    gone = tmp_path / "moved_away"
+    with pytest.raises(pa.BaseUnavailableError, match="moved_away"):
+        pa.load_base("gone", gone)
+    assert issubclass(pa.BaseUnavailableError, FileNotFoundError)
+    present = _write_base(tmp_path, _tiny_cfg())
+    config = {**pa.CONFIG, "bases": ["gone", "tiny"], "arms": [MLP_REMOVED], "budget": "base_protocol",
+              "seeds": [(1, 1)], "dry_run": True}
+    assert pa.main(config, bases={"gone": str(gone), "tiny": str(present)}) == 1
+    out = capsys.readouterr().out
+    assert "base gone: unavailable" in out and str(gone) in out
+    assert f"base tiny: {present}" in out and MLP_REMOVED in out
