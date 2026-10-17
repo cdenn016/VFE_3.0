@@ -218,7 +218,7 @@ config = dict(
 
     ####################################
     #       Positional Encoding
-    #    BCH gauge-frame PE (pos_phi)
+    #    gauge-frame PE (pos_phi): exact right factor exp(X_i) exp(Y_n)
     #     gauge-RoPE (rope_mode)
     ####################################
 
@@ -364,7 +364,8 @@ config = dict(
     # buys only ~1.8x, while the SAME algebra in float64 buys nine decades. It is a precision
     # problem, not a factorization problem. sigma_log_embed trains freely against only the eps=1e-6
     # floor, so this is harmless at init and about one order of magnitude of shrinkage from
-    # material; watch decode_sigma_v_min. Default "fp32" is bit-identical to every run on disk.
+    # material; watch the decode_sigma_v_min column of metrics.csv. Default "fp32" is bit-identical
+    # to every run on disk.
     decode_av_precision                  = "fp64",     #  "fp32" | "fp64"
 
 

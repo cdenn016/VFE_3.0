@@ -504,7 +504,7 @@ the validator for the complete admission rules.
 | `predictive_readout="minimal_agent"` | Replaces the kernel readout by each receiver's exact Gaussian conditioning on a noisy comparison record whose key is tied to the content ($S_K=T$, no $O$). Routing is the source posterior at temperature 1, so `relational_routing`, `kappa_beta` and `kl_max` are unread. `minimal_agent_inference="exact"` combines per-head exact posteriors by assumed-density filtering; `"mean_field"` uses KL labels and an information-form fusion, with `minimal_agent_cavi_steps` coordinate-ascent sweeps. |
 | `predictive_covariance="spread_corrected"` | Minimal agent with mean-field inference only. Restores the between-source spread that the mean field drops: the mean-field covariance $P$ plus the linearized label spread $\sum_h PS_h^\top R'_hS_hP$, $R'_h=\sum_j\beta_{ij}^{(h)}d_jd_j^\top$, plus the floor; invariant under a reference change. |
 | `relational_routing="noisy_key"` | Kernel readout only. Routes on $D_{\mathrm{KL}}(\mathcal N(a_i,V_{Q,i})\Vert\mathcal N(b_j,V_{K,j}+n_hI))$ at temperature 1, with a learned per-head key noise $n_h$ (`routing_key_log_noise`, initialized from `relational_key_noise`, score learning rate, no weight decay). |
-| `diagnose_agent_elbo` | Default `False`. At the evaluation cadence, logs per layer the ELBO of the minimal agent's posterior and of each prototype-agent block, the evidence of the declared record model and their gap, in nats per token; computed without autograd and never in the loss. With coupled heads the minimal agent's evidence is an assumed-density value, so its gap is not guaranteed nonnegative. The mean-field minimal agent also reports the channel-noise M-step optimum $n_h^\star$ (`channel_noise_mstep`) as a diagnostic; the learned noise is not set to it. |
+| `diagnose_agent_elbo` | Default `False`. At the evaluation cadence, logs per layer the ELBO of the minimal agent's posterior and of each prototype-agent block, the evidence of the declared record model and their gap, in nats per token; computed without autograd and never in the loss. With coupled heads the minimal agent's evidence is an assumed-density value, so its gap is not guaranteed nonnegative. The minimal agent also logs a 64-draw importance-sampled evidence under its posterior q with the effective sample size fraction of the weights (`is_ess`); with heterogeneous source covariances the mean-field q is narrower than the posterior mixture, single receivers can be off by more than a nat, and a low `is_ess` flags them. The mean-field minimal agent also reports the channel-noise M-step optimum $n_h^\star$ (`channel_noise_mstep`) as a diagnostic; the learned noise is not set to it. |
 | `block_mlp_mode="prototype_agents"` | Replaces the feed-forward block MLP by the minimal-agent model on $M$ = `block_mlp_expansion`·$K$ template agents. `block_mlp_inference` selects `"mean_field"` (KL-label responsibilities and a power posterior, `block_mlp_cavi_steps` sweeps) or `"exact"` (the mixture posterior); `block_mlp_covariance="posterior"` returns the template posterior covariance; `block_mlp_em_weight>0` adds an EM M-step term on the templates; `block_mlp_template_init` is `"absolute"` or `"working_variance"`. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `rope_mode="none"` or comparison-space RoPE (`"comparison"` or `"comparison_invariant"`). |
@@ -516,13 +516,20 @@ Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
 zero weight decay.
 
-Three numerical safeguards trade cost for conditioning; each is at its cheapest setting by default.
+Four numerical safeguards trade cost for conditioning; each is at its cheapest setting by default.
 
 | Setting | Effect |
 |---|---|
 | `phi_frame_condition_max` | Default `None`. A number $\kappa_{\max}>1$ bounds $\mathrm{cond}_2(U_i)\le\kappa_{\max}$ after each accepted step: through $\kappa_2(e^X)\le e^{\mathrm{spread}(\mathrm{sym}X)}$, the eigenvalue spread of the traceless symmetric part of every head block of each frame factor is limited to $\log\kappa_{\max}/n_{\mathrm{factors}}$, keeping the trace and the skew part. `block_glk`, `block_glmc` and `block_sl` with `m_phi_update_mode="adamw"` and `encode_mode="per_token"` only (inert, since $\mathrm{cond}_2=1$, for `block_so`, `block_co`, `so_n` and `su_n`; refused for `block_borel` and `block_unipotent`); under `pos_phi="frozen"` the frozen positional factor is not bounded. |
 | `projected_factorization` | Factorization of the projected Gaussian-KL scorer. `"gram"` (default) factors the float32 Gram matrix (error $O(\epsilon\kappa^2)$); `"gram_certified"` also rebuilds entries that factor but fail a condition certificate; `"cholesky_qr2_certified"` factors by CholeskyQR2 (error $O(\epsilon\kappa)$) where the scorer has source roots. The certified modes are costly on CUDA. |
 | `frame_pair_escalation_tol` | Default `None`. A tolerance in $(0,1)$ recomputes a frame producer call in float64 when its float32 frame pair has $\epsilon_{32}\kappa_F(U)$ above it; about 7 times the cost of an escalated step. |
+| `predictive_covariance_precision` | Default `"fp32"`. `"fp64"` computes the kernel moment-matched covariance update in float64 from float32 beliefs and casts it back, removing the float32 round-trip error amplified by about $\kappa(U)^2$ (positive-but-wrong variances that `predictive_covariance_fp64_escalation` does not see); the minimal agent does not read it. The cost is not measured; the estimate is about twice the step time at $K=128$. |
+
+`relational_tile_mib` (default 32) is the byte budget, in MiB, of one tile of the relational
+scorer and of the routed spread's query rows. A larger budget dispatches fewer kernels and holds
+more transient memory; values change only by float32 reduction order, and every loop above
+32 MiB stays checkpointed, so a raised budget changes the tile count and never what autograd
+saves. Its step-time effect on CUDA is not measured.
 
 Under `m_phi_update_mode="pullback_group"`, `m_phi_group_differential_mode` selects how the
 strict Frobenius-pullback direction evaluates the trivialized exponential differentials
@@ -580,9 +587,14 @@ losses and an exactly zero off-diagonal covariance. The current launcher's
 `predictive_covariance="moment_matched"` densifies it, so on the launcher's route the
 diagonal family keeps only the diagonal of the local moment-matched covariance and the two
 families differ. A genuinely full covariance requires `gaussian_full` together with
-`block_mlp_covariance="delta_full"`, `block_norm_covariance="pushforward"`,
-`predictive_covariance="moment_matched"`, or the covariance updates of
-`attention_mode="projected_gradient"`.
+`block_mlp_covariance="delta_full"`, `block_norm_covariance="pushforward"` or
+`"pushforward_moment"`, `predictive_covariance="moment_matched"`, or the covariance updates of
+`attention_mode="projected_gradient"`. Of the two LayerNorm pushforwards, `"pushforward"` is the
+delta method at the norm's scale $s$, capped at the sphere bound where $\Sigma/s^2$ is large, so
+there it keeps the delta method's near rank-one radial shape; `"pushforward_moment"` evaluates the
+same expression at the effective scale $s_{\mathrm{eff}}^2=s^2+\operatorname{tr}(\Pi\Sigma\Pi)/K$ with a
+span floor, a moment estimate of the LayerNorm output at every $\Sigma/s^2$ (within 4% per
+coordinate of Monte Carlo at $K=128$). Both are read only under `norm_type_block="layernorm"`.
 `VFE3Config.inactive_fields()`
 reports this equivalence when it holds, together with every other setting that no active path reads
 (for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
@@ -1031,9 +1043,11 @@ by a base of positive dimension with an induced connection would make the constr
 field of such agent populations; the theory admits that extension, and this repository does
 not implement it.
 
-The `grow_K_mup` scaling route varies `e_q_mu_lr` and requires gradient belief
-updates; it rejects `predictive_content`, which does not read that rate.
-Use the standard width/depth/budget grids for predictive content; see
-[scaling settings](docs/scaling-settings.md).
+The `grow_K_mup` scaling route pairs each width K with a twin that applies the muP Adam
+learning-rate rule $K_0/K$ to the hidden and output matrices (relational score and content
+maps, block MLP, linear readout; Yang et al. 2022, Table 3). The input tables and the E-step
+rate stay at the baseline. It is the rate rule only, not full muP: the readout init variance
+and the attention temperature are unchanged. A scaling cell is refused only when one of its
+overrides is inert under its own config; see [scaling settings](docs/scaling-settings.md).
 
 Decoder memory/compute options and independent mean/variance rates are documented in [Decoder controls](docs/decoder-controls.md).

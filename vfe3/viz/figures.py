@@ -1683,8 +1683,8 @@ _CANONICAL_ROUTER_SERIES: Tuple[Tuple[str, str], ...] = (
     ("canonical_beta_tv", r"$\frac{1}{2}\sum_j|\beta_{ij}-\beta^*_{ij}|$ (model vs canonical router)"),
     ("canonical_self_weight", r"canonical self weight $\beta^*_{ii}$"),
 )
-_CANONICAL_FE_NOTE = ("Canonical F at the beliefs each router read (diagnose_canonical_free_energy): a diagnostic. "
-                      "No step on this route optimizes it.")
+_CANONICAL_FE_NOTE = ("Canonical F at the beliefs each router read (diagnose_canonical_free_energy): a "
+                      "tau-tempered diagnostic, not an ELBO. No step on this route optimizes it.")
 # The batch the plotted canonical F was evaluated on: the val_* columns of _val_diagnostics (the validation split
 # val_ce is scored on) or, for a run that logged only the log-step columns, the training batch (audit 2026-10-16
 # F83): (title prefix, note sentence).
@@ -5598,8 +5598,8 @@ def plot_kmup_stability(
     *,
     path: Optional[str] = None,
 ):
-    r"""F1/EXP-6: inverse-K scaling width-fixed (grow_K) vs muP-corrected (grow_K_mup) on a shared
-    K=embed_dim axis.
+    r"""F1/EXP-6: inverse-K scaling width-fixed (grow_K) vs the muP Adam rate rule on the hidden and output
+    matrices (grow_K_mup; not full muP) on a shared K=embed_dim axis.
 
     Test PPL vs K per route with cross-seed 95% CI bars (the small-sample t-quantile, not a fixed 1.96)
     and a requested offset power-law fit ``PPL = A K^{-alpha} + E`` overlaid when at least four
@@ -5607,7 +5607,7 @@ def plot_kmup_stability(
     and label the realized log-log fallback without reporting an irreducible floor. The exponent
     ``b = -alpha`` is annotated per route. The grow_K_mup route is split into its matched /fixed and /mup arms upstream, so
     |b_fixed - b_muP| -- the width-stability readout -- is read directly off the two muP curves; a large
-    gap means the headline exponent is partly optimization mis-tuning the muP correction removes."""
+    gap means the headline exponent is partly optimization mis-tuning the muP rate rule removes."""
     fig, ax = plt.subplots(figsize=(6.8, 4.8))
     for j, (name, pts) in enumerate(routes.items()):
         pts = sorted(pts, key=lambda p: float(p["embed_dim"]))

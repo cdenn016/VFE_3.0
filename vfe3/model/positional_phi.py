@@ -64,7 +64,8 @@ def _pos_phi_learned(
     When ``n`` exceeds the trained table length (extrapolation eval beyond ``max_seq_len``; H1/EXP-13)
     the index is CLAMPED to the last learned row rather than sliced -- a bare ``pos_phi_free[:n]``
     silently returns the FULL ``max_seq_len`` table (slicing past the end does not error), which then
-    shape-mismatches the ``(n, n_gen)`` frame in ``compose_phi``. Clamping degrades gracefully: unseen
+    shape-mismatches the ``(n, n_gen)`` frame of the right factor ``exp(Y_n)`` in
+    ``build_factored_transport``. Clamping degrades gracefully: unseen
     positions share the boundary offset and are positionally indistinguishable -- the expected
     learned-absolute failure-to-extrapolate, measured rather than crashed."""
     if pos_phi_free is None:

@@ -433,7 +433,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
    
     ####################################
     #       Positional Encoding
-    #    BCH gauge-frame PE (pos_phi)
+    #    gauge-frame PE (pos_phi): exact right factor exp(X_i) exp(Y_n)
     #     gauge-RoPE (rope_mode)
     ####################################
 

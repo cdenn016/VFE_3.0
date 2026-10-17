@@ -521,8 +521,9 @@ class VFEModel(nn.Module):
         # Gauge-RoPE rotation R(theta) is similarly loop-invariant for fixed (N, device, dtype);
         # cache keyed on (N, device, dtype) so it is built once. None on the 'none' path.
         self._rope_cache: dict = {}
-        # BCH positional encoding (default-off): a learned per-position Lie-algebra element table
-        # composed into the gauge frame before transport. Created ONLY for pos_phi='learned' (a raw
+        # Gauge-frame positional encoding (default-off): a learned per-position Lie-algebra element table
+        # composed into the gauge frame as the exact right factor exp(X_i) exp(Y_n) before transport
+        # (build_factored_transport right_phi; no BCH truncation). Created ONLY for pos_phi='learned' (a raw
         # nn.Parameter, not a network); the "none"/"frozen" paths add no
         # parameter, so the pure path stays param-free. Init scaled by pos_phi_scale.
         if cfg.pos_phi == "learned":
