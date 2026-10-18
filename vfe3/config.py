@@ -191,6 +191,19 @@ class VFE3Config:
     #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
     #   group  one set per optimizer group, so one exploding group cannot set the coefficient of the others
     grad_clip_scope:                  str             = "role"
+    # Failed-step recovery (audit 2026-10-17 item 16). None keeps the historical abort: a step whose strictest
+    # precision rung raises before any optimizer update ends the run. N >= 1: up to N such steps over the run are
+    # skipped instead (gradients zeroed, no optimizer or scheduler step, the batch saved under
+    # diagnostics/failed_steps/, counted in metrics.csv failed_step_skips), and a failed evaluation reports NaN
+    # validation with no best-model update; the (N+1)-th failure aborts as before.
+    max_failed_step_skips:            Optional[int]   = None
+    # Abort after this many consecutive rejected updates of any kind (non-finite, failed, loss spike) through the
+    # crash path (diagnostics/crash.json and a resumable checkpoint). None = never abort on consecutive skips.
+    max_consecutive_skips:            Optional[int]   = None
+    # Reject the update of a step whose training loss exceeds the divergence monitor's loss EMA by more than this
+    # many nats (after its 50-step warmup; audit 2026-10-17 item 17), read from the host loss the step already
+    # transfers. Rejections are counted in metrics.csv loss_spike_rejected_updates. None = off.
+    loss_spike_skip_nats:             Optional[float] = None
 
     seed:                             int             = 6
     
@@ -203,6 +216,9 @@ class VFE3Config:
     log_interval:                     int             = 100          # console log every N steps (0 = off)
     eval_interval:                    int             = 1500         # validation every N steps (0 = off)
     checkpoint_interval:              int             = 15000        # resumable checkpoint every N steps (0 = off)
+    checkpoint_keep_last:             Optional[int]   = None         # keep the newest N step checkpoints; None = keep all
+    checkpoint_at_end:                bool            = False        # also write a resumable checkpoint after the last step
+    block_variance_at_log:            bool            = False        # also write diagnostics/block_variance.csv at log steps
     val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
     # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
     # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
@@ -2102,6 +2118,15 @@ class VFE3Config:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
         if self.checkpoint_interval < 0:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
+        for name in ("checkpoint_keep_last", "max_failed_step_skips", "max_consecutive_skips"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be None or an int >= 1, got {value!r}")
+        if self.loss_spike_skip_nats is not None and (
+                isinstance(self.loss_spike_skip_nats, bool) or not isinstance(self.loss_spike_skip_nats, Real)
+                or not math.isfinite(float(self.loss_spike_skip_nats)) or float(self.loss_spike_skip_nats) <= 0.0):
+            raise ValueError(f"loss_spike_skip_nats must be None or a finite real value > 0, "
+                             f"got {self.loss_spike_skip_nats!r}")
         # max_steps=0 is an empty training loop and warmup_steps<0 is meaningless; warmup_steps=0
         # stays legal. A warmup longer than the run never reaches the peak rate, so the cosine
         # schedule would silently train at a fraction of it. (The plain-int type is gated at the top
@@ -2283,6 +2308,12 @@ class VFE3Config:
                      "group inherits it")
         if self.grad_clip is None or self.grad_clip == 0:
             mark(("grad_clip_scope",), "only read when grad_clip > 0")
+        if self.checkpoint_interval == 0 and not self.checkpoint_at_end:
+            mark(("checkpoint_keep_last",), "only read when a checkpoint is written (checkpoint_interval > 0 or "
+                 "checkpoint_at_end=True)")
+        if self.log_interval == 0 or self.eval_interval == 0:
+            mark(("block_variance_at_log",), "only read at log steps of a run with evaluation (log_interval > 0 and "
+                 "eval_interval > 0, which build the diagnostic windows)")
         if self.beta_attention_prior not in ("causal_alibi", "causal_alibi_noself"):
             mark(("alibi_slope",), "only read by an alibi attention prior")
         if not self.use_cg_coupling:

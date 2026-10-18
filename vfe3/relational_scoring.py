@@ -12,7 +12,7 @@ import torch
 from torch.autograd.function import once_differentiable
 from torch.utils.checkpoint import checkpoint
 
-from vfe3.contracts import host_check, host_read
+from vfe3.contracts import describe_offending_entries, host_check, host_read
 from vfe3.runtime import ieee_fp32_matmul
 from vfe3.numerics import (
     FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, triangular_condition_estimate,
@@ -1136,7 +1136,11 @@ def projected_gaussian_kl(
             # No recovery can act and no fallback is estimated, so every verdict can only raise
             # (_strict_cholesky raises on a failed factor without a source tuple, and nothing is
             # certificate-flagged with condition recovery off): queue it and take the healthy branch.
-            host_check(torch.cat(verdicts), _healthy_kl_verdict)
+            host_check(torch.cat(verdicts), _healthy_kl_verdict, detail=lambda: "; ".join((   # failure only (item 4)
+                describe_offending_entries(Gq, label="query covariances", positive=False,
+                                           axes=("batch", "token", "head", "row", "column")),
+                describe_offending_entries(Gk, label="key covariances", positive=False,
+                                           axes=("batch", "token", "head", "row", "column")))))
             fallback_slices = []
             chol_q, rec_q = q_status[0], None
             chol_k, rec_k = k_status[0], None
@@ -1444,7 +1448,11 @@ def _projected_diagonal_kl(
                                  torch.isfinite(gk).all(), (gk > 0).all()))
         fallback_slices: List[int] = []
         if gemm_expansion_tol is None:
-            host_check(flags, _diagonal_kl_verdict)
+            # On a failure only, the note names the count, minimum and first (batch, head, token, coordinate) of
+            # the offending variances (audit 2026-10-17 item 4); the healthy path does no added device work.
+            host_check(flags, _diagonal_kl_verdict, detail=lambda: "; ".join((
+                describe_offending_entries(gq, label="query variances"),
+                describe_offending_entries(gk, label="key variances"))))
         else:
             fallback = ~(_diagonal_gemm_expansion_error(aq, ak, gk) <= gemm_expansion_tol)   # (..., H)
             slice_shape = torch.broadcast_shapes(aq.shape[:-2], ak.shape[:-2])              # (..., H)

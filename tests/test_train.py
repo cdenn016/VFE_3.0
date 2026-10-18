@@ -573,11 +573,13 @@ def test_grad_clip_per_role_calls_once_per_nonempty_role(monkeypatch):
             id(p) for p in group["params"]
         )
     calls = _install_clip_spy(monkeypatch)
-    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=0.25)
+    # A threshold below every role norm binds every role: a role whose coefficient is exactly 1 skips the
+    # multiply (bit-identical; audit 2026-10-17 item 70), so a binding threshold is needed to see every call.
+    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1e-9)
     assert {frozenset(ids) for ids, _ in calls} == {
         frozenset(ids) for ids in expected.values() if ids
     }
-    assert all(max_norm == 0.25 for _, max_norm in calls)
+    assert all(max_norm == 1e-9 for _, max_norm in calls)
     flattened = [pid for ids, _ in calls for pid in ids]
     assert len(flattened) == len(set(flattened))
 

@@ -121,6 +121,9 @@ config = dict(
     batch_size                       = 32,
     max_steps                        = 30000,
     grad_clip_scope                  = "role",      # "role" | "group" (one L2 clip per optimizer role, or per optimizer group)
+    max_failed_step_skips            = None,        # None (a step failing at the strictest precision aborts) | int >= 1 (skip up to N such steps)
+    max_consecutive_skips            = None,        # None (never abort on skips) | int >= 1 (abort with crash.json + checkpoint after N rejected updates in a row)
+    loss_spike_skip_nats             = None,        # None (off) | float > 0 (reject an update whose loss exceeds the monitor's loss EMA by this many nats)
 
     n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
@@ -133,6 +136,9 @@ config = dict(
     eval_interval                    = 1500,      # periodic validation every N steps (0 = off)
     diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off)   
+    checkpoint_keep_last             = None,      # None (keep every checkpoint) | int >= 1 (keep the newest N)
+    checkpoint_at_end                = False,     # True | False (also save a resumable checkpoint after the last step)
+    block_variance_at_log            = False,     # True | False (also write diagnostics/block_variance.csv at log steps)
     
     #################################
     #           Modes               #
