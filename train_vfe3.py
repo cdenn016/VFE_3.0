@@ -99,7 +99,8 @@ RUN_ROOT = "vfe3_runs"
 # break gauge covariance are overridden (vfe3.gauge_covariant: frame transport on, a family that carries
 # g Sigma g^T, block and decoder in reference coordinates, no fixed-coordinate caps or trust regions, total-KL
 # self term) and the run is refused unless every gauge flag of the pure-path report holds. The content links
-# (Lie-algebra L_ij), routing, readout and learning rates are not touched. The overrides are logged and listed
+# (Lie-algebra L_ij), routing, readout, predictive covariance floor (both floor modes are covariant under the
+# local frame change), decode covariance and learning rates are not touched. The overrides are logged and listed
 # in the run's config.md. False: the config exactly as written.
 fully_gauge_covariant = False
 
@@ -140,7 +141,7 @@ config = dict(
     prior_covariance_table           = "diagonal",  # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
-    decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
+    decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I, in reference coordinates under decode_coordinates="reference"); prior-bank decode only
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',        # "passthrough" | "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) | "spread_corrected" (minimal_agent mean_field: plus the label spread)
@@ -162,7 +163,7 @@ config = dict(
               
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     relational_key_noise             = 1.0,         # relational_routing="noisy_key" only: initial per-head key noise n_h > 0 (learned; routes at temperature 1)
-    predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
+    predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: f, the floor's scale (floor_mode "prior": f * Sigma_p, reference-invariant; "relative": f tr(C)/K U U^T)
     predictive_covariance_floor_mode = "prior",     # "prior" (f Sigma_p, reference-invariant) | "relative" (f tr(C)/K U U^T, the pre-2026-10-12 floor)
     predictive_covariance_ceiling    = None,        # None (off) | c > floor, e.g. 100: Loewner ceiling Sigma^+ <= c * Sigma_p (a clamp; counted in metrics.csv)
     diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
@@ -224,7 +225,7 @@ config = dict(
     decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
       
-    deterministic                    = True,
+    deterministic                    = True,        # True | False: torch/cuDNN deterministic algorithms (TF32: see fp32_matmul_precision)
     generate_embedding_figures       = False,
     
 
@@ -335,7 +336,7 @@ config = dict(
     #   Numerics/Speed
     #################################
   
-    kl_max                           = None,          # None (8 * embed_dim) | nats: safety clamp on every divergence, binding only on blowups
+    kl_max                           = None,          # None (8 * embed_dim) | float > 0 nats (inf disables): safety clamp on every divergence, binding only on blowups
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
