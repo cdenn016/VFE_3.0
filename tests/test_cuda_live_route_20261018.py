@@ -76,5 +76,9 @@ def test_cuda_live_route_matches_a_float64_cpu_copy(record_property: Any) -> Non
     record_property("cuda_live_loss_rel_vs_fp64", loss_rel)
     record_property("cuda_live_grad_rel_vs_fp64", str(grad_rel))
     assert loss_rel <= _REL_TOL, loss_rel
-    assert {name: (value, floor[name]) for name, value in grad_rel.items()
-            if value > floor[name] and float(g64[name].norm()) > 0.0} == {}
+    # A parameter whose gradient is tiny against the whole model's (channel_log_noise, norm about 4e-6) has an
+    # ill-conditioned relative error, so it also passes when its absolute error is below 1e-5 of the total norm.
+    total = float(torch.sqrt(sum(g.double().norm() ** 2 for g in g64.values())))
+    abs_err = {name: float((g32[name].double() - g64[name].double()).norm()) for name in g64}
+    assert {name: (value, floor[name], abs_err[name]) for name, value in grad_rel.items()
+            if value > floor[name] and float(g64[name].norm()) > 0.0 and abs_err[name] > 1e-5 * total} == {}
