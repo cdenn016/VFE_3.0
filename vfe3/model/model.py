@@ -160,7 +160,7 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
         kwargs["group_n"] = cfg.group_n
     if cfg.irrep_spec is not None and "irrep_spec" in params:
         kwargs["irrep_spec"] = cfg.irrep_spec
-    if cfg.gauge_tying is not None and "tying" in params:
+    if getattr(cfg, "gauge_tying", None) is not None and "tying" in params:   # cfg may be a namespace
         kwargs["tying"] = cfg.gauge_tying
     if arity == 1:
         return builder(cfg.embed_dim, **kwargs)

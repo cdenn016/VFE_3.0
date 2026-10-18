@@ -408,7 +408,8 @@ def _outlier_probe(squares: bool, H: int = 2, d: int = 4, N: int = 16, kappa: fl
 
 def test_spread_squares_cuts_the_fp32_error_on_the_outlier_probe() -> None:
     old, new = _outlier_probe(False), _outlier_probe(True)
-    assert new < 1e-3 and new < old / 10.0
+    # the old path's fp32 error depends on the BLAS (about 2e-3 under one build, 3e-5 under another)
+    assert new < 1e-4 and new < old / 4.0
 
 
 @pytest.mark.parametrize("residual", [False, True])

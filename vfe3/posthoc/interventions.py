@@ -854,6 +854,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
 
     def scored(*args: Any, **kwargs: Any) -> torch.Tensor:
         record["intercepted_calls"] += 1
+        kwargs.pop("term_support", None)   # the diagnostic term medians are not captured in this intervention
         return _frame_free_covariance_score(*args, scorer=scorer, **kwargs)
 
     bound_decode = model._decode_belief_with_context

@@ -289,7 +289,7 @@ def _written_columns() -> set:
                   + train.DECODE_VARIANCE_COLUMNS + train.LOG_TIMING_COLUMNS + train._GROUP_COLUMNS
                   + train._STEP_LR_COLUMNS + train._TRAIN_SAMPLE_COLUMNS)
     module = ast.parse(Path(train.__file__).read_text(encoding="utf-8"))
-    tree = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "train")
+    tree = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "_train_loop")
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for target in node.targets:
