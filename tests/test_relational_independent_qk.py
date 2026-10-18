@@ -6,7 +6,7 @@ from vfe3.gradients.relational import relational_score
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _relational_artifact_fields
 from vfe3.train import build_optimizer
-from tests.test_relational_filtering import _fixture
+from tests._relational_fixture import _fixture
 from tests.test_relational_integration import _cfg, _tokens
 
 

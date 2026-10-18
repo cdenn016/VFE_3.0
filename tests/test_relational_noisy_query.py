@@ -259,7 +259,7 @@ def test_operators_carry_routing_without_new_state() -> None:
 
 def test_relational_score_dispatches_on_the_operator_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     import vfe3.gradients.relational as relational
-    from tests.test_relational_filtering import _fixture
+    from tests._relational_fixture import _fixture
 
     mu, sigma, _, frame, _, _ = _fixture()
     called = []

@@ -3,7 +3,7 @@ from tests.profiles import make_relational_operators
 import pytest
 import torch
 
-from tests.test_relational_filtering import _fixture
+from tests._relational_fixture import _fixture
 from tests.test_relational_integration import _cfg, _tokens
 from vfe3.gradients.relational import relational_score
 from vfe3.model.model import VFEModel

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 import build_wikitext103_word_cache as builder
 import generate_text
 import vfe3.train as train_module
-from tests.test_relational_filtering import _fixture
+from tests._relational_fixture import _fixture
 from tests.test_relational_integration import _cfg as _relational_cfg
 from tests.test_word_level_20260918 import fake_corpus  # noqa: F401  (pytest fixture)
 from vfe3.config import VFE3Config
