@@ -653,9 +653,15 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     from vfe3.experiment import saved_train_window_mode
     from vfe3.legacy_config import lenient_config_from_serialized
 
-    run_dir = Path(path)
-    if not run_dir.is_absolute():
-        run_dir = ROOT / run_dir
+    from vfe3.paper.runs import AmbiguousRunFolder, RunFolderNotFound, find_run_folder
+
+    # The entry resolves against this folder, else by its folder name under vfe3_runs and D:/DATA_KEEP
+    # (audit 2026-10-17 item 52); a missing or ambiguous name leaves the base unavailable.
+    try:
+        run_dir = find_run_folder(path, base=ROOT)
+    except (RunFolderNotFound, AmbiguousRunFolder) as exc:
+        raise BaseUnavailableError(f"base {name!r}: {exc} (moved, renamed or deleted; update its BASES "
+                                   "entry)") from exc
     if not (run_dir / "config.json").is_file():
         raise BaseUnavailableError(f"base {name!r}: {run_dir} holds no config.json (moved, renamed or deleted; "
                                    "update its BASES entry)")
@@ -1364,12 +1370,21 @@ def failed_run_reason(run_dir: Path) -> Optional[str]:
 
     A run that published ``summary.json`` finished; one whose ``test_ce`` is not a finite number (NaN or
     infinity after a divergence, or null) finished and failed. A run without a readable ``summary.json``
-    is unfinished (interrupted, or still training) and is not a failure.
+    failed when :func:`vfe3.experiment.run_vfe` (or ``run_baseline``) recorded a crash in ``failure.json``
+    (:func:`vfe3.experiment.read_failure_record`), so a relaunch does not re-roll the pair (audit
+    2026-10-17 item 28); without either file it is unfinished (interrupted, or still training) and is not
+    a failure.
     """
     try:
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        from vfe3.experiment import read_failure_record
+
+        crash = read_failure_record(run_dir)
+        if crash is None:
+            return None
+        return (f"crashed with {crash.get('error_type')}: {crash.get('error')} "
+                f"(stage {crash.get('stage')}, step {crash.get('step')}; failure.json)")
     if not isinstance(summary, dict):
         return None
     value = summary.get("test_ce")

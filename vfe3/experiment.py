@@ -20,11 +20,18 @@ scores the test split and writes the run's records, and the directory
 this code trains draws a per-epoch random origin (:data:`CURRENT_TRAIN_WINDOW_MODE`); the config loaders
 drop a saved ``train_window_offset`` silently, so launchers that reuse or pool saved runs read the
 protocol here (audit 2026-10-16 F59).
+
+When training or finalization raises, :func:`run_vfe` (and ``train_baseline.run_baseline``) writes
+:data:`FAILURE_RECORD` into the run directory with :func:`write_failure_record` before re-raising, so a
+crashed run is a recorded failure rather than an unfinished one, and a relaunch does not re-roll its seed
+pair (audit 2026-10-17 item 28). :func:`read_failure_record` reads it back.
 """
 
 from __future__ import annotations
 
+import csv
 import functools
+import json
 import logging
 import math
 import re
@@ -42,7 +49,11 @@ from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 from vfe3.runtime import restored_fp32_matmul_precision
 
 __all__ = ["run_vfe", "reserve_directory", "rename_run_by_test_ppl", "saved_train_window_mode",
+           "write_failure_record", "read_failure_record", "FAILURE_RECORD",
            "CURRENT_TRAIN_WINDOW_MODE", "TRAIN_WINDOW_OFFSET_RETIREMENT_COMMIT"]
+
+# The crash record a library run writes before re-raising (audit 2026-10-17 item 28).
+FAILURE_RECORD = "failure.json"
 
 # The training-window origin. ``train_window_offset`` existed from 2026-10-09 (default ``'fixed'``; before
 # then every training window started at a fixed origin) until the commit below hardcoded the per-epoch
@@ -110,6 +121,63 @@ def saved_train_window_mode(
     return "fixed", (f"trained at commit {short}, before the 2026-10-12 retirement of train_window_offset, "
                      "and config.json records no train_window_offset (fixed windows were the only mode "
                      "before 2026-10-09 and the option's default after)")
+
+
+def _last_logged_step(run_dir: Path) -> Optional[int]:
+    r"""The largest finite ``step`` in ``run_dir/metrics.csv``, or None when there is none."""
+    try:
+        with open(run_dir / "metrics.csv", newline="", encoding="utf-8") as handle:
+            steps = []
+            for row in csv.DictReader(handle):
+                try:
+                    value = float(row.get("step") or "nan")
+                except ValueError:
+                    continue
+                if math.isfinite(value):
+                    steps.append(int(value))
+    except (OSError, csv.Error):
+        return None
+    return max(steps) if steps else None
+
+
+def write_failure_record(
+    run_dir: Path,
+    exc:     BaseException,
+
+    *,
+    stage:   str,
+    step:    Optional[int] = None,
+) -> Optional[Path]:
+    r"""Write :data:`FAILURE_RECORD` into ``run_dir``: the exception type and message, the stage and step.
+
+    ``step`` defaults to ``exc.step`` when the exception carries one, else to the last step logged in
+    ``metrics.csv`` (``step_source`` says which; None when neither is known). Never raises: a record
+    that cannot be written is skipped, so the original exception still propagates.
+    """
+    step_source = "argument" if step is not None else None
+    if step is None and isinstance(getattr(exc, "step", None), int):
+        step, step_source = int(getattr(exc, "step")), "exception"
+    if step is None:
+        step = _last_logged_step(run_dir)
+        step_source = "last_logged_step" if step is not None else None
+    record = {"status": "failed", "error_type": type(exc).__name__, "error": str(exc), "stage": stage,
+              "step": step, "step_source": step_source,
+              "timestamp": datetime.now().isoformat(timespec="seconds")}
+    try:
+        from vfe3.run_artifacts import _write_json_atomic
+
+        return _write_json_atomic(Path(run_dir) / FAILURE_RECORD, record)
+    except Exception:                                   # the crash itself must still propagate
+        return None
+
+
+def read_failure_record(run_dir: Path) -> Optional[Dict[str, Any]]:
+    r"""The :data:`FAILURE_RECORD` of ``run_dir`` as a mapping, or None when absent or unreadable."""
+    try:
+        record = json.loads((Path(run_dir) / FAILURE_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
 
 
 def reserve_directory(root: Path, base: str) -> Path:
@@ -217,16 +285,18 @@ def run_vfe(
 ) -> Path:
     r"""Train ``cfg`` on ``dataset`` and finalize the run; return its (renamed) run directory.
 
+    An exception during training or finalization writes :data:`FAILURE_RECORD` into the run directory
+    (:func:`write_failure_record`) and is re-raised.
+
     ``seed`` replaces ``cfg.seed`` (the model-initialization and global RNG seed); ``data_seed``
     seeds the training shuffle generator only. ``label`` names the run directory
     ``<out_root>/<timestamp>_<label>`` while training and ``<out_root>/<test PPL:.2f>_<label>``
     after finalization. ``device`` defaults to CUDA when available.
     """
-    from vfe3.data.datasets import _tokenizer_tag, _validate_path_component, tokens_per_char
+    from vfe3.data.datasets import _validate_path_component, tokens_per_char
     from vfe3.model.model import VFEModel
-    from vfe3.run_artifacts import RunArtifacts, finalize_run
+    from vfe3.run_artifacts import RunArtifacts
     from vfe3.runtime import seed_everything
-    from vfe3.train import evaluate, train
 
     for name, value in (("seed", seed), ("data_seed", data_seed)):
         if type(value) is not int or value < 0:
@@ -256,6 +326,40 @@ def run_vfe(
     logger.info("run %s | %s | %s params | K=%d L=%d heads=%d | steps=%d batch=%d N=%d | seed=%d "
                 "data_seed=%d | %s", run_dir, dataset, f"{n_params:,}", cfg.embed_dim, cfg.n_layers,
                 cfg.n_heads, cfg.max_steps, cfg.batch_size, cfg.max_seq_len, cfg.seed, data_seed, device)
+
+    try:
+        return _train_and_finalize(model, cfg, artifacts, run_dir, label, dataset=dataset, data_seed=data_seed,
+                                   train_loader=train_loader, val_loader=val_loader, val_tpc=val_tpc,
+                                   test_loader=test_loader, test_tpc=test_tpc, device=device, logger=logger)
+    except Exception as exc:
+        # A crash is a recorded failure of the seed pair, not an unfinished run (audit 2026-10-17 item 28).
+        write_failure_record(run_dir, exc, stage="train_or_finalize")
+        raise
+
+
+def _train_and_finalize(
+    model:        torch.nn.Module,
+    cfg:          VFE3Config,
+    artifacts:    Any,
+    run_dir:      Path,
+    label:        str,
+
+    *,
+    dataset:      str,
+    data_seed:    int,
+    train_loader: DataLoader,
+    val_loader:   DataLoader,
+    val_tpc:      Any,
+    test_loader:  DataLoader,
+    test_tpc:     Any,
+    device:       torch.device,
+    logger:       logging.Logger,
+) -> Path:
+    r"""The training, final validation, test scoring and rename of :func:`run_vfe`."""
+    from vfe3.data.datasets import _tokenizer_tag
+    from vfe3.run_artifacts import finalize_run
+    from vfe3.runtime import seed_everything
+    from vfe3.train import evaluate, train
 
     # Reseed after construction, exactly as the launcher does, so the loop's global draws do not
     # depend on the config-dependent amount of RNG VFEModel(cfg) consumed.

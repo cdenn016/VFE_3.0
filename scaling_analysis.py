@@ -113,6 +113,8 @@ _CSV_COLUMNS = [
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
     "best_val_ppl",
+    # realized updates (audit 2026-10-17 item 29): a run with rejected updates trained on another schedule
+    "skipped_steps", "accepted_update_frac", "skipped_updates_flag",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
     "git_sha", "code_identity_forced",
     "cell_git_dirty", "cell_git_dirty_fingerprint",
@@ -481,6 +483,13 @@ def _forced_row_matches_strict_source_anchor(
     )
 
 
+def _skipped_count(value: object) -> int:
+    r"""A recorded ``skipped_steps`` as a non-negative int (0 when absent or not a finite number)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return 0
+    return max(0, int(value))
+
+
 def harvest(
     input_dir: Path,
 
@@ -555,6 +564,9 @@ def harvest(
             "test_bits_per_token": verified["test_bits_per_token"],
             "test_bpc": verified["test_bpc"],
             "best_val_ppl": summ.get("best_val_ppl"),
+            "skipped_steps": summ.get("skipped_steps"),
+            "accepted_update_frac": summ.get("accepted_update_frac"),
+            "skipped_updates_flag": _skipped_count(summ.get("skipped_steps")) > 0,
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
             "data_sha256": prov.get("data_sha256") or prov.get("test_data_sha256"),
             "train_data_sha256": prov.get("train_data_sha256"),
@@ -817,6 +829,35 @@ def _requested_design(
         "cells": cells,
         "counts": counts,
     }
+
+
+def _design_path(input_dir: Path) -> Path:
+    r"""``scaling_design.json`` of ``input_dir``, or of its parent when ``input_dir`` is one route."""
+    path = input_dir / "scaling_design.json"
+    return path if path.is_file() else input_dir.parent / "scaling_design.json"
+
+
+def print_design_attempts(design: Mapping[str, Any]) -> None:
+    r"""Print every design cell that failed or needed more than one attempt.
+
+    ``scaling.py`` records ``n_attempts``, ``n_failed_attempts`` and ``attempts`` per cell in
+    ``scaling_design.json``; archived attempts are never harvested, so this is where a cell that failed
+    before it succeeded, or failed and was not retried, stays visible (audit 2026-10-17 item 28).
+    """
+    cells = design.get("cells") if isinstance(design, Mapping) else None
+    flagged = [cell for cell in (cells if isinstance(cells, list) else [])
+               if isinstance(cell, Mapping) and ((cell.get("n_failed_attempts") or 0) > 0
+                                                 or (cell.get("n_attempts") or 0) > 1)]
+    if not flagged:
+        return
+    print("\n  Cells with failed or repeated attempts (the fit is not conditioned on eventual success):")
+    for cell in flagged:
+        kinds = ", ".join(f"#{a.get('attempt')} {a.get('status')} ({a.get('error_kind')})"
+                          for a in cell.get("attempts", []) if isinstance(a, Mapping)
+                          and a.get("status") != "complete")
+        print(f"    {cell.get('route')}/{cell.get('label')}/s{cell.get('seed')}: {cell.get('n_attempts')} "
+              f"attempt(s), {cell.get('n_failed_attempts')} failed, now {cell.get('status')}"
+              + (f"; {kinds}" if kinds else ""))
 
 
 def write_csv(rows: List[Dict[str, Any]], out_path: Path) -> None:
@@ -1507,6 +1548,12 @@ def analyze() -> None:
     write_csv(rows, input_dir / "scaling_points.csv")
     print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
+    print_design_attempts(_read_json(_design_path(input_dir)))   # audit 2026-10-17 item 28
+    unstable = [row for row in rows if row.get("skipped_updates_flag")]
+    if unstable:                                                  # audit 2026-10-17 item 29
+        print(f"\nWARNING: {len(unstable)} run(s) rejected optimizer updates and trained on another schedule "
+              "than their config: " + ", ".join(f"{row['route']}/{row['label']}/s{row['seed']} "
+                                                f"({row['skipped_steps']} skipped)" for row in unstable))
     if design.get("forced_code_identity_acceptance") is True:
         print(
             "\nWARNING: FORCED CODE-IDENTITY ACCEPTANCE is active for "

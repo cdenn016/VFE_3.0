@@ -105,6 +105,15 @@ CONFIG: Dict[str, Any] = {
     # are skipped with explicit provenance labeling; partial cells are restarted.
     "resume":     True,
 
+    # Per-cell router cap for routes that vary the head dimension d_head = embed_dim / n_heads: a number c sets
+    # kl_max = c * d_head in every cell that does not set kl_max itself, so the per-dimension cap is the same in
+    # every cell; None keeps today's caps (BASELINE's kl_max, 8 * embed_dim when None).
+    "kl_max_per_head_dim": None,  # None | a positive number of nats per head dimension
+
+    # Under resume, a cell whose earlier attempt crashed or ended non-finite is reported, not retrained, so
+    # the fit is not conditioned on eventual success; True retrains it (every attempt is archived).
+    "retry_failed": False,       # False | True
+
     "output_dir": "vfe3_scaling_results/standard",
 }
 
@@ -743,7 +752,62 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
         d["generate_embedding_figures"] = False
     if max_steps is not None:
         d["max_steps"] = int(max_steps)
+    per_dim = CONFIG.get("kl_max_per_head_dim")
+    if per_dim is not None and "kl_max" not in overrides:
+        d["kl_max"] = _per_head_dim_kl_max(d, per_dim)
     return d
+
+
+def _per_head_dim_kl_max(cell: Mapping[str, Any], per_dim: object) -> float:
+    r"""The router cap :math:`\mathrm{kl\_max} = c \cdot d_\mathrm{head}` with :math:`d_\mathrm{head} = K / H`, of one cell.
+
+    The routes that vary the head dimension at a fixed cap (``blocks_K48``: kl_max = 8K with
+    :math:`d_\mathrm{head}` = 3 to 24; ``grow_K_GL{b}``: kl_max = 8K at fixed :math:`d_\mathrm{head}`) give
+    their cells different per-dimension caps, so whether a cell can lose a head to the clamp depends on the
+    cell (audit 2026-10-17 item 10). ``c`` is in nats per head dimension.
+    """
+    if isinstance(per_dim, bool) or not isinstance(per_dim, (int, float)) or not float(per_dim) > 0.0:
+        raise ValueError(f"CONFIG['kl_max_per_head_dim'] must be None or a positive number, got {per_dim!r}")
+    embed_dim = int(cell.get("embed_dim", _VFE3_DEFAULTS.get("embed_dim")))
+    n_heads = int(cell.get("n_heads", _VFE3_DEFAULTS.get("n_heads")))
+    if n_heads <= 0 or embed_dim % n_heads:
+        raise ValueError(f"kl_max_per_head_dim needs n_heads dividing embed_dim, got K={embed_dim}, H={n_heads}")
+    return float(per_dim) * (embed_dim // n_heads)
+
+
+def _dead_router_heads(run_dir: Path) -> Dict[str, Any]:
+    r"""Dead (layer, head) routers of one cell, read from ``diagnostics/cap_clamped_rows.csv`` when present.
+
+    At the last recorded step, a head with more than ``DEAD_ROUTER_CLAMPED_ROW_FRAC`` of its scored rows fully
+    clamped at kl_max routes those rows by the attention prior alone, with zero router gradient (the
+    threshold the training loop warns on). Returns ``available`` (False without the file), ``step``,
+    ``dead_heads`` (count), ``dead`` ([layer, head] pairs) and ``heads_recorded`` (audit 2026-10-17 item 10).
+    """
+    import csv
+
+    from vfe3.train import DEAD_ROUTER_CLAMPED_ROW_FRAC
+
+    path = run_dir / "diagnostics" / "cap_clamped_rows.csv"
+    try:
+        with open(path, newline="", encoding="utf-8") as handle:
+            records = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return {"available": False, "step": None, "dead_heads": None, "dead": [], "heads_recorded": 0}
+    parsed = []
+    for record in records:
+        try:
+            parsed.append((int(float(record["step"])), int(float(record["layer"])), int(float(record["head"])),
+                           float(record["clamped_rows"]), float(record["rows"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not parsed:
+        return {"available": False, "step": None, "dead_heads": None, "dead": [], "heads_recorded": 0}
+    last = max(step for step, *_ in parsed)
+    at_last = [row for row in parsed if row[0] == last]
+    dead = sorted([layer, head] for _step, layer, head, clamped, rows in at_last
+                  if rows > 0 and clamped / rows > DEAD_ROUTER_CLAMPED_ROW_FRAC)
+    return {"available": True, "step": last, "dead_heads": len(dead), "dead": dead,
+            "heads_recorded": len(at_last)}
 
 
 def _current_code_identity() -> Dict[str, object]:
@@ -1179,6 +1243,79 @@ def _archive_scaling_attempt(
     raise RuntimeError("scaling attempt archive exhausted its numeric namespace")
 
 
+# Failure kinds a run produces itself; under resume they are terminal unless CONFIG["retry_failed"] is set
+# (audit 2026-10-17 item 28). Config and path failures are recomputed on every invocation.
+_SCALING_TERMINAL_FAILURE_KINDS = frozenset({"train", "nonfinite"})
+
+
+def _terminal_scaling_failure(
+    run_dir: Path,
+    cfg:     VFE3Config,
+
+    *,
+    route:   str,
+    label:   str,
+    seed:    int,
+) -> Optional[Dict[str, Any]]:
+    r"""The recorded run failure of this exact cell, or None.
+
+    The cell's ``scaling_failure.json`` must name the route, label and seed and carry a run-produced
+    ``error_kind`` (:data:`_SCALING_TERMINAL_FAILURE_KINDS`); when the attempt wrote ``scaling_cell.json``,
+    its ``config_sha256`` must equal ``cfg``'s, so a changed cell is retrained rather than reported.
+    """
+    try:
+        failure = json.loads((run_dir / "scaling_failure.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(failure, dict)
+            or failure.get("error_kind") not in _SCALING_TERMINAL_FAILURE_KINDS
+            or failure.get("route") != route or failure.get("label") != label
+            or failure.get("seed") != int(seed)):
+        return None
+    try:
+        cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cellmeta = None
+    if isinstance(cellmeta, Mapping):
+        current = _canonical_json_sha256(json.loads(json.dumps(serialize_config(cfg), default=str)))
+        if cellmeta.get("config_sha256") != current:
+            return None
+    return failure
+
+
+def _scaling_attempt_history(run_dir: Path, seed: int) -> Dict[str, Any]:
+    r"""Every attempt of one cell: the archived ones under ``.attempts`` and the current directory.
+
+    Each attempt reports ``status``, ``error_kind`` and ``error`` from its ``scaling_result.json`` (or
+    ``scaling_failure.json``); an archived attempt with neither was interrupted.
+    """
+    def read(directory: Path) -> Optional[Dict[str, Any]]:
+        for name in ("scaling_result.json", "scaling_failure.json"):
+            try:
+                record = json.loads((directory / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(record, dict):
+                return record
+        return None
+
+    archive_root = run_dir.parent / ".attempts"
+    directories = (sorted(archive_root.glob(f"s{int(seed)}__attempt_*")) if archive_root.is_dir() else [])
+    attempts: List[Dict[str, Any]] = []
+    for directory in [*directories, run_dir]:
+        record = read(directory)
+        if record is None:
+            if directory is run_dir:
+                continue
+            record = {"status": "interrupted", "error_kind": None,
+                      "error": "the attempt published no scaling_result.json"}
+        attempts.append({"attempt": len(attempts) + 1, "status": record.get("status"),
+                         "error_kind": record.get("error_kind"), "error": record.get("error"),
+                         "archive": None if directory is run_dir else directory.name})
+    failed = [a for a in attempts if a["status"] not in ("complete", None)]
+    return {"n_attempts": len(attempts), "n_failed": len(failed), "attempts": attempts}
+
+
 def _scaling_cell_has_payload(run_dir: Path) -> bool:
     """Return whether a cell contains anything beyond its ownership sentinel."""
     return run_dir.is_dir() and any(
@@ -1253,8 +1390,19 @@ def run_cell(
               f"N={metrics['n_params']}{suffix}")
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
                 "error_kind": None, "seed": seed, "cached": True,
-                "cache_status": resume_status,
+                "cache_status": resume_status, "kl_max": float(cfg.kl_max),
+                "router_dead_heads": _dead_router_heads(run_dir),
                 **metrics}
+    terminal = (None if not CONFIG["resume"] or CONFIG.get("retry_failed", False) else
+                _terminal_scaling_failure(run_dir, cfg, route=cell["route"], label=label, seed=seed))
+    if terminal is not None:
+        print(f"    [FAILED earlier, not retried] {label} s{seed}  {terminal.get('error_kind')}: "
+              f"{terminal.get('error')}  (set retry_failed=True to retrain)")
+        return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
+                "error_kind": terminal.get("error_kind"), "error": terminal.get("error"), "seed": seed,
+                "preserve_existing": True, "terminal_failure": True,
+                "test_ce": None, "test_ppl": None, "test_bits_per_token": None,
+                "test_bpc": None, "n_params": None}
 
     if _scaling_cell_has_payload(run_dir):
         archived = _archive_scaling_attempt(
@@ -1371,7 +1519,8 @@ def run_cell(
             "test_ce": results.get("test_ce"), "test_ppl": results.get("test_ppl"),
             "test_bits_per_token": results.get("test_bits_per_token"),
             "test_bpc": results.get("test_bpc"),
-            "n_params": actual_n, "n_gen": n_gen, "wall_time_s": wall}
+            "n_params": actual_n, "n_gen": n_gen, "wall_time_s": wall,
+            "kl_max": float(cfg.kl_max), "router_dead_heads": _dead_router_heads(run_dir)}
 
 
 def _cleanup() -> None:
@@ -1654,11 +1803,22 @@ def main() -> int:
                 elif status != "complete":
                     incomplete = True
                 manifest_cell = design_cells[(name, cell["label"], int(seed))]
+                try:
+                    history = _scaling_attempt_history(
+                        _trusted_scaling_run_dir(output_dir, name, cell["label"], int(seed)), int(seed))
+                except (OSError, ValueError):
+                    history = {"n_attempts": None, "n_failed": None, "attempts": []}
                 manifest_cell.update({
                     "status": status,
                     "error_kind": published.get("error_kind"),
                     "error": published.get("error"),
                     "cache_status": published.get("cache_status"),
+                    "terminal_failure": bool(published.get("terminal_failure")),
+                    "kl_max": published.get("kl_max"),
+                    "router_dead_heads": published.get("router_dead_heads"),
+                    "n_attempts": history["n_attempts"],
+                    "n_failed_attempts": history["n_failed"],
+                    "attempts": history["attempts"],
                 })
                 design["status"] = "incomplete" if incomplete else "running"
                 _trusted_scaling_output_dir(output_dir)
@@ -1666,6 +1826,10 @@ def main() -> int:
                 if status == "complete" and not res.get("cached"):
                     print(f"      -> test_ce={res.get('test_ce')}  ppl={res.get('test_ppl')}  "
                           f"({res.get('wall_time_s', 0.0):.0f}s)")
+                dead = res.get("router_dead_heads") or {}
+                if dead.get("dead_heads"):
+                    print(f"      -> {dead['dead_heads']} dead router head(s) at kl_max={res.get('kl_max')}: "
+                          f"{dead['dead']} (cap_clamped_rows.csv, step {dead['step']})")
 
     invocation_errors: List[str] = []
     try:
@@ -1688,8 +1852,12 @@ def main() -> int:
         design["error"] = "; ".join(invocation_errors)
 
     design["status"] = "incomplete" if incomplete else "complete"
+    design["retry_failed"] = bool(CONFIG.get("retry_failed", False))
     _trusted_scaling_output_dir(output_dir)
     _write_json_atomic(design_path, design)
+    from scaling_analysis import print_design_attempts
+
+    print_design_attempts(design)              # failed and repeated attempts (audit 2026-10-17 item 28)
     if incomplete:
         print(f"\nROUTES INCOMPLETE. Inspect {design_path} and per-cell scaling_failure.json files.")
         return 1
