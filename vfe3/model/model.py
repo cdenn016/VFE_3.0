@@ -844,19 +844,36 @@ class VFEModel(nn.Module):
         mu_q:          torch.Tensor,                             # (B, N, K)
         sigma_q:       torch.Tensor,                             # (B, N, K) or (B, N, K, K) the stack's Sigma_q
         encoded_sigma: Optional[torch.Tensor],                   # the stack's input covariance, same layout or diagonal
+        canonical_frame: Optional[CanonicalFrameContext] = None,  # realized U_i (decode_coordinates='reference')
     ) -> torch.Tensor:                                            # the covariance the prior-bank decoder reads
         r"""The covariance the prior-bank decoder reads, selected by ``cfg.decode_covariance``.
 
         ``"belief"`` returns the stack's final :math:`\Sigma_q`, so the logit is the exact
         :math:`-\mathrm{KL}(q^*_i\Vert p_v)/\tau`. ``"encoded"`` returns the token's encoded covariance (the stack's
-        input), and ``"constant"`` returns :math:`\sigma_{\mathrm{init}}I`. Both alternatives keep the trace term
-        :math:`\mathrm{tr}(\Sigma_v^{-1}\Sigma_q)/(2\tau)` of the logit off the covariance the stack builds.
+        input), and ``"constant"`` returns :math:`\sigma_{\mathrm{init}}I` in the coordinates the decoder reads. Both
+        alternatives keep the trace term :math:`\mathrm{tr}(\Sigma_v^{-1}\Sigma_q)/(2\tau)` of the logit off the
+        covariance the stack builds.
+
+        Under ``decode_coordinates='local'`` the constant is :math:`\sigma_{\mathrm{init}}I` in local coordinates.
+        Under ``'reference'`` the decoder pulls the local covariance back to :math:`U_i^{-1}\Sigma U_i^{-\top}`, which
+        for a local :math:`\sigma_{\mathrm{init}}I` is :math:`\sigma_{\mathrm{init}}U_i^{-1}U_i^{-\top}`, frame-dependent
+        unless :math:`U_i` is orthogonal (audit 2026-10-17, item 25). A full layout there therefore returns the local
+        covariance :math:`U_i(\sigma_{\mathrm{init}}I)U_i^\top`, so the decoder reads :math:`\sigma_{\mathrm{init}}I`
+        in reference coordinates (up to rounding) and the logits are invariant under :math:`U_i \to g_iU_i`. A
+        diagonal layout cannot carry :math:`U_iU_i^\top` and returns its moment-matched diagonal, exact for
+        orthogonal and conformal frames; the diagonal family is off the gauge facet in any case.
         """
         mode = self.cfg.decode_covariance
         if mode == "belief":
             return sigma_q
         full = sigma_q.dim() == mu_q.dim() + 1                   # (..., K, K) layout
         if mode == "constant":
+            if self.cfg.decode_coordinates == "reference" and canonical_frame is not None:
+                from vfe3.model.frame_actions import local_covariance
+                K = sigma_q.shape[-1]
+                eye = torch.eye(K, dtype=sigma_q.dtype, device=sigma_q.device)
+                reference = (float(self.cfg.sigma_init) * eye).expand(*mu_q.shape[:-1], K, K)   # (..., N, K, K)
+                return local_covariance(mu_q, reference, canonical_frame, diagonal=not full).to(sigma_q.dtype)
             if full:
                 eye = torch.eye(sigma_q.shape[-1], dtype=sigma_q.dtype, device=sigma_q.device)
                 return (float(self.cfg.sigma_init) * eye).expand_as(sigma_q).contiguous()
@@ -890,7 +907,7 @@ class VFEModel(nn.Module):
         the diagnostic capture's ``initial_belief.sigma`` (audit 2026-10-16 F64).
         """
         if self.cfg.decode_mode != "linear":
-            sigma_q = self._decode_covariance(mu_q, sigma_q, encoded_sigma)
+            sigma_q = self._decode_covariance(mu_q, sigma_q, encoded_sigma, canonical_frame)
         if decode_last:
             last = slice(-1, None)
             mu_q, sigma_q = mu_q[:, last], sigma_q[:, last]
@@ -1211,13 +1228,14 @@ class VFEModel(nn.Module):
         )
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) stack output
         encoded_sigma = encoded_sigma_out["sigma"] if encoded_sigma_out is not None else None
-        if self.cfg.decode_mode != "linear":
-            sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma)   # what the decoder reads
         canonical_frame = (
             cap.get("canonical_frame") if cap is not None else None
         )
         if decode_frame_out is not None:
             canonical_frame = decode_frame_out["frame"]          # realized U_i: the decoder reads (xi, C)
+        if self.cfg.decode_mode != "linear":
+            sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma,   # what the decoder reads
+                                                  canonical_frame)
 
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
         # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
@@ -1799,8 +1817,10 @@ class VFEModel(nn.Module):
         With :math:`S_i` the causal sources of query :math:`i` and the scored rows :math:`|S_i| \ge 2`:
         ``klmax_frac`` is the capped share of the support (the per-head :meth:`_klmax_frac`);
         ``clamped_row_frac`` the share of scored rows whose every entry is capped (the
-        ``_capture_numerics_counts`` rule: such a row routes uniformly with zero router gradient, which
-        happens only under the absolute reference); ``self_weight`` the mean :math:`\beta_{ii}` and
+        ``_capture_numerics_counts`` rule: such a row has zero router gradient and routes by the attention prior
+        alone, :math:`\beta_{ij} \propto e^{\log\pi_{ij}}` (uniform over the sources only under a flat prior such as
+        plain causal; by the ALiBi distance profile under ``causal_alibi``), which happens only under the absolute
+        reference); ``self_weight`` the mean :math:`\beta_{ii}` and
         ``self_argmax_frac`` the share of rows with :math:`\beta_{ii} = \max_{j \in S_i}\beta_{ij}`, both
         over scored rows that admit self (NaN for a head with none, e.g. a ``*_noself`` prior).
         """

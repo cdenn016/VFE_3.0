@@ -25,7 +25,7 @@ from typing import Callable, Dict, Tuple
 import pytest
 import torch
 
-from tests.profiles import _CONFIG_VALUES, _LIVE_OMITTED, _LIVE_TINY, config_values, launcher_values
+from tests.profiles import _CONFIG_VALUES, _LIVE_OMITTED, config_values, launcher_values, live_tiny
 from vfe3.belief import BeliefState
 from vfe3.config import _RETIRED_GAUGE_GROUPS, VFE3Config
 from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
@@ -33,6 +33,7 @@ from vfe3.geometry.groups import _GROUPS
 from vfe3.geometry.lie_ops import embed_phi, extract_phi
 from vfe3.geometry.matrix_log import logm_principal
 from vfe3.model.model import VFEModel
+from vfe3.run_artifacts import _pure_path_report
 
 B, N = 2, 4
 _REL = 1e-9          # observed: below 1e-14 on these cases, about 2e-12 on the launcher route of 2026-10-16
@@ -52,6 +53,9 @@ _BASE = dict(attention_mode="projected_predictive", predictive_readout="kernel",
              vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=N, n_layers=2, batch_size=B, block_mlp_expansion=2)
 _SO3 = dict(gauge_group="so_n", group_n=3, irrep_spec=[("l1", 1), ("l2", 1)], embed_dim=8)          # 3 + 5
 _SU3 = dict(gauge_group="su_n", group_n=3, irrep_spec=[("pq1_0", 1), ("pq1_1", 1)], embed_dim=14)   # 6 + 8
+# The gradient receiver has no reference block coordinates, so its block is the equivariant norm without an MLP.
+_GRADIENT = dict(attention_mode="projected_gradient", lambda_alpha_mode="state_dependent", use_block_mlp=False,
+                 norm_type_block="none")
 
 CASES: Dict[str, dict] = {
     # every registered structure group, under each tying it admits
@@ -78,6 +82,38 @@ CASES: Dict[str, dict] = {
     "kl_decode":          {"decode_mode": "diagonal_chunked"},           # the switch moves it to full_chunked
     "gaussian_block":     {"family": "gaussian_block", "decode_mode": "full_chunked"},
     "lowrank_edges":      {"content_link_chart": "exponential", "content_link_edges": "lowrank"},
+    # further opt-in routes (audit 2026-10-17, item 81), on block_glk unless named
+    "pure_gauge_edges":   {"content_link_chart": "exponential", "content_link_edges": "pure_gauge"},
+    "comparison_invariant_rope":      {"rope_mode": "comparison_invariant"},
+    "comparison_invariant_rope_glmc": {"gauge_group": "block_glmc", "rope_mode": "comparison_invariant"},
+    "noisy_key_routing":   {"relational_routing": "noisy_key"},
+    "noisy_query_routing": {"relational_routing": "noisy_query"},
+    "gradient_closed_form":          {**_GRADIENT, "relational_receiver_update": "closed_form"},
+    "gradient_closed_form_profiled": {**_GRADIENT, "relational_receiver_update": "closed_form_profiled"},
+    "gradient_euler":                {**_GRADIENT, "relational_receiver_update": "euler"},
+    "covariance_ceiling": {"predictive_covariance_ceiling": 2.0},
+    "relative_floor":     {"predictive_covariance_floor_mode": "relative"},               # item 43
+    "relative_floor_minimal_agent": {"predictive_covariance_floor_mode": "relative",
+                                     "predictive_readout": "minimal_agent"},
+    "pushforward_moment": {"block_norm_covariance": "pushforward_moment"},
+    "delta_full_mlp":     {"block_mlp_covariance": "delta_full"},
+    "attention_residual": {"attention_residual": True},
+    "tied_comparison_maps": {"tie_comparison_maps": True},
+    "learned_temperature": {"learn_attention_temperature": True},
+    "prior_handoff":      {"prior_handoff_rho": 0.5, "prior_handoff_sigma": 0.5},
+    "self_coupling":      {"mstep_self_coupling_weight": 0.5},
+    "pos_phi_slk":        {"pos_phi": "learned", "pos_phi_project_slk": True},
+    "so_n_cg_delta_full": {**_SO3, "use_cg_coupling": True, "cg_covariance_mode": "delta_full",
+                           "family": "gaussian_full", "use_block_mlp": False, "norm_type_block": "none"},
+    "minimal_agent_mean_field": {"predictive_readout": "minimal_agent", "minimal_agent_inference": "mean_field"},
+    "minimal_agent_spread": {"predictive_readout": "minimal_agent", "minimal_agent_inference": "mean_field",
+                             "predictive_covariance": "spread_corrected"},
+    # the decode covariance on a non-compact group (item 25): "constant" is sigma_init I in reference coordinates
+    "decode_encoded":     {"family": "gaussian_full", "decode_mode": "full_chunked", "decode_covariance": "encoded"},
+    "decode_constant":    {"family": "gaussian_full", "decode_mode": "full_chunked", "decode_covariance": "constant"},
+    "decode_constant_kl": {"decode_mode": "diagonal_chunked", "decode_covariance": "constant"},
+    "decode_constant_gaussian_block": {"family": "gaussian_block", "decode_mode": "full_chunked",
+                                       "decode_covariance": "constant"},
 }
 
 
@@ -175,7 +211,11 @@ def test_the_switched_model_is_invariant_under_a_local_change_of_frame(case: str
     assert gauge_covariance_failures(VFE3Config(**raw))                # unswitched, the route is not covariant
     cfg = _switched(raw)
     assert cfg.use_cg_coupling == raw["use_cg_coupling"]               # the CG case keeps its coupling
+    for key in ("decode_covariance", "predictive_covariance_floor_mode"):   # the switch keeps both (items 25, 43)
+        assert getattr(cfg, key) == raw[key]
     logits_change, loss_change, beliefs_only_change = _invariance(_model(cfg))
+    # The pure-path report certifies the route, and the measured residual agrees (audit 2026-10-17, item 81).
+    assert _pure_path_report(cfg, [])["on_gauge_pure_path"] is True
     assert logits_change < _REL and loss_change < _REL
     assert beliefs_only_change > 1e-3                                  # the frames carry the invariance
 
@@ -190,18 +230,40 @@ def test_reverting_one_override_breaks_the_invariance(key: str, flag: str) -> No
     assert _invariance(model)[0] < _REL
     reverted = VFE3Config(**{**raw, **overrides, key: "local"})
     assert flag in gauge_covariance_failures(reverted)
+    assert _pure_path_report(reverted, [])["on_gauge_pure_path"] is False
     assert _invariance(_model(reverted, state=model.state_dict()))[0] > 1e-3
 
 
-def test_the_launcher_route_under_the_switch_is_invariant() -> None:
+def test_local_decode_coordinates_leave_the_constant_decode_covariance_frame_dependent() -> None:
+    r"""Control for item 25 (audit 2026-10-17): with the switch's decoder reverted to local coordinates, the report
+    and the measured residual agree that the constant-covariance route is not covariant."""
+    raw = _raw("decode_constant")
+    overrides = fully_gauge_covariant_overrides(raw)
+    assert overrides["decode_coordinates"] == "reference"
+    reverted = VFE3Config(**{**raw, **overrides, "decode_coordinates": "local"})
+    assert _pure_path_report(reverted, [])["on_gauge_pure_path"] is False
+    assert _invariance(_model(reverted))[0] > 1e-3
+
+
+@pytest.mark.parametrize("variant", [
+    {},
+    # a prior-bank decoder under each non-belief decode covariance, and the relative floor (audit 2026-10-17,
+    # items 25 and 43); the switch moves diagonal_chunked to full_chunked on the full family
+    {"decode_mode": "diagonal_chunked", "decode_covariance": "constant"},
+    {"decode_mode": "diagonal_chunked", "decode_covariance": "encoded"},
+    {"predictive_covariance_floor_mode": "relative"},
+], ids=["as_written", "kl_decode_constant", "kl_decode_encoded", "relative_floor"])
+def test_the_launcher_route_under_the_switch_is_invariant(variant: dict) -> None:
     r"""The route ``train_vfe3.py`` trains, at tiny scale, with the switch applied as the launcher applies it."""
-    launcher = launcher_values()
+    launcher = {**launcher_values(), **variant}
     try:
         overrides = fully_gauge_covariant_overrides(launcher)
     except ValueError as exc:                                          # a refusal is the switch's contract
         pytest.skip(f"the launcher route has no covariant reading: {exc}")
-    values = {**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher, **_LIVE_TINY, **overrides,
+    values = {**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher, **live_tiny(launcher), **overrides,
               "max_seq_len": N, "batch_size": B}
-    logits_change, loss_change, beliefs_only_change = _invariance(_model(_switched(values)))
+    cfg = _switched(values)
+    assert _pure_path_report(cfg, [])["on_gauge_pure_path"] is True
+    logits_change, loss_change, beliefs_only_change = _invariance(_model(cfg))
     assert logits_change < _REL and loss_change < _REL
     assert beliefs_only_change > 1e-3
