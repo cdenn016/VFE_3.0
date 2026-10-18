@@ -10,7 +10,7 @@ from dataclasses import asdict, fields
 
 import torch
 
-from tests.profiles import _LIVE_TINY, config_values, launcher_values, live_config, live_values
+from tests.profiles import _LIVE_TINY, config_values, launcher_values, live_config, live_kl_max, live_values
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
@@ -42,7 +42,15 @@ def test_live_profile_is_the_launcher_route() -> None:
                 if field.default is not dataclasses.MISSING}
     omitted = {name for name in values if name not in launcher and name not in resized}
     assert {name: (values[name], defaults[name]) for name in omitted if values[name] != defaults[name]} == {}
-    assert live_config().kl_max == 8.0 * live_config().embed_dim
+    # kl_max keeps the launcher's nats per dimension: a launcher number scales by K_tiny / K_launcher, None (8 K)
+    # stays None and resolves to 8 K at the tiny K (audit 2026-10-17, item 38).
+    cfg = live_config()
+    if launcher.get("kl_max") is None:
+        assert values["kl_max"] == 8.0 * cfg.embed_dim
+    else:
+        assert values["kl_max"] == launcher["kl_max"] * cfg.embed_dim / launcher["embed_dim"]
+    assert live_kl_max({"kl_max": 128.0, "embed_dim": 128}) == float(_LIVE_TINY["embed_dim"])
+    assert live_kl_max({"kl_max": None, "embed_dim": 128}) is None
 
 
 def test_live_forward_backward_is_finite() -> None:

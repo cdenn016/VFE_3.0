@@ -16,6 +16,7 @@ import warnings
 import pytest
 import torch
 
+from tests.profiles import test_config
 from tests.test_audit_20261012_floor import (
     FAMILIES, FLOOR, READOUTS, _change_reference, _inputs, _operators, _readout, _reference_change, _relative)
 from vfe3.config import VFE3Config
@@ -127,8 +128,10 @@ def test_spectral_ceiling_backward_matches_finite_differences() -> None:
 
 def test_config_rejects_a_ceiling_at_or_below_the_floor() -> None:
     with pytest.raises(ValueError, match="predictive_covariance_ceiling"):
-        VFE3Config(predictive_covariance_floor=1e-2, predictive_covariance_ceiling=1e-2)
-    assert VFE3Config(predictive_covariance_ceiling=100.0).predictive_covariance_ceiling == 100.0
+        test_config(attention_mode="projected_predictive", predictive_covariance="moment_matched", predictive_covariance_floor=1e-2,
+                    predictive_covariance_ceiling=1e-2)
+    assert test_config(attention_mode="projected_predictive", predictive_covariance="moment_matched",
+                       predictive_covariance_ceiling=100.0).predictive_covariance_ceiling == 100.0
 
 
 @pytest.mark.parametrize("diagonal", [True, False])
