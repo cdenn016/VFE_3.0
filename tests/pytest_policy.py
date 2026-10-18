@@ -27,6 +27,9 @@ CUDA_TESTS: frozenset[str] = frozenset({
     'test_kl_decode_triton_20261012.py::test_cuda_fused_route_matches_float64_like_the_torch_route',
     # The amp_dtype reduced-precision probe under CUDA autocast's operation lists (2026-10-12).
     'test_amp_routes_20261012.py::test_cuda_autocast_probe_matches_the_rule',
+    # The tiny live launcher route on CUDA (fused KL-decode CE, fixed-schedule frame exponential) against a
+    # float64 CPU copy (audit 2026-10-17 item 26).
+    'test_cuda_live_route_20261018.py::test_cuda_live_route_matches_a_float64_cpu_copy',
 })
 
 CUDA_MIRROR_TESTS: frozenset[str] = frozenset({
