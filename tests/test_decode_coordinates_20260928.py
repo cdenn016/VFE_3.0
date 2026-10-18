@@ -347,7 +347,8 @@ def test_functional_stack_is_covariant_under_block_frame_changes(decode: str) ->
     (dict(attention_mode="transported", attention_residual=False,
           decode_mode="diagonal_chunked"), "transported"),
     (dict(rope_mode="frame_value"), "rope_mode"),
-    (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
+    # gaussian_frame_diagonal (revived 2026-10-18) decodes through diagonal_chunked; its full decoder is refused
+    (dict(family="gaussian_frame_diagonal", decode_mode="full_chunked"), "decode_mode='full_chunked'"),
     (dict(decode_mode="expected_likelihood_chunked"), "decode_mode"),
 ])
 def test_config_fails_closed_where_the_decode_frame_is_undefined(over: Dict[str, Any], message: str) -> None:

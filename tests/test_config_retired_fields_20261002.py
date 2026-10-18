@@ -130,9 +130,16 @@ def test_gaussian_diagonal_exact_migrates_to_gaussian_diagonal() -> None:
     assert _load(family="gaussian_diagonal_exact").family == "gaussian_diagonal"
 
 
-def test_gaussian_frame_diagonal_is_refused_as_retired() -> None:
-    with pytest.raises(ValueError, match="retired family='gaussian_frame_diagonal'"):
-        _load(family="gaussian_frame_diagonal")
+def test_gaussian_frame_diagonal_loads_as_the_revived_family_and_laplace_stays_retired() -> None:
+    r"""Retired 2026-10-01 and revived 2026-10-18 (vfe3.families.frame_gaussian): a serialized config naming it is no
+    longer refused as retired; it loads on the family's route and meets its route validation elsewhere."""
+    cfg = _load(family="gaussian_frame_diagonal", attention_mode="projected_predictive", predictive_readout="kernel",
+                decode_mode="diagonal_chunked")
+    assert cfg.family == "gaussian_frame_diagonal"
+    with pytest.raises(ValueError, match="requires attention_mode='projected_predictive'"):
+        _load(family="gaussian_frame_diagonal", attention_mode="projected_gradient")
+    with pytest.raises(ValueError, match="retired family='laplace_diagonal'"):
+        _load(family="laplace_diagonal")
 
 
 @pytest.mark.parametrize("mode", ["canonical_content_gauge", "canonical_content_projected"])
