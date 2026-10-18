@@ -7,7 +7,6 @@ from tests.test_relational_filtering import _fixture
 from tests.test_relational_integration import _cfg, _tokens
 from vfe3.gradients.relational import relational_score
 from vfe3.model.model import VFEModel
-from vfe3.model.relational_operators import RelationalOperators
 
 
 @pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal"])

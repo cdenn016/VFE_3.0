@@ -22,7 +22,6 @@ from vfe3.model.model import VFEModel
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.full_link import build_full_link_context
 from vfe3.gradients.relational import relational_score
-from vfe3.model.relational_operators import RelationalOperators
 
 
 # --------------------------------------------------------------------------- rope_space pin

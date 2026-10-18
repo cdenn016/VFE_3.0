@@ -269,7 +269,6 @@ def test_float32_diagonal_kl_keeps_relative_accuracy_near_equality(kl) -> None:
 
 @pytest.mark.parametrize("kl", [_gaussian_kl])
 def test_regrouped_diagonal_kl_matches_the_textbook_form_and_gradcheck(kl) -> None:
-    import math
 
     torch.manual_seed(1)
     mu_q, mu_p = torch.randn(6, dtype=torch.float64), torch.randn(6, dtype=torch.float64)

@@ -15,11 +15,11 @@ import torch
 
 from tests.profiles import make_relational_operators
 from tests.test_audit_20261012_floor import (
-    FLOOR, D, H, N, _change_reference, _inputs, _reference_change, _relative,
+    FLOOR, D, H, _change_reference, _inputs, _reference_change, _relative,
 )
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.relational import relational_predictive_readout
-from vfe3.relational_scoring import projected_gaussian_kl, projected_noisy_key_cost
+from vfe3.relational_scoring import projected_noisy_key_cost
 
 F64 = torch.float64
 

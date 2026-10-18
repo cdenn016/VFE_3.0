@@ -2,7 +2,7 @@ from tests.profiles import test_config
 import pytest
 import torch
 
-from vfe3.geometry.groups import GaugeGroup, get_group, register_group
+from vfe3.geometry.groups import get_group
 
 
 def test_single_head_block_glk_group_full_basis():

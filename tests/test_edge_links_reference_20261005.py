@@ -41,7 +41,7 @@ in every head are never visited, so the reference stays finite where the impleme
 """
 from tests.profiles import make_relational_operators
 import itertools
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pytest
 import torch

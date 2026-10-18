@@ -8,7 +8,6 @@ import torch
 from vfe3.config import serialize_config, config_from_serialized
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.relational import relational_score
-from vfe3.model.relational_operators import RelationalOperators
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _relational_artifact_fields
 from tests.test_relational_filtering import _fixture

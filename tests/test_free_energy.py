@@ -4,7 +4,6 @@ from vfe3.attention_prior import attention_log_prior
 from vfe3.free_energy import (
     attention_weights,
     free_energy,
-    log_partition,
     reduced_free_energy,
 )
 

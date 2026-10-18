@@ -319,16 +319,15 @@ def pca_spectrum(X: Any, k: int = 50) -> np.ndarray:
 # Cosine-geometry summaries
 # ----------------------------------------------------------------------------------------------
 
-def anisotropy(X: Any, rng: Optional[np.random.Generator] = None, n_pairs: int = 20000,
-               center: bool = False) -> float:
+def anisotropy(X: Any, center: bool = False) -> float:
     r"""Mean cosine similarity over distinct pairs of rows (Ethayarajh 2019).
 
     Computed EXACTLY over all ordered pairs ``i != j`` from unit rows ``z_i``:
 
     .. math:: \overline{\cos} = \frac{\lVert\sum_i z_i\rVert^2 - n}{n(n-1)},
 
-    which is the expectation that a random-pair estimate samples, so ``rng``/``n_pairs`` are not
-    used (kept for interface stability). ``center=True`` removes the row mean first.
+    which is the expectation that a random-pair estimate samples. ``center=True`` removes the row
+    mean first.
     """
     X = _f64(X)
     n = X.shape[0]
@@ -348,13 +347,12 @@ def mean_vector_ratio(X: Any) -> float:
     return float(np.linalg.norm(X.mean(axis=0)) / mean_norm)
 
 
-def rogue_dimensions(X: Any, rng: Optional[np.random.Generator] = None, n_pairs: int = 20000,
-                     top: int = 5) -> Dict[str, Any]:
+def rogue_dimensions(X: Any, top: int = 5) -> Dict[str, Any]:
     r"""Per-dimension contribution to the mean pairwise cosine (Timkey & van Schijndel 2021).
 
     With unit rows ``z_i``, ``CC_k = E_{i != j}[z_{ik} z_{jk}]``, computed exactly as
-    ``((sum_i z_ik)^2 - sum_i z_ik^2) / (n(n-1))``; ``sum_k CC_k`` is the mean cosine. The
-    ``rng``/``n_pairs`` arguments are unused (exact expectation). Also reports the mean cosine
+    ``((sum_i z_ik)^2 - sum_i z_ik^2) / (n(n-1))``; ``sum_k CC_k`` is the mean cosine (the exact
+    expectation, so no pair sampling). Also reports the mean cosine
     after z-scoring every dimension, the post-processing Timkey & van Schijndel recommend.
     """
     X = _f64(X)

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import vfe3.relational_scoring as scoring
-from tests.test_audit_20261007_opus_fixes import B, K, N, V, _cfg, _minimal_agent, _rope_cfg
+from tests.test_audit_20261007_opus_fixes import B, N, V, _cfg, _minimal_agent, _rope_cfg
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.model import VFEModel
 
@@ -124,7 +124,6 @@ def test_mean_distance_tiles_match_the_direct_grid(monkeypatch: pytest.MonkeyPat
 
 def test_relational_score_dispatches_through_the_routing_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     import vfe3.gradients.relational as rel
-    from vfe3.model.relational_operators import RelationalOperators
 
     called = []
     for name in ("gaussian_kl", "noisy_query"):

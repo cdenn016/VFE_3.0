@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from tests.profiles import test_config, tiny_config
-from vfe3.config import ConfigNotice
 from vfe3.geometry.generators import local_basis_borel, local_basis_sl, local_basis_unipotent
 from vfe3.geometry.groups import check_admissible, get_group, group_traits
 from vfe3.geometry.lie_ops import project_phi_to_slk

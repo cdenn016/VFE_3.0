@@ -114,7 +114,7 @@ def test_hoisted_current_element_matches_a_recomputed_one():
     group = _group()
     _, phi = _staging_inputs()
     g = torch.Generator().manual_seed(7)
-    delta = 1e-3 * torch.randn_like(phi)
+    delta = 1e-3 * torch.randn(phi.shape, generator=g, dtype=phi.dtype).to(phi.device)
     candidate_phi = phi + delta
 
     hoisted = gauge_optim._pullback_group_current_element(phi, group)

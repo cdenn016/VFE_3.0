@@ -10,9 +10,6 @@ from tests.profiles import test_config
 import pytest
 import torch
 
-from vfe3.belief import BeliefState
-from vfe3.geometry.groups import get_group
-from vfe3.inference.e_step import e_step_iteration
 from vfe3.model.model import VFEModel
 
 
