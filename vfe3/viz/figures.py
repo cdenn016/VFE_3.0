@@ -1319,6 +1319,7 @@ def plot_trajectory(
     smooth:         int           = 0,
     annotate:       Optional[str] = None,   # 'min' | 'max' -> mark + label the running best point
     epoch_boundaries: Optional[Sequence[float]] = None,
+    markers:        Optional[Tuple[Sequence[float], Sequence[float]]] = None,   # (steps, values) of spike rows
     path:           Optional[str] = None,
 ):
     r"""Line plot of a scalar trajectory over the real training step.
@@ -1331,7 +1332,9 @@ def plot_trajectory(
     its step, ``annotate_final`` tags the last value at the right edge, and ``median_line`` draws the
     series median as a dashed reference (the typical value on a heavy-tailed log axis where the
     spikes sit decades above the floor). ``epoch_boundaries`` adds subdued vertical guides at
-    completed corpus passes; it does not alter either the raw series or its smoothing.
+    completed corpus passes; it does not alter either the raw series or its smoothing. ``markers``
+    ``(steps, values)`` are the divergence-spike rows, drawn as crosses outside the line and its
+    smoothing (:func:`_overlay_spike_markers`).
     """
     v = _np(values).reshape(-1).astype(float)
     x = np.arange(v.size, dtype=float) if steps is None else _np(steps).reshape(-1).astype(float)
@@ -1350,6 +1353,9 @@ def plot_trajectory(
                 ax.axvline(float(boundary), color="#777777", ls=":", lw=0.8, alpha=0.45, zorder=0)
     if logy:
         ax.set_yscale("log")
+    if markers is not None and _overlay_spike_markers(
+            ax, {"step": markers[0], "value": markers[1]}, "value", "#444444", logy=logy):
+        title = f"{title} (x: divergence-spike rows)"
     if median_line and v.size:
         med = float(np.median(v))
         ax.axhline(med, color="#444444", ls="--", lw=1)
@@ -1867,6 +1873,9 @@ def _grad_norm_decomp_fig(
     #                                      figure does not show (e.g. phi when e_phi_lr=0)
     ylabel:  str,
     path:    Optional[str],
+
+    *,
+    spikes:  Optional[Mapping[str, object]] = None,   # {step, key: [...]} of divergence-spike rows
 ):
     r"""Shared body for the mu / sigma / phi gradient-norm decomposition figures (M-step and E-step).
 
@@ -1894,10 +1903,14 @@ def _grad_norm_decomp_fig(
             ax.plot(x, _rolling_mean(vv, w), lw=1.5, color=color, label=f"{label} (last {vv[-1]:.3g})")
         if roles:
             ax.set_yscale("log")
+            marked = sum(_overlay_spike_markers(ax, spikes, key, color, logy=True)
+                         for key, _, color, _ in spec if key in history)
             if step.size and _set_finite_xlim(ax, step):
                 _step_xaxis(ax)
             ax.legend(fontsize=6.5, frameon=False, loc="best")
             title = f"{title} ({' / '.join(roles)})"
+            if marked:
+                title += "\nx: divergence-spike rows"
         ax.set(xlabel="training step", ylabel=ylabel, title=title)
         fig.tight_layout()
         return _save(fig, path)
@@ -2000,6 +2013,7 @@ def _family_small_multiples(
 
     *,
     max_cols: int = 5,
+    spikes:   Optional[Mapping[str, object]] = None,   # {step, key: [...]} of divergence-spike rows
 ) -> object:
     r"""One small log-y panel per live parameter group of ``prefix``, grouped by family, no legends.
 
@@ -2022,6 +2036,7 @@ def _family_small_multiples(
         fig, axes = plt.subplots(len(rows), ncols, squeeze=False, sharex=True, sharey=True,
                                  figsize=(MAX_FIGURE_WIDTH_IN, 1.6 * len(rows) + 0.5))
         title_pt = float(plt.rcParams["axes.titlesize"])
+        marked = 0
         for r, (header, groups, color) in enumerate(rows):
             for c in range(ncols):
                 ax = axes[r][c]
@@ -2037,6 +2052,7 @@ def _family_small_multiples(
                 else:
                     ax.plot(x, vv, "o-", ms=2.0, lw=1.0, color=color)
                 ax.set_yscale("log")
+                marked += _overlay_spike_markers(ax, spikes, f"{prefix}{groups[c]}", color, logy=True)
                 ax.set_title(_GROUP_LABELS[groups[c]])
                 ax.tick_params(labelbottom=True, labelleft=c == 0)
                 if c == 0:
@@ -2052,7 +2068,7 @@ def _family_small_multiples(
             first.xaxis.set_major_locator(MaxNLocator(nbins=3, integer=True, steps=[1, 2, 2.5, 5, 10]))
             first.xaxis.set_major_formatter(FuncFormatter(_kstep))
         _tidy_log_axis(first.yaxis)                                  # final tick labels before layout
-        fig.suptitle(suptitle)
+        fig.suptitle(f"{suptitle} (x: divergence-spike rows)" if marked else suptitle)
         fig.supxlabel("training step", fontsize=float(plt.rcParams["axes.labelsize"]))
         fig.tight_layout()
         return _save(fig, path)
@@ -2063,6 +2079,7 @@ def plot_grad_norm_decomposition(
     history: Dict,                       # step + grad_norm_group_<g> and/or legacy grad_norm_mu/_sigma/_phi
 
     *,
+    spikes:  Optional[Mapping[str, object]] = None,   # the same columns over divergence-spike rows
     path:    Optional[str] = None,
 ):
     r"""M-STEP pre-clip parameter-gradient L2 norms over training, by named parameter group.
@@ -2075,12 +2092,12 @@ def plot_grad_norm_decomposition(
     role aggregates: the 'mu' role holds every parameter outside the Sigma and phi tables (decode,
     MLPs, relational maps, normalization), so it is not a mu-table gradient. Captured after
     ``unscale_`` and before clipping in ``train_step``; the E-step analogue is
-    ``estep_grad_norm_decomposition``.
+    ``estep_grad_norm_decomposition``. Divergence-spike rows (``spikes``) are crosses, not line points.
     """
     if any(_live(history, f"grad_norm_group_{group}") for group in PARAMETER_GROUPS):
         return _family_small_multiples(
             history, "grad_norm_group_", r"pre-clip $\|\nabla L\|_2$",
-            "M-step gradient norm by parameter group", path)
+            "M-step gradient norm by parameter group", path, spikes=spikes)
     spec = [
         ("grad_norm_mu",    _ROLE_LABELS["mu"],    _CB[0], "mu"),
         ("grad_norm_sigma", _ROLE_LABELS["sigma"], _CB[1], "sigma"),
@@ -2088,7 +2105,7 @@ def plot_grad_norm_decomposition(
     ]
     return _grad_norm_decomp_fig(
         history, spec, "M-step gradient norm by optimizer role",
-        r"pre-clip $\|\nabla_\theta L\|_2$ (per role)", path)
+        r"pre-clip $\|\nabla_\theta L\|_2$ (per role)", path, spikes=spikes)
 
 
 @register_figure("estep_grad_norm_decomposition")
@@ -2400,6 +2417,48 @@ def plot_phi_numerics_reference(
 # optimizer geometry). Shared helpers below; one registered figure per family.
 # ---------------------------------------------------------------------------
 
+SPIKE_MARKER_NOTE = "x: divergence-spike rows, drawn as markers and left out of the lines"
+
+
+def _overlay_spike_markers(
+    ax:     object,
+    spikes: Optional[Mapping[str, object]],   # {step, key: [...]} over the divergence-spike rows
+    key:    str,
+    color:  str,
+
+    *,
+    logy:   bool = False,
+) -> int:
+    r"""Draw the spike rows' ``key`` values as crosses on ``ax`` and widen the y range to show them.
+
+    Spike rows are forced between the log and eval rows by a reported divergence spike
+    (:mod:`vfe3.metrics_schema`); the readers leave them out of every line and rolling mean, and
+    this overlays them as markers instead. Returns the number of markers drawn.
+    """
+    if not spikes or key not in spikes or "step" not in spikes:
+        return 0
+    x = _np(spikes["step"]).astype(float).reshape(-1)
+    v = _np(spikes[key]).astype(float).reshape(-1)
+    keep = np.isfinite(x) & np.isfinite(v)
+    if logy:
+        keep &= v > 0
+    if not keep.any():
+        return 0
+    x, v = x[keep], v[keep]
+    lo, hi = ax.get_ylim()
+    ax.plot(x, v, ls="none", marker="x", ms=3.5, mew=0.9, color=color, zorder=6)
+    vmin, vmax = float(v.min()), float(v.max())
+    if logy:
+        new_lo = min(lo, vmin / 1.3) if lo > 0 else vmin / 1.3
+        new_hi = max(hi, vmax * 1.3)
+    else:
+        span = max(hi - lo, abs(vmax - vmin), 1e-12)
+        new_lo = min(lo, vmin - 0.05 * span)
+        new_hi = max(hi, vmax + 0.05 * span)
+    ax.set_ylim(new_lo, new_hi)
+    return int(v.size)
+
+
 def _series_panel(
     ax,
     history: Dict,
@@ -2641,6 +2700,7 @@ def _history_dashboard(
     ncols:    int           = 3,
     note:     Optional[str] = None,      # one-line figure footnote (e.g. what a legend role holds)
     labels:   str           = "legend",  # "legend" (in-axes legend) | "direct" (line-end labels)
+    spikes:   Optional[Mapping[str, object]] = None,   # {step, key: [...]} of divergence-spike rows
 ) -> object:
     r"""Small-multiples dashboard over training history: one mini-panel per group of commensurate
     columns. A panel whose every column is absent or all-NaN is dropped (so a run missing a metric
@@ -2651,7 +2711,9 @@ def _history_dashboard(
     A panel may carry its own ``"data"`` history (``{step, key: [...]}``) and ``"xlabel"``; it then
     plots against that step axis instead of the shared one (an eval-cadence long-format table next
     to log-cadence columns). ``labels="direct"`` names each line at its right end instead of drawing
-    a legend (:func:`_labeled_series_panel`), for panels of several series that a legend would cover."""
+    a legend (:func:`_labeled_series_panel`), for panels of several series that a legend would cover.
+    ``spikes`` (the same columns over the divergence-spike rows) is overlaid as crosses on the panels
+    that plot against the shared step axis (:func:`_overlay_spike_markers`)."""
     if labels not in ("legend", "direct"):
         raise ValueError(f"labels must be 'legend' or 'direct', got {labels!r}")
     live = []
@@ -2671,12 +2733,16 @@ def _history_dashboard(
         nrows = (len(live) + ncols - 1) // ncols
         width = MAX_FIGURE_WIDTH_IN if ncols > 1 else MAX_FIGURE_WIDTH_IN / 2.0
         fig, axes = plt.subplots(nrows, ncols, figsize=(width, 2.3 * nrows + 0.35), squeeze=False)
+        marked = 0
         for i, p in enumerate(live):
             ax = axes[i // ncols][i % ncols]
             source = p.get("data", history)
             panel_step = _np(source["step"]).astype(float)
             draw = _labeled_series_panel if labels == "direct" else _series_panel
             draw(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)))
+            if "data" not in p:
+                for key, _, color in p["series"]:
+                    marked += _overlay_spike_markers(ax, spikes, key, color, logy=bool(p.get("logy", False)))
             ax.set(xlabel=p.get("xlabel", "training step"), ylabel=p["ylabel"], title=p["title"])
             if panel_step.size and _set_finite_xlim(ax, panel_step):
                 _step_xaxis(ax)
@@ -2686,6 +2752,8 @@ def _history_dashboard(
         # Direct labels sit in a gutter right of each panel: keep a clear gap before the next
         # column's y label.
         w_pad = 1.8 if labels == "direct" else None
+        if marked:
+            note = SPIKE_MARKER_NOTE if not note else f"{note}; {SPIKE_MARKER_NOTE}"
         if note:
             fig.text(0.01, 0.005, note, fontsize=6, color="#444444", ha="left", va="bottom",
                      wrap=True)
@@ -3076,6 +3144,7 @@ def plot_optimizer_geometry(
     history: Dict,                       # step + per-group norms / update ratios, sigma_log moments, legacy role norms
 
     *,
+    spikes:  Optional[Mapping[str, object]] = None,   # the same columns over divergence-spike rows
     path:    Optional[str] = None,
 ):
     r"""Optimizer geometry over training: parameter norms and update scales by parameter group.
@@ -3161,7 +3230,7 @@ def plot_optimizer_geometry(
     title = ("Optimizer geometry with pullback-group phi update" if pullback
              else "Optimizer geometry")
     return _history_dashboard(hist, panels, title, path, ncols=2,
-                              note=None if grouped else _ROLE_NOTE, labels="direct")
+                              note=None if grouped else _ROLE_NOTE, labels="direct", spikes=spikes)
 
 
 # ---------------------------------------------------------------------------

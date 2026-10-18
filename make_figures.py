@@ -146,9 +146,15 @@ def _generate_figures_isolated(
     n_e_steps:     Optional[int],
     generate_embedding_figures: bool,
 ) -> List[Path]:
-    r"""Run the entire report stack in a disposable child and validate its published outputs."""
+    r"""Run the entire report stack in a disposable child and validate its published outputs.
+
+    ``run_dir`` is resolved to an absolute path first: the child runs with the repository root as its
+    working directory, so a relative path would resolve there, and the worker's ownership check of the
+    result file would fail whenever this process was launched elsewhere (audit 2026-10-17 item 67).
+    """
     if type(generate_embedding_figures) is not bool:
         raise TypeError("generate_embedding_figures must be bool")
+    run_dir = Path(run_dir).resolve()
     with _unique_sibling_temp(run_dir / "figure_request.json") as request_path:
         with _unique_sibling_temp(run_dir / "figure_result.json") as result_path:
             request_path.write_text(json.dumps({

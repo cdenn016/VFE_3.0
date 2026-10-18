@@ -44,7 +44,9 @@ from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from numbers import Real
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, Union,
+)
 
 import torch
 
@@ -66,6 +68,7 @@ from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
     get_block_mlp_registration,
 )
+from vfe3.metrics_schema import normalize_metric_row, split_spike_rows
 from vfe3.process_utils import run_process_tree
 from vfe3.runtime import deterministic_state, ieee_fp32_matmul
 
@@ -2085,17 +2088,24 @@ class RunArtifacts:
             raise ValueError(f"artifact name must be a regular bare filename, got {name!r}")
         return _write_json_atomic(self.run_dir / name, obj)
 
-    def log_metrics(self, row: Dict[str, float]) -> None:
+    def log_metrics(self, row: Mapping[str, object]) -> None:
         r"""Atomically publish ``metrics.csv`` with one additional rectangular row.
 
         The column set is fixed by the first row; later rows must share those keys so the CSV
         stays rectangular (the training loop emits a homogeneous row each periodic eval).
+
+        Every cell first passes :func:`vfe3.metrics_schema.normalize_metric_cell` (audit 2026-10-17
+        item 31): one-element tensors and NumPy scalars become Python numbers, a bool becomes 0 or 1,
+        ``None`` becomes NaN, and a string in a column the schema declares numeric, a multi-element
+        array or any other object raises ``TypeError`` before anything is written. The file and the
+        in-memory history hold the same normalized values.
 
         NaN cells are written to the file as BLANK (empty string), so an eval-cadence column
         (val_*, generalization_gap, the held-out probes) -- NaN on the denser log-interval rows
         between evals -- shows an empty cell rather than a repeated value or a literal "nan".
         The IN-MEMORY ``self.history`` keeps the raw NaN float so
         the figure pass (which filters on ``math.isfinite``) is unaffected."""
+        row = normalize_metric_row(row)
         fieldnames = list(row) if self._fieldnames is None else list(self._fieldnames)
         if set(row) != set(fieldnames):
             missing = sorted(set(fieldnames) - set(row))
@@ -3941,8 +3951,9 @@ def _resources_record(
     :func:`vfe3.train.train` after the last step. ``peak_gpu_memory_mb`` is the maximum of the
     per-log-window ``peak_mem_mb`` column (train() resets the allocator peak at every log row) and
     the allocator peak since the last reset. Throughput quantiles are over the logged windows of
-    ``tokens_per_s`` (pipeline, includes data loading) and ``train_step_tokens_per_s``; the
-    windows that contain an evaluation are included, so the pipeline quantiles bracket both.
+    ``tokens_per_s`` (pipeline, includes data loading) and ``train_step_tokens_per_s`` on the log and
+    eval rows; the windows that contain an evaluation are included, so the pipeline quantiles bracket
+    both, and divergence-spike rows (:mod:`vfe3.metrics_schema`) are left out.
     """
     record: Dict[str, object] = {
         "device_name": (torch.cuda.get_device_name(device) if device.type == "cuda"
@@ -3967,8 +3978,11 @@ def _resources_record(
     if device.type == "cuda":
         peaks.append(torch.cuda.max_memory_allocated(device) / 1e6)
     record["peak_gpu_memory_mb"] = max(peaks) if peaks else None
+    # Divergence-spike rows close a short pipeline window around one anomalous step; their throughput is not
+    # a sample of the regular windows, so the quantiles read the log and eval rows only (audit 2026-10-17 item 5).
+    regular, _ = split_spike_rows(history, cfg=cfg)
     record["throughput_tokens_per_s"] = {
-        column: _quantile_summary([row.get(column) for row in history])
+        column: _quantile_summary([row.get(column) for row in regular])
         for column in ("tokens_per_s", "train_step_tokens_per_s")
     }
     seen = [row.get("tokens_seen") for row in history
@@ -5387,8 +5401,28 @@ def _pure_path_report(
     }
 
 
+# A metrics.csv cell as the figure pass sees it: a number, or text such as row_kind or relational_semantics.
+HistoryValue = Union[float, int, str]
+
+
+class FigureArtifacts(Protocol):
+    r"""What :func:`_save_figures` reads from its artifacts: a :class:`RunArtifacts` during training, or the
+    ``SimpleNamespace(run_dir, cfg, history)`` the figure worker rebuilds from ``metrics.csv`` (whose ``cfg``
+    can itself be a namespace of raw saved values)."""
+
+    run_dir: Path
+    cfg:     object
+    history: List[Dict[str, HistoryValue]]
+
+
+def _finite_cell(value: object) -> bool:
+    r"""Whether a history cell is a finite real number (not a bool, a text cell or a blank NaN)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def _save_figures(
-    artifacts: RunArtifacts,
+    artifacts: FigureArtifacts,
     losses:    Optional[List[float]],
     logger:    logging.Logger,
 
@@ -5417,10 +5451,13 @@ def _save_figures(
         class _IsolatedFigures:
             r"""Proxy plot calls so one failed renderer cannot abort or leak into the next one."""
 
+            def __init__(self, module: object = raw_figs) -> None:
+                self._module = module
+
             def __getattr__(self, name: str) -> object:
                 if name == "plt":
                     return _SafePyplot()
-                value = getattr(raw_figs, name)
+                value = getattr(self._module, name)
                 if not name.startswith("plot_") or not callable(value):
                     return value
 
@@ -5445,6 +5482,9 @@ def _save_figures(
                     except Exception as exc:
                         for number in set(raw_figs.plt.get_fignums()) - before:
                             raw_figs.plt.close(number)
+                        if isinstance(exc, raw_figs.FigureSkipped):
+                            logger.info("figure %s skipped (%s)", name, exc)
+                            return None
                         logger.warning("figure %s failed (%s); remaining figures continue", name, exc)
                         return None
 
@@ -5461,31 +5501,43 @@ def _save_figures(
         for name, reason in route_skips.items():            # route-trivial: fixed by the config, not news
             logger.debug("figure %s skipped (%s)", name, reason)
 
-        def _aligned(key: str) -> tuple:
-            r"""Aligned (step, value) for a history column, dropping pre-first-eval NaN rows."""
-            xs, ys = [], []
-            for i, r in enumerate(artifacts.history):
-                if key in r and math.isfinite(r[key]):
-                    xs.append(r.get("step", i))
-                    ys.append(r[key])
+        # Divergence-spike rows are forced between the log and eval rows (vfe3.metrics_schema): every
+        # trend below reads the regular rows only, and the gradient-norm, optimizer-geometry and numerics
+        # figures overlay the spike rows as markers (audit 2026-10-17 item 5).
+        history, spike_rows = split_spike_rows(artifacts.history, cfg=getattr(artifacts, "cfg", None))
+
+        def _aligned(key: str) -> Tuple[List[float], List[float]]:
+            r"""Aligned (step, value) for a history column over the regular rows, dropping rows where it is
+            not a finite number (pre-first-eval NaN, a blank or a text cell)."""
+            xs: List[float] = []
+            ys: List[float] = []
+            for i, r in enumerate(history):
+                if _finite_cell(r.get(key)):
+                    xs.append(float(r.get("step", i)))
+                    ys.append(float(r[key]))
             return xs, ys
 
-        def _hist_subset(keys: tuple) -> Optional[Dict]:
-            r"""A ``{step, key: [...]}`` history dict over ``keys`` present (finite on >= 1 row), each a
+        def _subset(rows: Sequence[Mapping[str, HistoryValue]], keys: Sequence[str]) -> Optional[Dict]:
+            r"""A ``{step, key: [...]}`` dict over the ``keys`` finite on at least one of ``rows``, each a
             full-length column with NaN where missing so an eval-cadence key keeps its step alignment and
-            the dashboard masks it per series. Returns None when no key is present (caller skips)."""
-            present = [k for k in keys
-                       if any(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k])
-                              for r in artifacts.history)]
+            the dashboard masks it per series. None when no key is present (caller skips)."""
+            present = [k for k in keys if any(_finite_cell(r.get(k)) for r in rows)]
             if not present:
                 return None
-            cols: Dict = {"step": [r.get("step", i) for i, r in enumerate(artifacts.history)]}
+            cols: Dict = {"step": [r.get("step", i) for i, r in enumerate(rows)]}
             for k in present:
-                cols[k] = [float(r[k]) if (k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]))
-                           else float("nan") for r in artifacts.history]
+                cols[k] = [float(r[k]) if _finite_cell(r.get(k)) else float("nan") for r in rows]
             return cols
 
-        readout_keys = tuple({key for row in artifacts.history for key in row
+        def _hist_subset(keys: tuple) -> Optional[Dict]:
+            r""":func:`_subset` over the regular (non-spike) history rows."""
+            return _subset(history, keys)
+
+        def _spike_subset(keys: tuple) -> Optional[Dict]:
+            r""":func:`_subset` over the divergence-spike rows, for the marker overlays."""
+            return _subset(spike_rows, keys) if spike_rows else None
+
+        readout_keys = tuple({key for row in history for key in row
                               if key.startswith("relational_")})
         if readout_keys:
             # The canonical-F panels read the diagnose_canonical_free_energy columns (NaN otherwise, so
@@ -5524,7 +5576,7 @@ def _save_figures(
             steps_per_epoch = next(
                 (
                     int(r["steps_per_epoch"])
-                    for r in artifacts.history
+                    for r in history
                     if isinstance(r.get("steps_per_epoch"), (int, float))
                     and math.isfinite(float(r["steps_per_epoch"]))
                     and int(r["steps_per_epoch"]) > 0
@@ -5557,9 +5609,11 @@ def _save_figures(
         # norm, belief-covariance conditioning, and the per-eval E-step endpoint delta.
         nx, ny = _aligned("grad_norm")
         if ny:
+            spike_norm = _spike_subset(("grad_norm",))
             fig = figs.plot_trajectory(
                 ny, nx, ylabel=r"$\|\nabla\|_2$ (pre-clip)", title="Gradient norm",
                 color=figs._CB[5 % len(figs._CB)], logy=True, smooth=max(5, len(ny) // 80),
+                markers=((spike_norm["step"], spike_norm["grad_norm"]) if spike_norm else None),
                 path=str(run / "grad_norm.png"))
             figs.plt.close(fig)
         # M-step per-role gradient-norm decomposition (mu / sigma / phi): the parameter-learning
@@ -5570,7 +5624,9 @@ def _save_figures(
         # Per-named-group columns when logged (NaN-padded per series), else the legacy role columns.
         hist_gd = _hist_subset(raw_figs.GRAD_NORM_DECOMPOSITION_COLUMNS)
         if hist_gd:
-            fig = figs.plot_grad_norm_decomposition(hist_gd, path=str(run / "grad_norm_decomposition.png"))
+            fig = figs.plot_grad_norm_decomposition(
+                hist_gd, spikes=_spike_subset(raw_figs.GRAD_NORM_DECOMPOSITION_COLUMNS),
+                path=str(run / "grad_norm_decomposition.png"))
             figs.plt.close(fig)
         # E-step belief-gradient decomposition (mu / sigma / phi): the INFERENCE analogue of the M-step
         # figure above -- ||grad F|| over the belief tuple per inner-loop component, logged by train_step
@@ -5583,13 +5639,13 @@ def _save_figures(
             "estep_grad_norm_phi_microbatch_mean",
         )
         eg_keys = (eg_mean_keys if any(any(k in r for k in eg_mean_keys)
-                                      for r in artifacts.history)
+                                      for r in history)
                    else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
         eg_present = [k for k in eg_keys
-                      if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
+                      if any(_finite_cell(r.get(k)) for r in history)]
         if eg_present and "estep_grad_norm_decomposition" not in route_skips:
-            eg_rows = [r for r in artifacts.history
-                       if all(k in r and math.isfinite(r[k]) for k in eg_present)]
+            eg_rows = [r for r in history
+                       if all(_finite_cell(r.get(k)) for k in eg_present)]
             if eg_rows:
                 hist_eg = {"step": [r.get("step", i) for i, r in enumerate(eg_rows)],
                            **{k: [r[k] for r in eg_rows] for k in eg_present}}
@@ -5618,8 +5674,7 @@ def _save_figures(
 
         def _finite_rows(keys: tuple) -> List[Dict]:
             r"""History rows on which every column of ``keys`` is a finite number."""
-            return [r for r in artifacts.history
-                    if all(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]) for k in keys)]
+            return [r for r in history if all(_finite_cell(r.get(k)) for k in keys)]
 
         def _canonical_rows(rows: List[Dict]) -> bool:
             # On the projected routes the F columns are finite only under diagnose_canonical_free_energy, which
@@ -5702,7 +5757,23 @@ def _save_figures(
         # accepted factor scale/chart health, per-role weight norms, and gradient-to-weight ratio.
         hist_opt = _hist_subset(raw_figs.OPTIMIZER_GEOMETRY_COLUMNS)
         if hist_opt:
-            fig = figs.plot_optimizer_geometry(hist_opt, path=str(run / "optimizer_geometry.png"))
+            fig = figs.plot_optimizer_geometry(
+                hist_opt, spikes=_spike_subset(raw_figs.OPTIMIZER_GEOMETRY_COLUMNS),
+                path=str(run / "optimizer_geometry.png"))
+            figs.plt.close(fig)
+        # Numerics counters, the decode variance margin and the per-layer block variances (audit 2026-10-17
+        # item 64). Each is drawn only when its inputs exist, so older runs skip both without a warning.
+        from vfe3.viz import diagnostic_figures as raw_diag
+        diag = _IsolatedFigures(raw_diag)
+        hist_num = _hist_subset(raw_diag.NUMERICS_PANEL_COLUMNS)
+        if hist_num:
+            fig = diag.plot_numerics_history(
+                hist_num, spikes=_spike_subset(raw_diag.NUMERICS_PANEL_COLUMNS),
+                path=str(run / "numerics_history.png"))
+            figs.plt.close(fig)
+        block_variance = raw_diag.read_block_variance(run / "diagnostics" / "block_variance.csv")
+        if block_variance is not None:
+            fig = diag.plot_block_variance_history(block_variance, path=str(run / "block_variance_history.png"))
             figs.plt.close(fig)
     except Exception as exc:                                    # never let a plot kill a finished run
         logger.warning("figure generation failed (%s); numeric results are still saved", exc)

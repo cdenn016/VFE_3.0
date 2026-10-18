@@ -42,6 +42,16 @@ COUNTER_PAIRS: Tuple[Tuple[str, str, str, str], ...] = (
     ("frame_projection_count", "frame_projection_total", "frame-generator projections", "cumulative"),
     ("skipped_updates", "attempted_updates", "skipped updates", "cumulative"),
 )
+# Cumulative numerics counters with no denominator column (audit 2026-10-17 item 64): (count column, label).
+# Each counts tokens, entries or slices since step 0 over every forward, diagnostic and evaluation passes
+# included, so no logged column is its denominator; panel D draws them as counts, not fractions.
+COUNTER_TOTALS: Tuple[Tuple[str, str], ...] = (
+    ("layernorm_trace_cap_elements", "LayerNorm trace-cap tokens"),
+    ("covariance_ceiling_elements", "covariance-ceiling entries"),
+    ("covariance_escalation_elements", "float64 covariance recomputes"),
+    ("gemm_fallback_slices", "pair-KL GEMM fallback slices"),
+    ("source_recovery_elements", "source-factor recoveries"),
+)
 
 
 class FigureSkipped(RuntimeError):
@@ -597,6 +607,16 @@ def _counter_panel(run: RunRecord) -> Dict[str, Any]:
                                "source": f"metrics.csv {count_col}/{denom_col}"})
                 continue
         absent.append(f"{count_col}/{denom_col}")
+    totals = []
+    for count_col, label in COUNTER_TOTALS:
+        count = metrics.get(count_col)
+        if step is not None and count is not None:
+            rows = np.isfinite(step) & np.isfinite(count)
+            if rows.any():
+                totals.append({"label": label, "step": step[rows], "count": count[rows],
+                               "source": f"metrics.csv {count_col}"})
+                continue
+        absent.append(count_col)
     endpoints = []
     if "metrics.csv skipped_updates/attempted_updates" not in {s["source"] for s in series}:
         skipped, attempted = run.summary.get("skipped_steps"), run.summary.get("attempted_steps")
@@ -612,10 +632,10 @@ def _counter_panel(run: RunRecord) -> Dict[str, Any]:
                               "count": int(sum(int(r.get("n_capped", 0)) for r in scored)),
                               "denominator": int(sum(int(r.get("n_entries", 0)) for r in scored)),
                               "source": "posthoc.json klcap validation (scored population)"})
-    if not series and not endpoints:
+    if not series and not endpoints and not totals:
         return {"status": "skipped", "reason": "no counter columns (" + ", ".join(absent) + ") and no "
                                                "recorded endpoint counts"}
-    return {"status": "ok", "series": series, "endpoints": endpoints, "absent": absent}
+    return {"status": "ok", "series": series, "endpoints": endpoints, "totals": totals, "absent": absent}
 
 
 def numerics_data(run: RunRecord) -> Dict[str, Any]:
@@ -769,7 +789,21 @@ def plot_numerics(run: RunRecord, out_dir: Path, *, stem: str = "s1_numerics") -
             ax.set_title("Event counters")
             _step_axis(ax, figs, last_step)
             ax.legend(frameon=False, loc="upper left")
-        draw.append(("D", draw_d))
+        if d["series"] or d["endpoints"]:
+            draw.append(("D", draw_d))
+
+        def draw_d_totals(ax: Any) -> None:
+            for i, s in enumerate(d["totals"]):
+                ax.plot(s["step"], s["count"], marker="o", ms=1.8, lw=0.9, color=figs._CB[i % len(figs._CB)],
+                        label=f"{s['label']}\n{int(s['count'][-1]):,}")
+            ax.set_yscale("symlog", linthresh=1.0)
+            ax.set_ylim(bottom=0.0)
+            ax.set_ylabel("count since step 0")
+            ax.set_title("Cumulative numerics events")
+            _step_axis(ax, figs, last_step)
+            ax.legend(frameon=False, loc="upper left")
+        if d.get("totals"):
+            draw.append(("" if d["series"] or d["endpoints"] else "D", draw_d_totals))
 
     record: Dict[str, Any] = {"run_dir": str(run.run_dir), "panels": _strip_arrays(data)}
     if not draw:

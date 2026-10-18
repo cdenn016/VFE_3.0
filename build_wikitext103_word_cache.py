@@ -144,31 +144,34 @@ def _count_split_tokens(split: str, *, eos: bool = False) -> "tuple[int, int, in
     return n_rows, n_tokens, n_chars, counts
 
 
-def _encode_split(split: str, vocabulary: WordVocabulary) -> np.ndarray:
-    r"""Encode ``split`` into one flat int64 array, shard by shard (rows end in ``<eos>`` when the
-    vocabulary is an ``<eos>`` vocabulary).
+def _encode_split(split: str, vocabulary: WordVocabulary) -> "tuple[np.ndarray, int, int]":
+    r"""Encode ``split`` into one flat int64 array in a single pass, shard by shard (rows end in
+    ``<eos>`` when the vocabulary is an ``<eos>`` vocabulary).
 
-    Each parquet object becomes its own array, concatenated at the end, so nothing holds more than
-    one shard's rows plus the finished stream.
+    Returns ``(ids, n_rows, n_chars)``. Each row is tokenized once and its ids appended to the shard's
+    int64 buffer, so the shard's rows are read and tokenized once (the former sizing pass tokenized
+    every row twice; audit 2026-10-17 item 79). Each parquet object becomes its own array,
+    concatenated at the end, so nothing holds more than one shard's rows plus the finished stream.
     """
+    from array import array
+
     eos = vocabulary.eos
     shards = []
+    n_rows = n_chars = 0
     for file_name in SPLIT_FILES[split]:
         rows = _read_rows(file_name)
-        n_tokens = sum(len(tokenize_row(row, eos=eos)) for row in rows)
-        out = np.empty(n_tokens, dtype=np.int64)
-        cursor = 0
+        n_rows += len(rows)
+        buffer = array("q")
         for row in rows:
+            n_chars += len(row)
             tokens = tokenize_row(row, eos=eos)
             if tokens:
-                ids = vocabulary.encode(tokens)
-                out[cursor:cursor + len(ids)] = ids
-                cursor += len(ids)
-        if cursor != n_tokens:
-            raise AssertionError(f"encoded {cursor} ids but sized the array for {n_tokens}")
-        shards.append(out)
-        del rows
-    return shards[0] if len(shards) == 1 else np.concatenate(shards)
+                buffer.extend(vocabulary.encode(tokens))
+        # A writable zero-copy view: the array keeps the buffer alive after the name is dropped.
+        shards.append(np.frombuffer(buffer, dtype=np.int64) if len(buffer) else np.empty(0, dtype=np.int64))
+        del rows, buffer
+    ids = shards[0] if len(shards) == 1 else np.concatenate(shards)
+    return ids, n_rows, n_chars
 
 
 def _atomic_publish(target: Path, write: Callable[[Path], None]) -> None:
@@ -211,6 +214,9 @@ def build(
 
     print(f"[1/3] counting training tokens (dataset={dataset}, min_count={min_count}) ...", flush=True)
     n_train_rows, n_train_tokens, n_train_chars, counts = _count_split_tokens("train", eos=eos)
+    # (rows, tokens, characters) of each split counted so far: the encode pass checks against them instead of
+    # recounting (the training split was tokenized four times before; audit 2026-10-17 item 79).
+    split_counts: Dict[str, Tuple[int, int, int]] = {"train": (n_train_rows, n_train_tokens, n_train_chars)}
     print(f"      train rows={n_train_rows:,} tokens={n_train_tokens:,} "
           f"chars={n_train_chars:,} types={len(counts):,}", flush=True)
 
@@ -229,7 +235,8 @@ def build(
         measured = {"train": n_train_tokens}
         for split in SPLIT_FILES:
             if split != "train":
-                measured[split] = _count_split_tokens(split, eos=True)[1]
+                split_counts[split] = _count_split_tokens(split, eos=True)[:3]
+                measured[split] = split_counts[split][1]
         wrong = {split: (measured[split], REFERENCE_N_TOKENS_EOS[split]) for split in measured
                  if measured[split] != REFERENCE_N_TOKENS_EOS.get(split)}
         if wrong:
@@ -259,10 +266,13 @@ def build(
     for split in SPLIT_FILES:
         target = targets[split]
         meta_target = Path(str(target) + ".meta.json")
-        n_rows, n_tokens, n_chars_source, _counts = _count_split_tokens(split, eos=eos)
-        ids = _encode_split(split, vocabulary)
-        if ids.size != n_tokens:
-            raise AssertionError(f"{split}: encoded {ids.size} ids but counted {n_tokens}")
+        ids, n_rows, n_chars_source = _encode_split(split, vocabulary)
+        if split in split_counts:
+            counted_rows, counted_tokens, counted_chars = split_counts[split]
+            if (ids.size, n_rows, n_chars_source) != (counted_tokens, counted_rows, counted_chars):
+                raise AssertionError(
+                    f"{split}: encoded {ids.size} ids over {n_rows} rows and {n_chars_source} characters but "
+                    f"counted {counted_tokens} tokens over {counted_rows} rows and {counted_chars} characters")
         meta = {
             "schema_version": 1,
             "dataset_id": DATASET_ID,
