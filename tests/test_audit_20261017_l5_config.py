@@ -129,7 +129,7 @@ _TRAIN_LOOP = {"log_interval", "eval_interval", "checkpoint_interval", "max_step
 _PRECISION = {"deterministic", "fp32_matmul_precision", "amp_dtype", "decode_av_precision",
               "predictive_covariance_precision", "projected_factorization", "decode_ce_triton", "decode_logits_amp",
               "decode_chunk_size", "relational_tile_mib", "decode_ce_checkpoint", "predictive_covariance_checkpoint",
-              "pair_kl_gemm_tol"}
+              "pair_kl_gemm_tol", "relational_diag_moments_kernel"}
 # Thresholds that act only when crossed (clamps, caps, escalations, trust radii), and the corpus unigram tempering,
 # which the synthetic batches here do not populate.
 _RARE_TRIGGER = {"predictive_covariance_ceiling", "phi_frame_condition_max", "frame_pair_escalation_tol", "kl_max",
