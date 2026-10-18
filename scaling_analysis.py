@@ -113,6 +113,8 @@ _CSV_COLUMNS = [
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
     "best_val_ppl",
+    # realized updates (audit 2026-10-17 item 29): a run with rejected updates trained on another schedule
+    "skipped_steps", "accepted_update_frac", "skipped_updates_flag",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
     "git_sha", "code_identity_forced",
     "cell_git_dirty", "cell_git_dirty_fingerprint",
@@ -481,6 +483,13 @@ def _forced_row_matches_strict_source_anchor(
     )
 
 
+def _skipped_count(value: object) -> int:
+    r"""A recorded ``skipped_steps`` as a non-negative int (0 when absent or not a finite number)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return 0
+    return max(0, int(value))
+
+
 def harvest(
     input_dir: Path,
 
@@ -555,6 +564,9 @@ def harvest(
             "test_bits_per_token": verified["test_bits_per_token"],
             "test_bpc": verified["test_bpc"],
             "best_val_ppl": summ.get("best_val_ppl"),
+            "skipped_steps": summ.get("skipped_steps"),
+            "accepted_update_frac": summ.get("accepted_update_frac"),
+            "skipped_updates_flag": _skipped_count(summ.get("skipped_steps")) > 0,
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
             "data_sha256": prov.get("data_sha256") or prov.get("test_data_sha256"),
             "train_data_sha256": prov.get("train_data_sha256"),
@@ -1537,6 +1549,11 @@ def analyze() -> None:
     print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
     print_design_attempts(_read_json(_design_path(input_dir)))   # audit 2026-10-17 item 28
+    unstable = [row for row in rows if row.get("skipped_updates_flag")]
+    if unstable:                                                  # audit 2026-10-17 item 29
+        print(f"\nWARNING: {len(unstable)} run(s) rejected optimizer updates and trained on another schedule "
+              "than their config: " + ", ".join(f"{row['route']}/{row['label']}/s{row['seed']} "
+                                                f"({row['skipped_steps']} skipped)" for row in unstable))
     if design.get("forced_code_identity_acceptance") is True:
         print(
             "\nWARNING: FORCED CODE-IDENTITY ACCEPTANCE is active for "

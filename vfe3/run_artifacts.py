@@ -5017,6 +5017,11 @@ def finalize_validation_run(
         "n_params":            n_params,
         "terminal_checkpoint": terminal_checkpoint,
         "save_model_artifacts": artifacts.save_model_artifacts,
+        # The realized-update counts, so arms with different skip rates are flagged in every comparison
+        # table, not only in summary.json (audit 2026-10-17 item 29). None without a realized record.
+        "skipped_steps":       dict(getattr(artifacts, "realized_updates", None) or {}).get("skipped_steps"),
+        "accepted_update_frac": dict(getattr(artifacts, "realized_updates", None) or {}).get(
+            "accepted_update_frac"),
     }
 
 

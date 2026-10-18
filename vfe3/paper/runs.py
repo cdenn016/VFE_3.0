@@ -46,7 +46,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 # Config fields excluded from the within-arm homogeneity check: the model seed (the data-order seed is a
 # train_vfe3 argument recorded in provenance.json, not a config field) and the run-cadence fields, which
@@ -228,7 +228,9 @@ def resolve_run_paths(entries: Iterable[Any]) -> Tuple[List[Path], List[str]]:
 
     An entry is a run directory, a glob pattern (every matching run directory), or a multi-seed root
     (its immediate child run directories). Order follows the declaration, then the sorted matches;
-    duplicates are dropped.
+    duplicates are dropped. A plain entry that matches nothing is looked up by its folder name
+    (:func:`find_run_folder`), so a run moved into the archive still resolves; an ambiguous name stays
+    unresolved, with the candidates in its text.
     """
     out: List[Path] = []
     unresolved: List[str] = []
@@ -254,9 +256,84 @@ def resolve_run_paths(entries: Iterable[Any]) -> Tuple[List[Path], List[str]]:
                 for child in children:
                     add(child)
                 matched = matched or bool(children)
+        if not matched and not _GLOB_CHARS.search(text):
+            try:
+                add(find_run_folder(text))
+                matched = True
+            except AmbiguousRunFolder as exc:
+                text = f"{text} ({exc})"
+            except RunFolderNotFound:
+                pass
         if not matched:
             unresolved.append(text)
     return out, unresolved
+
+
+# ----------------------------------------------------------------------------------------------
+# Run folders by name
+# ----------------------------------------------------------------------------------------------
+
+# Where run folders are searched by name when a declared path no longer exists: the repository's run
+# tree and the archive (audit 2026-10-17 item 52). Relative roots resolve against the repository root.
+RUN_SEARCH_ROOTS: Tuple[str, ...] = ("vfe3_runs", "D:/DATA_KEEP")
+RUN_SEARCH_DEPTH: int = 3                   # root/<name>, root/*/<name>, root/*/*/<name>
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class RunFolderNotFound(FileNotFoundError):
+    r"""No run folder of the declared name exists at its path or under :data:`RUN_SEARCH_ROOTS`."""
+
+
+class AmbiguousRunFolder(FileNotFoundError):
+    r"""More than one run folder of the declared name exists under :data:`RUN_SEARCH_ROOTS`."""
+
+
+def find_run_folder(
+    entry: Union[str, Path],
+
+    *,
+    base:  Optional[Union[str, Path]] = None,
+    roots: Optional[Sequence[Union[str, Path]]] = None,
+    depth: int = RUN_SEARCH_DEPTH,
+) -> Path:
+    r"""The run directory ``entry`` names: its path when that is a run directory, else the unique folder
+    of the same name under ``roots``.
+
+    A relative ``entry`` resolves against ``base`` (the repository root by default, where every
+    click-to-run driver lives), never the working directory. When that path is not a run directory
+    (:func:`is_run_dir`), the folder name is searched up to ``depth`` levels below each root of ``roots``
+    (:data:`RUN_SEARCH_ROOTS`; relative roots against ``base``), so a run moved into a dated archive folder
+    is still found. Raises :class:`RunFolderNotFound` when no run folder of that name exists and
+    :class:`AmbiguousRunFolder` when several do (it never chooses between them). Which run a driver names
+    is unchanged; only how the name resolves.
+    """
+    anchor = Path(base) if base is not None else _REPO_ROOT
+    path = Path(entry)
+    direct = path if path.is_absolute() else anchor / path
+    if is_run_dir(direct):
+        return direct
+    name = path.name
+    if not name:
+        raise RunFolderNotFound(f"{entry!r} names no folder")
+    searched: List[str] = []
+    found: Dict[str, Path] = {}
+    for root in (RUN_SEARCH_ROOTS if roots is None else roots):
+        root_path = Path(root) if Path(root).is_absolute() else anchor / Path(root)
+        searched.append(str(root_path))
+        if not root_path.is_dir():
+            continue
+        for level in range(int(depth)):
+            pattern = "/".join(["*"] * level + [glob.escape(name)])
+            for candidate in root_path.glob(pattern):
+                if is_run_dir(candidate):
+                    found.setdefault(str(candidate.resolve()).lower(), candidate)
+    if len(found) == 1:
+        return next(iter(found.values()))
+    if not found:
+        raise RunFolderNotFound(f"{direct} is not a run directory and no run folder named {name!r} exists "
+                                f"under {searched} (depth {depth})")
+    raise AmbiguousRunFolder(f"{len(found)} run folders are named {name!r}: "
+                             f"{sorted(str(p) for p in found.values())}; name one by its full path")
 
 
 def load_config(

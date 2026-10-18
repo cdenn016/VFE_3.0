@@ -653,9 +653,15 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     from vfe3.experiment import saved_train_window_mode
     from vfe3.legacy_config import lenient_config_from_serialized
 
-    run_dir = Path(path)
-    if not run_dir.is_absolute():
-        run_dir = ROOT / run_dir
+    from vfe3.paper.runs import AmbiguousRunFolder, RunFolderNotFound, find_run_folder
+
+    # The entry resolves against this folder, else by its folder name under vfe3_runs and D:/DATA_KEEP
+    # (audit 2026-10-17 item 52); a missing or ambiguous name leaves the base unavailable.
+    try:
+        run_dir = find_run_folder(path, base=ROOT)
+    except (RunFolderNotFound, AmbiguousRunFolder) as exc:
+        raise BaseUnavailableError(f"base {name!r}: {exc} (moved, renamed or deleted; update its BASES "
+                                   "entry)") from exc
     if not (run_dir / "config.json").is_file():
         raise BaseUnavailableError(f"base {name!r}: {run_dir} holds no config.json (moved, renamed or deleted; "
                                    "update its BASES entry)")

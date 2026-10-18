@@ -1786,7 +1786,43 @@ def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
         for value in _sweep_values(sweep):
             overrides = {**requires, param: value}
             runs.append((f"{param}={value}", overrides))
-    return runs
+    return _with_base_cell(sweep_name, sweep, runs)
+
+
+# The label of the cell added to a sweep that has no cell at its own base settings (audit 2026-10-17 item 59).
+SHARED_BASELINE_LABEL = "baseline"
+
+
+def _with_base_cell(
+    sweep_name: str,
+    sweep:      Mapping[str, Any],
+    runs:       List[Tuple[str, Dict[str, Any]]],
+) -> List[Tuple[str, Dict[str, Any]]]:
+    r"""``runs`` with a cell at the sweep's base settings appended when no cell sits there.
+
+    The base is ``BASELINE_CONFIG`` with the sweep's ``requires`` (:func:`_sweep_base_settings`); the added
+    cell (overrides ``requires``; for a ``param`` sweep also the swept field at its base value, labeled
+    ``param=value`` like the other cells, else :data:`SHARED_BASELINE_LABEL`) is the reference of the
+    sweep's paired differences. For a sweep without ``requires`` it is the shared baseline cell, which :func:`run_sweep`
+    reuses from any other sweep of the cohort that already trained it, so it costs no extra run. Not added
+    to a sweep that declares ``forest_baseline_label``, a scheduled (``schedule_seed``) or learning-rate
+    transfer sweep, or one that sets ``include_baseline`` False.
+    """
+    if (sweep.get("include_baseline", True) is False or sweep.get("forest_baseline_label")
+            or "schedule_seed" in sweep or sweep_name == _LR_WIDTH_TRANSFER_SWEEP):
+        return runs
+    base = _sweep_base_settings(sweep)
+    if any(all(_same_setting(base.get(key, _NO_SETTING), value) for key, value in overrides.items())
+           for _label, overrides in runs):
+        return runs
+    overrides = dict(sweep.get("requires", {}) or {})
+    label = SHARED_BASELINE_LABEL
+    if "param" in sweep:                 # the swept field at its base value, labeled as the other cells are
+        overrides[sweep["param"]] = base.get(sweep["param"])
+        label = f"{sweep['param']}={overrides[sweep['param']]}"
+    if any(existing == label for existing, _overrides in runs):
+        return runs
+    return [*runs, (label, overrides)]
 
 
 def _require_gauge_covariant(cfg: VFE3Config) -> None:
@@ -2351,6 +2387,8 @@ _CSV_COLUMNS = [
     "final_val_ce", "final_val_bits_per_token", "final_val_bpc", "best_val_ppl", "final_train_loss",
     "n_params", "target_n_params", "param_difference", "param_relative_deviation",
     "n_steps", "max_steps", "stop_after_steps",
+    # realized updates (audit 2026-10-17 item 29): a cell with rejected updates trained on another schedule
+    "skipped_steps", "accepted_update_frac", "skipped_updates_flag",
     "block_mlp_structural_mode", "block_mlp_covariance_contract",
     "block_mlp_intertwiner_compatible", "on_gauge_pure_path", "on_causal_lm_path",
     "transport_exactness_status", "on_theory_pure_path",
@@ -3455,8 +3493,19 @@ def _write_sweep_csv(sweep_dir: Path, results: List[Dict[str, Any]]) -> None:
             writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             for result in results:
-                writer.writerow({key: result.get(key, "") for key in _CSV_COLUMNS})
+                row = {key: result.get(key, "") for key in _CSV_COLUMNS}
+                row["skipped_updates_flag"] = _skipped_updates(result) > 0
+                writer.writerow(row)
         _atomic_replace(final_path, temporary_path)
+
+
+def _skipped_updates(row: Mapping[str, Any]) -> int:
+    r"""The rejected optimizer updates a cell recorded (``skipped_steps``; 0 when absent or unreadable)."""
+    try:
+        value = float(row.get("skipped_steps"))                # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return int(value) if math.isfinite(value) and value > 0 else 0
 
 
 def _collect_sweep_results(
@@ -3937,6 +3986,102 @@ def _print_cell_attempts(summary: Mapping[str, Mapping[str, Any]]) -> None:
               + (f"; {kinds}" if kinds else ""))
 
 
+def _link_or_copy(source: str, target: str) -> str:
+    r"""Hard-link ``source`` to ``target`` (no extra disk on one volume), else copy it."""
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+    return target
+
+
+def _cohort_duplicate_cell(
+    output_dir: Path,
+    sweep_dir:  Path,
+    expected_contract: Mapping[str, object],
+
+    *,
+    save_model_artifacts:   bool,
+    paired_token_bootstrap: bool,
+) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    r"""A successful cell of another sweep under ``output_dir`` with this cell's exact contract, or None.
+
+    Cells pair by ``cell_contract_fingerprint`` (:func:`vfe3.run_artifacts.semantic_config_fingerprint` of the
+    cell contract: semantic config, seed, data, code and requested outputs; neither the sweep nor the label
+    enters it), and the candidate must still pass :func:`_cell_is_current`, the model-artifact check and the
+    paired-token check (audit 2026-10-17 item 59).
+    """
+    fingerprint = semantic_config_fingerprint(dict(expected_contract))
+    for other in sorted(output_dir.iterdir()):
+        if (other == sweep_dir or not other.is_dir() or other.name.startswith(".")
+                or other.is_symlink() or _path_is_junction(other)):
+            continue
+        for marker_path in sorted(other.glob("*/ablation_result.json")):
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            source = marker_path.parent
+            if (isinstance(marker, Mapping) and marker.get("status") == "success"
+                    and marker.get("error_kind") is None
+                    and marker.get("cell_contract_fingerprint") == fingerprint
+                    and _cell_dir_is_owned(other, source)
+                    and _cell_is_current(source, expected_contract)
+                    and _model_artifacts_are_current(source, marker, save_model_artifacts=save_model_artifacts)
+                    and _paired_token_artifact_is_current(source, required=paired_token_bootstrap)):
+                return source, dict(marker)
+    return None
+
+
+def _reuse_cohort_cell(
+    sweep_dir:  Path,
+    run_dir:    Path,
+    source:     Path,
+    source_marker: Mapping[str, Any],
+
+    *,
+    sweep_scope: str,
+    label:       str,
+    seed:        int,
+    overrides:   Mapping[str, Any],
+    contract:    Mapping[str, object],
+    gauge_fields: Mapping[str, object],
+    save_model_artifacts: bool,
+) -> Optional[Dict[str, Any]]:
+    r"""Publish ``source``'s result as this cell: its files are hard-linked (or copied) and its marker relabeled.
+
+    The cell directory is cleared through :func:`_start_owned_cell_generation`, every file of ``source``
+    except its ownership sentinel, marker and contract is linked in, the terminal checkpoint is re-pointed
+    into ``run_dir`` and revalidated, and the contract is published before the marker, as for a trained
+    cell. The marker records ``reused_from``. Returns None (nothing published) when revalidation fails.
+    """
+    _start_owned_cell_generation(sweep_dir, run_dir, sweep_name=sweep_scope, label=label, seed=seed)
+    skip = {_ABLATION_CELL_OWNER_FILENAME, "ablation_result.json", "cell_contract.json"}
+    for child in sorted(source.iterdir()):
+        if child.name in skip or child.is_symlink() or _path_is_junction(child):
+            continue
+        if child.is_dir():
+            shutil.copytree(child, run_dir / child.name, copy_function=_link_or_copy)
+        elif child.is_file():
+            _link_or_copy(str(child), str(run_dir / child.name))
+    result = dict(source_marker)
+    relpath = result.get("terminal_checkpoint_relpath")
+    if isinstance(relpath, str) and relpath:
+        result["terminal_checkpoint"] = str(run_dir / relpath)
+    result.update({"label": label, "sweep": sweep_scope, "seed": int(seed), "overrides": _jsonable(dict(overrides)),
+                   "reused_from": f"{source.parent.name}/{source.name}"})
+    _merge_gauge_reporting_defaults(result, dict(gauge_fields))
+    if not _model_artifacts_are_current(run_dir, result, save_model_artifacts=save_model_artifacts):
+        return None
+    if save_model_artifacts:
+        identity = _terminal_checkpoint_identity(run_dir, result)
+        if identity is None or identity.get("terminal_checkpoint_sha256") != result.get("terminal_checkpoint_sha256"):
+            return None
+    _write_json_atomic(run_dir / "cell_contract.json", dict(contract))
+    _write_json_atomic(run_dir / "ablation_result.json", result)
+    return result
+
+
 def _invalidate_code_drifted_cells(
     sweep_dir: Path,
     cells:     List[Tuple[str, Dict[str, Any], int]],
@@ -4312,6 +4457,34 @@ def run_sweep(
             else:
                 if archived_attempt is not None:
                     print(f"  [ARCHIVED] earlier attempt of {label} -> {archived_attempt}")
+        # A cell another sweep of the cohort already trained under the identical contract is reused rather
+        # than retrained (audit 2026-10-17 item 59): the shared baseline appears in most sweeps.
+        duplicate = (_cohort_duplicate_cell(output_dir, sweep_dir, expected_contract,
+                                            save_model_artifacts=save_model_artifacts,
+                                            paired_token_bootstrap=paired_token_bootstrap)
+                     if resume and expected_contract is not None and label not in parameter_record_by_label
+                     else None)
+        if duplicate is not None:
+            try:
+                reused = _reuse_cohort_cell(sweep_dir, run_dir, duplicate[0], duplicate[1],
+                                            sweep_scope=sweep_scope, label=label, seed=cell_seed,
+                                            overrides=overrides, contract=expected_contract,
+                                            gauge_fields=expected_gauge_fields,
+                                            save_model_artifacts=save_model_artifacts)
+            except OSError as exc:
+                logger.warning("  [%s] cohort duplicate could not be reused: %s", label, exc)
+                reused = None
+            if reused is not None:
+                print(f"  [REUSED] {label}: identical cell {reused['reused_from']} "
+                      f"(val PPL {_as_float(reused.get('primary_val_ppl')):.3f})")
+                cell_attempts = attempt_ledger.setdefault(label, [])
+                cell_attempts.append({**_attempt_record(reused, len(cell_attempts) + 1),
+                                      "reused_from": reused["reused_from"]})
+                _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger)
+                results.append(reused)
+                _write_sweep_csv(sweep_dir, _collect_sweep_results(
+                    sweep_dir, aggregation_contract=(aggregation_contract or {})))
+                continue
         try:
             _start_owned_cell_generation(
                 sweep_dir,
@@ -4574,10 +4747,10 @@ def run_sweep(
         print(f"\nSWEEP INCOMPLETE: {sweep_name}  ->  {sweep_error}")
         return []
     finished = [r for r in union if _as_float(r.get("primary_val_ppl")) < float("inf")]
-    if finished:
-        best = min(finished, key=lambda r: _as_float(r.get("primary_val_ppl")))
-        print(f"\nSWEEP COMPLETE: {sweep_name}  ->  best {best['label']} "
-              f"(val PPL {_as_float(best['primary_val_ppl']):.3f})")
+    best_mean = _best_by_seed_mean(finished)
+    if best_mean is not None:
+        print(f"\nSWEEP COMPLETE: {sweep_name}  ->  best {best_mean['label']} "
+              f"(mean val PPL {best_mean['mean']:.3f} over {best_mean['n']} seed(s))")
     else:
         print(f"\nSWEEP COMPLETE: {sweep_name}  ->  no successful run")
     return union
@@ -4630,6 +4803,108 @@ def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(agg, key=lambda d: d["mean"])
 
 
+def _sweep_name_of(sweep_dir: Path) -> Optional[str]:
+    r"""The logical sweep name recorded in ``sweep_meta.json`` (the directory name when unrecorded)."""
+    try:
+        name = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8")).get("sweep_name")
+    except (OSError, ValueError, AttributeError):
+        name = None
+    return str(name) if isinstance(name, str) and name else sweep_dir.name
+
+
+def _sweep_requires(sweep_name: Optional[str]) -> Dict[str, Any]:
+    r"""The ``requires`` overrides a sweep runs every cell on (empty for a sweep on the shared baseline)."""
+    sweep = SWEEPS.get(str(sweep_name)) if sweep_name is not None else None
+    requires = sweep.get("requires") if isinstance(sweep, Mapping) else None
+    return dict(requires) if isinstance(requires, Mapping) else {}
+
+
+def _requires_text(requires: Mapping[str, Any]) -> str:
+    r"""``" [on base + a=1, b=2]"`` for a sweep with ``requires``; empty on the shared baseline."""
+    if not requires:
+        return ""
+    return " [on base + " + ", ".join(f"{key}={value}" for key, value in requires.items()) + "]"
+
+
+def _row_ce(row: Mapping[str, Any]) -> float:
+    r"""Validation CE in nats, :math:`\log \mathrm{PPL}` of ``primary_val_ppl`` (inf when not finite and positive)."""
+    ppl = _as_float(row.get("primary_val_ppl"))
+    return math.log(ppl) if math.isfinite(ppl) and ppl > 0.0 else float("inf")
+
+
+def _data_order_status_line(sweep_dir: Path) -> str:
+    r"""Whether the seeds of a sweep shared one data order, and what the seed SD and paired SE then omit.
+
+    Read from the sweep's aggregation contract (``data_seed_override``), else the module ``DATA_SEED``
+    (audit 2026-10-17 item 61).
+    """
+    try:
+        contract = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))["aggregation_contract"]
+        data_seed = contract["data_seed_override"]
+    except Exception:
+        data_seed = DATA_SEED
+    if data_seed is not None:
+        return (f"data order: every seed trains on one shared batch order (data seed {data_seed}); the SD and "
+                "paired SE are model-initialization variance only and exclude data-order variance")
+    return ("data order: each model seed draws its own batch order; the SD and paired SE include data-order "
+            "variance")
+
+
+def _is_shared_baseline_overrides(overrides: object) -> bool:
+    r"""Whether a cell's overrides leave the shared ``BASELINE_CONFIG`` (over the VFE3Config defaults) unchanged."""
+    if not isinstance(overrides, Mapping):
+        return False
+    base = _sweep_base_settings({})
+    return all(_same_setting(base.get(key, _NO_SETTING), value) for key, value in overrides.items())
+
+
+def _baseline_noise_floor(sweep_dirs: Sequence[Path]) -> Optional[Dict[str, Any]]:
+    r"""The shared-baseline seed noise floor across ``sweep_dirs`` (None with fewer than two seeds).
+
+    Every successful cell whose overrides leave the shared baseline unchanged is one baseline replicate;
+    duplicates of one seed (the same cell in several sweeps) count once. Returns the seeds, the mean and SD
+    (ddof = 1) of the validation CE :math:`\log \mathrm{PPL}` in nats, and the SD of the PPL (audit
+    2026-10-17 item 59).
+    """
+    by_seed: Dict[int, float] = {}
+    for sweep_dir in sweep_dirs:
+        for marker in sorted(Path(sweep_dir).glob("*/ablation_result.json")):
+            try:
+                result = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (not isinstance(result, Mapping) or result.get("status") != "success"
+                    or type(result.get("seed")) is not int
+                    or not _is_shared_baseline_overrides(result.get("overrides"))):
+                continue
+            ce = _row_ce(result)
+            if math.isfinite(ce):
+                by_seed.setdefault(int(result["seed"]), ce)
+    if len(by_seed) < 2:
+        return None
+    ces = [by_seed[seed] for seed in sorted(by_seed)]
+    mean = sum(ces) / len(ces)
+    sd = math.sqrt(sum((c - mean) ** 2 for c in ces) / (len(ces) - 1))
+    ppls = [math.exp(c) for c in ces]
+    mean_ppl = sum(ppls) / len(ppls)
+    sd_ppl = math.sqrt(sum((v - mean_ppl) ** 2 for v in ppls) / (len(ppls) - 1))
+    return {"seeds": sorted(by_seed), "n": len(ces), "mean_ce": mean, "sd_ce": sd, "sd_ppl": sd_ppl}
+
+
+def _print_noise_floor(floor: Optional[Mapping[str, Any]]) -> None:
+    if floor is None:
+        return
+    print(f"\nbaseline noise floor: {floor['n']} seeds {floor['seeds']} of the shared baseline, SD of val CE "
+          f"{floor['sd_ce']:.4f} nats (SD of PPL {floor['sd_ppl']:.3f}); a single-seed difference smaller than "
+          "about twice this is within seed noise")
+
+
+def _best_by_seed_mean(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    r"""The base label with the lowest across-seed mean PPL (seeds aggregated before the pick; audit item 58)."""
+    aggregated = _seed_aggregate(list(rows))
+    return aggregated[0] if aggregated else None
+
+
 _NO_SETTING = object()                    # a field neither the baseline nor VFE3Config sets
 
 
@@ -4645,6 +4920,17 @@ def _same_setting(a: Any, b: Any) -> bool:
     return a == b
 
 
+def _sweep_base_settings(sweep: Mapping[str, Any]) -> Dict[str, Any]:
+    r"""The settings a sweep's cells start from: VFE3Config defaults, ``BASELINE_CONFIG``, the sweep's ``requires``."""
+    defaults: Dict[str, Any] = {}
+    for f in dataclass_fields(VFE3Config):
+        if f.default is not MISSING:
+            defaults[f.name] = f.default
+        elif f.default_factory is not MISSING:
+            defaults[f.name] = f.default_factory()
+    return {**defaults, **BASELINE_CONFIG, **dict(sweep.get("requires", {}) or {})}
+
+
 def _paired_reference_label(sweep_name: Optional[str]) -> Optional[str]:
     r"""The arm a seeded sweep's paired differences are taken against.
 
@@ -4658,13 +4944,7 @@ def _paired_reference_label(sweep_name: Optional[str]) -> Optional[str]:
         return str(sweep["forest_baseline_label"])
     if "parameter_grid" in sweep:
         return None
-    defaults: Dict[str, Any] = {}
-    for f in dataclass_fields(VFE3Config):
-        if f.default is not MISSING:
-            defaults[f.name] = f.default
-        elif f.default_factory is not MISSING:
-            defaults[f.name] = f.default_factory()
-    baseline = {**defaults, **BASELINE_CONFIG, **sweep.get("requires", {})}
+    baseline = _sweep_base_settings(sweep)
     try:
         runs = make_run_overrides(str(sweep_name))
     except (KeyError, ValueError, TypeError):
@@ -4677,8 +4957,13 @@ def _paired_reference_label(sweep_name: Optional[str]) -> Optional[str]:
 def _paired_seed_differences(
     rows:      Sequence[Mapping[str, Any]],   # sweep_results.csv rows
     reference: str,                           # base label of the reference arm
+
+    *,
+    scale:     str = "ppl",                   # "ppl" | "ce" (log PPL, nats; the paper rule's scale)
 ) -> List[Dict[str, Any]]:
-    r"""Seed-paired primary validation PPL differences of every arm against ``reference``.
+    r"""Seed-paired primary validation PPL (``scale="ppl"``) or CE (``scale="ce"``, :math:`\log\mathrm{PPL}`)
+    differences of every arm against ``reference``. One blow-up dominates a PPL mean; the CE scale is the one
+    the paper's decision rule uses (audit 2026-10-17 item 61).
 
     Cells of one seed share the model-init seed and the data order (``_effective_data_seed``), so the arms pair on
     the seed: :math:`d_s = \mathrm{PPL}^{\rm arm}_s - \mathrm{PPL}^{\rm ref}_s` over the :math:`n` seeds both arms
@@ -4689,9 +4974,11 @@ def _paired_seed_differences(
 
     the 95% Student-t interval; SE and the interval are None for :math:`n < 2`. A row without a finite PPL or an
     integer seed is not paired. Sorted by :math:`\bar d`; empty when the reference arm has no row."""
+    if scale not in ("ppl", "ce"):
+        raise ValueError(f"scale must be 'ppl' or 'ce', got {scale!r}")
     by_arm: Dict[str, Dict[int, float]] = {}
     for row in rows:
-        ppl = _as_float(row.get("primary_val_ppl"))
+        ppl = _as_float(row.get("primary_val_ppl")) if scale == "ppl" else _row_ce(row)
         try:
             seed = int(str(row.get("seed", "")).strip())
         except ValueError:
@@ -4758,12 +5045,14 @@ def _print_ablation_rows(rows: List[Dict[str, Any]], *, parameter_matched: bool)
         ppl = "inf" if row.get("_ppl", _as_float(row.get("primary_val_ppl"))) == float("inf") else f"{row.get('_ppl', _as_float(row.get('primary_val_ppl'))):.3f}"
         params = f"{int(_as_float(row.get('n_params'))):,}" if row.get("n_params") not in ("", None) else "-"
         gauge = _sensitivity_gauge_label(row)
+        skipped = _skipped_updates(row)
+        flag = f"  [UNSTABLE: {skipped} skipped updates]" if skipped else ""
         if parameter_matched:
             relative = _as_float(row.get("param_relative_deviation"))
             deviation = "-" if relative == float("inf") else f"{relative * 100:.2f}%"
-            print(f"{row['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}")
+            print(f"{row['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}{flag}")
         else:
-            print(f"{row['label']:<34}{ppl:>12}{params:>12}  {gauge}")
+            print(f"{row['label']:<34}{ppl:>12}{params:>12}  {gauge}{flag}")
 
 
 _LR_WIDTH_TRANSFER_LABEL = re.compile(r"^K=(\d+),H=(\d+),([A-Za-z0-9_]+)=x([0-9.eE+-]+)$")
@@ -4776,10 +5065,12 @@ def fit_lr_width_transfer(
     r"""Per rate and width, the best multiplier by final validation PPL; per rate, the fit
     :math:`\log \eta^*(K) = a + b \log K` over the widths whose best multiplier is interior.
 
-    A cell with an error or a non-finite PPL counts as diverged. Seeds of one cell are averaged. ``b`` is the width
+    A cell with an error or a non-finite PPL counts as diverged; a finite cell whose run rejected optimizer
+    updates is listed under ``skipped_update_multipliers``. Seeds of one cell are averaged. ``b`` is the width
     exponent (``eta* ~ K^b``) and ``eta_at`` extrapolates it; a rate with fewer than two interior widths gets no fit.
     """
     cells: Dict[Tuple[str, int, int, float], List[float]] = {}
+    skipped_cells: set = set()
     for row in rows:
         # _base_label strips the __s<seed> suffix of a seeded sweep, so the seeds of a cell meet in one key.
         match = _LR_WIDTH_TRANSFER_LABEL.match(_base_label(str(row.get("label", "")).split("|")[0].strip()))
@@ -4790,6 +5081,8 @@ def fit_lr_width_transfer(
         ppl = _as_float(row.get("final_val_ppl"))
         failed = bool(str(row.get("error", "") or "").strip()) or not math.isfinite(ppl)
         cells.setdefault((field, embed_dim, n_heads, multiplier), []).append(float("inf") if failed else ppl)
+        if _skipped_updates(row):
+            skipped_cells.add((field, embed_dim, n_heads, multiplier))
     fields: Dict[str, Any] = {}
     for field in sorted({key[0] for key in cells}):
         widths = sorted({(key[1], key[2]) for key in cells if key[0] == field})
@@ -4802,6 +5095,9 @@ def fit_lr_width_transfer(
                 "embed_dim": embed_dim, "n_heads": n_heads,
                 "ppl_by_multiplier": {f"{m:g}": (ppl if math.isfinite(ppl) else None) for m, ppl in grid},
                 "diverged_multipliers": [m for m, ppl in grid if not math.isfinite(ppl)],
+                # finite cells whose run rejected optimizer updates (audit 2026-10-17 item 29)
+                "skipped_update_multipliers": [m for m, _ppl in grid
+                                               if (field, embed_dim, n_heads, m) in skipped_cells],
             }
             if finite:
                 best_multiplier, best_ppl = min(finite, key=lambda item: item[1])
@@ -4830,12 +5126,22 @@ def analyze_lr_width_transfer(sweep_dir: Path) -> Dict[str, Any]:
     (sweep_dir / "lr_width_transfer_fit.json").write_text(json.dumps(report, indent=2, sort_keys=True),
                                                          encoding="utf-8")
     print(f"\n{'=' * 70}\nLR WIDTH TRANSFER: {sweep_dir.name}\n{'=' * 70}")
+    try:
+        horizon_steps = _validated_sweep_aggregation_contract(json.loads(
+            (sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))["aggregation_contract"])["max_steps"]
+    except Exception:
+        horizon_steps = LR_WIDTH_TRANSFER.get("max_steps")
+    horizon = f"a {horizon_steps}-step horizon" if horizon_steps is not None else "the baseline horizon"
     for field, fit in report["fields"].items():
         best = ", ".join(f"K={e['embed_dim']}: x{e['best_multiplier']:g}{' (edge)' if e['at_grid_edge'] else ''}"
                          for e in fit["widths"] if "best_multiplier" in e)
-        exponent = (f"exponent {fit['exponent']:+.2f}, lr(K=160) {fit['eta_at']['160']:.3g}" if "exponent" in fit
+        # Only the exponent is published, with its horizon: absolute rates chosen on a short horizon are
+        # biased toward larger values (audit 2026-10-17 item 60); eta_at stays in the JSON.
+        exponent = (f"exponent {fit['exponent']:+.2f} at {horizon}" if "exponent" in fit
                     else f"no fit ({fit['interior_widths']} interior widths)")
         print(f"  {field:<28}{exponent}  [{best}]")
+    print(f"  (exponents fit on {horizon}; short-horizon optima favor larger rates, so the absolute rates in "
+          "lr_width_transfer_fit.json are not adopted as long-run rates)")
     return report
 
 
@@ -4848,7 +5154,12 @@ def analyze_sweep(sweep_dir: Path) -> None:
         r["_ppl"] = _as_float(r.get("primary_val_ppl"))
     rows.sort(key=lambda r: r["_ppl"])
 
-    print(f"\n{'=' * 70}\nANALYSIS: {sweep_dir.name}\n{'=' * 70}")
+    sweep_name = _sweep_name_of(sweep_dir)
+    requires = _sweep_requires(sweep_name)
+    print(f"\n{'=' * 70}\nANALYSIS: {sweep_dir.name}{_requires_text(requires)}\n{'=' * 70}")
+    if requires:
+        print(f"every cell runs on BASELINE_CONFIG + requires {requires}; compare it with this sweep's own "
+              "base cell, not with the shared baseline")
     parameter_matched = any(r.get("target_n_params") not in ("", None) for r in rows)
     _print_ablation_rows(rows, parameter_matched=parameter_matched)
 
@@ -4858,6 +5169,9 @@ def analyze_sweep(sweep_dir: Path) -> None:
         print(f"\nrelative to best ({finished[0]['label']}):")
         for r in finished:
             print(f"  {r['label']:<34}{(r['_ppl'] - best) / best * 100:+.1f}%")
+    print(_data_order_status_line(sweep_dir))
+    if not any(a["n"] > 1 for a in _seed_aggregate(rows)):
+        _print_noise_floor(_baseline_noise_floor(_cohort_sweep_dirs(sweep_dir)))
 
     # Across-seed aggregation (only when a base label carries multiple seeds): n / mean / SD / CV of the
     # val PPL per config, so a sub-3-percent effect is read against the seed noise rather than as a
@@ -4871,12 +5185,19 @@ def analyze_sweep(sweep_dir: Path) -> None:
             print(f"{a['label']:<34}{a['n']:>4}{a['mean']:>12.3f}{a['sd']:>10.3f}{a['cv'] * 100:>8.1f}")
 
     # Seed-paired differences against the reference arm: every arm of a seed shares its init seed and data
-    # order, so the paired SE is the honest error bar on an arm-vs-reference difference.
-    try:
-        sweep_name = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8")).get("sweep_name")
-    except (OSError, ValueError, AttributeError):
-        sweep_name = None
+    # order, so the paired SE is the honest error bar on an arm-vs-reference difference. The CE table is the
+    # decision scale (audit 2026-10-17 item 61); the PPL table is kept for reading.
     reference = _paired_reference_label(sweep_name)
+    paired_ce = _paired_seed_differences(rows, reference, scale="ce") if reference else []
+    if any(p["n"] > 1 for p in paired_ce):
+        print(f"\npaired across-seed differences vs {reference} on CE = log PPL (nats, arm - reference on "
+              "shared seeds):")
+        print(f"{'label':<34}{'n':>4}{'mean diff':>12}{'SE':>10}{'95% t-interval':>24}")
+        print("-" * 84)
+        for p in paired_ce:
+            se = "-" if p["se"] is None else f"{p['se']:.4f}"
+            ci = "-" if p["ci95"] is None else f"[{p['ci95'][0]:+.4f}, {p['ci95'][1]:+.4f}]"
+            print(f"{p['label']:<34}{p['n']:>4}{p['mean']:>+12.4f}{se:>10}{ci:>24}")
     paired = _paired_seed_differences(rows, reference) if reference else []
     if any(p["n"] > 1 for p in paired):
         print(f"\npaired across-seed differences vs {reference} (PPL arm - PPL reference on shared seeds):")
@@ -4931,6 +5252,21 @@ def _sweep_matches_cohort(
         return False
 
 
+def _cohort_sweep_dirs(sweep_dir: Path) -> List[Path]:
+    r"""The complete sibling sweeps of ``sweep_dir`` in its comparison cohort, and ``sweep_dir`` itself."""
+    out = [sweep_dir]
+    try:
+        identity = _cross_sweep_cohort_identity(json.loads(
+            (sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))["aggregation_contract"])
+    except Exception:
+        return out
+    for sibling in sorted(sweep_dir.parent.iterdir()):
+        if (sibling != sweep_dir and sibling.is_dir() and not sibling.name.startswith(".")
+                and _sweep_matches_cohort(sibling, identity)):
+            out.append(sibling)
+    return out
+
+
 def summarize_sweeps(
     output_dir: Path,
 
@@ -4957,15 +5293,26 @@ def summarize_sweeps(
     if not sweep_dirs:
         print("No completed sweeps found in the current comparison cohort.")
         return
-    print(f"{'sweep':<24}{'best config':<30}{'val PPL':>10}  gauge classification")
-    print("-" * 104)
+    # Seeds are aggregated by base label before the best is picked, and sweeps that run on another base
+    # (``requires``) are listed apart with that base in the label (audit 2026-10-17 item 58).
+    groups: Dict[str, List[Tuple[Path, Dict[str, Any]]]] = {}
     for d in sweep_dirs:
-        rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
-        if not rows:
-            continue
-        best = min(rows, key=lambda r: _as_float(r.get("primary_val_ppl")))
-        gauge = _sensitivity_gauge_label(best)
-        print(f"{d.name:<24}{best['label']:<30}{_as_float(best['primary_val_ppl']):>10.3f}  {gauge}")
+        requires = _sweep_requires(_sweep_name_of(d))
+        groups.setdefault(_requires_text(requires).strip(), []).append((d, requires))
+    for base_text in sorted(groups, key=lambda text: (text != "", text)):
+        print("\nshared baseline" if not base_text else f"\nanother base: {base_text.strip('[]')}")
+        print(f"{'sweep':<24}{'best config (seed mean)':<34}{'n':>3}{'val PPL':>10}  gauge classification")
+        print("-" * 108)
+        for d, _requires in groups[base_text]:
+            rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
+            best = _best_by_seed_mean(rows)
+            if best is None:
+                continue
+            member = next(r for r in rows if _base_label(str(r.get("label", ""))) == best["label"])
+            gauge = _sensitivity_gauge_label(member)
+            print(f"{d.name:<24}{best['label']:<34}{best['n']:>3}{best['mean']:>10.3f}  {gauge}")
+    print(_data_order_status_line(sweep_dirs[0]))
+    _print_noise_floor(_baseline_noise_floor(sweep_dirs))
 
 
 # =============================================================================
@@ -5102,7 +5449,7 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
         fontsize=9,
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.9},
     )
-    ax.set_title(sweep_dir.name)
+    ax.set_title(sweep_dir.name + _requires_text(_sweep_requires(_sweep_name_of(sweep_dir))))
     fig.tight_layout()
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}.png"
@@ -5412,6 +5759,29 @@ def _sensitivity_gauge_label(row: Mapping[str, object]) -> str:
     return f"block_mlp={block_mlp}"
 
 
+def sensitivity_rows(sweep_dirs: Sequence[Path]) -> List[Dict[str, Any]]:
+    r"""Per sweep, the seed-paired best-minus-reference CE difference that :func:`_plot_sensitivity` plots.
+
+    ``difference`` is None for a sweep without a reference arm or without an arm that pairs with it.
+    """
+    out: List[Dict[str, Any]] = []
+    for d in sweep_dirs:
+        rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
+        if not rows:
+            continue
+        name = _sweep_name_of(d)
+        reference = _paired_reference_label(name)
+        paired = _paired_seed_differences(rows, reference, scale="ce") if reference else []
+        best = paired[0] if paired else None
+        member = next((r for r in rows if best is not None
+                       and _base_label(str(r.get("label", ""))) == best["label"]), rows[0])
+        out.append({"sweep": d.name, "requires_text": _requires_text(_sweep_requires(name)),
+                    "reference": reference, "best": best["label"] if best else None,
+                    "difference": best["mean"] if best else None, "se": best["se"] if best else None,
+                    "n": best["n"] if best else 0, "gauge": _sensitivity_gauge_label(member)})
+    return out
+
+
 def _plot_sensitivity(
     output_dir: Path,
     fig_dir:    Path,
@@ -5419,10 +5789,14 @@ def _plot_sensitivity(
     *,
     cohort_identity: Optional[Mapping[str, object]] = None,
 ) -> None:
-    r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
+    r"""Cross-sweep comparison: the paired best-minus-baseline CE difference per sweep, sorted by size.
 
-    Made once after all sweeps. Scans EVERY persisted sweep under ``output_dir`` (not just this
-    run's), matching the per-sweep figures' accumulated view.
+    For each sweep with a reference arm (:func:`_paired_reference_label`), the arm with the most negative
+    seed-paired mean CE difference (:math:`\log\mathrm{PPL}`, nats) against the reference is the sweep's best,
+    and its difference (with the paired SE when two or more seeds pair) is the bar. A worst-minus-best range
+    grows with the number of cells under pure noise, so it is not used (audit 2026-10-17 item 58). A sweep
+    on another base carries its ``requires`` in the label; one without a reference arm is listed in the
+    title as not comparable. Scans EVERY persisted sweep under ``output_dir`` in the cohort.
     """
     sweep_dirs = [
         directory
@@ -5434,36 +5808,31 @@ def _plot_sensitivity(
             and _sweep_matches_cohort(directory, cohort_identity)
         )
     ]
-    sensitivity: List[Tuple[str, float, str, str]] = []      # sweep, PPL range, best label, gauge class
+    sensitivity = sensitivity_rows(sweep_dirs)
     gauge_summaries: List[Mapping[str, object]] = []
     for d in sweep_dirs:
-        rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
-        if not rows:
-            continue
         gauge_summary = _sweep_gauge_purity(d)
         if isinstance(gauge_summary, Mapping):
             gauge_summaries.append(gauge_summary)
-        ppls = [_as_float(r["primary_val_ppl"]) for r in rows]
-        best = min(rows, key=lambda r: _as_float(r["primary_val_ppl"]))
-        sensitivity.append((
-            d.name,
-            max(ppls) - min(ppls),
-            best["label"],
-            _sensitivity_gauge_label(best),
-        ))
-    if not sensitivity:
+    comparable = [row for row in sensitivity if row["difference"] is not None]
+    if not comparable:
         return
     plt = _plt_or_none()
     if plt is None:
         return
-    sensitivity.sort(key=lambda t: t[1], reverse=True)
-    fig, ax = plt.subplots(figsize=(9, max(3, 0.5 * len(sensitivity))))
-    ax.barh(range(len(sensitivity)), [s[1] for s in sensitivity], color="#d62728", alpha=0.8)
-    ax.set_yticks(range(len(sensitivity)))
-    ax.set_yticklabels([f"{s[0]}\n(best: {s[2]}; gauge: {s[3]})" for s in sensitivity])
+    comparable.sort(key=lambda row: row["difference"])
+    fig, ax = plt.subplots(figsize=(9, max(3, 0.5 * len(comparable))))
+    ax.barh(range(len(comparable)), [row["difference"] for row in comparable],
+            xerr=[row["se"] if row["se"] is not None else 0.0 for row in comparable],
+            color="#d62728", alpha=0.8)
+    ax.axvline(0.0, color="black", lw=0.8)
+    ax.set_yticks(range(len(comparable)))
+    ax.set_yticklabels([f"{row['sweep']}{row['requires_text']}\n(best: {row['best']} vs {row['reference']}, "
+                        f"n={row['n']}; gauge: {row['gauge']})" for row in comparable])
     ax.invert_yaxis()
-    ax.set_xlabel("validation PPL range (worst - best)")
-    ax.set_title("hyperparameter sensitivity")
+    ax.set_xlabel("paired best - baseline validation CE (nats; bar = paired SE)")
+    missing = [row["sweep"] for row in sensitivity if row["difference"] is None]
+    ax.set_title("hyperparameter sensitivity" + (f"\n(no reference arm: {', '.join(missing)})" if missing else ""))
     fig.tight_layout()
     _annotate_gauge_disclosure(fig, {
         "contains_coordinate_mean_only_nonintertwiner": any(

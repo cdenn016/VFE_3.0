@@ -123,11 +123,31 @@ COMPUTE_MATCH: Optional[Dict[str, Any]] = None
 # Library
 # ================================================================================================
 
+class BaseUnavailableError(FileNotFoundError):
+    r"""The base run of a preset or directory cannot be found (moved, renamed, deleted or ambiguous)."""
+
+
+def resolve_base_dir(base: str) -> Path:
+    r"""The run directory of a preset name or run directory.
+
+    A relative path resolves against this script's folder (as ``paper_arms`` does), not the working
+    directory; a path that no longer exists is looked up by its folder name under ``vfe3_runs`` and
+    ``D:/DATA_KEEP`` (:func:`vfe3.paper.runs.find_run_folder`, audit 2026-10-17 item 52). Raises
+    :class:`BaseUnavailableError` when no unique run folder is found.
+    """
+    from vfe3.paper.runs import AmbiguousRunFolder, RunFolderNotFound, find_run_folder
+
+    try:
+        return find_run_folder(BASE_PRESETS.get(base, base), base=Path(__file__).resolve().parent)
+    except (RunFolderNotFound, AmbiguousRunFolder) as exc:
+        raise BaseUnavailableError(f"base {base!r}: {exc}") from exc
+
+
 def load_base_config(base: str) -> Any:
     r"""The VFE base config of a preset name or run directory (lenient: retired fields are dropped)."""
     from vfe3.legacy_config import lenient_config_from_serialized
 
-    path = Path(BASE_PRESETS.get(base, base))
+    path = resolve_base_dir(base)
     record = json.loads((path / "config.json").read_text(encoding="utf-8"))
     payload = record.get("config", record)
     cfg, dropped = lenient_config_from_serialized(payload, source=str(path / "config.json"))
@@ -157,7 +177,7 @@ def check_base_data(
     record is logged as unchecked; any recorded disagreement raises ``ValueError``.
     """
     logger = logger or logging.getLogger("train_baseline")
-    path = Path(BASE_PRESETS.get(base, base))
+    path = resolve_base_dir(base)
     record = json.loads((path / "config.json").read_text(encoding="utf-8"))
     prov_path = path / "provenance.json"
     prov: Dict[str, Any] = (json.loads(prov_path.read_text(encoding="utf-8")) if prov_path.is_file() else {})
@@ -323,7 +343,8 @@ def lr_sweep(
     r"""Short runs at each peak learning rate; the winner has the lowest best validation perplexity.
 
     Every run keeps the protocol of ``cfg`` except ``lr`` and ``max_steps`` (the warmup is capped at
-    ``max_steps``); selection reads only ``summary.json`` ``best_val_ppl`` (validation). ``at_grid_edge`` is True
+    ``max_steps``); selection reads only ``summary.json`` ``best_val_ppl`` (validation). ``runner_up_lr`` is the
+    second-best rate (see :func:`short_horizon_warning`). ``at_grid_edge`` is True
     when the winner is the lowest or highest swept rate, so the grid does not bracket the optimum (None without a
     winner). The edge is that of the swept grid, so a diverged rate beyond the winner brackets it.
     """
@@ -339,11 +360,34 @@ def lr_sweep(
         rows.append({"lr": float(lr), "best_val_ppl": summary.get("best_val_ppl"), "run_dir": str(run_dir)})
     finite = [row for row in rows if isinstance(row["best_val_ppl"], (int, float))
               and math.isfinite(row["best_val_ppl"])]
-    best = min(finite, key=lambda row: row["best_val_ppl"]) if finite else None
+    ranked = sorted(finite, key=lambda row: row["best_val_ppl"])
+    best = ranked[0] if ranked else None
+    runner_up = ranked[1] if len(ranked) > 1 else None
     swept_lrs = [float(lr) for lr in lrs]
     at_grid_edge = (best["lr"] in (min(swept_lrs), max(swept_lrs))) if best else None
     return {"rows": rows, "best_lr": (best["lr"] if best else None), "selection": "best_val_ppl",
-            "at_grid_edge": at_grid_edge, "max_steps": int(max_steps)}
+            "at_grid_edge": at_grid_edge, "max_steps": int(max_steps),
+            "runner_up_lr": (runner_up["lr"] if runner_up else None),
+            "runner_up_best_val_ppl": (runner_up["best_val_ppl"] if runner_up else None)}
+
+
+def short_horizon_warning(sweep: Mapping[str, Any], full_steps: int) -> Optional[str]:
+    r"""The warning printed when a short learning-rate sweep's winner is adopted for a longer run.
+
+    A rate selected at ``sweep["max_steps"]`` steps is biased toward larger values at a longer budget: in
+    the repository's own records the 6,000-step sweep ranked 5e-3 above 4e-3 and 3e-3, while at 150,000
+    steps 3e-3 beat 5e-3 (audit 2026-10-17 item 60). Names the runner-up so it can be retrained longer
+    before either is trusted. None when no rate was selected or the sweep ran the full budget.
+    """
+    best = sweep.get("best_lr")
+    if best is None or int(sweep.get("max_steps", 0)) >= int(full_steps):
+        return None
+    runner = sweep.get("runner_up_lr")
+    runner_text = (f"the runner-up lr={runner:g} (best val PPL {sweep.get('runner_up_best_val_ppl'):.2f})"
+                   if runner is not None else "no runner-up (one finite rate)")
+    return (f"lr sweep: lr={best:g} won at {int(sweep['max_steps'])} steps, but the seeded runs train "
+            f"{int(full_steps)} steps; short-horizon winners are biased toward larger rates, so retrain it and "
+            f"{runner_text} for longer before trusting the choice")
 
 
 def calibrate_widths(
@@ -437,7 +481,11 @@ def main() -> None:
     r"""Click-to-run: optional lr sweep, calibration and compute matching, then one run per seed."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_baseline")
-    base = load_base_config(BASE)
+    try:
+        base = load_base_config(BASE)
+    except BaseUnavailableError as exc:            # an unavailable base plans nothing (audit 2026-10-17 item 52)
+        logger.error("base unavailable, nothing trained: %s", exc)
+        raise SystemExit(1) from exc
     check_base_data(BASE, dataset=DATASET, seeds=SEEDS, data_seed=DATA_SEED, max_tokens=MAX_TOKENS, logger=logger)
     fallback = {} if getattr(base, "rope_mode", "none") != "none" else dict(POSITION_FALLBACK)
     cfg = BaselineConfig.matched_to(base, per_type_table=PER_TYPE_TABLE, **{**fallback, **OVERRIDES})
@@ -471,6 +519,9 @@ def main() -> None:
         if sweep["best_lr"] is not None:
             cfg = replace(cfg, lr=sweep["best_lr"])
             logger.info("lr sweep: selected lr=%g on validation", sweep["best_lr"])
+            warning = short_horizon_warning(sweep, cfg.max_steps)
+            if warning is not None:
+                logger.warning(warning)
             if sweep["at_grid_edge"]:
                 logger.warning("lr sweep: the selected lr=%g is at the edge of LR_SWEEP; the optimum may lie "
                                "outside the grid, so extend it before trusting this rate", sweep["best_lr"])
