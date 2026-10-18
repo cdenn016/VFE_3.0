@@ -5,9 +5,12 @@ gauge group can act on the K-dim embedding through a DIRECT SUM of irreps,
 
     G_a = blockdiag_b rho_b(X_a),        a = 1, ..., n_gen = dim g,
 
-with ONE shared per-token phi -- a TIED gauge: the same group element acts in every
-block through that block's representation, so attention heads can be DIFFERENT irreps
-of one structure group (possibly with unequal dimensions). Registered families:
+with ONE shared per-token phi under the tied gauge (``gauge_tying='shared'``): the same group
+element acts in every block through that block's representation, so attention heads can be
+DIFFERENT irreps of one structure group (possibly with unequal dimensions). Under
+``gauge_tying='per_head'`` the tower is untied instead: ``_build_irrep_tower`` (vfe3.geometry.groups)
+gives each nontrivial block its own copy of the generators, so each head carries its own element of
+the structure group in its irrep. Registered families:
 
     so : label 'l<p>'   -- symmetric-traceless rank-p tensors over R^N,
                            dim = C(N+p-1, p) - C(N+p-3, p-2); for N = 3 this is the

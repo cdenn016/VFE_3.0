@@ -3,7 +3,9 @@ r"""Gauge transport for VFE_3.0 (flat phi-cocycle, Gaussian / location-scale spe
 The flat transport parameterization:
   phi (exp):    Omega_ij = exp(phi_i . G) exp(-phi_j . G) in GL+(K) (det>0).
 The projected scorers read the vertex frames U_i directly; retractions are a separate module.
-Gauge-RoPE folds a positional rotation into the transport via :class:`RopeTransport`.
+Under a frame-space ``rope_mode`` ('frame', 'frame_value') gauge-RoPE folds a positional rotation into the transport
+via :class:`RopeTransport`; the comparison-space modes ('comparison', 'comparison_invariant') never build one and
+rotate only the routing moments.
 """
 
 import math
@@ -908,10 +910,11 @@ def compute_transport_operators(
 
     Conditioning note (audit 2026-06-09 overnight F26): for the NON-COMPACT groups
     (block_glk; skew_symmetric=False) Omega is not orthogonal and cond(Omega)
-    grows like exp(2 ||phi_matrix||); at the phi retraction's default max_norm=5.0 a
-    draw can reach cond ~1e7-1e10; compact so towers give orthogonal Omega (cond = 1).
-    Omega is built at the working dtype here, so for extreme draws prefer a compact group or
-    bound phi via the retraction max_norm.
+    grows like exp(2 ||phi_matrix||); the only bound is the fail-closed chart radius
+    ``transport_chart_max_norm`` (default 50) on every transport exponential, far above the
+    phi norms at which cond(Omega) reaches ~1e7-1e10; compact so towers give orthogonal Omega
+    (cond = 1). Omega is built at the working dtype here, so for extreme draws prefer a compact
+    group or bound the frames (``phi_mstep_max_matrix_norm``, ``phi_frame_condition_max``).
     """
     B, N, _ = phi.shape
     K = group.generator_shape[-1]
