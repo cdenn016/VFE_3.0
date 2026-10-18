@@ -114,8 +114,9 @@ def test_homogeneity_reports_mixed_code_identity() -> None:
     mixed = [_record("a", {"git_sha": "891cb1a", "git_dirty": True}),
              _record("b", {"git_sha": "a81a4aa", "git_dirty": False})]
     report = check_homogeneity(mixed)
-    assert not report["homogeneous"]
-    assert [v["field"] for v in report["violations"]] == ["provenance:code_identity"]
+    # Audit 2026-10-17 item 27: a code-identity difference is reported as a note, never a violation.
+    assert report["homogeneous"] and report["violations"] == []
+    assert [v["field"] for v in report["code_identity_differences"]] == ["provenance:code_identity"]
     # The source-archive content hash wins over the git triple when every run records it.
     archived = [_record(n, {"git_sha": sha, "source_archive": {"available": True, "tree_sha256": "t"}})
                 for n, sha in (("a", "1"), ("b", "2"))]

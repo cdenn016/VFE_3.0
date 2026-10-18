@@ -48,9 +48,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-# Config fields excluded from the within-arm homogeneity check (the model seed; the data-order seed
-# is a train_vfe3 argument recorded in provenance.json, not a config field).
-HOMOGENEITY_IGNORED_FIELDS: Tuple[str, ...] = ("seed",)
+# Config fields excluded from the within-arm homogeneity check: the model seed (the data-order seed is a
+# train_vfe3 argument recorded in provenance.json, not a config field) and the run-cadence fields, which
+# decide when a run logs or writes a resumable checkpoint and where it resumes from, not the trained weights
+# (a reused base run carries its own cadence; audit 2026-10-17 item 27).
+HOMOGENEITY_CADENCE_FIELDS: Tuple[str, ...] = ("checkpoint_interval", "log_interval", "resume_from")
+HOMOGENEITY_IGNORED_FIELDS: Tuple[str, ...] = ("seed", *HOMOGENEITY_CADENCE_FIELDS)
 
 # Provenance fields compared across the runs of one arm (data identity and tokenizer).
 HOMOGENEITY_PROVENANCE_FIELDS: Tuple[str, ...] = (
@@ -510,7 +513,10 @@ def code_identity_mismatch(
 
 def _comparable_fields(run: RunRecord) -> Dict[str, Any]:
     r"""Every config field (normalized through the loaded config when possible), the retired fields
-    dropped on reload, the dataset, the provenance data and tokenizer identity, and the code identity."""
+    dropped on reload, the dataset, and the provenance data and tokenizer identity.
+
+    The code identity is not compared here: :func:`check_homogeneity` reports it as a note, never as a
+    violation (audit 2026-10-17 item 27)."""
     if run.cfg is not None:
         values: Dict[str, Any] = {f.name: getattr(run.cfg, f.name) for f in dataclasses.fields(run.cfg)}
         values.update({f"retired:{key}": value for key, value in run.dropped_config_fields.items()})
@@ -519,7 +525,6 @@ def _comparable_fields(run: RunRecord) -> Dict[str, Any]:
     values["config.json:dataset"] = run.dataset
     for key in HOMOGENEITY_PROVENANCE_FIELDS:
         values[f"provenance:{key}"] = run.provenance.get(key)
-    values["provenance:code_identity"] = code_identity(run)
     return values
 
 
@@ -549,9 +554,14 @@ def check_homogeneity(
 
     Returns ``{"n_runs", "homogeneous", "violations": [{"field", "values": {run: value}}],
     "allowed_differences", "seeds", "data_seeds", "duplicate_seed_pairs", "model_seed_varied",
-    "data_seed_varied"}``. A violation is reported, not raised: the assemblers still aggregate the arm
-    and mark it. ``allowed`` names fields a scaling grid varies on purpose; their differences are
-    listed under ``allowed_differences``.
+    "data_seed_varied", "code_identity_differences"}``. A violation is reported, not raised: the
+    assemblers still aggregate the arm and mark it. ``allowed`` names fields a scaling grid varies on
+    purpose; their differences are listed under ``allowed_differences``.
+
+    The run-cadence fields (:data:`HOMOGENEITY_CADENCE_FIELDS`) are ignored by default. The code identity
+    (:func:`code_identity`) is never decisive: every edit to an archived root script changes it, so runs
+    whose identities differ are listed under ``code_identity_differences`` as a note and do not make the
+    arm non-homogeneous (audit 2026-10-17 item 27).
 
     The training-window protocol (``train_window_mode``, :func:`vfe3.experiment.saved_train_window_mode`) is
     compared too: the loaders drop a saved ``train_window_offset`` silently, and fixed-window and per-epoch-random
@@ -575,6 +585,9 @@ def check_homogeneity(
         if len({mode for mode in modes.values() if mode != "unknown"}) > 1:
             (allowed_differences if "train_window_mode" in allowed_set else violations).append(
                 {"field": "train_window_mode", "values": modes})
+    identities = {run.name: code_identity(run) for run in runs}
+    code_differences = ([{"field": "provenance:code_identity", "values": identities}]
+                        if len({_canonical(v) for v in identities.values()}) > 1 else [])
     pairs = [(run.seed, run.data_seed) for run in runs]
     duplicates = sorted({pair for pair in pairs if pairs.count(pair) > 1}, key=str)
     seeds = [run.seed for run in runs]
@@ -589,6 +602,7 @@ def check_homogeneity(
         "duplicate_seed_pairs": [list(pair) for pair in duplicates],
         "model_seed_varied": len({s for s in seeds if s is not None}) > 1,
         "data_seed_varied": len({s for s in data_seeds if s is not None}) > 1,
+        "code_identity_differences": code_differences,
     }
 
 

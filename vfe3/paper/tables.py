@@ -29,6 +29,7 @@ manuscript row text and may contain LaTeX).
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -440,6 +441,10 @@ def paired_difference(evaluated: Arm, other: Arm, rule: str) -> Dict[str, Any]:
     :math:`t = \bar d / \mathrm{SE}` on :math:`n - 1` degrees of freedom, its one-sided p-value
     :math:`p = P(T_{n-1} \ge t)` against :math:`H_0: \mathbb{E} d \le 0`, and the 95% interval
     :math:`\bar d \pm t_{0.975,\,n-1}\,\mathrm{SE}` (None while :math:`\mathrm{SE}` is None or zero).
+
+    ``margin_alpha_one_sided`` is the realized one-sided level of the :math:`2\,\mathrm{SE}` part of the
+    margin, :math:`\alpha = P(T_{n-1} \ge 2)` under :math:`\mathbb{E} d = 0` (about 0.092 at three pairs);
+    where the 0.03-nat floor binds the test is stricter (audit 2026-10-17 item 84). None for :math:`n < 2`.
     """
     a, unpaired_a = _selected_by_pair(evaluated, rule)
     b, unpaired_b = _selected_by_pair(other, rule)
@@ -457,9 +462,15 @@ def paired_difference(evaluated: Arm, other: Arm, rule: str) -> Dict[str, Any]:
         p_one_sided = float(student_t.sf(t_stat, dof))
         half = float(student_t.ppf(0.975, dof)) * se
         ci95 = [mean - half, mean + half]
+    margin_alpha = None
+    if len(diffs) >= 2:
+        from scipy.stats import t as student_t
+
+        margin_alpha = float(student_t.sf(DECISION_SE_MULTIPLE, len(diffs) - 1))
     unmatched = sorted(set(a) ^ set(b))
     return {"pairs": [list(p) for p in pairs], "differences": diffs, "n": len(diffs), "mean": mean,
             "sd": sd, "se": se, "margin": margin, "t": t_stat, "p_one_sided": p_one_sided, "ci95": ci95,
+            "margin_alpha_one_sided": margin_alpha,
             "unmatched_seed_pairs": [list(p) for p in unmatched], "unpaired_runs": unpaired_a + unpaired_b}
 
 
@@ -510,10 +521,16 @@ def _code_identity_notes(arm: Arm) -> List[str]:
     Every edit to a tracked root script after a run trains changes the identity, so a mismatch alone
     does not make a clause undetermined; the note lets a reader check the diff between the code lines.
     """
-    if not arm.code_identity_mismatch:
-        return []
-    return [f"{arm.label!r}: {len(arm.code_identity_mismatch)} run(s) trained on code other than the "
-            "current tree (code_identity_mismatch)"]
+    notes: List[str] = []
+    if arm.code_identity_mismatch:
+        notes.append(f"{arm.label!r}: {len(arm.code_identity_mismatch)} run(s) trained on code other than the "
+                     "current tree (code_identity_mismatch)")
+    differences = (arm.homogeneity or {}).get("code_identity_differences") or []
+    if differences:
+        n_ids = len({json.dumps(v, sort_keys=True, default=str) for v in differences[0]["values"].values()})
+        notes.append(f"{arm.label!r}: its runs trained on {n_ids} different code identities "
+                     "(homogeneity code_identity_differences; a note, not a violation)")
+    return notes
 
 
 def _window_protocol_notes(arm: Arm) -> List[str]:
@@ -655,6 +672,11 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
         if c.get("unmatched_seed_pairs") or c.get("unpaired_runs"):
             lines.append(f"Clause ({clause}): seed pairs present in one arm only {c['unmatched_seed_pairs']}; "
                          f"runs without a selected test value or seed pair {c['unpaired_runs']}.")
+        if c.get("margin_alpha_one_sided") is not None:
+            lines.append(f"Clause ({clause}): with {c['n']} pairs the {record['se_multiple']:g} SE margin is a "
+                         f"one-sided paired-t test at realized level alpha = {c['margin_alpha_one_sided']:.3f} "
+                         f"(P(T_{c['n'] - 1} >= {record['se_multiple']:g}) under a zero mean difference); "
+                         f"where the {record['margin_nats']:g}-nat floor binds the test is stricter.")
         for reason in c.get("undetermined") or []:
             lines.append(f"Clause ({clause}) undetermined: {reason}.")
         for note in [*(c.get("code_identity_notes") or []), *(c.get("window_protocol_notes") or [])]:
