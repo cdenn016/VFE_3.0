@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypedDict
+from typing import Callable, Dict, Iterator, List, Mapping, NotRequired, Optional, Tuple, TypedDict
 
 import torch
 
@@ -336,9 +336,15 @@ class DataStateBuffer(TypedDict, total=False):
 
 
 class DataState(TypedDict):
-    """Required iterator state written into a resumable checkpoint."""
+    """Iterator state written into a resumable checkpoint.
+
+    The first four keys are required. ``window_offset`` (the epoch's window origin under per-epoch window
+    origins) is written by ``train()`` on that route and read by ``save_checkpoint`` when present, so it is
+    declared but not required (audit 2026-10-17 item 65).
+    """
 
     epoch_start_generator_state: Optional[torch.Tensor]
     batches_consumed:            int
     epoch:                       int
     data_identity:               Dict[str, object]
+    window_offset:               NotRequired[int]
