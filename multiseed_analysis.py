@@ -55,6 +55,7 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 
 import numpy as np
 
+from vfe3.metrics_schema import metrics_csv_spike_mask
 from vfe3.paper.runs import load_config
 from vfe3.run_artifacts import _write_json_atomic
 
@@ -796,6 +797,9 @@ def aggregate_seed_curves(
     structurally blank for every seed at another metric's cadence. ``columns=None`` selects every
     supported numeric column except ``x`` and ignores columns that are blank for all seeds.
 
+    Divergence-spike rows (declared by ``row_kind``, else inferred from ``divergence_spike`` and the
+    intervals of the seed's ``config.json``; :mod:`vfe3.metrics_schema`) are dropped before alignment.
+
     ``withheld`` (a dict the caller owns) switches to per-column withholding: a column that is
     absent for every seed, or not finite for every seed at its active steps, is left out and
     recorded as ``withheld[column] = reason`` instead of emptying the whole curve set.
@@ -817,8 +821,16 @@ def aggregate_seed_curves(
             return {}
         if x not in data or not data[x]:
             return {}
+        try:
+            spike = np.array(metrics_csv_spike_mask(f), bool)
+        except (OSError, UnicodeError, csv.Error):
+            return {}
+        if spike.size != len(data[x]):
+            return {}
         steps = np.array([np.nan if v is None else v for v in data[x]], float)
-        keep = np.isfinite(steps)
+        # Divergence-spike rows sit off the log/eval grid of one seed only, so they would withhold every
+        # every-row column at their steps (audit 2026-10-17 item 5); the curves use the regular rows.
+        keep = np.isfinite(steps) & ~spike
         steps = steps[keep]
         if not steps.size:
             return {}

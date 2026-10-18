@@ -769,7 +769,9 @@ def resource_record(run: RunRecord, *, read_checkpoints: bool = True) -> Dict[st
     out["optimizer_state_bytes"] = opt if opt_source else None
     out["optimizer_state_source"] = opt_source
     throughput = ph.get("throughput")
-    if not isinstance(throughput, Mapping):
+    # A posthoc.json summary written before divergence-spike rows were excluded from the quantiles carries no
+    # spike_rows_excluded and overstates the median (audit 2026-10-17 item 5), so it is recomputed.
+    if not isinstance(throughput, Mapping) or "spike_rows_excluded" not in throughput:
         try:
             from vfe3.run_resources import throughput_summary
             throughput = throughput_summary(run.run_dir)
