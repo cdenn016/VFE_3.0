@@ -274,7 +274,8 @@ class VFE3Config:
     #                   invariant under the passive action. only: projected_predictive, predictive_readout="kernel",
     #                   content_link_edges "off", no frame-space RoPE, no CG coupling, norm_type_block "none" |
     #                   "layernorm", a "coordinate" block MLP, decode_mode "linear" | "diagonal_chunked", no
-    #                   decode_second_order, m_table_update_mode "fisher" only with gauge_transport="off"
+    #                   decode_second_order, m_table_update_mode "fisher" only with pos_phi="none" (its metric
+    #                   U_v^-T diag(1/s_v) U_v^-1 reads the type frame; positional frames make it per occurrence)
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, any
     #                   block_* group or an equal-block so_n / su_n tower; any tying), content_link_edges
@@ -1495,11 +1496,15 @@ class VFE3Config:
                                       "diagonal KL decoder reads diag Sigma_i in local or c_i in reference coordinates)")
             if self.decode_second_order:
                 frame_problems.append("decode_second_order=True (its trace term reads a local diagonal covariance)")
-            if self.m_table_update_mode == "fisher" and self.gauge_transport != "off":
+            # The table Fisher step preconditions mu_v by the metric U_v^-T diag(1/s_v) U_v^-1 of the type's layer-0
+            # frame U_v (vfe3.table_optim). A positional frame makes U_i depend on the position, so the exact metric
+            # would be the occurrence average of U_i^-T diag(1/s_v) U_i^-1, which the step does not implement.
+            if self.m_table_update_mode == "fisher" and self.gauge_transport != "off" and self.pos_phi != "none":
                 frame_problems.append(
-                    "m_table_update_mode='fisher' with learned or frozen frames (the Fisher metric of p_v in mu_v is "
-                    "U_i^-T diag(1/s_v) U_i^-1, which depends on each occurrence's frame; the table step's diag(1/s_v) "
-                    "is exact only for identity frames, gauge_transport='off')")
+                    f"m_table_update_mode='fisher' with pos_phi={self.pos_phi!r} (the Fisher metric of p_v in mu_v is "
+                    "U_i^-T diag(1/s_v) U_i^-1 with a position-dependent layer-0 frame U_i, whose occurrence average "
+                    "the table step does not form; the step supports frames that depend on the token only, "
+                    "pos_phi='none')")
             if frame_problems:
                 raise ValueError(f"family={self.family!r} stores the covariance diagonal in reference coordinates and "
                                  "is defined only where every covariance consumer reads it through the realized frame; "

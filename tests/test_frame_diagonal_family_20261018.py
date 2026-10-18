@@ -413,7 +413,7 @@ def test_the_family_is_accepted_and_serializes() -> None:
     (dict(decode_mode="full_chunked"), "decode_mode='full_chunked'"),
     (dict(decode_mode="expected_likelihood_chunked"), "decode_mode='expected_likelihood_chunked'"),
     (dict(decode_mode="linear", decode_second_order=True), "decode_second_order"),
-    (dict(m_table_update_mode="fisher", untie_decode_bank=True), "m_table_update_mode='fisher'"),
+    (dict(m_table_update_mode="fisher", untie_decode_bank=True, pos_phi="learned"), "m_table_update_mode=.fisher. with pos_phi=.learned."),
 ])
 def test_routes_outside_the_envelope_are_refused_with_the_reason(over: Dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):

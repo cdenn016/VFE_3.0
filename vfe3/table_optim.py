@@ -35,14 +35,34 @@ varying diagonal preconditioner such as :math:`s_v`. The step keeps no optimizer
 The base optimizer steps first, with the table gradients hidden, and the table step follows, so a frame step whose
 metric reads the prior rows (``fisher_group``, :class:`vfe3.train.PhiFisherStatisticsProvider`) evaluates it at
 the pre-step rows (audit 2026-10-10 round 2, item 34).
+
+Frame-diagonal family (``gaussian_frame_diagonal``, 2026-10-18). There the prior of type :math:`v` at a position whose
+layer-0 frame is :math:`U_v` is :math:`p_v = \mathcal N(\mu_v, U_v\operatorname{diag}(s_v)U_v^\top)`, so its Fisher
+metric in the local mean is :math:`U_v^{-\top}\operatorname{diag}(1/s_v)U_v^{-1}` and in :math:`l_v` it is still
+:math:`\operatorname{diag}(1/2)`, since :math:`s_v` is a reference-coordinate diagonal. Without positional frames
+:math:`U_v` depends on the type alone (:meth:`vfe3.model.model.VFEModel.token_type_frames`), and the natural step is
+the diagonal step in the reference mean :math:`\xi_v = U_v^{-1}\mu_v`:
+
+.. math::
+    g_{\xi_v} = U_v^\top\partial_{\mu_v}\mathcal L,\qquad
+    \Delta\xi_v = -\eta\frac{N}{n_v}\,s_v\odot g_{\xi_v},\qquad
+    \Delta\mu_v = U_v\Delta\xi_v = -\eta\frac{N}{n_v}U_v\operatorname{diag}(s_v)U_v^\top\partial_{\mu_v}\mathcal L,
+
+with :math:`\|\Delta\|_G^2 = \Delta\mu^\top U^{-\top}\operatorname{diag}(1/s)U^{-1}\Delta\mu + \tfrac12\|\Delta l\|^2
+= \sum_k\Delta\xi_k^2/s_k + \tfrac12\|\Delta l\|^2`. The trust radius, the weight :math:`N/n_v`, the schedule factor,
+the decay order and the diagnostics are those of the diagonal step, evaluated on :math:`(\Delta\xi, \Delta l)`. The
+frames are built detached, before the base step moves ``phi_embed``, for the step's distinct types only (one
+``unique`` over the step's tokens, a host read the diagonal step does not make). Every other family, and this
+family on identity frames, takes the diagonal step unchanged.
 """
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
 from vfe3.gauge_optim import GaugeManifoldAdamW
+from vfe3.model.frame_actions import frame_matvec
 from vfe3.numerics import bounded_variance_from_log
 
 # Log-row diagnostics of the table step (fixed key set; NaN when no row was active or the step was skipped).
@@ -64,10 +84,16 @@ class TableFisherStatistics:
     point :math:`s_v` and its variance floor.
     """
 
-    def __init__(self, prior_bank: torch.nn.Module) -> None:
+    def __init__(
+        self,
+        prior_bank:    torch.nn.Module,
+        frame_builder: Optional[Callable[[torch.Tensor], Any]] = None,   # (R,) type ids -> CanonicalFrameContext
+    ) -> None:
         self._prior_bank = prior_bank
+        self._frame_builder = frame_builder
         self._tokens: Optional[torch.Tensor] = None
         self._scored: Optional[torch.Tensor] = None
+        self._frames: Optional[Tuple[torch.Tensor, Any]] = None
 
     def set_batch(
         self,
@@ -76,6 +102,30 @@ class TableFisherStatistics:
     ) -> None:
         self._tokens = tokens
         self._scored = scored
+        self._frames = None
+
+    @property
+    def reads_frames(self) -> bool:
+        r"""Whether the metric of :math:`p_v` in :math:`\mu_v` reads the frame :math:`U_v` (``gaussian_frame_diagonal``)."""
+        return self._frame_builder is not None
+
+    def capture_frames(self) -> None:
+        r"""Build the detached frames :math:`U_v` of the step's distinct types from the current (pre-step) ``phi``.
+
+        Called by the optimizer before its base step, which may move ``phi_embed``; a no-op without a frame builder.
+        """
+        self._frames = None
+        if self._frame_builder is None:
+            return
+        tokens, _ = self.batch()
+        rows = torch.unique(tokens.reshape(-1))                                     # (R,) distinct types, sorted
+        self._frames = (rows, self._frame_builder(rows))
+
+    def frames(self) -> Optional[Tuple[torch.Tensor, Any]]:
+        r"""``(rows, frame)`` captured by :meth:`capture_frames`, or ``None`` (diagonal metric)."""
+        if self._frame_builder is not None and self._frames is None:
+            raise RuntimeError("the frame-diagonal table Fisher step needs the frames captured before the base step")
+        return self._frames
 
     def batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._tokens is None or self._scored is None:
@@ -201,6 +251,14 @@ class _TableFisherMixin:
             return g if grad_scale is None else g / grad_scale.to(device=g.device, dtype=dtype)
 
         g_mu, g_l = gradient(mu), gradient(log_s)
+        # gaussian_frame_diagonal: the step is the diagonal step in xi_v = U_v^{-1} mu_v, whose gradient is U_v^T g_mu.
+        frames = self.table_statistics_provider.frames() if g_mu is not None else None
+        if frames is not None:
+            rows, frame = frames
+            rows = rows.to(device=g_mu.device)
+            forward = frame.forward.to(device=g_mu.device)                         # (R, G, d, d) or (R, K, K)
+            g_mu = g_mu.index_copy(0, rows, frame_matvec(forward.transpose(-1, -2), g_mu[rows],
+                                                         frame.block_diagonal))      # (V, K) g_xi on the rows
         eta = self._table_fisher_lr
         step_mu = None if g_mu is None else -eta * weight * s * g_mu                                 # (V, K)
         step_l = None if g_l is None else -eta * weight * 2.0 * g_l                                  # (V, K)
@@ -239,6 +297,10 @@ class _TableFisherMixin:
             if factor != 0.0:
                 scheduled = torch.where(trust > 0, factor * trust * step, torch.zeros_like(step))   # (V, K)
                 scheduled = torch.where(overflow.unsqueeze(-1), (factor * wide).to(dtype), scheduled)
+                if frames is not None and p is mu:
+                    # Delta mu_v = U_v Delta xi_v on the step's rows (every other row's step is zero).
+                    scheduled = scheduled.index_copy(0, rows, frame_matvec(forward, scheduled[rows],
+                                                                           frame.block_diagonal))   # (V, K)
                 update = scheduled.to(p.dtype)
                 p.add_(update if skip is None else torch.where(skip, torch.zeros_like(update), update))
                 realized_sq = realized_sq + factor ** 2 * torch.where(overflow, torch.zeros_like(part), part)
@@ -270,6 +332,8 @@ class _TableFisherMixin:
         # The base step runs with the table gradients hidden (it skips a parameter whose grad is None, decay
         # included), so the frame step's Fisher metric reads the pre-step prior rows; the table step follows.
         tables = [group["params"][0] for group in self._table_fisher_groups() if group is not None]
+        if self.table_statistics_provider.reads_frames and any(p.grad is not None for p in tables):
+            self.table_statistics_provider.capture_frames()                 # U_v at the pre-step phi
         stashed = [(p, p.grad) for p in tables]
         for p, _ in stashed:
             p.grad = None

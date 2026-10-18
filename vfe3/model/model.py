@@ -806,6 +806,39 @@ class VFEModel(nn.Module):
             if rope is not None and self.cfg.rope_mode == "frame" else frame)
         return shared_omega, frame, value_frame
 
+    @torch.no_grad()
+    def token_type_frames(
+        self,
+        rows: torch.Tensor,                       # (R,) token type ids
+    ) -> CanonicalFrameContext:                   # forward/inverse (R, G, d, d) compact, or (R, K, K) dense
+        r"""The detached layer-0 relational frames :math:`U_v` of the token types ``rows``, built as the forward builds them.
+
+        Without a positional frame (``pos_phi='none'``) and without a frame-space RoPE the realized frame of a position
+        holding type :math:`v` depends on the type alone, :math:`U_v = \exp(\phi_v\cdot G)` with :math:`\phi_v` the
+        encoder's frame coordinates (``prior_bank.encode``: ``phi_embed[v]``, or zero under ``per_token_additive``).
+        This method runs the same encoder, the same flat factored transport and the same canonical frame read as
+        :meth:`_relational_frames`, on one row of the ``R`` types, so a block group keeps its compact per-head blocks
+        and never forms a dense :math:`K \times K` factor. The table Fisher step of ``gaussian_frame_diagonal`` reads
+        it (:mod:`vfe3.table_optim`). A positional or RoPE-folded frame depends on the position as well, so this
+        method refuses those configurations.
+        """
+        if self.cfg.pos_phi != "none" or self.cfg.rope_mode in _FRAME_ROPE_MODES:
+            raise RuntimeError("token_type_frames: the layer-0 frame depends on the position under "
+                               f"pos_phi={self.cfg.pos_phi!r} / rope_mode={self.cfg.rope_mode!r}")
+        from vfe3.inference.e_step import build_belief_transport
+
+        beliefs = self.prior_bank.encode(rows.reshape(1, -1))                            # (1, R, ...)
+        phi = self._apply_pos_phi(beliefs.phi).detach()                                  # (1, R, n_gen)
+        transport = build_belief_transport(
+            phi, self.group,
+            compact_phi_block_transport=self._compact_phi_blocks_enabled(),
+            require_vertex_factors=True,
+            validity_max_norm=self.cfg.transport_chart_max_norm,
+        )
+        frame = self._canonical_frame_context(transport, compact=True)
+        return CanonicalFrameContext(forward=frame.forward[0].detach(), inverse=frame.inverse[0].detach(),
+                                     block_diagonal=frame.block_diagonal)
+
     def _build_shared_flat_transport(
         self,
         beliefs: BeliefState,

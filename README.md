@@ -143,7 +143,10 @@ coupling, a `none` or `layernorm` block norm with a `coordinate` block MLP (loca
 push $U_i\operatorname{diag}(c_i)U_i^\top$ and read back $\operatorname{diag}(U_i^{-1}SU_i^{-\top})$;
 reference coordinates push $\operatorname{diag}(c_i)$ and keep the diagonal), the `linear` or
 `diagonal_chunked` decoders (the latter reads $(\xi_i, c_i)$ in reference coordinates, or
-$\operatorname{diag}\Sigma_i$ in local ones), and the table Fisher step only with identity frames.
+$\operatorname{diag}\Sigma_i$ in local ones), and the table Fisher step only with `pos_phi="none"`.
+That step preconditions the mean row by the metric $U_v^{-\top}\operatorname{diag}(1/s_v)U_v^{-1}$ of
+the type's layer-0 frame, the diagonal step in $\xi_v = U_v^{-1}\mu_v$; a positional frame would
+make the metric an average over occurrences, which the step does not form.
 
 ### Whom to listen to: query and key
 
