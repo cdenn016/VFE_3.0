@@ -4,7 +4,8 @@ The relational router bounds every cost to :math:`[0, \kappa]` before the softma
 :math:`\bar D_{ij} = \min(D_{ij} - m_i, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (non-finite costs are
 also set to :math:`\kappa`) and the clamp reference :math:`m_i` of ``routing_kl_max_reference``: :math:`m_i = 0`
 under ``'absolute'``, the row minimum :math:`\min_{j \in \mathcal S_i} D_{ij}` under ``'row_min'``
-(:func:`vfe3.gradients.relational.clamped_routing_cost`). The captured ``score_energy_pre`` is
+(:func:`vfe3.gradients.relational.clamped_routing_cost`), and the query-only row constant :math:`c_i` of the cost
+under ``'query_shifted'``, where the bound is from above only (audit 2026-10-17 item 2). The captured ``score_energy_pre`` is
 :math:`\bar D_{ij}` either way, so an entry is *at the cap* when :math:`\bar D_{ij} \ge \kappa`; under
 ``'row_min'`` that is a gap to the row's best source, ``max_cost_uncapped`` is the largest uncapped gap, and
 the reference is recorded in the summary (``kl_max_reference``). The unweighted
@@ -13,7 +14,12 @@ fraction of capped entries says how often the bound is reached; the routing weig
 .. math::
     m_i = \sum_{j \le i,\ \bar D_{ij} \ge \kappa} \beta_{ij},
 
-says how much of the routing the bound touches. Two query-row populations are reported, each with its
+says how much of the routing the bound touches, and bounds the clamp's effect on the row,
+:math:`\mathrm{TV}(\beta_i, \beta_i^{\text{unclamped}}) \le m_i/(1 - m_i)`; ``capped_beta_mass_max`` is its row
+maximum. Where the capture carries the pre-clamp row extremes ``score_raw_row_min_pre`` and
+``score_raw_row_max_pre`` (the kernel readout, audit 2026-10-17 item 9), ``raw_row_min_mean``, ``raw_row_min_max``
+and ``raw_row_gap_mean`` report the raw row minimum and row range of the cost before the reference and the clamp,
+which separate a row just above the cap from one far above it (NaN without the capture). Two query-row populations are reported, each with its
 causal sources :math:`j` (finite attention log-prior; every source with :math:`\beta_{ij} > 0` when the
 model has no log-prior). Both keep only rows with at least two causal sources: a single-source row has
 :math:`\beta_{ii} = 1` whatever its cost, so the cap cannot change its routing.
@@ -31,6 +37,7 @@ model has no log-prior). Both keep only rows with at least two causal sources: a
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
@@ -39,7 +46,8 @@ import torch
 POPULATIONS: Tuple[str, ...] = ("scored", "computed")
 # Accumulated per (population, layer, head): slot index of each sum.
 _SLOTS: Tuple[str, ...] = (
-    "n_rows", "n_entries", "n_capped", "capped_beta_mass", "rows_with_cap", "capped_at_window_start")
+    "n_rows", "n_entries", "n_capped", "capped_beta_mass", "rows_with_cap", "capped_at_window_start",
+    "n_raw_rows", "raw_row_min_sum", "raw_row_gap_sum")
 
 
 def causal_support(
@@ -64,6 +72,8 @@ class KLCapObserver:
         self._sums: Dict[Tuple[str, int, int], np.ndarray] = {}
         self._max_beta_capped: Dict[Tuple[str, int, int], float] = {}
         self._max_cost_uncapped: Dict[Tuple[str, int, int], float] = {}
+        self._max_capped_mass: Dict[Tuple[str, int, int], float] = {}
+        self._max_raw_row_min: Dict[Tuple[str, int, int], float] = {}
         self._windows_with_cap: Dict[Tuple[str, int], Set[int]] = {}
         self.n_batches = 0
         self.missing_captures = 0
@@ -94,12 +104,21 @@ class KLCapObserver:
             support = causal_support(beta, log_prior)                           # (B, H, N, N)
             multi_source = support.sum(dim=-1) >= 2                             # (B, H, N)
             at_cap = score >= self.kl_max
+            raw_low, raw_high = cap.get("score_raw_row_min_pre"), cap.get("score_raw_row_max_pre")
+            if raw_low is not None and raw_high is not None:
+                raw_low, raw_high = raw_low.double(), raw_high.double()          # (B, H, N)
+                if raw_low.dim() == 2:
+                    raw_low, raw_high = raw_low.unsqueeze(1), raw_high.unsqueeze(1)
+            else:
+                raw_low = raw_high = torch.full((B, H, N), float("nan"), dtype=torch.float64, device=beta.device)
             for population, row_mask in (("scored", valid), ("computed", input_valid)):
                 rows = (torch.as_tensor(row_mask, device=beta.device)[:, None, :].expand(B, H, N)
                         & multi_source)                                         # (B, H, N)
                 entries = support & rows[..., None]                                 # (B, H, N, N)
                 capped = entries & at_cap                                           # (B, H, N, N)
                 capped_mass = torch.where(capped, beta, torch.zeros_like(beta)).sum(dim=-1)   # (B, H, N)
+                raw_rows = rows & torch.isfinite(raw_low)                               # (B, H, N)
+                zero = torch.zeros((), dtype=torch.float64, device=beta.device)
                 stacked = torch.stack([
                     rows.sum(dim=(0, 2)).double(),
                     entries.sum(dim=(0, 2, 3)).double(),
@@ -107,11 +126,17 @@ class KLCapObserver:
                     capped_mass.double().sum(dim=(0, 2)),
                     capped.any(dim=-1).sum(dim=(0, 2)).double(),
                     capped[..., 0].sum(dim=(0, 2)).double(),
+                    raw_rows.sum(dim=(0, 2)).double(),
+                    torch.where(raw_rows, raw_low, zero).sum(dim=(0, 2)),
+                    torch.where(raw_rows, raw_high - raw_low, zero).sum(dim=(0, 2)),
                 ], dim=-1).cpu().numpy()                                           # (H, len(_SLOTS))
                 beta_capped = torch.where(capped, beta, torch.full_like(beta, -1.0)).amax(dim=(0, 2, 3))
                 cost_uncapped = torch.where(entries & ~capped, score,
                                             torch.full_like(score, -1.0)).amax(dim=(0, 2, 3))   # (H,)
                 beta_capped, cost_uncapped = beta_capped.cpu().tolist(), cost_uncapped.cpu().tolist()
+                mass_max = torch.where(rows, capped_mass, torch.full_like(capped_mass, -1.0)).amax(dim=(0, 2))
+                raw_max = torch.where(raw_rows, raw_low, torch.full_like(raw_low, -math.inf)).amax(dim=(0, 2))
+                mass_max, raw_max = mass_max.cpu().tolist(), raw_max.cpu().tolist()
                 for head in range(H):
                     key = (population, layer, head)
                     self._sums[key] = self._sums.get(key, np.zeros(len(_SLOTS))) + stacked[head]
@@ -120,6 +145,10 @@ class KLCapObserver:
                     if cost_uncapped[head] >= 0.0:
                         self._max_cost_uncapped[key] = max(self._max_cost_uncapped.get(key, 0.0),
                                                            cost_uncapped[head])
+                    if mass_max[head] >= 0.0:
+                        self._max_capped_mass[key] = max(self._max_capped_mass.get(key, 0.0), mass_max[head])
+                    if math.isfinite(raw_max[head]):
+                        self._max_raw_row_min[key] = max(self._max_raw_row_min.get(key, -math.inf), raw_max[head])
                 window_has_cap = capped.any(dim=(1, 2, 3)).cpu().numpy()            # (B,)
                 if window_has_cap.any():
                     self._windows_with_cap.setdefault((population, layer), set()).update(
@@ -143,6 +172,12 @@ class KLCapObserver:
                 "max_beta_capped": self._max_beta_capped.get(key, float("nan")),
                 "max_cost_uncapped": self._max_cost_uncapped.get(key, float("nan")),
                 "capped_at_window_start": int(s["capped_at_window_start"]),
+                "capped_beta_mass_max": self._max_capped_mass.get(key, float("nan")),
+                "raw_row_min_mean": (s["raw_row_min_sum"] / s["n_raw_rows"] if s["n_raw_rows"]
+                                     else float("nan")),
+                "raw_row_min_max": self._max_raw_row_min.get(key, float("nan")),
+                "raw_row_gap_mean": (s["raw_row_gap_sum"] / s["n_raw_rows"] if s["n_raw_rows"]
+                                     else float("nan")),
             })
         return out
 
