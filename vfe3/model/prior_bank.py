@@ -38,7 +38,7 @@ import torch
 import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
-from vfe3.config import _REFERENCE_DECODE_MODES, VFE3Config
+from vfe3.config import _REFERENCE_DECODE_MODES
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.frame_actions import frame_matvec, reference_covariance, reference_variances
 
@@ -721,31 +721,32 @@ class PriorBank(nn.Module):
         n_gen:        int,
 
         *,
-        mu_init_std:         float = 0.02,
-        sigma_init:          float = 1.0,
-        phi_scale:           float = 0.01,
-        decode_tau:          float = 1.0,
-        eps:                 float = 1e-6,
-        diagonal_covariance: bool  = True,
-        family:              str   = "gaussian_diagonal",
-        divergence_family:   str   = "renyi",
+        # Keywords that mirror a VFE3Config field are required (no defaults), so they cannot drift from the config
+        # (audit 2026-10-17, item 55); VFEModel passes each from cfg.
+        mu_init_std:         float,
+        sigma_init:          float,
+        phi_scale:           float,
+        decode_tau:          float,
+        eps:                 float,
+        family:              str,
+        encode_mode:         str,
+        decode_mode:         str,
+        decode_chunk_size:   int,
+        decode_av_precision: Optional[str],          # None: the module default _DECODE_AV_PRECISION
+        decode_ce_checkpoint: str,
+        decode_ce_triton:     bool,
+        decode_ranking_fp64_escalation: bool,
+        unigram_kappa:        float,
+        decode_unigram_prior: bool,
+        untie_decode_bank:    bool,
+        decode_coordinates:     str,
+        prior_covariance_table: str,
+
+        diagonal_covariance: bool  = True,           # derived from the family (VFE3Config.diagonal_covariance)
+        divergence_family:   str   = "renyi",        # retired config fields, pinned to the KL readout
         renyi_order:         float = 1.0,
-        encode_mode:         str   = "per_token",
-        decode_mode:         str   = "diagonal_chunked",
-        decode_chunk_size:   int   = 8192,
-        decode_av_precision: Optional[str] = None,
-        decode_ce_checkpoint: str  = "auto",
-        decode_ce_triton:     bool = False,
-        decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
-
-        unigram_kappa:        float = 1.0,
-        decode_unigram_prior: bool  = False,
-        untie_decode_bank:    bool  = False,
-
         irrep_dims:             Optional[List[int]] = None,
         gauge_group_name:       Optional[str]       = None,
-        decode_coordinates:     str                 = "local",
-        prior_covariance_table: str                 = "diagonal",
     ) -> None:
         super().__init__()
         if prior_covariance_table not in PRIOR_COVARIANCE_TABLES:

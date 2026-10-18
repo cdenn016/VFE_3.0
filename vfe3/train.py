@@ -4523,11 +4523,11 @@ def train(
     cfg:    VFE3Config,
 
     *,
-    n_steps:   int             = 100,
-    grad_clip: Optional[float] = 1.0,
+    n_steps:   Optional[int]   = None,   # None -> cfg.max_steps
+    grad_clip: Optional[float] = None,   # None -> cfg.grad_clip (pass 0.0 to disable clipping)
 
-    log_interval:    Optional[int]            = None,
-    eval_interval:   Optional[int]            = None,
+    log_interval:    Optional[int]            = None,   # None -> cfg.log_interval (0 = silent)
+    eval_interval:   Optional[int]            = None,   # None -> cfg.eval_interval (0 = off)
     val_loader:      Optional[Iterable]       = None,
     tokens_per_char: Optional[float]           = None,   # None -> BPC unavailable; BPT remains defined
     device:          Optional[torch.device]   = None,
@@ -4549,8 +4549,10 @@ def train(
     ``n_steps`` gradient steps, re-iterating the loader when it is exhausted. The loss
     history is the per-step cross-entropy; the cutover criterion is that it decreases.
 
-    With ``log_interval`` falsy (``None`` or ``0``) and ``eval_interval`` falsy the loop
-    is bitwise-identical to the silent path: the two truthiness-guarded blocks
+    ``n_steps``, ``grad_clip``, ``log_interval`` and ``eval_interval`` left ``None`` resolve from ``cfg``
+    (``max_steps``, ``grad_clip``, ``log_interval``, ``eval_interval``), so a caller passing only ``cfg`` trains
+    what ``config.json`` records (audit 2026-10-17, item 54). With ``log_interval`` and ``eval_interval`` resolved to
+    ``0`` the loop is bitwise-identical to the silent path: the two truthiness-guarded blocks
     short-circuit, drawing no RNG, running no extra forward, and printing nothing. When
     ``log_interval`` is positive a per-step line is emitted every
     ``log_interval`` steps (CE and diagnostics recomputed under ``no_grad`` only at those
@@ -4566,6 +4568,10 @@ def train(
     the clip-binding fraction and the realized clip coefficients), and a spike logs a warning and
     forces a metrics row at its step (audit 2026-10-10 round 2, item 1).
     """
+    n_steps = cfg.max_steps if n_steps is None else n_steps
+    grad_clip = cfg.grad_clip if grad_clip is None else grad_clip
+    log_interval = cfg.log_interval if log_interval is None else log_interval
+    eval_interval = cfg.eval_interval if eval_interval is None else eval_interval
     # Never expose a stale result after a partial/resumed run or a failed call.
     if _final_validation_out is not None:
         _final_validation_out.clear()

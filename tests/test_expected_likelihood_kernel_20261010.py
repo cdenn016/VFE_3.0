@@ -13,6 +13,7 @@ torch kernel (the expected_likelihood_kernel selector was removed 2026-10-12). T
 
 The interpreter and compile checks run in subprocesses, so the test process never imports triton.
 """
+from tests.profiles import make_prior_bank
 import json
 import os
 import subprocess
@@ -39,7 +40,7 @@ def _bank(dtype: torch.dtype, *, V: int, K: int, unigram: bool, seed: int = 0,
           chunk: int = 16) -> PriorBank:
     r"""A tiny expected-likelihood bank with non-degenerate tables (several vocabulary chunks)."""
     torch.manual_seed(seed)
-    pb = PriorBank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=chunk,
+    pb = make_prior_bank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=chunk,
                    decode_unigram_prior=unigram, unigram_kappa=0.7, decode_tau=0.9).to(dtype)
     with torch.no_grad():
         pb.sigma_log_embed.normal_(0.0, 0.5)
@@ -96,8 +97,8 @@ def test_cpu_tensors_run_and_record_the_torch_kernel() -> None:
 def test_cpu_route_never_imports_triton() -> None:
     script = """
     import json, sys, torch
-    from vfe3.model.prior_bank import PriorBank
-    pb = PriorBank(11, 3, 3, decode_mode="expected_likelihood_chunked")
+    from tests.profiles import make_prior_bank
+    pb = make_prior_bank(11, 3, 3, decode_mode="expected_likelihood_chunked")
     mu_q = torch.randn(1, 4, 3, requires_grad=True)
     ce = pb.decode_ce_expected_likelihood_chunked(mu_q, 0.5 + torch.rand(1, 4, 3), torch.tensor([[1, 2, -100, 4]]))
     ce.backward()
@@ -116,6 +117,7 @@ except Exception as exc:
     print("triton import failed:", exc)
     sys.exit(77)
 import torch
+from tests.profiles import make_prior_bank
 from vfe3.model.prior_bank import PriorBank
 from vfe3.numerics import bounded_variance_from_log
 from vfe3.kernels.expected_likelihood import expected_likelihood_ce
@@ -124,7 +126,7 @@ assert tk.INTERPRETED
 
 def case(dtype, B, N, V, K, unigram, ignore, seed):
     torch.manual_seed(seed)
-    pb = PriorBank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=16,
+    pb = make_prior_bank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=16,
                    decode_unigram_prior=unigram, unigram_kappa=0.7, decode_tau=0.9).to(dtype)
     with torch.no_grad():
         pb.sigma_log_embed.normal_(0.0, 0.5); pb.mu_embed.normal_(0.0, 1.0); pb.decode_log_scale.fill_(0.2)

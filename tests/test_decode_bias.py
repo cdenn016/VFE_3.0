@@ -6,6 +6,7 @@ distribution). Prior-bank decoder modes, whose per-vocab priors already carry th
 create no bias parameter.
 """
 
+from tests.profiles import make_prior_bank
 from tests.profiles import test_config
 import torch
 import torch.nn.functional as F
@@ -17,18 +18,18 @@ from vfe3.train import build_optimizer
 
 def test_bias_param_created_only_on_linear_path():
     V, K, n_gen = 20, 4, 16
-    pb = PriorBank(V, K, n_gen, decode_mode="linear")
+    pb = make_prior_bank(V, K, n_gen, decode_mode="linear")
     assert isinstance(pb.output_proj_bias, torch.nn.Parameter)
     assert pb.output_proj_bias.shape == (V,)
     assert torch.equal(pb.output_proj_bias, torch.zeros(V))         # zero-init
 
-    pb_kl = PriorBank(V, K, n_gen, decode_mode="diagonal_chunked")
+    pb_kl = make_prior_bank(V, K, n_gen, decode_mode="diagonal_chunked")
     assert pb_kl.output_proj_bias is None                           # no bias on the KL path
 
 
 def test_zero_init_bias_is_bit_identical_to_the_bias_free_map():
     V, K, n_gen = 12, 4, 16
-    pb = PriorBank(V, K, n_gen, decode_mode="linear")
+    pb = make_prior_bank(V, K, n_gen, decode_mode="linear")
     rng = torch.Generator().manual_seed(1)
     mu_q = torch.randn(2, 3, K, generator=rng)
     sigma_q = torch.rand(2, 3, K, generator=rng) + 0.5
@@ -37,7 +38,7 @@ def test_zero_init_bias_is_bit_identical_to_the_bias_free_map():
 
 def test_bias_adds_per_vocab_shift_to_linear_logits():
     V, K, n_gen = 10, 3, 9
-    pb = PriorBank(V, K, n_gen, decode_mode="linear")
+    pb = make_prior_bank(V, K, n_gen, decode_mode="linear")
     rng = torch.Generator().manual_seed(2)
     mu_q = torch.randn(2, 4, K, generator=rng)
     sigma_q = torch.rand(2, 4, K, generator=rng) + 0.5
@@ -53,7 +54,7 @@ def test_bias_gradient_descends_toward_log_unigram():
     # (uniform softmax) gives grad_v = 1/V - p_emp(v), so gradient DESCENT raises the most
     # frequent token's bias the most: argmin(grad) == argmax(freq), grad monotone in freq.
     V, K, n_gen = 8, 3, 9
-    pb = PriorBank(V, K, n_gen, decode_mode="linear")
+    pb = make_prior_bank(V, K, n_gen, decode_mode="linear")
     with torch.no_grad():
         pb.output_proj_weight.zero_()
     mu_q = torch.zeros(1, 50, K)

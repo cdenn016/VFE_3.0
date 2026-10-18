@@ -1,3 +1,4 @@
+from tests.profiles import make_prior_bank
 from tests.profiles import test_config
 import pytest
 import torch
@@ -17,7 +18,7 @@ from vfe3.numerics import bounded_variance_from_log
 
 def test_encode_shapes_and_positive_sigma():
     V, K, n_gen = 20, 4, 16
-    pb = PriorBank(V, K, n_gen)
+    pb = make_prior_bank(V, K, n_gen)
     tokens = torch.randint(0, V, (2, 5))
     b = pb.encode(tokens)
     assert isinstance(b, BeliefState)
@@ -27,7 +28,7 @@ def test_encode_shapes_and_positive_sigma():
 
 def test_encode_is_a_lookup():
     V, K, n_gen = 6, 3, 9
-    pb = PriorBank(V, K, n_gen)
+    pb = make_prior_bank(V, K, n_gen)
     b = pb.encode(torch.tensor([[0, 0]]))
     assert torch.allclose(b.mu[0, 0], b.mu[0, 1])             # same token -> same prior
 
@@ -35,7 +36,7 @@ def test_encode_is_a_lookup():
 def test_decode_matches_divergence_seam_exactly():
     rng = torch.Generator().manual_seed(0)
     V, K, n_gen = 12, 4, 16
-    pb = PriorBank(V, K, n_gen)
+    pb = make_prior_bank(V, K, n_gen)
     mu_q = torch.randn(2, 3, K, generator=rng); sigma_q = torch.rand(2, 3, K, generator=rng) + 0.5
     logits = pb.decode(mu_q, sigma_q)
     # decode_log_scale=0 -> tau_eff=decode_tau
@@ -57,7 +58,7 @@ def test_decode_matches_reference_across_table_routes(
     untie_decode_bank: bool,
 ) -> None:
     V, K, n_gen = 5, 3, 9
-    pb = PriorBank(
+    pb = make_prior_bank(
         V,
         K,
         n_gen,
@@ -88,7 +89,7 @@ def test_decode_matches_reference_across_table_routes(
 def test_decode_tau_scaling():
     rng = torch.Generator().manual_seed(1)
     V, K = 10, 3
-    pb = PriorBank(V, K, 9)
+    pb = make_prior_bank(V, K, 9)
     mu_q = torch.randn(1, 2, K, generator=rng); sigma_q = torch.rand(1, 2, K, generator=rng) + 0.5
     l1 = pb.decode(mu_q, sigma_q, tau=1.0)
     l2 = pb.decode(mu_q, sigma_q, tau=2.0)
@@ -102,7 +103,7 @@ def test_decode_matches_seam_in_large_kl_regime():
     # EXACTLY and predict the SAME token (argmax preserved, no flattening).
     torch.manual_seed(1)
     V, K, n_gen = 6, 4, 16
-    pb = PriorBank(V, K, n_gen)
+    pb = make_prior_bank(V, K, n_gen)
     with torch.no_grad():
         pb.sigma_log_embed.fill_(-4.0)                       # sigma_v = exp(-4) ~ 0.018 (tight)
         pb.mu_embed.normal_(0.0, 1.0)
@@ -125,7 +126,7 @@ def test_decode_exact_at_large_mean_offset():
     # version exceeded it near offset ~100 and grew ~mu^2 thereafter).
     torch.manual_seed(0)
     V, K, n_gen = 8, 4, 16
-    pb = PriorBank(V, K, n_gen)
+    pb = make_prior_bank(V, K, n_gen)
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.1).add_(1000.0)           # means clustered far from zero
     mu_q = (1000.0 + 0.1) * torch.ones(1, 1, K); sigma_q = torch.ones(1, 1, K)
@@ -168,7 +169,7 @@ def _family_reference_logits(pb, mu_q, sigma_q, tau_eff):
 def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
     torch.manual_seed(0)
     V, K, n_gen = 7, 3, 4
-    pb = PriorBank(V, K, n_gen, decode_tau=1.3, family="gaussian_diagonal",
+    pb = make_prior_bank(V, K, n_gen, decode_tau=1.3, family="gaussian_diagonal",
                    renyi_order=alpha, decode_mode="diagonal_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.7)
@@ -190,7 +191,7 @@ def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
 def test_reference_decode_dispatches_configured_divergence(alpha):
     torch.manual_seed(2)
     V, K, n_gen = 7, 3, 4
-    pb = PriorBank(V, K, n_gen, decode_tau=1.1, family="gaussian_diagonal",
+    pb = make_prior_bank(V, K, n_gen, decode_tau=1.1, family="gaussian_diagonal",
                    renyi_order=alpha, decode_mode="diagonal_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.5)
@@ -213,7 +214,7 @@ def test_retired_family_decode_is_not_a_config_value():
 
 def test_prior_bank_family_metadata_defaults_and_state_dict_unchanged():
     torch.manual_seed(0)
-    pb = PriorBank(6, 3, 9)                                      # NO family/divergence/order args
+    pb = make_prior_bank(6, 3, 9)                                      # NO family/divergence/order args
     assert pb.family == "gaussian_diagonal"
     assert pb.divergence_family == "renyi"
     assert pb.renyi_order == 1.0
@@ -222,8 +223,8 @@ def test_prior_bank_family_metadata_defaults_and_state_dict_unchanged():
         "mu_embed", "sigma_log_embed", "phi_embed", "decode_log_scale",
     }
     # every existing test-style constructor keeps working unchanged.
-    assert PriorBank(6, 3, 9, decode_mode="linear").divergence_family == "renyi"
-    assert PriorBank(6, 3, 9, decode_tau=1.7).renyi_order == 1.0
+    assert make_prior_bank(6, 3, 9, decode_mode="linear").divergence_family == "renyi"
+    assert make_prior_bank(6, 3, 9, decode_tau=1.7).renyi_order == 1.0
 
 
 # --- DecodeRegistration metadata resolution --------------------------------------------------

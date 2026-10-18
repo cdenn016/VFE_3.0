@@ -20,6 +20,7 @@ reading ``pb.decode_ce_checkpoint`` -- was applied to all of them for consistenc
 dispatched target.
 """
 
+from tests.profiles import make_prior_bank
 from tests.profiles import test_config
 import warnings
 
@@ -48,7 +49,7 @@ def _full_bank(seed=0, **kw):
     convention for exercising a PriorBank kernel in isolation.
     """
     torch.manual_seed(seed)
-    return PriorBank(V, K, N_GEN, mu_init_std=0.4, diagonal_covariance=False,
+    return make_prior_bank(V, K, N_GEN, mu_init_std=0.4, diagonal_covariance=False,
                      decode_mode="full_chunked", **kw)
 
 
@@ -292,7 +293,7 @@ def test_config_decode_ce_checkpoint_live_under_full_chunked():
 ])
 def test_other_diagonal_chunked_kernels_value_identical_always_vs_never(decode_mode, kwargs):
     torch.manual_seed(0)
-    pb = PriorBank(V, K, N_GEN, mu_init_std=0.4, decode_mode=decode_mode, **kwargs)
+    pb = make_prior_bank(V, K, N_GEN, mu_init_std=0.4, decode_mode=decode_mode, **kwargs)
     mu = (0.3 * torch.randn(2, 3, K)).requires_grad_(True)
     sigma = (0.5 + 0.5 * torch.rand(2, 3, K)).requires_grad_(True)
     targets = torch.randint(0, V, (2, 3))
@@ -307,7 +308,7 @@ def test_other_diagonal_chunked_kernels_value_identical_always_vs_never(decode_m
 
 def test_linear_chunked_value_identical_always_vs_never():
     torch.manual_seed(0)
-    pb = PriorBank(V, K, N_GEN, mu_init_std=0.4, decode_mode="linear")
+    pb = make_prior_bank(V, K, N_GEN, mu_init_std=0.4, decode_mode="linear")
     mu = (0.3 * torch.randn(2, 3, K)).requires_grad_(True)
     targets = torch.randint(0, V, (2, 3))
     for chunk in (7, 100):

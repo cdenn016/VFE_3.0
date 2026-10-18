@@ -7,6 +7,7 @@ policies computed one quantity to rounding, so any saved value is dropped. A sav
 eigh basis, or without the field (saved before 2026-10-05), is refused, as is a linear decoder saved
 without its bias.
 """
+from tests.profiles import make_prior_bank
 from dataclasses import fields
 from typing import Any
 
@@ -82,7 +83,7 @@ def test_prior_bank_no_longer_accepts_the_removed_arguments() -> None:
     for name, value in (("expected_likelihood_kernel", "torch"), ("decode_bias", True),
                         ("full_cov_precision_policy", "fp64")):
         with pytest.raises(TypeError):
-            PriorBank(7, 3, 3, **{name: value})
+            make_prior_bank(7, 3, 3, **{name: value})
 
 
 def test_full_gaussian_has_no_precision_policy() -> None:
