@@ -13,8 +13,6 @@ SLOW_TESTS: frozenset[str] = frozenset()
 
 CUDA_TESTS: frozenset[str] = frozenset({
     # cuSOLVER batched-eigensolver ceiling guards, which skip without CUDA (audit 2026-10-10, item 50).
-    'test_eigvalsh_batch_ceiling_20260807.py::test_convex_regime_survives_batch_above_eigvalsh_ceiling',
-    'test_eigvalsh_batch_ceiling_20260807.py::test_eigvalsh_ceiling_is_real_and_cholesky_ex_has_none',
     'test_eigvalsh_batch_ceiling_20260807.py::test_safe_eigvalsh_survives_a_batch_above_the_ceiling',
     # The training loop on the device: fused AdamW, autocast, transfers, CUDA RNG restore, evaluation.
     'test_cuda_training_lane_20261010.py::test_cuda_resume_matches_the_uninterrupted_run',
