@@ -171,7 +171,6 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
     from vfe3.viz.figures import (
         plot_beta_channel_decomposition,
         plot_context_sensitivity,
-        plot_estep_character,
         plot_phi_numerics_reference,
         set_publication_style,
     )
@@ -179,7 +178,6 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
     set_publication_style()
 
     saved_probes = (
-        ("estep_character.json", "estep_character.png", plot_estep_character),
         (
             "beta_channel_decomposition.json",
             "beta_channel_decomposition.png",
@@ -242,100 +240,10 @@ def _render_persisted_run_figures(
     _save_figures(artifacts, losses, logger, losses_start_step=losses_start_step)
 
 
-def _distance_profile(beta: "torch.Tensor") -> "torch.Tensor":
-    r"""Row-mean attention against key distance: ``p[d] = mean_{i-j=d} beta_ij`` over the causal band.
-
-    ``beta`` is (N, N) with rows = query i. Only ``j <= i`` is averaged, and each lag is normalized
-    by the number of query rows that HAVE that lag, so the tail is not damped by the shrinking
-    support (which would hide exactly the long-range revivals this panel exists to show).
-    """
-    import torch
-
-    n = beta.shape[-1]
-    idx = torch.arange(n, device=beta.device)
-    lag = idx[:, None] - idx[None, :]                        # (N, N), >= 0 on the causal band
-    out = torch.zeros(n, dtype=torch.float64)
-    flat, lags = beta.reshape(-1).double(), lag.reshape(-1)
-    keep = lags >= 0
-    out.scatter_add_(0, lags[keep], flat[keep])
-    counts = torch.zeros(n, dtype=torch.float64).scatter_add_(
-        0, lags[keep], torch.ones_like(flat[keep]))
-    return out / counts.clamp(min=1.0)
-
-
-def _render_estep_attention(
-    maps:    "torch.Tensor",                 # (3, L, H, N, N) entry / converged / prior
-    out_dir: Path,                           # already-claimed attention_estep/ directory
-    step:    int,
-    figs:    object,
-) -> None:
-    r"""One panel per head: attention against key distance for all three scoring points.
-
-    A log-scaled heatmap hides both failure modes this exists to expose. A rotary schedule whose
-    positional kernel revives at long lag appears here as an off-diagonal bump; a beta that has
-    collapsed onto its attention prior appears as the entry and prior curves lying on top of each
-    other (audit 2026-07-26 R-2 measured 94% of pairs pinned at ``kl_max``, which is exactly that).
-
-    READ IT AS A POSITIONAL PROFILE, NOT A CONTENT TEST. Each point averages over every query row
-    sharing that lag, so content structure that is not distance-aligned averages away: coincident
-    curves prove only that content moves no LAG-ALIGNED mass. On the 2026-07-26 rope pair the
-    profiles nearly coincide while the pointwise ``max|entry - prior|`` is still 0.36. The
-    per-(layer, head) heatmaps beside this panel, and
-    :func:`~vfe3.run_artifacts.collect_beta_channel_decomposition`, are where content is judged.
-    """
-    plt = figs.plt
-    arms = (("E-step (entry belief)", maps[0], "#0072B2", "-"),
-            ("converged re-score",    maps[1], "#D55E00", "--"),
-            ("attention prior only",  maps[2], "#009E73", ":"))
-    n_layers, n_heads = maps.shape[1], maps.shape[2]
-    panels = n_layers * n_heads
-    figure, axes = plt.subplots(1, panels, figsize=(4.2 * panels, 3.4), squeeze=False)
-    n = maps.shape[-1]
-    half = max(2, n // 2)                                    # lags sampled by >= half the rows
-    for layer in range(n_layers):
-        for head in range(n_heads):
-            ax = axes[0][layer * n_heads + head]
-            floor = None
-            for label, arm, color, style in arms:
-                profile = _distance_profile(arm[layer, head])
-                ax.plot(range(1, profile.shape[0]), profile[1:].cpu().numpy(),
-                        color=color, linestyle=style, linewidth=1.4, label=label)
-                well_sampled = profile[1:half]
-                positive = well_sampled[well_sampled > 0]
-                if positive.numel():
-                    lo = float(positive.min())
-                    floor = lo if floor is None else min(floor, lo)
-            # Lag d is averaged over only N-d query rows, so the far tail is a one-sample estimate
-            # that plunges many decades and would compress the near field into nothing on a log
-            # axis. Bound the view by the WELL-SAMPLED half; the tail still draws, off-scale.
-            if floor is not None and floor > 0.0:
-                ax.set_ylim(bottom=floor * 0.5)
-            ax.set_yscale("log")
-            ax.axvline(half, color="0.6", linewidth=0.8, linestyle="-", zorder=0)
-            ax.set_xlabel("key distance |i - j|")
-            if layer == 0 and head == 0:
-                ax.set_ylabel(r"mean $\beta_{ij}$ at that lag")
-                ax.legend(fontsize=7, frameon=False)
-            ax.set_title(f"layer {layer} head {head}", fontsize=9)
-    figure.suptitle(
-        f"Attention vs key distance (step {step}). Entry is the pattern the E-step aggregated with. "
-        "Curves apart => content moves beta at that lag; curves together => no LAG-ALIGNED content "
-        f"(row-averaging hides content that is not distance-aligned). Y-range set by lags < {half} "
-        "(gray line); beyond it each lag averages fewer rows.", fontsize=8)
-    figure.tight_layout()
-    final_path = out_dir / f"step_{step}_profile.png"
-    with _unique_sibling_output_temp(final_path) as temporary_path:
-        figure.savefig(str(temporary_path), dpi=150, bbox_inches="tight")
-        if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-            raise RuntimeError(f"attention profile figure for step {step} was not written")
-        _atomic_replace(final_path, temporary_path)
-    plt.close(figure)
-
-
 def _render_attention_request(request: Mapping[str, object], run_dir: Path) -> None:
-    """Render one periodic beta or E-step map bundle entirely inside this worker."""
+    """Render one periodic beta map bundle entirely inside this worker."""
     channel = request.get("channel")
-    if channel not in ("beta", "estep"):
+    if channel != "beta":
         raise ValueError(f"unsupported attention channel {channel!r}")
     step = request.get("step")
     if type(step) is not int or step < 0:
@@ -350,11 +258,8 @@ def _render_attention_request(request: Mapping[str, object], run_dir: Path) -> N
     )
     if not isinstance(maps, torch.Tensor):
         raise ValueError("attention request payload must be a tensor")
-    expected_rank = {"beta": 4, "estep": 5}[channel]
-    if maps.ndim != expected_rank:
-        raise ValueError(
-            f"{channel} attention request must have rank {expected_rank}, got {maps.ndim}"
-        )
+    if maps.ndim != 4:
+        raise ValueError(f"{channel} attention request must have rank 4, got {maps.ndim}")
 
     from vfe3.viz import figures as figs
 
@@ -362,29 +267,15 @@ def _render_attention_request(request: Mapping[str, object], run_dir: Path) -> N
     # Claim the output directory ONCE. prepare_owned_output_child re-establishes ownership of the
     # child on every call, which sweeps in-flight temporaries -- calling it a second time while a
     # sibling figure was mid-write deleted that temp out from under the writer.
-    attention_dir = prepare_owned_output_child(
-        run_dir,
-        "attention_estep" if channel == "estep" else "attention",
-        role="attention figure",
-    )
-    if channel == "estep":
-        # (3, L, H, N, N) -> the ENTRY-belief maps are what gets heatmapped; all three arms feed
-        # the profile panel. Its own directory so the shipped attention/ set is untouched.
-        _render_estep_attention(maps, attention_dir, step, figs)
-        maps = maps[0]
+    attention_dir = prepare_owned_output_child(run_dir, "attention", role="attention figure")
     positive = maps[maps > 0]
     vmax = float(positive.max()) if positive.numel() else 1.0
     vmin = float(positive.min()) if positive.numel() else vmax * 1e-3
     n_layers, n_heads = maps.shape[0], maps.shape[1]
     for layer in range(n_layers):
         for head in range(n_heads):
-            if channel == "estep":
-                filename = f"step_{step}_layer{layer}_head{head}.png"
-                title = (f"E-step attention (step {step:,}), layer {layer} head {head}"
-                         "\nscored at the ENTRY belief (the pattern the E-step aggregated with)")
-            else:
-                filename = f"step_{step}_layer{layer}_head{head}.png"
-                title = f"Attention (step {step:,}), layer {layer} head {head}"
+            filename = f"step_{step}_layer{layer}_head{head}.png"
+            title = f"Attention (step {step:,}), layer {layer} head {head}"
             matrix = maps[layer, head]
             final_path = attention_dir / filename
             with _unique_sibling_output_temp(final_path) as temporary_path:

@@ -9,7 +9,6 @@ import math
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.free_energy import attention_tau
 from vfe3.geometry.generators import generate_son
 from vfe3.geometry.groups import check_admissible, get_group

@@ -3,7 +3,7 @@ from collections.abc import MutableMapping
 import pytest
 import torch
 
-from vfe3.alpha_i import alpha_regularizer, register_alpha, self_coupling_alpha
+from vfe3.alpha_i import register_alpha, self_coupling_alpha
 
 
 _MISSING = object()

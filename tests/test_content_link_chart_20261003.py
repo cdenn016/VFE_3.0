@@ -19,7 +19,7 @@ import vfe3.run_artifacts as ra
 import vfe3.train as T
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.model.relational_operators import (CONTENT_LINK_CHARTS, RelationalOperators, _phi1,
+from vfe3.model.relational_operators import (CONTENT_LINK_CHARTS, _phi1,
                                              chart_receive_map)
 from vfe3.posthoc.maps import map_invariants, relational_maps
 

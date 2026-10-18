@@ -22,7 +22,6 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-import train_vfe3
 import vfe3.geometry.transport as transport
 import vfe3.model.model as model_module
 from tests.profiles import config_values, test_config
@@ -42,7 +41,6 @@ from vfe3.geometry.transport import (
     reset_frame_pair_fp64_escalations,
     stable_matrix_exp_pair,
 )
-from vfe3 import metrics
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import (

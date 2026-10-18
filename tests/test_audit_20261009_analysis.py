@@ -5,7 +5,6 @@ figure worker replays; ``aggregate_seed_curves`` keeps the last finite value of 
 the scaling harvest logs the specific failed check; incomplete optimization candidates do not enter
 the interaction projection.
 """
-from tests.profiles import test_config
 
 import json
 import math

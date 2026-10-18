@@ -46,7 +46,6 @@ def _reference(sources: tuple, cost: Callable) -> torch.Tensor:
 
 
 def test_config_disabled_validated_and_active_on_supported_routes() -> None:
-    from tests.profiles import tiny_config
     from tests.test_relational_integration import _cfg
     assert _cfg(projected_factorization="gram").projected_factorization == "gram"
     with pytest.raises(ValueError, match="projected_factorization"):

@@ -8,7 +8,6 @@ point list or JSON run directory; no model is built.
 """
 
 import json
-from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np

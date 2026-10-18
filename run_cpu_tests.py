@@ -1,5 +1,12 @@
-"""Run the ordinary CPU pytest lanes with bounded parallelism."""
+"""Run the ordinary CPU pytest lanes with bounded parallelism.
 
+Run this file under ``$CUDA_PYTHON`` (``C:/anaconda/python.exe``): ``CPU_ENVIRONMENT`` hides CUDA from
+the lanes, and that interpreter has triton, which the Triton interpreter tests of the live decode kernel
+need. Under an interpreter without triton those tests skip, so the runner refuses to start unless
+``ALLOW_MISSING_TRITON`` is set (audit 2026-10-17 item 40).
+"""
+
+import importlib.util
 import os
 import subprocess
 import sys
@@ -8,6 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from xml.etree import ElementTree
 
+from check_junit import read_junit_counts
 from vfe3.process_utils import run_process_tree
 
 
@@ -31,7 +39,29 @@ CPU_ENVIRONMENT = {
     "VECLIB_MAXIMUM_THREADS": "1",
 }
 
-_COUNT_FIELDS = ("tests", "failures", "errors", "skipped")
+# Click-to-run opt-out: True runs the lanes under an interpreter without triton, accepting that the
+# Triton interpreter tests below skip and the live decode kernel's gradients go unchecked.
+ALLOW_MISSING_TRITON = False                    # False (default) | True
+TRITON_INTERPRETER_TESTS = (
+    "tests/test_kl_decode_triton_20261012.py",
+    "tests/test_expected_likelihood_kernel_20261010.py",
+    "tests/test_audit_20261016_a2b_decode_bias_reduction.py",
+    "tests/test_audit_20261016_a2b_decode_once_differentiable.py",
+    "tests/test_audit_20261016_a2b_el_kernel_small_tau.py",
+)
+
+
+def triton_preflight(
+    allow_missing: bool,
+    triton_found:  bool,
+) -> "str | None":
+    r"""The refusal message when triton is absent and not explicitly allowed, else ``None``."""
+    if triton_found or allow_missing:
+        return None
+    listed = "\n".join(f"  {path}" for path in TRITON_INTERPRETER_TESTS)
+    return (f"triton is not importable under {sys.executable}; the Triton interpreter tests would "
+            f"skip:\n{listed}\nRun under $CUDA_PYTHON (C:/anaconda/python.exe) or set "
+            "ALLOW_MISSING_TRITON = True to run without them.")
 
 
 def resolve_cpu_workers(
@@ -115,40 +145,6 @@ def build_cpu_lane_command(
     ]
 
 
-def _local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
-
-
-def _read_junit_counts(path: Path) -> dict[str, int]:
-    root = ElementTree.parse(path).getroot()
-    root_name = _local_name(root.tag)
-    if root_name not in ("testsuite", "testsuites"):
-        raise ValueError(f"unsupported JUnit root element {root_name!r}")
-
-    suites = [element for element in root.iter() if _local_name(element.tag) == "testsuite"]
-    if not suites:
-        raise ValueError("JUnit XML contains no testsuite elements")
-
-    counts = {field: 0 for field in _COUNT_FIELDS}
-    for suite in suites:
-        for field in _COUNT_FIELDS:
-            if field not in suite.attrib:
-                raise ValueError(f"JUnit testsuite lacks the {field!r} count")
-            try:
-                value = int(suite.attrib[field])
-            except ValueError as exc:
-                raise ValueError(f"invalid JUnit {field!r} count") from exc
-            if value < 0:
-                raise ValueError(f"JUnit {field!r} count must be nonnegative")
-            counts[field] += value
-
-    if counts["failures"] + counts["errors"] + counts["skipped"] > counts["tests"]:
-        raise ValueError("JUnit failure/error/skip counts exceed the test count")
-    if counts["tests"] == 0:
-        raise ValueError("JUnit XML contains no executed tests")
-    return counts
-
-
 def run_lane(
     lane:              str,
     environment:       Mapping[str, str],
@@ -188,7 +184,7 @@ def run_lane(
             print(f"{lane}: no tests selected")
             return 0
         try:
-            counts = _read_junit_counts(junit_path)
+            counts = read_junit_counts(junit_path)
         except (OSError, ElementTree.ParseError, ValueError) as exc:
             print(f"{lane}: invalid JUnit result: {exc}", file=sys.stderr)
             return int(completed.returncode) or 1
@@ -213,6 +209,10 @@ def main() -> int:
         preflight_cpu_lane_workers(logical_cpu_count)
     except (TypeError, ValueError) as exc:
         print(f"CPU lane preflight failed: {exc}", file=sys.stderr)
+        return 1
+    refusal = triton_preflight(ALLOW_MISSING_TRITON, importlib.util.find_spec("triton") is not None)
+    if refusal is not None:
+        print(f"CPU lane preflight failed: {refusal}", file=sys.stderr)
         return 1
 
     child_environment = build_cpu_environment(os.environ)

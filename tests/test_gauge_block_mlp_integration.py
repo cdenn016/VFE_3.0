@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 import ablation
-import train_vfe3
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.block import vfe_block
 from vfe3.model.block_mlp import CanonicalFrameBlockMLP, GaugeGateBlockMLP

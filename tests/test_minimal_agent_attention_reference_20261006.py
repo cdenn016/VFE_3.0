@@ -28,7 +28,7 @@ are :math:`10^{-10}` relative (scale-aware) unless a test explains a looser one.
 from tests.profiles import make_relational_operators
 import itertools
 import math
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Sequence, Tuple
 
 import pytest
 import torch

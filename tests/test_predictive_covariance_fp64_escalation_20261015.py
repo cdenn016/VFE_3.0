@@ -110,7 +110,6 @@ def test_only_the_failing_sequences_are_recomputed() -> None:
     r"""Healthy sequences keep their float32 values bit for bit; the failing one takes the float64 values."""
     from vfe3.contracts import CanonicalFrameContext
     ops, mu, sigma, beta, frame, receive = _case(2, 2, False, (3,), torch.float32, seed=4)
-    healthy = _call(ops, mu, sigma, beta, frame, receive)
     ops.predictive_covariance_fp64_escalation = True
     original = ops._predictive_covariance_update
     poisoned_batch = {"rows": None}

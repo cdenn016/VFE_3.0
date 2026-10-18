@@ -7,7 +7,7 @@ head) since the 2026-10-09 audit, is pinned too, and so are the recovery-path fa
 does not exist on the CPU, so these tests record the policy each operation sees and check the restore.
 Tiny CPU shapes only.
 """
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Set
 
 import pytest
 import torch

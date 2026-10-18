@@ -1,7 +1,7 @@
 """Tiny CPU regressions for the September 22 audit remediation."""
 
 from tests.profiles import make_prior_bank
-from tests.profiles import config_values, test_config
+from tests.profiles import test_config
 import json
 import math
 

@@ -12,7 +12,7 @@ routes; the run record; the content-link diagnostics; and a checkpoint/config ro
 from tests.profiles import make_relational_operators
 import math
 import warnings
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import pytest
 import torch

@@ -7,7 +7,6 @@ free-energy self-coupling stay on ``PriorBank`` for every decoder mode.
 
 from tests.profiles import make_prior_bank
 from tests.profiles import test_config
-import pytest
 import torch
 
 from vfe3.model.model import VFEModel

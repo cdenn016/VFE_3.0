@@ -97,8 +97,7 @@ def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
     assert math.isfinite(diagnostics.metrics["val_relational_receiver_cost_after"])
     assert "val_inner_alignment_energy_total" not in diagnostics.metrics
     assert "val_free_energy_total" not in diagnostics.metrics
-    assert diagnostics.metrics["estep_f_comparisons"] == 0.0
-    assert math.isnan(diagnostics.metrics["estep_f_drop"])
+    assert not any(key.startswith("estep_") for key in diagnostics.metrics)
     assert math.isfinite(diagnostics.metrics["pos_loss_ratio"])
 
 

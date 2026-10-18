@@ -5688,70 +5688,6 @@ def _plot_kappa_dispersion(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
-def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
-    r"""B3/EXP-14 PPL-vs-n_e_steps figure, Fisher vs raw mean preconditioner, from the
-    fisher_mu_precond cells (label '<precond>_T<n_e_steps>'). No-op unless >= 2 such cells finished."""
-    cells: List[Dict[str, Any]] = []
-    for r in _collect_sweep_results(sweep_dir):
-        lab = _base_label(str(r.get("label", "")))   # strip __s<seed> before parsing (M4)
-        if "_T" not in lab or _as_float(r.get("primary_val_ppl")) >= float("inf"):
-            continue
-        pre, _, t = lab.partition("_T")
-        if pre not in ("fisher", "raw"):
-            continue
-        try:
-            n_e = int(t)
-        except ValueError:
-            continue
-        cells.append({"precond": pre, "n_e_steps": n_e, "ppl": _as_float(r.get("primary_val_ppl"))})
-    cells = _aggregate_cells(cells, ("precond", "n_e_steps"), ("ppl",))   # collapse seeds (M4)
-    if len(cells) < 2:
-        return
-    plt = _plt_or_none()
-    if plt is None:
-        return
-    try:
-        from vfe3.viz.figures import plot_mu_precond
-    except Exception as exc:                                  # plotting is best-effort, never fatal
-        print(f"mu-precond figure unavailable ({exc}); skipping")
-        return
-    fig_dir.mkdir(exist_ok=True)
-    out = fig_dir / f"{sweep_dir.name}_mu_precond.png"
-    _save_ablation_figure(plot_mu_precond(cells), out, sweep_dir, plt)
-    print(f"  figure -> {out}")
-
-
-def _plot_renyi_saturation(sweep_dir: Path, fig_dir: Path) -> None:
-    r"""B2/EXP-12 H(beta)-vs-alpha + kl_max-saturation-vs-alpha figure from the renyi_order cells
-    (label 'renyi_order=<alpha>', with attn_entropy + energy_klmax_frac diagnostics). No-op unless
-    >= 2 such cells finished."""
-    cells: List[Dict[str, Any]] = []
-    for r in _collect_sweep_results(sweep_dir):
-        lab = str(r.get("label", ""))
-        if not lab.startswith("renyi_order=") or _as_float(r.get("primary_val_ppl")) >= float("inf"):
-            continue
-        try:
-            alpha = float(lab.split("=")[-1])
-        except ValueError:
-            continue
-        cells.append({"alpha": alpha, "attn_entropy": _as_float(r.get("attn_entropy")),
-                      "energy_klmax_frac": _as_float(r.get("energy_klmax_frac"))})
-    if len(cells) < 2:
-        return
-    plt = _plt_or_none()
-    if plt is None:
-        return
-    try:
-        from vfe3.viz.figures import plot_renyi_saturation
-    except Exception as exc:                                  # plotting is best-effort, never fatal
-        print(f"renyi-saturation figure unavailable ({exc}); skipping")
-        return
-    fig_dir.mkdir(exist_ok=True)
-    out = fig_dir / f"{sweep_dir.name}_renyi_saturation.png"
-    _save_ablation_figure(plot_renyi_saturation(cells), out, sweep_dir, plt)
-    print(f"  figure -> {out}")
-
-
 def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
     r"""H1/EXP-13 CE-vs-N extrapolation overlay (one line per positional scheme) from each cell's
     ``extrap_ce`` curve (persisted by run_single under collect_extrapolation). No-op unless >= 2 cells
@@ -5955,8 +5891,6 @@ def _render_sweep_figures(sweep_dir: Path, fig_dir: Path) -> None:
     _plot_cg_coupling(sweep_dir, fig_dir)
     _plot_kappa_dispersion(sweep_dir, fig_dir)
     _plot_pos_extrapolation(sweep_dir, fig_dir)
-    _plot_renyi_saturation(sweep_dir, fig_dir)
-    _plot_mu_precond(sweep_dir, fig_dir)
 
 
 def _run_ablation_figures_isolated(

@@ -8,7 +8,6 @@ test runs amp_dtype=None); these tests pin the AMP wiring specifically.
 """
 
 from tests.profiles import test_config
-from contextlib import nullcontext
 from unittest import mock
 
 import numpy as np

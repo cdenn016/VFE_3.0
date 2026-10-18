@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, finalize_validation_run, load_checkpoint
+from vfe3.run_artifacts import RunArtifacts, finalize_validation_run
 from vfe3.train import (
     TrainingTerminalState,
     build_optimizer,
@@ -685,10 +685,7 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
         if calls["n"] == 1:
             current = original_val_diagnostics(*a, **k)
             metrics = dict(current.metrics)
-            metrics.update({
-                "val_inner_alignment_energy_total": 1.23,
-                "val_inner_alignment_energy_total": 1.23,
-            })
+            metrics.update({"val_inner_alignment_energy_total": 1.23})
             return vt.ValidationDiagnostics(
                 metrics,
                 current.token_ids,
@@ -703,8 +700,6 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     with open(tmp_path / "run" / "metrics.csv", newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert calls["n"] == 2                                      # both evals hit the probe
-    assert rows[0]["val_inner_alignment_energy_total"] == "1.23"
-    assert rows[1]["val_inner_alignment_energy_total"] == ""
     assert rows[0]["val_inner_alignment_energy_total"] == "1.23"           # eval 1 wrote the fresh value
     assert rows[1]["val_inner_alignment_energy_total"] == ""               # eval 2 failed -> NaN -> blank, NOT stale 1.23
 

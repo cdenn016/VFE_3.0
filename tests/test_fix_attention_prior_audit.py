@@ -40,7 +40,6 @@ def test_causal_alibi_masks_strictly_above_diagonal():
 
 def test_causal_alibi_equals_causal_mask_plus_alibi_on_triangle():
     # (3) on the causal triangle (j <= i) value == -slope_h*(i - j).  H=1 for simplicity.
-    import math
     H, n = 1, 6
     alibi_slope = 0.25
     B = attention_log_prior("causal_alibi", n, n, n_heads=H, alibi_slope=alibi_slope)
@@ -68,7 +67,6 @@ def test_causal_alibi_is_not_symmetric():
 def test_default_slope_matches_alibi():
     # Default n_heads=1, alibi_slope=0.5: Press slope for h=1,H=1 is 2^(-8), scaled by base 0.5.
     # On the diagonal dist=0 so bias is 0; one step below: -0.5 * 2^(-8) * 1.
-    import math
     H, n = 1, 3
     B = attention_log_prior("causal_alibi", n, n)   # default n_heads=1, alibi_slope=0.5
     assert B.shape == (H, n, n)

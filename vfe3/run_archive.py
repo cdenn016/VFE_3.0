@@ -93,6 +93,12 @@ def source_tree_sha256(
 def _sha256_file(
     path: Path,
 ) -> str:
+    r"""Stream ``path`` in fixed 1 MiB blocks and return its SHA-256 hex digest.
+
+    Reads the file in bounded blocks (never materializing the whole corpus in memory) so hashing a
+    multi-hundred-megabyte tokenized cache stays within a fixed working set. The one copy, shared by
+    :mod:`vfe3.data.datasets` (audit 2026-10-17 item 85).
+    """
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):

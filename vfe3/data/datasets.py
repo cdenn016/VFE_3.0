@@ -22,6 +22,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from vfe3.run_archive import _sha256_file  # noqa: F401  (re-exported: ablation.py imports it from here)
+
 _CL100K_DATASETS = ("wiki-ja", "wiki-en", "wiki-ar")
 
 # Datasets whose cache holds WORD-level ids (whitespace tokens, not BPE). Their vocabulary is a
@@ -116,19 +118,6 @@ def cache_path(
     _validate_path_component(split,   "split")
     root = default_cache_dir() if cache_dir is None else Path(cache_dir)
     return root / f"{dataset}_{split}_{_tokenizer_tag(dataset)}_tokens.{suffix}"
-
-
-def _sha256_file(path: Path) -> str:
-    r"""Stream ``path`` in fixed 1 MiB blocks and return its SHA-256 hex digest.
-
-    Reads the file in bounded blocks (never materializing the whole corpus in memory) so hashing a
-    multi-hundred-megabyte tokenized cache stays within a fixed working set.
-    """
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _resolved_binary_cache_paths(

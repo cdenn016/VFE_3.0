@@ -12,7 +12,6 @@ between. ``'pushforward'`` is kept unchanged for saved runs. Tiny CPU cases in f
 """
 from __future__ import annotations
 
-import math
 
 import pytest
 import torch

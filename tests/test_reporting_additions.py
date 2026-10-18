@@ -80,12 +80,6 @@ def test_geometry_health_renders():
     fig = figs.plot_geometry_health(h); assert fig is not None; plt.close(fig)
 
 
-def test_estep_quality_renders():
-    h = _hist(("estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
-               "estep_r_phi_last"))
-    fig = figs.plot_estep_quality(h); assert fig is not None; plt.close(fig)
-
-
 def test_validation_sanity_renders_with_eval_cadence_gaps():
     # eval-cadence columns are NaN on non-eval rows; the dashboard must mask per series and still render.
     h = _hist(("generalization_gap", "pos_loss_ratio", "val_future_leakage", "val_row_sum_error",
@@ -112,7 +106,6 @@ def test_ppl_offset_renders():
 
 def test_new_figures_registered():
     for name, fn in (("geometry_health", figs.plot_geometry_health),
-                     ("estep_quality", figs.plot_estep_quality),
                      ("validation_sanity", figs.plot_validation_sanity),
                      ("optimizer_geometry", figs.plot_optimizer_geometry),
                      ("ppl_offset", figs.plot_ppl_offset)):
@@ -133,7 +126,7 @@ def test_save_figures_emits_dashboards(tmp_path):
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
     keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
-            "estep_f_drop", "estep_r_mu_last", "generalization_gap", "val_holonomy_wilson",
+            "generalization_gap", "val_holonomy_wilson",
             "phi_ridge_direction_cosine_mean", "weight_norm_mu", "grad_norm_mu")
     art.history = [{"step": s, **{k: 1.0 / (s + 1) + 0.1 for k in keys}} for s in range(12)]
     _save_figures(art, [3.0, 2.5], logging.getLogger("test"))
@@ -174,26 +167,6 @@ def test_gauge_transport_figure_aggregates_seeds(monkeypatch, tmp_path):
     assert set(by) == {("on", "L1"), ("off", "L1")}
     assert abs(by[("on", "L1")]["ppl"] - 11.0) < 1e-9      # (10 + 12) / 2
     assert abs(by[("off", "L1")]["ppl"] - 21.0) < 1e-9     # (20 + 22) / 2
-
-
-def test_mu_precond_figure_aggregates_seeds(monkeypatch, tmp_path):
-    # M4(b): fisher_T2__s6 must parse (int('2__s6') would ValueError and skip); aggregate to one point
-    # per (precond, n_e_steps).
-    rows = [
-        {"label": "fisher_T2__s6", "primary_val_ppl": "30.0"},
-        {"label": "fisher_T2__s7", "primary_val_ppl": "32.0"},
-        {"label": "raw_T2__s6",    "primary_val_ppl": "40.0"},
-        {"label": "raw_T2__s7",    "primary_val_ppl": "42.0"},
-    ]
-    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d: rows)
-    cap = _capture_ablation_figure(monkeypatch, "plot_mu_precond")
-    ablation._plot_mu_precond(tmp_path, tmp_path)
-    assert "cells" in cap, "figure skipped: int('2__s6') ValueError on seeded labels"
-    assert len(cap["cells"]) == 2
-    by = {(c["precond"], c["n_e_steps"]): c for c in cap["cells"]}
-    assert set(by) == {("fisher", 2), ("raw", 2)}
-    assert abs(by[("fisher", 2)]["ppl"] - 31.0) < 1e-9
-    assert abs(by[("raw", 2)]["ppl"] - 41.0) < 1e-9
 
 
 def test_offset_power_law_honors_weights():
