@@ -50,6 +50,7 @@ TRITON_INTERPRETER_TESTS = (
     "tests/test_audit_20261016_a2b_decode_bias_reduction.py",
     "tests/test_audit_20261016_a2b_decode_once_differentiable.py",
     "tests/test_audit_20261016_a2b_el_kernel_small_tau.py",
+    "tests/test_diag_moments_triton_20261018.py",
 )
 
 
