@@ -334,9 +334,10 @@ def safe_cholesky(
     elements so a ``safe_kl_clamp`` maps them to ``kl_max``.
 
     JITTER SCALE (audit 2026-08-06 C3/F18; relative hardcoded 2026-10-02). The ridge is RELATIVE:
-    round ``t`` adds :math:`\epsilon 10^t s(M) I` with :math:`s(M) = \max(1, |\operatorname{tr}(M)/K|)`,
-    so every element receives the same relative perturbation and the ladder is covariant under
-    :math:`M \to c M` for diagonal means above one. An absolute ridge (the retired alternative)
+    round ``t`` adds :math:`\epsilon 10^t s(M) I` with :math:`s(M) = \max(|\operatorname{tr}(M)/K|, \mathrm{tiny})`
+    (``finfo(dtype).tiny``), so every element receives the same relative perturbation and the ladder is covariant
+    under :math:`M \to c M` at every scale; the earlier :math:`\max(1, \cdot)` made the ridge absolute below unit
+    mean diagonal, where it dominated a small matrix and still reported success (audit 2026-10-17 item 62). An absolute ridge (the retired alternative)
     doubles an eigenvalue sitting on the ``eps=1e-6`` SPD floor while being a no-op at
     ``sigma_max=100``. The ladder only fires above cond ~1e8.
     """
@@ -347,7 +348,9 @@ def safe_cholesky(
         return L, ok
     K = M.shape[-1]
     eye = torch.eye(K, device=M.device, dtype=M.dtype)
-    scale = M.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1.)
+    # The ridge is a repair constant: its scale carries no gradient (below unit mean diagonal the former clamp
+    # at 1 had none either), so the repaired factor differentiates as that of M + c I.
+    scale = M.detach().diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(torch.finfo(M.dtype).tiny)
     # Select a ridge without retaining any failed factorization in autograd.
     ridge = torch.zeros_like(scale)
     with torch.no_grad():
