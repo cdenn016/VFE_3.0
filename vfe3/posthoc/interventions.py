@@ -700,14 +700,6 @@ def _frame_free_covariance_score(
                                        row_invariant=row_invariant, scorer=scorer, public=public)
 
 
-def _key_noise_options(operators: Any) -> Dict[str, torch.Tensor]:
-    r"""``{"key_noise": n}``, the per-head key noise :math:`n_h = \exp(\log n_h)` ``(H,)`` under
-    ``relational_routing='noisy_key'``, as the router passes it (:func:`vfe3.gradients.relational.relational_score`);
-    empty for every other routing cost (audit 2026-10-12 round 2, item 11)."""
-    log_noise = getattr(operators, "routing_key_log_noise", None)              # (H,) or None
-    return {} if log_noise is None else {"key_noise": log_noise.exp()}
-
-
 @contextmanager
 def _instance_override(obj: Any, name: str, value: Any) -> Iterator[None]:
     r"""Shadow a method by an instance attribute and remove the shadow on exit (the class method returns)."""
@@ -862,6 +854,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
 
     def scored(*args: Any, **kwargs: Any) -> torch.Tensor:
         record["intercepted_calls"] += 1
+        kwargs.pop("term_support", None)   # the diagnostic term medians are not captured in this intervention
         return _frame_free_covariance_score(*args, scorer=scorer, **kwargs)
 
     bound_decode = model._decode_belief_with_context

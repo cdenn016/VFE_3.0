@@ -99,7 +99,8 @@ RUN_ROOT = "vfe3_runs"
 # break gauge covariance are overridden (vfe3.gauge_covariant: frame transport on, a family that carries
 # g Sigma g^T, block and decoder in reference coordinates, no fixed-coordinate caps or trust regions, total-KL
 # self term) and the run is refused unless every gauge flag of the pure-path report holds. The content links
-# (Lie-algebra L_ij), routing, readout and learning rates are not touched. The overrides are logged and listed
+# (Lie-algebra L_ij), routing, readout, predictive covariance floor (both floor modes are covariant under the
+# local frame change), decode covariance and learning rates are not touched. The overrides are logged and listed
 # in the run's config.md. False: the config exactly as written.
 fully_gauge_covariant = False
 
@@ -120,6 +121,9 @@ config = dict(
     batch_size                       = 32,
     max_steps                        = 30000,
     grad_clip_scope                  = "role",      # "role" | "group" (one L2 clip per optimizer role, or per optimizer group)
+    max_failed_step_skips            = None,        # None (a step failing at the strictest precision aborts) | int >= 1 (skip up to N such steps)
+    max_consecutive_skips            = None,        # None (never abort on skips) | int >= 1 (abort with crash.json + checkpoint after N rejected updates in a row)
+    loss_spike_skip_nats             = None,        # None (off) | float > 0 (reject an update whose loss exceeds the monitor's loss EMA by this many nats)
 
     n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
@@ -132,6 +136,9 @@ config = dict(
     eval_interval                    = 1500,      # periodic validation every N steps (0 = off)
     diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off)   
+    checkpoint_keep_last             = None,      # None (keep every checkpoint) | int >= 1 (keep the newest N)
+    checkpoint_at_end                = False,     # True | False (also save a resumable checkpoint after the last step)
+    block_variance_at_log            = False,     # True | False (also write diagnostics/block_variance.csv at log steps)
     
     #################################
     #           Modes               #
@@ -140,7 +147,7 @@ config = dict(
     prior_covariance_table           = "diagonal",  # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
-    decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
+    decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I, in reference coordinates under decode_coordinates="reference"); prior-bank decode only
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',        # "passthrough" | "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) | "spread_corrected" (minimal_agent mean_field: plus the label spread)
@@ -162,8 +169,8 @@ config = dict(
               
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     relational_key_noise             = 1.0,         # relational_routing="noisy_key" only: initial per-head key noise n_h > 0 (learned; routes at temperature 1)
-    predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
-    predictive_covariance_floor_mode = "prior",     # "prior" (f Sigma_p, reference-invariant) | "relative" (f tr(C)/K U U^T, the pre-2026-10-12 floor)
+    predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: f, the floor's scale (floor_mode "prior": f * Sigma_p, reference-invariant; "relative": f tr(C)/K U U^T)
+    predictive_covariance_floor_mode = "prior",     # "prior" (f Sigma_p, reference-invariant) | "relative" (f tr(C)/K U U^T, the pre-2026-10-12 floor) | "max" (the larger of the two: relative scaling with the absolute bound f Sigma_p)
     predictive_covariance_ceiling    = None,        # None (off) | c > floor, e.g. 100: Loewner ceiling Sigma^+ <= c * Sigma_p (a clamp; counted in metrics.csv)
     diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
@@ -203,6 +210,7 @@ config = dict(
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
     block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal) | "pushforward_moment" (the same at the effective scale s^2 + tr(Pi Sigma Pi)/K with a span floor; a moment estimate at every Sigma/s^2)
     block_norm_trace_cap             = True,               # True | False: cap the LayerNorm covariance pushforward at the sphere bound K max(gamma^2) (False: uncapped delta method)
+    block_norm_cap_moment_fallback   = False,              # True | False: capped 'pushforward' only: where the cap binds, return the 'pushforward_moment' estimate instead of the capped delta method
 
     #################################
     #        Initialization
@@ -224,7 +232,7 @@ config = dict(
     decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
       
-    deterministic                    = True,
+    deterministic                    = True,        # True | False: torch/cuDNN deterministic algorithms (TF32: see fp32_matmul_precision)
     generate_embedding_figures       = False,
     
 
@@ -256,6 +264,7 @@ config = dict(
     
     lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
     mstep_self_coupling_weight       = 0.0,      # float >= 0: alpha_hat of the M-step term alpha_hat * mean_i alpha_i D(q_i*||p_i), gradient through q*; 0.0 = off
+    self_kl_max                      = None,     # None | float > 0 (float("inf") allowed): divergence clamp of the M-step self term; None = kl_max
   
     ########################################
     #     Attention Belief/Model Settings
@@ -335,10 +344,10 @@ config = dict(
     #   Numerics/Speed
     #################################
   
-    kl_max                           = None,          # None (8 * embed_dim) | nats: safety clamp on every divergence, binding only on blowups
+    kl_max                           = None,          # None (8 * embed_dim) | float > 0 nats (inf disables): safety clamp on every divergence, binding only on blowups
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
-    routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
+    routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" | "query_shifted" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, or D_ij less its query-only row constant)
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
     relational_tile_mib              = 32,         # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
         
@@ -351,6 +360,8 @@ config = dict(
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
     predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
     predictive_covariance_precision  = "fp32",     # "fp32" | "fp64": moment_matched kernel readout: run the whole covariance update in float64 from fp32 beliefs (removes kappa(U)^2 rounding; costly)
+    predictive_covariance_spread_squares = False,  # True | False: moment_matched kernel readout: routed spread as a nonnegative sum of squares after the sandwich (no edge links)
+    predictive_covariance_symmetric_pairs = False, # True | False: moment_matched kernel readout, blockwise body: head pairs h <= g only, off-diagonal pairs doubled (no edge links)
         
    
     

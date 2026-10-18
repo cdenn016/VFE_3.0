@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, finalize_validation_run, load_checkpoint
+from vfe3.run_artifacts import RunArtifacts, finalize_validation_run
 from vfe3.train import (
     TrainingTerminalState,
     build_optimizer,
@@ -459,7 +459,10 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
     assert any("Sample:" in r.message for r in caplog.records)
 
 
-def test_train_vfe3_clickrun_importable_and_runs_one_step(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_train_vfe3_imports_and_a_local_operating_point_runs_one_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The launcher module imports, and its config construction runs one step on a local test operating point that
+    replaces ``train_vfe3.config``; the launcher dictionary itself is not read here (the live route is covered by
+    tests/test_live_route_profile.py; audit 2026-10-17, item 42)."""
     import train_vfe3
 
     # Exercise the launcher's config construction with a complete local operating point.
@@ -570,11 +573,13 @@ def test_grad_clip_per_role_calls_once_per_nonempty_role(monkeypatch):
             id(p) for p in group["params"]
         )
     calls = _install_clip_spy(monkeypatch)
-    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=0.25)
+    # A threshold below every role norm binds every role: a role whose coefficient is exactly 1 skips the
+    # multiply (bit-identical; audit 2026-10-17 item 70), so a binding threshold is needed to see every call.
+    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1e-9)
     assert {frozenset(ids) for ids, _ in calls} == {
         frozenset(ids) for ids in expected.values() if ids
     }
-    assert all(max_norm == 0.25 for _, max_norm in calls)
+    assert all(max_norm == 1e-9 for _, max_norm in calls)
     flattened = [pid for ids, _ in calls for pid in ids]
     assert len(flattened) == len(set(flattened))
 
@@ -682,10 +687,7 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
         if calls["n"] == 1:
             current = original_val_diagnostics(*a, **k)
             metrics = dict(current.metrics)
-            metrics.update({
-                "val_inner_alignment_energy_total": 1.23,
-                "val_inner_alignment_energy_total": 1.23,
-            })
+            metrics.update({"val_inner_alignment_energy_total": 1.23})
             return vt.ValidationDiagnostics(
                 metrics,
                 current.token_ids,
@@ -700,8 +702,6 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     with open(tmp_path / "run" / "metrics.csv", newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert calls["n"] == 2                                      # both evals hit the probe
-    assert rows[0]["val_inner_alignment_energy_total"] == "1.23"
-    assert rows[1]["val_inner_alignment_energy_total"] == ""
     assert rows[0]["val_inner_alignment_energy_total"] == "1.23"           # eval 1 wrote the fresh value
     assert rows[1]["val_inner_alignment_energy_total"] == ""               # eval 2 failed -> NaN -> blank, NOT stale 1.23
 
@@ -857,7 +857,8 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
                             "expected_targets", "scored_targets", "excluded_targets",
                             "val_expected_targets", "val_scored_targets", "val_excluded_targets",
                             "best_val_ppl", "best_step", "final_train_loss", "n_params",
-                            "terminal_checkpoint", "save_model_artifacts"}
+                            "terminal_checkpoint", "save_model_artifacts",
+                            "skipped_steps", "accepted_update_frac"}
     # After the terminal maybe_save_best the primary equals the selected finite best (no earlier best).
     assert mapping["primary_val_ppl"] == mapping["best_val_ppl"] == mapping["final_val_ppl"]
     assert Path(mapping["terminal_checkpoint"]).exists()

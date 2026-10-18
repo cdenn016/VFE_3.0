@@ -10,6 +10,7 @@ The fused chunked kernel must match a dense float64 reference in value and gradi
 ``gradcheck`` in float64, reduce to the plug-in CE as :math:`\sigma \to 0`, leave the default
 (toggle-off) loss bitwise unchanged, and reach the model loss only in training mode.
 """
+from tests.profiles import make_prior_bank
 import pytest
 import torch
 import torch.nn.functional as F
@@ -24,7 +25,7 @@ V, K, N_GEN = 23, 4, 4
 def _bank(dtype: torch.dtype = torch.float64) -> PriorBank:
     r"""A tiny linear-decode bank with a nonzero bias and a set unigram prior."""
     torch.manual_seed(0)
-    pb = PriorBank(V, K, N_GEN, decode_mode="linear", decode_unigram_prior=True,
+    pb = make_prior_bank(V, K, N_GEN, decode_mode="linear", decode_unigram_prior=True,
                    unigram_kappa=0.7).to(dtype)
     with torch.no_grad():
         pb.output_proj_weight.normal_(std=0.8)

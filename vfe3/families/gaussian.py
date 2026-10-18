@@ -311,13 +311,16 @@ class DiagonalGaussian(BeliefParams):
         ``divergence._gaussian_diagonal_renyi``; mu_q=self, mu_t=other). ``alpha`` must lie in the
         KL switch (ValueError otherwise).
 
-        ``eps`` is the variance floor for the log/division terms and MUST equal the upstream belief
-        sigma floor (``cfg.eps``, default 1e-6; the SPD retraction clamps every sigma to
-        [eps, sigma_max], so on the live pipeline every input sigma is already >= cfg.eps and this
-        clamp is inert defense-in-depth, never the binding floor). This is a DIFFERENT, looser floor
-        than the hardcoded 1e-12 in ``natural()``/``entropy()`` (the generic A-path): the closed form
-        tracks the pipeline floor, while the natural-parameter maps only need positivity for
-        log(-2 t2)."""
+        ``eps`` is the variance floor for the log/division terms (``cfg.eps``, default 1e-6). Where the
+        SPD retraction produced sigma it is already in [eps, sigma_max] and the clamp is inert, but the
+        moment-matched readouts (projected_predictive) apply no retraction clamp: their output is bounded
+        below only by the additive floor f Sigma_p (or the relative floor), and runs have logged
+        variances near 1e-14. There the clamp binds, the divergence is that of sigma clamped to eps
+        (smaller than the true value) and its derivative in the clamped coordinates is zero; with
+        ``kl_max`` also saturating, the self-coupling term carries no gradient (audit 2026-10-17 item
+        33). Only ``kl_max=inf`` with an ``eps`` below the smallest variance evaluates the exact
+        divergence. This is a DIFFERENT, looser floor than the hardcoded 1e-12 in
+        ``natural()``/``entropy()`` (the generic A-path), which only need positivity for log(-2 t2)."""
         _require_kl_order(alpha, "DiagonalGaussian.renyi_closed_form")
         compute_dtype = (torch.float64
                          if torch.float64 in (self.mu.dtype, self.sigma.dtype,

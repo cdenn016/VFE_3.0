@@ -499,7 +499,6 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
 
 
 def _group_log_model_cfg(**overrides):
-    from vfe3.config import VFE3Config
 
     values = dict(
         vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,

@@ -140,7 +140,6 @@ def test_reduced_score_and_content_have_correct_live_derivatives() -> None:
 
 def test_operator_initialization_and_compact_frames() -> None:
     from vfe3.contracts import CanonicalFrameContext
-    from vfe3.model.relational_operators import RelationalOperators
 
     rng_before = torch.random.get_rng_state().clone()
     content = make_relational_operators([3, 3], seed=7).double()
@@ -203,7 +202,6 @@ def test_autocast_keeps_factorization_precision_and_leading_batch_dims(dtype: to
 def test_ill_conditioned_source_maps_preserve_projected_kl(smallest: float) -> None:
     from vfe3.contracts import CanonicalFrameContext
     from vfe3.gradients.relational import relational_score
-    from vfe3.model.relational_operators import RelationalOperators
     generator = torch.Generator().manual_seed(0)
     Q = torch.linalg.qr(torch.randn(3, 3, generator=generator))[0]
     R = torch.linalg.qr(torch.randn(3, 3, generator=generator))[0]

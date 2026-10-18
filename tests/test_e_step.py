@@ -1,4 +1,3 @@
-from tests.profiles import test_config
 import torch
 
 from vfe3.belief import BeliefState

@@ -8,10 +8,9 @@ import torch
 from vfe3.config import serialize_config, config_from_serialized
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.relational import relational_score
-from vfe3.model.relational_operators import RelationalOperators
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _relational_artifact_fields
-from tests.test_relational_filtering import _fixture
+from tests._relational_fixture import _fixture
 from tests.test_relational_integration import _cfg, _tokens
 from vfe3.relational_scoring import projected_moments, projected_gaussian_kl
 from tests.test_relational_source_factorization import _inputs

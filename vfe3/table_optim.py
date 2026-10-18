@@ -37,6 +37,7 @@ metric reads the prior rows (``fisher_group``, :class:`vfe3.train.PhiFisherStati
 the pre-step rows (audit 2026-10-10 round 2, item 34).
 """
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -112,6 +113,44 @@ def _schedule_factor(group: Dict[str, object]) -> float:
     return 0.0 if initial == 0.0 or lr == 0.0 else lr / initial
 
 
+def _robust_table_steps(
+    g_mu:         Optional[torch.Tensor],     # (V, K) unscaled mean gradient, or None
+    g_l:          Optional[torch.Tensor],     # (V, K) unscaled log-variance gradient, or None
+    weight:       torch.Tensor,               # (V, 1) N / n_v
+    s:            torch.Tensor,               # (V, K) prior variances s_v
+    eta:          float,
+    trust_radius: float,
+    active:       torch.Tensor,               # (V,) bool n_v > 0
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""The trust-scaled table step :math:`\min(1, r/\|d\|)\,d` computed without overflow (audit 2026-10-17 item 47).
+
+    In float64 the step :math:`d = -\eta(N/n_v)(s\odot g_\mu, 2g_l)` of a finite float32 gradient cannot overflow, and
+    its Fisher norm is taken max-abs normalized, :math:`\|d\| = a\,\|d/a\|` with :math:`a = \max_k|c_k|` over the
+    metric-scaled components :math:`c = (d_\mu/\sqrt s, d_l/\sqrt2)`, so the sum of squares cannot overflow either.
+    Returns ``(scaled_mu, scaled_l, sq_mu, sq_l, trust)``: the float64 scaled steps (zeros where a part is absent),
+    their squared Fisher norms per row and the trust factor :math:`\min(1, r/\|d\|)` (0 on inactive rows).
+    """
+    s64 = s.to(torch.float64)
+    weight64 = weight.to(torch.float64)
+    reference = g_mu if g_mu is not None else g_l
+    zeros = torch.zeros(reference.shape, dtype=torch.float64, device=reference.device)
+    step_mu = -eta * weight64 * s64 * g_mu.to(torch.float64) if g_mu is not None else zeros         # (V, K)
+    step_l = -eta * weight64 * 2.0 * g_l.to(torch.float64) if g_l is not None else zeros            # (V, K)
+    c_mu = step_mu / s64.sqrt()
+    c_l = step_l / math.sqrt(2.0)
+    scale = torch.maximum(c_mu.abs().amax(-1), c_l.abs().amax(-1))                                  # (V,) a
+    safe = torch.where(scale > 0, scale, torch.ones_like(scale)).unsqueeze(-1)
+    norm = scale * ((c_mu / safe).square().sum(-1) + (c_l / safe).square().sum(-1)).sqrt()          # (V,) ||d||
+    trust = torch.where(norm > 0, (trust_radius / torch.where(norm > 0, norm, torch.ones_like(norm))).clamp(max=1.0),
+                        torch.ones_like(norm))
+    trust = torch.where(active, trust, torch.zeros_like(trust))                                     # (V,)
+    scaled_mu = trust.unsqueeze(-1) * step_mu
+    scaled_l = trust.unsqueeze(-1) * step_l
+    sq_mu = (scaled_mu.square() / s64).sum(-1)
+    sq_l = 0.5 * scaled_l.square().sum(-1)
+    return scaled_mu, scaled_l, sq_mu, sq_l, trust
+
+
 class _TableFisherMixin:
     r"""Steps the groups marked ``table_fisher`` (``"mu"``, ``"sigma"``) after the base optimizer's step."""
 
@@ -176,8 +215,17 @@ class _TableFisherMixin:
         active = count > 0
         trust = (self._table_fisher_trust_radius / norm.clamp_min(torch.finfo(dtype).tiny)).clamp(max=1.0)
         trust = torch.where(active, trust, torch.zeros_like(trust)).unsqueeze(-1)                    # (V, 1)
+        # Overflow-robust rows (audit 2026-10-17 item 47). A large finite gradient overflows norm_sq (|g| ~ 1e17 at
+        # N/n_v = 8192, s = 5: trust 0, the row frozen) or the step itself (|g| ~ 1e35: trust * inf = NaN reaches
+        # the table). Those rows, and only those (a finite norm_sq keeps every other row bit-identical), take the
+        # same trust-region step from the float64 direction, where neither can overflow for float32 gradients.
+        overflow = active & ~torch.isfinite(norm_sq)                                                 # (V,)
+        wide_mu, wide_l, wide_sq_mu, wide_sq_l, wide_trust = _robust_table_steps(
+            g_mu, g_l, weight, s, eta, self._table_fisher_trust_radius, active)
         realized_sq = torch.zeros(V, dtype=dtype, device=reference.device)    # (V,) ||scheduled step||^2 / trust^2
-        for p, step, group, part in ((mu, step_mu, mu_group, norm_sq_mu), (log_s, step_l, sigma_group, norm_sq_l)):
+        overflow_sq = torch.zeros(V, dtype=torch.float64, device=reference.device)   # (V,) ||scheduled step||^2
+        for p, step, group, part, wide, wide_sq in ((mu, step_mu, mu_group, norm_sq_mu, wide_mu, wide_sq_mu),
+                                                    (log_s, step_l, sigma_group, norm_sq_l, wide_l, wide_sq_l)):
             if step is None:
                 continue
             decay = float(group["lr"]) * float(group.get("weight_decay", 0.0))
@@ -189,14 +237,18 @@ class _TableFisherMixin:
                     p.mul_(torch.where(skip, torch.ones_like(keep), keep))
             factor = _schedule_factor(group)
             if factor != 0.0:
-                update = (factor * trust * step).to(p.dtype)
+                scheduled = torch.where(trust > 0, factor * trust * step, torch.zeros_like(step))   # (V, K)
+                scheduled = torch.where(overflow.unsqueeze(-1), (factor * wide).to(dtype), scheduled)
+                update = scheduled.to(p.dtype)
                 p.add_(update if skip is None else torch.where(skip, torch.zeros_like(update), update))
-                realized_sq = realized_sq + factor ** 2 * part
+                realized_sq = realized_sq + factor ** 2 * torch.where(overflow, torch.zeros_like(part), part)
+                overflow_sq = overflow_sq + factor ** 2 * wide_sq
             p.grad = None
         if self._collect_table_diag:
-            accepted = trust.squeeze(-1)                                                             # (V,)
+            accepted = torch.where(overflow, wide_trust.to(dtype), trust.squeeze(-1))                # (V,)
             n_active = active.sum().to(dtype)
-            realized = accepted * realized_sq.sqrt()                                                 # (V,) realized norm
+            realized = torch.where(overflow, overflow_sq.sqrt().to(dtype),
+                                   accepted * realized_sq.sqrt())                                    # (V,) realized norm
             values = torch.stack([
                 n_active,
                 torch.where(active, accepted, torch.zeros_like(accepted)).sum() / n_active,

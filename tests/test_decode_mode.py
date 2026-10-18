@@ -5,8 +5,8 @@ r"""Behavioral boundary between linear and prior-bank decoder modes.
 free-energy self-coupling stay on ``PriorBank`` for every decoder mode.
 """
 
+from tests.profiles import make_prior_bank
 from tests.profiles import test_config
-import pytest
 import torch
 
 from vfe3.model.model import VFEModel
@@ -17,7 +17,7 @@ from vfe3.train import build_optimizer
 def test_linear_decode_is_plain_projection_of_mu():
     # Linear decode is exactly logits = mu_q @ W^T, W = output_proj_weight (V, K).
     V, K, n_gen = 12, 4, 16
-    pb = PriorBank(V, K, n_gen, decode_mode="linear")
+    pb = make_prior_bank(V, K, n_gen, decode_mode="linear")
     assert pb.output_proj_weight is not None
     assert pb.output_proj_weight.shape == (V, K)
     mu_q = torch.randn(2, 3, K)
@@ -31,7 +31,7 @@ def test_linear_decode_is_plain_projection_of_mu():
 def test_linear_decode_discards_sigma():
     # The linear projection reads only mu: changing sigma must not move the logits.
     V, K, n_gen = 8, 4, 16
-    pb = PriorBank(V, K, n_gen, decode_mode="linear")
+    pb = make_prior_bank(V, K, n_gen, decode_mode="linear")
     mu_q = torch.randn(1, 2, K)
     l1 = pb.decode(mu_q, torch.rand(1, 2, K) + 0.5)
     l2 = pb.decode(mu_q, torch.rand(1, 2, K) + 5.0)
@@ -40,15 +40,15 @@ def test_linear_decode_discards_sigma():
 
 def test_prior_bank_mode_has_no_output_projection():
     # The pure path carries no extra projection weight.
-    pb = PriorBank(6, 3, 9, decode_mode="diagonal_chunked")
+    pb = make_prior_bank(6, 3, 9, decode_mode="diagonal_chunked")
     assert pb.output_proj_weight is None
 
 
 def test_encode_is_unchanged_by_decoder_mode():
     # Decoder selection does not change the per-token prior-bank lookup.
     V, K, n_gen = 6, 3, 9
-    torch.manual_seed(0); pb_prior = PriorBank(V, K, n_gen, decode_mode="diagonal_chunked")
-    torch.manual_seed(0); pb_linear = PriorBank(V, K, n_gen, decode_mode="linear")
+    torch.manual_seed(0); pb_prior = make_prior_bank(V, K, n_gen, decode_mode="diagonal_chunked")
+    torch.manual_seed(0); pb_linear = make_prior_bank(V, K, n_gen, decode_mode="linear")
     tok = torch.tensor([[0, 1, 2]])
     prior, linear = pb_prior.encode(tok), pb_linear.encode(tok)
     assert torch.allclose(prior.mu, linear.mu)

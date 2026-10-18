@@ -12,7 +12,6 @@ from vfe3.data.datasets import (
     _tokenizer_tag,
     cache_source_identity,
     cache_path,
-    default_cache_dir,
     get_tiktoken_decoder,
     load_cached_tokens,
     tiktoken_encoding_name,
@@ -64,7 +63,7 @@ def test_get_tiktoken_decoder_synthetic_is_none():
 def test_get_tiktoken_decoder_roundtrips_when_tiktoken_present():
     # When tiktoken is installed, the gpt2 decoder round-trips a known id sequence to text;
     # skip cleanly on a box without tiktoken (the decoder is None there, never a crash).
-    tiktoken = pytest.importorskip("tiktoken")
+    pytest.importorskip("tiktoken")
     dec = get_tiktoken_decoder("wikitext-103")
     assert dec is not None
     assert dec([15496, 995]) == "Hello world"                  # gpt2 ids for 'Hello world'

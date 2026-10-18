@@ -201,6 +201,9 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
                 "decomposition uses one configured temperature per head for every layer")
     if any(getattr(op, "mixed_heads", False) for op in operators):
         return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
+    if any(getattr(op, "kl_max_reference", "absolute") == "query_shifted" for op in operators):
+        return ("routing_kl_max_reference='query_shifted': the router scores D_ij without its query-only row "
+                "constant, which this decomposition's cap and consistency checks do not model yet")
     return None
 
 

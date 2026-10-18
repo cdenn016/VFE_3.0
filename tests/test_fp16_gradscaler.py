@@ -3,13 +3,12 @@ docs/superpowers/specs/2026-06-08-fp16-gradscaler-design.md.
 """
 
 from tests.profiles import test_config
-import pytest
 import torch
 
 from vfe3.config import VFE3Config
 import vfe3.gauge_optim as gauge_optim
 from vfe3.model.model import VFEModel
-from vfe3.train import build_optimizer, train, train_step
+from vfe3.train import build_optimizer, train_step
 
 
 def _tiny_cfg(**overrides) -> VFE3Config:

@@ -140,17 +140,18 @@ def vfe_block(
     # composes the norm's, and under a norm other than the LayerNorm, the only norm with that pushforward (the
     # validator admits either value there and inactive_fields marks it inert; audit 2026-10-16 F5).
     from vfe3.model.block_mlp import BLOCK_NORM_PUSHFORWARD_MODES
-    norm_covariance = getattr(cfg, "block_norm_covariance", "passthrough")
+    norm_covariance = cfg.block_norm_covariance
     push_norm = (norm_covariance in BLOCK_NORM_PUSHFORWARD_MODES and not mlp_delta_full
-                 and getattr(cfg, "norm_type_block", "none") == "layernorm")
-    if getattr(cfg, "block_coordinates", "local") == "reference":
+                 and cfg.norm_type_block == "layernorm")
+    if cfg.block_coordinates == "reference":
         return _reference_coordinate_block(
             out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
             capture=capture, hidden_bias=hidden_bias,
             readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg),
             push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor,
             norm_covariance=norm_covariance if push_norm else "pushforward",
-            trace_cap=getattr(cfg, "block_norm_trace_cap", True))
+            trace_cap=cfg.block_norm_trace_cap,
+            cap_moment_fallback=cfg.block_norm_cap_moment_fallback)
     norm_linearization = norm_radial = norm_cap = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         if mlp_delta_full:
@@ -164,7 +165,7 @@ def vfe_block(
             # The composite is linear in the norm-stage covariance, so the norm's sphere-bound cap scales it
             # (audit 2026-10-12, item 1).
             norm_cap = (block_norm_trace_cap(block_norm, out.mu, out.sigma, cfg.block_mlp_covariance_floor)   # (B, N, 1)
-                        if getattr(cfg, "block_norm_trace_cap", True) else None)
+                        if cfg.block_norm_trace_cap else None)
         out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
@@ -237,7 +238,8 @@ def norm_covariance_pushforward(
     from vfe3.model.block_mlp import block_norm_covariance_pushforward
     return block_norm_covariance_pushforward(norm, mu, sigma, cfg.block_mlp_covariance_floor, _head_dims(group, cfg),
                                              mode=cfg.block_norm_covariance,
-                                             trace_cap=getattr(cfg, "block_norm_trace_cap", True))
+                                             trace_cap=cfg.block_norm_trace_cap,
+                                             cap_moment_fallback=cfg.block_norm_cap_moment_fallback)
 
 
 def _head_dims(group: GaugeGroup, cfg: VFE3Config) -> Optional[Sequence[int]]:
@@ -295,6 +297,7 @@ def _reference_coordinate_block(
     covariance_floor: float = 1e-4,                        # block_mlp_covariance_floor of the pushforwards
     norm_covariance: str = "pushforward",                  # push_norm only: the block_norm_covariance mode
     trace_cap:   bool = True,                              # block_norm_trace_cap
+    cap_moment_fallback: bool = False,                     # block_norm_cap_moment_fallback
 ) -> BeliefState:
     r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
 
@@ -355,7 +358,7 @@ def _reference_coordinate_block(
                    if trace_cap else None)
         if push:                                                             # Sigma' = U C' U^T, C' at the pre-norm xi
             pushed = block_norm_covariance_pushforward(block_norm, xi, C, covariance_floor, mode=norm_covariance,
-                                                       trace_cap=trace_cap)
+                                                       trace_cap=trace_cap, cap_moment_fallback=cap_moment_fallback)
             sigma = readout(local_covariance(out.mu, pushed, frame, diagonal=False).to(out.sigma.dtype))
     c = (C if delta_full                                                     # the composite reads the pre-norm C
          else reference_variances(out.mu, sigma, frame) if template          # diag C (of the pushed belief)

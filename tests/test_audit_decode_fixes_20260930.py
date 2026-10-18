@@ -1,5 +1,6 @@
 """Tiny CPU regressions for numerical and retained-work decoder repairs."""
 
+from tests.profiles import make_prior_bank
 import math
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ MODES = ("diagonal_chunked", "full_chunked", "expected_likelihood_chunked")
 
 def _bank(mode: str, checkpoint: str = "never", precision: str = "fp32") -> PriorBank:
     full = mode == "full_chunked"
-    return PriorBank(
+    return make_prior_bank(
         7, 2, 3, family="gaussian_full" if full else "gaussian_diagonal",
         diagonal_covariance=not full, decode_mode=mode, decode_chunk_size=4,
         decode_tau=1.0,

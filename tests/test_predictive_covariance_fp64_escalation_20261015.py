@@ -12,6 +12,7 @@ from typing import Callable
 import pytest
 import torch
 
+from tests.profiles import test_config
 from tests.test_blockwise_moment_matched_20261004 import _case
 from vfe3.config import VFE3Config
 from vfe3.model.relational_operators import covariance_escalation_elements, reset_covariance_escalation_elements
@@ -87,9 +88,11 @@ def test_escalated_update_carries_gradients_to_float32_leaves() -> None:
 
 
 def test_config_field_is_a_bool() -> None:
-    assert VFE3Config().predictive_covariance_fp64_escalation is False
+    for value in (False, True):
+        assert test_config(attention_mode="projected_predictive", predictive_covariance="moment_matched",
+                           predictive_covariance_fp64_escalation=value).predictive_covariance_fp64_escalation is value
     with pytest.raises(ValueError, match="predictive_covariance_fp64_escalation"):
-        VFE3Config(predictive_covariance_fp64_escalation=1)
+        test_config(attention_mode="projected_predictive", predictive_covariance="moment_matched", predictive_covariance_fp64_escalation=1)
 
 
 def test_escalation_accepts_per_run_receiving_maps() -> None:
@@ -107,7 +110,6 @@ def test_only_the_failing_sequences_are_recomputed() -> None:
     r"""Healthy sequences keep their float32 values bit for bit; the failing one takes the float64 values."""
     from vfe3.contracts import CanonicalFrameContext
     ops, mu, sigma, beta, frame, receive = _case(2, 2, False, (3,), torch.float32, seed=4)
-    healthy = _call(ops, mu, sigma, beta, frame, receive)
     ops.predictive_covariance_fp64_escalation = True
     original = ops._predictive_covariance_update
     poisoned_batch = {"rows": None}

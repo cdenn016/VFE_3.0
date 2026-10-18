@@ -25,11 +25,12 @@ back as float64 numpy arrays.
 
 from __future__ import annotations
 
-import contextlib
 import math
-from typing import Any, Dict, Hashable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from vfe3.runtime import ieee_fp32_matmul
 
 
 # ----------------------------------------------------------------------------------------------
@@ -60,26 +61,6 @@ def torch_device(device: Any) -> Optional[Any]:
     if not torch.cuda.is_available():
         raise RuntimeError(f"device {text!r} requested but torch.cuda.is_available() is False")
     return dev
-
-
-@contextlib.contextmanager
-def ieee_fp32_matmul() -> Iterator[None]:
-    r"""Run the enclosed torch float32 GEMMs in IEEE float32 (``"highest"``), then restore the policy.
-
-    A process that enabled TF32 (``"high"``) would otherwise round the GEMM inputs to a 10-bit
-    mantissa (relative error about ``1e-3``), enough to reorder near neighbors and analogy candidates.
-    """
-    import torch
-
-    previous = torch.get_float32_matmul_precision()
-    if previous == "highest":
-        yield
-        return
-    torch.set_float32_matmul_precision("highest")
-    try:
-        yield
-    finally:
-        torch.set_float32_matmul_precision(previous)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -319,16 +300,15 @@ def pca_spectrum(X: Any, k: int = 50) -> np.ndarray:
 # Cosine-geometry summaries
 # ----------------------------------------------------------------------------------------------
 
-def anisotropy(X: Any, rng: Optional[np.random.Generator] = None, n_pairs: int = 20000,
-               center: bool = False) -> float:
+def anisotropy(X: Any, center: bool = False) -> float:
     r"""Mean cosine similarity over distinct pairs of rows (Ethayarajh 2019).
 
     Computed EXACTLY over all ordered pairs ``i != j`` from unit rows ``z_i``:
 
     .. math:: \overline{\cos} = \frac{\lVert\sum_i z_i\rVert^2 - n}{n(n-1)},
 
-    which is the expectation that a random-pair estimate samples, so ``rng``/``n_pairs`` are not
-    used (kept for interface stability). ``center=True`` removes the row mean first.
+    which is the expectation that a random-pair estimate samples. ``center=True`` removes the row
+    mean first.
     """
     X = _f64(X)
     n = X.shape[0]
@@ -348,13 +328,12 @@ def mean_vector_ratio(X: Any) -> float:
     return float(np.linalg.norm(X.mean(axis=0)) / mean_norm)
 
 
-def rogue_dimensions(X: Any, rng: Optional[np.random.Generator] = None, n_pairs: int = 20000,
-                     top: int = 5) -> Dict[str, Any]:
+def rogue_dimensions(X: Any, top: int = 5) -> Dict[str, Any]:
     r"""Per-dimension contribution to the mean pairwise cosine (Timkey & van Schijndel 2021).
 
     With unit rows ``z_i``, ``CC_k = E_{i != j}[z_{ik} z_{jk}]``, computed exactly as
-    ``((sum_i z_ik)^2 - sum_i z_ik^2) / (n(n-1))``; ``sum_k CC_k`` is the mean cosine. The
-    ``rng``/``n_pairs`` arguments are unused (exact expectation). Also reports the mean cosine
+    ``((sum_i z_ik)^2 - sum_i z_ik^2) / (n(n-1))``; ``sum_k CC_k`` is the mean cosine (the exact
+    expectation, so no pair sampling). Also reports the mean cosine
     after z-scoring every dimension, the post-processing Timkey & van Schijndel recommend.
     """
     X = _f64(X)

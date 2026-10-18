@@ -245,7 +245,6 @@ def test_config_local_validation_serialization_and_inactive_mark(
 
 
 def test_operators_carry_routing_without_new_state() -> None:
-    from vfe3.model.relational_operators import RelationalOperators
 
     default = make_relational_operators([2, 2], 11, readout_mode="predictive_content")
     noisy = make_relational_operators([2, 2], 11, readout_mode="predictive_content",
@@ -260,8 +259,7 @@ def test_operators_carry_routing_without_new_state() -> None:
 
 def test_relational_score_dispatches_on_the_operator_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     import vfe3.gradients.relational as relational
-    from tests.test_relational_filtering import _fixture
-    from vfe3.model.relational_operators import RelationalOperators
+    from tests._relational_fixture import _fixture
 
     mu, sigma, _, frame, _, _ = _fixture()
     called = []

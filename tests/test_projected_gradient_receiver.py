@@ -20,7 +20,6 @@ from vfe3.gradients.full_link import (
 )
 from vfe3.inference.e_step import e_step
 from vfe3.model.model import VFEModel
-from vfe3.model.relational_operators import RelationalOperators
 from vfe3.relational_scoring import source_recovery_counter
 
 NOISE, HEADS = .7, (.6, 1.3)

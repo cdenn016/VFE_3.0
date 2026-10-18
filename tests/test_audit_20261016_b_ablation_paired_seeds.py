@@ -65,6 +65,10 @@ def test_reference_of_a_value_sweep_is_the_cell_at_the_baseline_value(monkeypatc
     monkeypatch.setitem(ablation.BASELINE_CONFIG, "m_phi_lr", 0.003)
     assert ablation._paired_reference_label("_paired_probe") == "m_phi_lr=0.003"
     monkeypatch.setitem(ablation.BASELINE_CONFIG, "m_phi_lr", 0.004)    # no cell at the baseline value
+    # Audit 2026-10-17 item 59: such a sweep gets the shared baseline cell, which is then its reference.
+    assert ablation._paired_reference_label("_paired_probe") == "m_phi_lr=0.004"
+    monkeypatch.setitem(ablation.SWEEPS, "_paired_probe", {"param": "m_phi_lr", "values": [0.001, 0.009],
+                                                           "include_baseline": False})
     assert ablation._paired_reference_label("_paired_probe") is None
 
 

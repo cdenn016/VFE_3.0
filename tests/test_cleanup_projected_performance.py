@@ -11,7 +11,6 @@ import vfe3.model.stack as stack_module
 from vfe3.config import VFE3Config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.model import VFEModel
-from vfe3.model.relational_operators import RelationalOperators
 
 
 def _moments(full: bool, compact: bool, dtype: torch.dtype = torch.float64) -> tuple:

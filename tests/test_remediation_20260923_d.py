@@ -17,9 +17,8 @@ from torch.utils.data import DataLoader
 
 import build_wikitext103_word_cache as builder
 import generate_text
-import vfe3.data.datasets as datasets_mod
 import vfe3.train as train_module
-from tests.test_relational_filtering import _fixture
+from tests._relational_fixture import _fixture
 from tests.test_relational_integration import _cfg as _relational_cfg
 from tests.test_word_level_20260918 import fake_corpus  # noqa: F401  (pytest fixture)
 from vfe3.config import VFE3Config
@@ -31,7 +30,6 @@ from vfe3.free_energy import self_divergence_for_alpha
 from vfe3.gradients.relational import relational_score
 from vfe3.model import prior_bank as prior_bank_module
 from vfe3.model.model import VFEModel, _derived_seed
-from vfe3.model.relational_operators import RelationalOperators
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import _eval_protocol_train_ce, build_optimizer, train
 

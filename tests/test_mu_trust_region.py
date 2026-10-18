@@ -11,7 +11,6 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.geometry.groups import get_group
-from vfe3.inference.e_step import e_step_iteration
 from vfe3.numerics import apply_mu_trust_region
 
 

@@ -5,6 +5,7 @@ overlapping candidates of the uncertain rows. Every non-candidate is certified b
 the argmax equals a complete float64 decode's. The fused CE never reads the ranking, so it keeps the
 streamed float32 CE. Candidate refinement is the only resolution since 2026-10-02.
 """
+from tests.profiles import make_prior_bank
 import copy
 
 import pytest
@@ -20,7 +21,7 @@ def _near_tie_bank(decode_mode: str, full: bool) -> PriorBank:
     kwargs = dict(decode_mode=decode_mode, decode_ranking_fp64_escalation=True)
     if full:
         kwargs.update(diagonal_covariance=False, family="gaussian_full")
-    pb = PriorBank(V, K, 9, **kwargs)
+    pb = make_prior_bank(V, K, 9, **kwargs)
     with torch.no_grad():
         mu = torch.randn(V, K, generator=generator)
         mu[1:4] = mu[0] + 1e-6 * torch.randn(3, K, generator=generator)

@@ -9,8 +9,8 @@ the Gibbs weights ``attention_weights`` are live.
 F is divergence-agnostic: it assembles the scalar from per-pair energies E_ij and
 self-divergences D(q_i||p_i) supplied by the `divergence` registry, so a new
 divergence slots in by registration, never by editing F. The only registered member is the KL
-(``renyi`` at alpha = 1): ``divergence_family`` and ``renyi_order`` are retired fields, and the
-squared Hellinger, Bhattacharyya and Jeffreys functionals and the alpha != 1 kernels were removed
+(``renyi`` at alpha = 1): the ``divergence_family`` and ``renyi_order`` config fields are retired,
+the matching helper keywords were removed (audit 2026-10-17 item 72), and the squared Hellinger, Bhattacharyya and Jeffreys functionals and the alpha != 1 kernels were removed
 (audit 2026-10-16 F93). Canonical (with
 the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
@@ -22,12 +22,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from vfe3.alpha_i import alpha_is_per_coord
-from vfe3.divergence import (
-    get_functional,
-    get_functional_per_coord,
-    has_per_coord_functional,
-    divergence_functionals_per_coord,
-)
+from vfe3.divergence import get_functional, get_functional_per_coord
 from vfe3.families.base import BeliefParams
 
 
@@ -118,11 +113,10 @@ def self_divergence(
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    divergence_family: str   = "renyi",
 ) -> torch.Tensor:                         # (..., N) D(q_i || p_i)
-    r"""Self-coupling divergence via the seam (full-K, not per-head: D(q_i||p_i) is the whole
-    belief). ``divergence_family`` selects the functional; the params' subclass the kernel."""
-    return get_functional(divergence_family)(
+    r"""Self-coupling KL via the seam (full-K, not per-head: D(q_i||p_i) is the whole
+    belief). The params' subclass selects the kernel; ``alpha`` must lie in the KL switch."""
+    return get_functional("renyi")(
         q, p, alpha=alpha, kl_max=kl_max, eps=eps,
     )
 
@@ -135,7 +129,6 @@ def self_divergence_per_coord(
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    divergence_family: str   = "renyi",
 ) -> torch.Tensor:                         # (..., N, K) per-coordinate D^(k)(q_i||p_i)
     r"""Per-coordinate self-divergence, unsummed over the coordinate axis.
 
@@ -145,14 +138,7 @@ def self_divergence_per_coord(
     """
     if not callable(getattr(q, "renyi_per_coord", None)):
         raise ValueError(f"{type(q).__name__} has no per-coordinate self-divergence")
-    if not has_per_coord_functional(divergence_family):
-        raise ValueError(
-            f"self_divergence_per_coord has no per-coordinate form for "
-            f"divergence_family={divergence_family!r}: only divergences that decompose "
-            f"coordinate-wise are registered ({divergence_functionals_per_coord()}). Use "
-            f"'renyi' (the KL) or a per-position lambda_alpha_mode."
-        )
-    return get_functional_per_coord(divergence_family)(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
+    return get_functional_per_coord("renyi")(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
 
 
 def self_divergence_for_alpha(
@@ -163,7 +149,6 @@ def self_divergence_for_alpha(
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    divergence_family: str   = "renyi",
     lambda_alpha_mode: str,
 ) -> torch.Tensor:                         # (..., N) summed, or (..., N, K) per-coordinate
     r"""Self-divergence shaped for the selected alpha form: per-coordinate (..., N, K) when the
@@ -173,14 +158,8 @@ def self_divergence_for_alpha(
     divergence-reduction need is honoured by its registration alone, with no consumer edited.
     """
     if alpha_is_per_coord(lambda_alpha_mode):
-        return self_divergence_per_coord(
-            q, p, alpha=alpha, kl_max=kl_max, eps=eps,
-            divergence_family=divergence_family,
-        )
-    return self_divergence(
-        q, p, alpha=alpha, kl_max=kl_max, eps=eps,
-        divergence_family=divergence_family,
-    )
+        return self_divergence_per_coord(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
+    return self_divergence(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
 
 
 def attention_weights(

@@ -13,8 +13,6 @@ SLOW_TESTS: frozenset[str] = frozenset()
 
 CUDA_TESTS: frozenset[str] = frozenset({
     # cuSOLVER batched-eigensolver ceiling guards, which skip without CUDA (audit 2026-10-10, item 50).
-    'test_eigvalsh_batch_ceiling_20260807.py::test_convex_regime_survives_batch_above_eigvalsh_ceiling',
-    'test_eigvalsh_batch_ceiling_20260807.py::test_eigvalsh_ceiling_is_real_and_cholesky_ex_has_none',
     'test_eigvalsh_batch_ceiling_20260807.py::test_safe_eigvalsh_survives_a_batch_above_the_ceiling',
     # The training loop on the device: fused AdamW, autocast, transfers, CUDA RNG restore, evaluation.
     'test_cuda_training_lane_20261010.py::test_cuda_resume_matches_the_uninterrupted_run',
@@ -27,6 +25,9 @@ CUDA_TESTS: frozenset[str] = frozenset({
     'test_kl_decode_triton_20261012.py::test_cuda_fused_route_matches_float64_like_the_torch_route',
     # The amp_dtype reduced-precision probe under CUDA autocast's operation lists (2026-10-12).
     'test_amp_routes_20261012.py::test_cuda_autocast_probe_matches_the_rule',
+    # The tiny live launcher route on CUDA (fused KL-decode CE, fixed-schedule frame exponential) against a
+    # float64 CPU copy (audit 2026-10-17 item 26).
+    'test_cuda_live_route_20261018.py::test_cuda_live_route_matches_a_float64_cpu_copy',
 })
 
 CUDA_MIRROR_TESTS: frozenset[str] = frozenset({

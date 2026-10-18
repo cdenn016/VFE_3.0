@@ -10,11 +10,8 @@ Tensors are accepted as torch or numpy; everything is detached to numpy for plot
 A registry (``register_figure``) lets a new figure slot in by name.
 """
 
-from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from threading import Event, RLock
-from types import TracebackType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 
@@ -24,9 +21,8 @@ matplotlib.use("Agg")                                            # non-interacti
 import matplotlib.figure
 import matplotlib.pyplot as plt
 
-from vfe3.families.base import get_functional_display
 from vfe3.metric_contracts import scaling_min_testable_sizes
-from vfe3.process_utils import ProcessTree, spawn_process_tree
+from vfe3.viz.umap_worker import UMAPWorker
 import numpy as np
 from matplotlib.collections import PathCollection, QuadMesh
 from matplotlib.colors import ListedColormap, LogNorm
@@ -355,27 +351,15 @@ class FigureSkipped(RuntimeError):
     """
 
 
-def has_estep_iterates(cfg: object) -> bool:
-    r"""Whether the legacy shared-objective E-step figure family applies.
-
-    These figures trace the legacy shared-objective E-step. Predictive attention is a readout;
-    projected-gradient receiver iterations have a frozen incoming router and a separate receiver
-    objective, so the legacy trajectory and objective probes do not apply to either retained mode.
-    """
-    return False
-
-
 def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     r"""Skip reasons for figures that are identically trivial on the configured route.
 
     Returns ``{figure_name: reason}``; a name absent from the result is emitted normally. The single
     source of the route gates of audit k160 Section 4, used by :mod:`vfe3.viz.report` and available to
-    the training-time emitters (``attention_estep``, ``estep_*``, ``belief_condition``).
+    the training-time emitters (``belief_condition``).
 
     * ``holonomy_curvature`` always: the projected routes run flat transport, whose holonomy is the
       identity by construction, so the figure plots float32 roundoff.
-    * The legacy E-step family when :func:`has_estep_iterates` is false: the retained routes use
-      predictive readout or a frozen-router receiver objective rather than that shared objective.
     * ``belief_spectrum``, ``spd_ellipses`` and ``belief_condition`` when the covariance is frozen at
       encode (:func:`vfe3.metrics.covariance_frozen_at_encode`): they would describe the decayed
       token table, not beliefs.
@@ -385,13 +369,6 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     reasons["holonomy_curvature"] = (
         "flat transport: holonomy is the identity by construction, so the figure would "
         "plot float32 roundoff")
-    if not has_estep_iterates(cfg):
-        reason = (f"attention_mode={getattr(cfg, 'attention_mode', 'projected_predictive')!r}: "
-                  "legacy shared-objective E-step probes do not apply")
-        for name in ("iterate_trajectory", "belief_trajectories",
-                     "estep_character", "estep_quality", "estep_grad_norm_decomposition",
-                     "attention_estep"):
-            reasons[name] = reason
     if metrics.covariance_frozen_at_encode(cfg):
         reason = ("covariance frozen at encode: Sigma is the input-token table row, not a belief "
                   "covariance")
@@ -469,532 +446,6 @@ def _zoom_bar_value_axis(ax, values, *, vertical: bool = True,
 _UMAP_N_NEIGHBORS = 15                                           # local-neighborhood size (callers scale with N)
 _UMAP_MIN_DIST    = 0.1                                          # display-tuned spacing (0.0 for clustering runs)
 
-# Worker source for the ISOLATED UMAP embedding subprocess (see UMAPWorker).
-# init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
-# clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
-# deterministic and data-aware. n_jobs=1 matches what random_state already forces, so it also
-# silences UMAP's "n_jobs overridden" warning. Same compute, no warning cascade.
-_UMAP_WORKER_SRC = (
-    "import json, os, sys, traceback\n"
-    "import numpy as np\n"
-    "import umap\n"
-    "for line in sys.stdin:\n"
-    "    request = json.loads(line)\n"
-    "    try:\n"
-    "        X = np.load(request['input'])\n"
-    "        reducer = umap.UMAP(n_neighbors=int(request['n_neighbors']),\n"
-    "                            min_dist=float(request['min_dist']),\n"
-    "                            n_components=int(request['n_components']), init='pca',\n"
-    "                            random_state=int(request['seed']), n_jobs=1)\n"
-    "        np.save(request['output'], reducer.fit_transform(X))\n"
-    "        response = {'ok': True}\n"
-    "    except BaseException:\n"
-    "        response = {'ok': False, 'error': traceback.format_exc()[-4000:]}\n"
-    "    status_tmp = request['status'] + '.tmp'\n"
-    "    with open(status_tmp, 'w', encoding='utf-8') as handle:\n"
-    "        json.dump(response, handle)\n"
-    "    os.replace(status_tmp, request['status'])\n"
-)
-
-
-# Cap on concurrent UMAP interpreters. Each fit is single-threaded by construction (random_state
-# forces it), so the pool is the ONLY parallelism available and one core per fit is the right unit.
-_UMAP_MAX_WORKERS = 8
-_STDERR_UNLINK_POLL_SECONDS = 0.005      # Windows handle-release lag after a drained process tree
-
-
-def _numba_cache_dir() -> Optional[str]:
-    r"""A PERSISTENT numba cache for the UMAP workers; None means "inherit numba's own default".
-
-    The worker used to point ``NUMBA_CACHE_DIR`` at its request tempdir, which ``close`` then
-    removed, so umap-learn's numba kernels were JIT-compiled from scratch on every report and the
-    cache never survived a single run. An explicitly set ``NUMBA_CACHE_DIR`` in the parent
-    environment wins; otherwise the first writable candidate is used.
-    """
-    import os
-    import tempfile
-    inherited = os.environ.get("NUMBA_CACHE_DIR")
-    if inherited:
-        return inherited
-    candidates = (Path.home() / ".cache" / "vfe3" / "numba",
-                  Path(tempfile.gettempdir()) / "vfe3-numba-cache")
-    for candidate in candidates:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            return str(candidate)
-        except OSError:
-            continue
-    return None
-
-
-@dataclass(eq=False)
-class _UMAPWorkerRecord:
-    """Identity-bearing lifecycle state for one owned worker process."""
-
-    tree: ProcessTree
-    stderr_handle: object
-    identity: str = field(default_factory=lambda: uuid4().hex)
-    retiring: bool = False
-    retired: bool = False
-    requests_submitted: int = 0
-    retired_event: Event = field(default_factory=Event)
-    cleanup_status: Optional[Dict[str, object]] = None
-
-    @property
-    def process(self):
-        return self.tree.process
-
-
-class UMAPWorker:
-    r"""A lazily started, crash-isolated POOL of UMAP interpreters reusable within a report.
-
-    One process was enough while embeddings were requested one at a time. The controlled multi-seed
-    protocol requests five fits of the SAME features per channel and fifteen per report, and each is
-    single-threaded, so a single worker left 23 of 24 cores idle while UMAP accounted for nearly all
-    of the figure wall clock. Processes are started on demand up to ``max_workers`` and reused, so a
-    caller that only ever asks for one embedding still pays for exactly one interpreter.
-    """
-
-    def __init__(
-        self,
-
-        *,
-        timeout:         float         = 1200.0,
-        cleanup_timeout: float         = 5.0,
-        max_workers:     Optional[int] = None,
-    ) -> None:
-        if timeout <= 0.0:
-            raise ValueError("UMAP worker timeout must be positive")
-        if cleanup_timeout <= 0.0:
-            raise ValueError("UMAP cleanup timeout must be positive")
-        cores = os.cpu_count() or 1
-        self.timeout = timeout
-        self.cleanup_timeout = cleanup_timeout
-        self.max_workers = (max(1, min(_UMAP_MAX_WORKERS, cores - 1)) if max_workers is None
-                            else max(1, int(max_workers)))
-        self._counter = 0
-        self._workers: List[_UMAPWorkerRecord] = []
-        self._lifecycle_lock = RLock()
-        self._closing = False
-        self._request_paths: set[str] = set()
-        self.cleanup_statuses: List[Dict[str, object]] = []
-        self._workdir = None
-
-    def _record_cleanup_failure(self, *, reason: str, path: str, exc: BaseException) -> dict:
-        status: Dict[str, object] = {
-            "pid": None,
-            "reason": reason,
-            "terminated": False,
-            "reaped": False,
-            "root_reaped": False,
-            "tree_termination_confirmed": False,
-            "returncode": None,
-            "cleanup_error": f"{type(exc).__name__}: {exc}",
-            "elapsed_s": 0.0,
-            "path": path,
-        }
-        with self._lifecycle_lock:
-            self.cleanup_statuses.append(status)
-        return status
-
-    def _cleanup_request_path(self, path: str) -> None:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            with self._lifecycle_lock:
-                self._request_paths.discard(path)
-        except OSError as exc:
-            self._record_cleanup_failure(reason="request_cleanup", path=path, exc=exc)
-        else:
-            with self._lifecycle_lock:
-                self._request_paths.discard(path)
-
-    def _ensure(self, count: int) -> None:
-        r"""Guarantee at least ``count`` live interpreters (never more than ``max_workers``)."""
-        import subprocess
-        import sys
-        import tempfile
-        with self._lifecycle_lock:
-            if self._closing:
-                raise RuntimeError("UMAP worker pool is closing")
-            if self._workdir is None:
-                self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
-            cache_dir = _numba_cache_dir()
-            while len(self._workers) < min(count, self.max_workers):
-                worker_env = os.environ.copy()
-                if cache_dir is None:
-                    worker_env.pop("NUMBA_CACHE_DIR", None)
-                else:
-                    worker_env["NUMBA_CACHE_DIR"] = cache_dir
-                handle = open(os.path.join(self._workdir, f"stderr_{uuid4().hex}.log"), "w+b")
-                try:
-                    tree = spawn_process_tree(
-                        [sys.executable, "-c", _UMAP_WORKER_SRC],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL,
-                        stderr=handle,
-                        text=True,
-                        env=worker_env,
-                    )
-                except BaseException:
-                    handle.close()
-                    raise
-                self._workers.append(_UMAPWorkerRecord(tree=tree, stderr_handle=handle))
-
-    def _error_tail(self, record: _UMAPWorkerRecord) -> str:
-        stderr_handle = record.stderr_handle
-        try:
-            stderr_handle.flush()
-        except (OSError, ValueError):
-            return ""
-        try:
-            with open(stderr_handle.name, "rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, handle.tell() - 1000), os.SEEK_SET)
-                return handle.read().decode(errors="replace")
-        except (OSError, ValueError):
-            return ""
-
-    def _retire(
-        self,
-        record: _UMAPWorkerRecord,
-        *,
-        reason: str,
-    ) -> Optional[Dict[str, object]]:
-        """Retire one identity exactly once, without holding the lock while waiting."""
-        with self._lifecycle_lock:
-            if record.retired:
-                return record.cleanup_status
-            if record.retiring:
-                owner = False
-            else:
-                record.retiring = True
-                owner = True
-        if not owner:
-            record.retired_event.wait(self.cleanup_timeout * 2.0 + 0.1)
-            return record.cleanup_status
-
-        from time import monotonic
-        retirement_started = monotonic()
-
-        proc = record.process
-        handle = record.stderr_handle
-        cleanup_errors: List[str] = []
-        returncode = proc.poll()
-        status: Dict[str, object] = {
-            "pid": int(proc.pid),
-            "reason": reason,
-            "terminated": True,
-            "reaped": returncode is not None,
-            "root_reaped": returncode is not None,
-            "tree_termination_confirmed": False,
-            "returncode": returncode,
-            "cleanup_error": None,
-            "elapsed_s": 0.0,
-        }
-        try:
-            try:
-                status = record.tree.terminate(reason=reason, timeout=self.cleanup_timeout)
-            except BaseException as exc:
-                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
-                returncode = proc.poll()
-                status.update(
-                    reaped=returncode is not None,
-                    root_reaped=returncode is not None,
-                    returncode=returncode,
-                )
-
-            # Only after bounded tree termination: close streams on daemon helpers sharing the
-            # remaining cleanup budget. TextIOWrapper.close() may flush behind a concurrent submit.
-            stdin = proc.stdin
-            proc.stdin = None
-            try:
-                stderr_path = handle.name
-            except BaseException as exc:
-                cleanup_errors.append(f"stderr path: {type(exc).__name__}: {exc}")
-                stderr_path = None
-
-            from threading import Thread
-            close_deadline = monotonic() + max(
-                0.0,
-                self.cleanup_timeout - float(status.get("elapsed_s", 0.0)),
-            )
-            pending_closes = []
-            for label, stream in (("stdin", stdin), ("stderr", handle)):
-                if stream is None:
-                    continue
-                completed = Event()
-                close_errors: List[BaseException] = []
-
-                def _close_stream(
-                    owned_stream=stream,
-                    errors=close_errors,
-                    done=completed,
-                ) -> None:
-                    try:
-                        owned_stream.close()
-                    except BaseException as exc:
-                        errors.append(exc)
-                    finally:
-                        done.set()
-
-                closer = Thread(
-                    target=_close_stream,
-                    name=f"umap-{label}-close-{proc.pid}",
-                    daemon=True,
-                )
-                try:
-                    closer.start()
-                except BaseException as exc:
-                    cleanup_errors.append(f"{label} close start: {type(exc).__name__}: {exc}")
-                    continue
-                pending_closes.append((label, completed, close_errors))
-
-            for label, completed, close_errors in pending_closes:
-                remaining = max(0.0, close_deadline - monotonic())
-                if not completed.wait(remaining):
-                    cleanup_errors.append(f"{label} close exceeded cleanup budget")
-                elif close_errors:
-                    exc = close_errors[0]
-                    cleanup_errors.append(f"{label} close: {type(exc).__name__}: {exc}")
-
-            if stderr_path is not None:
-                # Windows releases a terminated tree's INHERITED handles a few milliseconds after the
-                # job reports itself drained (the gated launcher hands its stderr to the real worker,
-                # so the log outlives both). A single unlinked attempt therefore lost the race and
-                # published WinError 32 on every worker. Retry inside the caller's cleanup budget --
-                # the same policy close() already applies to the scratch directory itself.
-                remove_deadline = retirement_started + self.cleanup_timeout
-                while True:
-                    try:
-                        os.remove(stderr_path)
-                    except FileNotFoundError:
-                        break
-                    except OSError as exc:
-                        remaining = remove_deadline - monotonic()
-                        if remaining <= 0.0:
-                            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
-                            break
-                        Event().wait(min(_STDERR_UNLINK_POLL_SECONDS, remaining))
-                    else:
-                        break
-        finally:
-            status["elapsed_s"] = monotonic() - retirement_started
-            existing_error = status.get("cleanup_error")
-            status["cleanup_error"] = " | ".join(
-                part for part in (existing_error, *cleanup_errors) if part
-            ) or None
-            with self._lifecycle_lock:
-                self._workers[:] = [
-                    active for active in self._workers if active.identity != record.identity
-                ]
-                record.cleanup_status = status
-                record.retired = True
-                record.retiring = False
-                self.cleanup_statuses.append(status)
-                record.retired_event.set()
-        return status
-
-    def _submit(self, record: _UMAPWorkerRecord, request: Dict[str, object]) -> None:
-        import json
-        from threading import Thread
-        proc = record.process
-        stream = proc.stdin
-        if stream is None:
-            raise OSError("UMAP worker input is unavailable")
-        payload = json.dumps(request) + "\n"
-        completed = Event()
-        outcome: List[BaseException] = []
-
-        def _write_request() -> None:
-            try:
-                stream.write(payload)
-                stream.flush()
-            except BaseException as exc:
-                outcome.append(exc)
-            finally:
-                completed.set()
-
-        writer = Thread(target=_write_request, name=f"umap-submit-{proc.pid}", daemon=True)
-        writer.start()
-        if not completed.wait(self.timeout):
-            self._retire(record, reason="submit_timeout")
-            raise TimeoutError(f"UMAP worker request submission exceeded {self.timeout:g} seconds")
-        if outcome:
-            exc = outcome[0]
-            tail = self._error_tail(record)
-            self._retire(record, reason="pipe_closed")
-            if "ModuleNotFoundError" in tail and "umap" in tail:
-                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
-            if isinstance(exc, (BrokenPipeError, OSError, ValueError)):
-                raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
-            raise exc
-        with self._lifecycle_lock:
-            if record.retired or record.retiring:
-                raise OSError("UMAP worker retired during request submission")
-            record.requests_submitted += 1
-
-    def _collect(self, record: _UMAPWorkerRecord, status: str, fout: str) -> np.ndarray:
-        r"""Block on one submitted request. The timeout starts HERE, matching the serial contract.
-
-        A queued request (more seeds than workers) therefore gets its full timeout from the moment
-        it is awaited rather than sharing one budget with the whole batch.
-        """
-        import json
-        from threading import Thread
-        proc = record.process
-        ready = Event()
-        canceled = Event()
-
-        def _watch() -> None:
-            while not canceled.is_set():
-                if os.path.exists(status) or proc.poll() is not None:
-                    ready.set()
-                    return
-                canceled.wait(0.01)
-
-        watcher = Thread(target=_watch, name=f"umap-status-{proc.pid}", daemon=True)
-        watcher.start()
-        with self._lifecycle_lock:
-            first_request = record.requests_submitted == 1
-        startup_grace = min(0.25, self.cleanup_timeout) if first_request else 0.0
-        finished = ready.wait(self.timeout + startup_grace)
-        canceled.set()
-        watcher.join(timeout=self.cleanup_timeout)
-        if not finished and not os.path.exists(status):
-            self._retire(record, reason="timeout")
-            raise TimeoutError(f"UMAP worker exceeded {self.timeout:g} seconds")
-        if not os.path.exists(status):
-            returncode = proc.poll()
-            tail = self._error_tail(record)
-            self._retire(record, reason="worker_exit")
-            if "ModuleNotFoundError" in tail and "umap" in tail:
-                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-            raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
-        with open(status, encoding="utf-8") as handle:
-            response = json.load(handle)
-        if not response.get("ok"):
-            error = str(response.get("error", "unknown worker failure"))
-            if "ModuleNotFoundError" in error and "umap" in error:
-                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-            raise OSError(f"UMAP embedding worker failed: {error[-500:]}")
-        return np.load(fout)
-
-    def embed(
-        self,
-        features: np.ndarray,
-
-        *,
-        n_neighbors:  int,
-        min_dist:     float,
-        n_components: int,
-        seed:         int,
-    ) -> np.ndarray:
-        return self.embed_many(features, seeds=(seed,), n_neighbors=n_neighbors,
-                               min_dist=min_dist, n_components=n_components)[int(seed)]
-
-    def embed_many(
-        self,
-        features: np.ndarray,
-
-        *,
-        seeds:        Sequence[int],
-        n_neighbors:  int,
-        min_dist:     float,
-        n_components: int,
-    ) -> Dict[int, np.ndarray]:
-        r"""Embed ONE feature bank under several seeds, one concurrent interpreter per seed.
-
-        Every fit is seeded and single-threaded exactly as the serial path ran it, and the features
-        are written once and read by each worker, so the returned coordinates are bit-identical to
-        embedding the seeds one at a time. Only the wall clock changes.
-        """
-        ordered = [int(seed) for seed in seeds]
-        if not ordered:
-            raise ValueError("embed_many needs at least one seed")
-        if len(set(ordered)) != len(ordered):
-            raise ValueError(f"embed_many needs distinct seeds, got {ordered!r}")
-        self._ensure(len(ordered))
-        with self._lifecycle_lock:
-            assert self._workdir is not None
-            self._counter += 1
-            stem = os.path.join(self._workdir, f"request_{self._counter}")
-            workers = tuple(self._workers)
-        fin = f"{stem}_in.npy"
-        np.save(fin, features)
-        paths = [fin]
-        jobs = []
-        try:
-            for position, seed in enumerate(ordered):
-                record = workers[position % len(workers)]
-                fout, status = f"{stem}_{seed}_out.npy", f"{stem}_{seed}_status.json"
-                paths += [fout, status, f"{status}.tmp"]
-                with self._lifecycle_lock:
-                    self._request_paths.update((fout, status, f"{status}.tmp"))
-                self._submit(record, dict(input=fin, output=fout, status=status,
-                                          n_neighbors=n_neighbors, min_dist=min_dist,
-                                          n_components=n_components, seed=seed))
-                jobs.append((record, seed, fout, status))
-            with self._lifecycle_lock:
-                self._request_paths.add(fin)
-            return {seed: self._collect(record, status, fout)
-                    for record, seed, fout, status in jobs}
-        finally:
-            for path in paths:
-                self._cleanup_request_path(path)
-
-    def close(self) -> List[Dict[str, object]]:
-        from time import monotonic
-        import shutil
-        statuses: List[Dict[str, object]] = []
-        with self._lifecycle_lock:
-            self._closing = True
-            workers = tuple(reversed(self._workers))
-            workdir = self._workdir
-            self._workdir = None
-        for record in workers:
-            status = self._retire(record, reason="close")
-            if status is not None:
-                statuses.append(status)
-        with self._lifecycle_lock:
-            request_paths = tuple(self._request_paths)
-        for path in request_paths:
-            self._cleanup_request_path(path)
-        if workdir is not None:
-            # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
-            # Windows can retain a terminated worker's file handles briefly. Retry only inside
-            # the caller's explicit cleanup budget and publish the terminal failure, if any.
-            cleanup_deadline = monotonic() + self.cleanup_timeout
-            while True:
-                try:
-                    shutil.rmtree(workdir)
-                    break
-                except FileNotFoundError:
-                    break
-                except OSError as exc:
-                    remaining = cleanup_deadline - monotonic()
-                    if remaining <= 0.0:
-                        statuses.append(self._record_cleanup_failure(
-                            reason="workdir_cleanup", path=workdir, exc=exc,
-                        ))
-                        break
-                    Event().wait(min(0.01, remaining))
-        with self._lifecycle_lock:
-            self._closing = False
-        return statuses
-
-    def __enter__(self) -> "UMAPWorker":
-        return self
-
-    def __exit__(
-        self,
-        _exc_type: Optional[type[BaseException]],
-        _exc:      Optional[BaseException],
-        _tb:       Optional[TracebackType],
-    ) -> None:
-        self.close()
-
-
 def _umap_prepare(
     features,                            # (N, D) tensor/array
     n_neighbors:  int,
@@ -1044,7 +495,7 @@ def umap_embed(
     if worker is not None:
         return worker.embed(X, n_neighbors=n_neighbors, min_dist=min_dist,
                             n_components=n_components, seed=seed)
-    with UMAPWorker(max_workers=1) as isolated_worker:
+    with UMAPWorker() as isolated_worker:
         return isolated_worker.embed(X, n_neighbors=n_neighbors, min_dist=min_dist,
                                      n_components=n_components, seed=seed)
 
@@ -1319,6 +770,7 @@ def plot_trajectory(
     smooth:         int           = 0,
     annotate:       Optional[str] = None,   # 'min' | 'max' -> mark + label the running best point
     epoch_boundaries: Optional[Sequence[float]] = None,
+    markers:        Optional[Tuple[Sequence[float], Sequence[float]]] = None,   # (steps, values) of spike rows
     path:           Optional[str] = None,
 ):
     r"""Line plot of a scalar trajectory over the real training step.
@@ -1331,7 +783,9 @@ def plot_trajectory(
     its step, ``annotate_final`` tags the last value at the right edge, and ``median_line`` draws the
     series median as a dashed reference (the typical value on a heavy-tailed log axis where the
     spikes sit decades above the floor). ``epoch_boundaries`` adds subdued vertical guides at
-    completed corpus passes; it does not alter either the raw series or its smoothing.
+    completed corpus passes; it does not alter either the raw series or its smoothing. ``markers``
+    ``(steps, values)`` are the divergence-spike rows, drawn as crosses outside the line and its
+    smoothing (:func:`_overlay_spike_markers`).
     """
     v = _np(values).reshape(-1).astype(float)
     x = np.arange(v.size, dtype=float) if steps is None else _np(steps).reshape(-1).astype(float)
@@ -1350,6 +804,9 @@ def plot_trajectory(
                 ax.axvline(float(boundary), color="#777777", ls=":", lw=0.8, alpha=0.45, zorder=0)
     if logy:
         ax.set_yscale("log")
+    if markers is not None and _overlay_spike_markers(
+            ax, {"step": markers[0], "value": markers[1]}, "value", "#444444", logy=logy):
+        title = f"{title} (x: divergence-spike rows)"
     if median_line and v.size:
         med = float(np.median(v))
         ax.axhline(med, color="#444444", ls="--", lw=1)
@@ -1500,7 +957,7 @@ _FE_LABELS = {
 }
 
 
-def _fe_terms(history: Dict, lambda_beta, *, include_attention_entropy=True) -> tuple:
+def _fe_terms(history: Dict, lambda_beta) -> tuple:
     r"""Per-eval complexity free-energy components shared by the decomposition/co-descent figures.
 
     Returns ``(step, components, total, ce)`` where ``components`` is an ordered list of
@@ -1508,8 +965,8 @@ def _fe_terms(history: Dict, lambda_beta, *, include_attention_entropy=True) -> 
     that the E-step descends. ``total`` does not include a data/likelihood term, so it is not the
     canonical full variational free energy. Cross-entropy is returned separately as ``ce`` for
     co-plotting and is never summed into this diagnostic. The belief blocks carry the (scalar or per-row)
-    ``lambda_beta`` weight; the attention-entropy block is included only when
-    ``include_attention_entropy`` (matching ``free_energy_terms``' gate on ``total``). The logged
+    ``lambda_beta`` weight, as does the attention-entropy block (the retired
+    ``include_attention_entropy`` field is pinned on, audit 2026-10-17 item 72). The logged
     diagnostics are already per token, so every component is commensurate and ``total`` matches the
     ``inner_alignment_energy_total`` column.
     """
@@ -1517,9 +974,8 @@ def _fe_terms(history: Dict, lambda_beta, *, include_attention_entropy=True) -> 
     lb   = _np(lambda_beta).astype(float)
     zeros = np.zeros(step.shape, dtype=float)
     comps = [("self",   _np(history["self_coupling"]).astype(float)),
-             ("belief", lb * _np(history["belief_coupling"]).astype(float))]
-    if include_attention_entropy:
-        comps.append(("attention_entropy", lb * _np(history["attention_entropy"]).astype(float)))
+             ("belief", lb * _np(history["belief_coupling"]).astype(float)),
+             ("attention_entropy", lb * _np(history["attention_entropy"]).astype(float))]
     total = sum((c for _, c in comps), zeros.copy())
     ce = _np(history["val_ce"]).astype(float) if "val_ce" in history else np.full(step.shape, np.nan)
     return step, comps, total, ce
@@ -1532,8 +988,6 @@ def plot_free_energy_relationship(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    include_attention_entropy: bool  = True,
-    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
     r"""Descriptive relationship between the target-blind objective and held-out loss.
@@ -1546,9 +1000,8 @@ def plot_free_energy_relationship(
     association of the two curves is in the title; it summarizes co-movement and does not establish
     that changing either quantity causes the other to change.
     """
-    step, _comps, total, ce = _fe_terms(history, lambda_beta,
-                                        include_attention_entropy=include_attention_entropy)
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    step, _comps, total, ce = _fe_terms(history, lambda_beta)
+    objective_label, objective_units = _KL_AXIS
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
     w = max(5, total.size // 80)
@@ -1582,13 +1035,9 @@ def plot_free_energy_relationship(
 plot_free_energy_codescent = plot_free_energy_relationship
 
 
-def _registered_divergence_axis(name: str) -> tuple[str, Optional[str]]:
-    """Return typed display metadata, or a unit-free generic divergence fallback."""
-    try:
-        display = get_functional_display(name)
-    except KeyError:
-        return "divergence", None
-    return display.label, display.units
+# Axis label and units of every objective axis: the divergence seam implements only the KL (audit
+# 2026-10-16 F93), so the axes read "KL (nats)" (audit 2026-10-17 item 72).
+_KL_AXIS: tuple[str, str] = ("KL", "nats")
 
 
 def _objective_axis_text(label: str, units: Optional[str], *, per_token: bool = False) -> str:
@@ -1602,8 +1051,6 @@ def plot_free_energy_decomposition(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    include_attention_entropy: bool  = True,
-    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
     r"""The per-token inner alignment-energy budget and how its terms move over training.
@@ -1618,9 +1065,8 @@ def plot_free_energy_decomposition(
     diagnostic must not be read as the canonical full variational free energy; see the co-descent
     figure for the separate CE.
     """
-    step, comps, _total, _ce = _fe_terms(history, lambda_beta,
-                                         include_attention_entropy=include_attention_entropy)
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    step, comps, _total, _ce = _fe_terms(history, lambda_beta)
+    objective_label, objective_units = _KL_AXIS
     dynamic_labels = dict(_FE_LABELS)
     dynamic_labels["self"] = ("self-coupling", f"self-coupling\n{objective_label}(q,p)")
     dynamic_labels["belief"] = (
@@ -1867,6 +1313,9 @@ def _grad_norm_decomp_fig(
     #                                      figure does not show (e.g. phi when e_phi_lr=0)
     ylabel:  str,
     path:    Optional[str],
+
+    *,
+    spikes:  Optional[Mapping[str, object]] = None,   # {step, key: [...]} of divergence-spike rows
 ):
     r"""Shared body for the mu / sigma / phi gradient-norm decomposition figures (M-step and E-step).
 
@@ -1894,10 +1343,14 @@ def _grad_norm_decomp_fig(
             ax.plot(x, _rolling_mean(vv, w), lw=1.5, color=color, label=f"{label} (last {vv[-1]:.3g})")
         if roles:
             ax.set_yscale("log")
+            marked = sum(_overlay_spike_markers(ax, spikes, key, color, logy=True)
+                         for key, _, color, _ in spec if key in history)
             if step.size and _set_finite_xlim(ax, step):
                 _step_xaxis(ax)
             ax.legend(fontsize=6.5, frameon=False, loc="best")
             title = f"{title} ({' / '.join(roles)})"
+            if marked:
+                title += "\nx: divergence-spike rows"
         ax.set(xlabel="training step", ylabel=ylabel, title=title)
         fig.tight_layout()
         return _save(fig, path)
@@ -2000,6 +1453,7 @@ def _family_small_multiples(
 
     *,
     max_cols: int = 5,
+    spikes:   Optional[Mapping[str, object]] = None,   # {step, key: [...]} of divergence-spike rows
 ) -> object:
     r"""One small log-y panel per live parameter group of ``prefix``, grouped by family, no legends.
 
@@ -2022,6 +1476,7 @@ def _family_small_multiples(
         fig, axes = plt.subplots(len(rows), ncols, squeeze=False, sharex=True, sharey=True,
                                  figsize=(MAX_FIGURE_WIDTH_IN, 1.6 * len(rows) + 0.5))
         title_pt = float(plt.rcParams["axes.titlesize"])
+        marked = 0
         for r, (header, groups, color) in enumerate(rows):
             for c in range(ncols):
                 ax = axes[r][c]
@@ -2037,6 +1492,7 @@ def _family_small_multiples(
                 else:
                     ax.plot(x, vv, "o-", ms=2.0, lw=1.0, color=color)
                 ax.set_yscale("log")
+                marked += _overlay_spike_markers(ax, spikes, f"{prefix}{groups[c]}", color, logy=True)
                 ax.set_title(_GROUP_LABELS[groups[c]])
                 ax.tick_params(labelbottom=True, labelleft=c == 0)
                 if c == 0:
@@ -2052,7 +1508,7 @@ def _family_small_multiples(
             first.xaxis.set_major_locator(MaxNLocator(nbins=3, integer=True, steps=[1, 2, 2.5, 5, 10]))
             first.xaxis.set_major_formatter(FuncFormatter(_kstep))
         _tidy_log_axis(first.yaxis)                                  # final tick labels before layout
-        fig.suptitle(suptitle)
+        fig.suptitle(f"{suptitle} (x: divergence-spike rows)" if marked else suptitle)
         fig.supxlabel("training step", fontsize=float(plt.rcParams["axes.labelsize"]))
         fig.tight_layout()
         return _save(fig, path)
@@ -2063,6 +1519,7 @@ def plot_grad_norm_decomposition(
     history: Dict,                       # step + grad_norm_group_<g> and/or legacy grad_norm_mu/_sigma/_phi
 
     *,
+    spikes:  Optional[Mapping[str, object]] = None,   # the same columns over divergence-spike rows
     path:    Optional[str] = None,
 ):
     r"""M-STEP pre-clip parameter-gradient L2 norms over training, by named parameter group.
@@ -2075,12 +1532,12 @@ def plot_grad_norm_decomposition(
     role aggregates: the 'mu' role holds every parameter outside the Sigma and phi tables (decode,
     MLPs, relational maps, normalization), so it is not a mu-table gradient. Captured after
     ``unscale_`` and before clipping in ``train_step``; the E-step analogue is
-    ``estep_grad_norm_decomposition``.
+    ``estep_grad_norm_decomposition``. Divergence-spike rows (``spikes``) are crosses, not line points.
     """
     if any(_live(history, f"grad_norm_group_{group}") for group in PARAMETER_GROUPS):
         return _family_small_multiples(
             history, "grad_norm_group_", r"pre-clip $\|\nabla L\|_2$",
-            "M-step gradient norm by parameter group", path)
+            "M-step gradient norm by parameter group", path, spikes=spikes)
     spec = [
         ("grad_norm_mu",    _ROLE_LABELS["mu"],    _CB[0], "mu"),
         ("grad_norm_sigma", _ROLE_LABELS["sigma"], _CB[1], "sigma"),
@@ -2088,7 +1545,7 @@ def plot_grad_norm_decomposition(
     ]
     return _grad_norm_decomp_fig(
         history, spec, "M-step gradient norm by optimizer role",
-        r"pre-clip $\|\nabla_\theta L\|_2$ (per role)", path)
+        r"pre-clip $\|\nabla_\theta L\|_2$ (per role)", path, spikes=spikes)
 
 
 @register_figure("estep_grad_norm_decomposition")
@@ -2126,60 +1583,6 @@ def plot_estep_grad_norm_decomposition(
         r"E-step $\|\nabla F\|_2$ (per component)", path)
 
 
-@register_figure("estep_convergence")
-@register_figure("iterate_trajectory")
-def plot_iterate_trajectory(
-    trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi
-
-    *,
-    diagonal:          Optional[bool] = None,
-    divergence_family: str = "renyi",
-    evidence:           Optional[Mapping[str, object]] = None,
-    path:               Optional[str] = None,
-):
-    r"""Belief motion across the configured E-step iterate trajectory.
-
-    The projected routes compute routing and readout in distinct conditional stages and define no shared free
-    energy, so panel A states that and the trace carries no free-energy series (audit 2026-10-16 F92). Panel B
-    is the per-iteration step length of the captured states, shown without treating small final movement as
-    convergence unless structured evidence establishes it.
-    """
-    from vfe3 import metrics
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
-    evidence = dict(evidence or {})
-    if diagonal is None:
-        diagonal = trace.get("diagonal_covariance")
-    res = metrics.estep_residuals(trace["mu"], trace["sigma"], trace["phi"], diagonal=diagonal)
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
-    axes[0].text(0.5, 0.5,
-                 "Shared free energy unavailable\nRouting and readout use distinct stages.\n"
-                 "The captured state movement is shown at right.",
-                 ha="center", va="center", transform=axes[0].transAxes, fontsize=9)
-    axes[0].set_axis_off()
-    trajectory_title = "E-step iterate trajectory"
-    if evidence.get("fixed_point_evidence"):
-        trajectory_title += " (fixed point established)"
-    elif evidence.get("descent_evidence"):
-        trajectory_title += " (descent established)"
-    axes[0].set(xlabel="E-step inner iteration",
-                ylabel=_objective_axis_text(objective_label, objective_units),
-                title=trajectory_title)
-    t = np.arange(1, _np(res["r_mu"]).shape[0] + 1)
-    _median_band(axes[1], t, _np(res["r_mu"]), _CB[0], r"$r_\mu$")
-    _median_band(axes[1], t, _np(res["r_sigma"]), _CB[1], r"$r_\Sigma$ (SPD)")
-    _median_band(axes[1], t, _np(res["r_phi"]), _CB[2], r"$r_\phi$")
-    if any(np.any(_np(res[key]) > 0) for key in ("r_mu", "r_sigma", "r_phi")):
-        axes[1].set_yscale("log")
-    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length",
-                title="Final-iterate movement")
-    axes[1].legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-plot_estep_convergence = plot_iterate_trajectory
-
-
 def _unavailable_probe_figure(record: Mapping[str, object], path: Optional[str]) -> object:
     """Render the recorded reason instead of an empty chart or an incorrect missing-data claim."""
     import textwrap
@@ -2189,53 +1592,6 @@ def _unavailable_probe_figure(record: Mapping[str, object], path: Optional[str])
     ax.text(0.5, 0.35, textwrap.fill(str(record.get("reason", "probe unavailable")), 66),
             ha="center", va="center", fontsize=9, transform=ax.transAxes)
     ax.set_axis_off()
-    return _save(fig, path)
-
-
-@register_figure("estep_character")
-def plot_estep_character(
-    record: Mapping[str, object],
-
-    *,
-    path:   Optional[str] = None,
-):
-    r"""Plot how far the belief E-step moves the belief with depth.
-
-    The relative belief displacement per depth, with the direction cosine against the first step
-    in the title. A flat displacement curve is one aggregation, not convergent inference.
-
-    Raises :class:`FigureSkipped` when the probe is unavailable or covers only the single configured
-    readout (``depth_sweep_available`` false): there are no E-step iterates, and the one point is
-    the layer-0 message-to-prior ratio, which ``diagnostics/residual_ratio.csv`` reports per layer and
-    per token.
-    """
-    if record.get("available") is False:
-        raise FigureSkipped(str(record.get("reason", "E-step character probe unavailable")))
-    if record.get("depth_sweep_available") is False:
-        raise FigureSkipped(
-            "single configured readout: no E-step iterates; the layer-0 message-to-prior ratio is "
-            "reported per layer by diagnostics/residual_ratio.csv")
-    points = [p for p in record.get("points", []) if p.get("rel_displacement") is not None]
-    fig, ax_move = plt.subplots(figsize=(5.6, 3.6))
-    if not points:
-        ax_move.text(0.5, 0.5, "no belief displacement recorded", ha="center", va="center",
-                     transform=ax_move.transAxes, fontsize=9)
-        ax_move.set_axis_off()
-        return _save(fig, path)
-    depths = np.asarray([p["belief_depth"] for p in points], dtype=float)
-    displacement = np.asarray([p["rel_displacement"] for p in points], dtype=float)
-    ax_move.plot(depths, displacement, "o-", color=_CB[0], label=r"$\|\Delta\mu\|/\|\mu_p\|$")
-    trained_depth = float(record.get("trained_depth", np.nan))
-    if np.isfinite(trained_depth):
-        ax_move.axvline(trained_depth, color="#555555", ls=":", lw=1.0, label="trained depth")
-    cosines = [p.get("cos_dir_vs_step1") for p in points if p.get("cos_dir_vs_step1") is not None]
-    if cosines:
-        ax_move.set_title(f"E-step character  (cos(dir, step 1) = {cosines[-1]:+.3f})")
-    else:
-        ax_move.set_title("E-step character")
-    ax_move.set(xlabel="belief E-step iterations", ylabel="relative belief displacement")
-    ax_move.legend(frameon=False, fontsize=8, loc="center right")
-    fig.tight_layout()
     return _save(fig, path)
 
 
@@ -2399,6 +1755,48 @@ def plot_phi_numerics_reference(
 # already logs but no standard figure surfaced (geometry / E-step / validation /
 # optimizer geometry). Shared helpers below; one registered figure per family.
 # ---------------------------------------------------------------------------
+
+SPIKE_MARKER_NOTE = "x: divergence-spike rows, drawn as markers and left out of the lines"
+
+
+def _overlay_spike_markers(
+    ax:     object,
+    spikes: Optional[Mapping[str, object]],   # {step, key: [...]} over the divergence-spike rows
+    key:    str,
+    color:  str,
+
+    *,
+    logy:   bool = False,
+) -> int:
+    r"""Draw the spike rows' ``key`` values as crosses on ``ax`` and widen the y range to show them.
+
+    Spike rows are forced between the log and eval rows by a reported divergence spike
+    (:mod:`vfe3.metrics_schema`); the readers leave them out of every line and rolling mean, and
+    this overlays them as markers instead. Returns the number of markers drawn.
+    """
+    if not spikes or key not in spikes or "step" not in spikes:
+        return 0
+    x = _np(spikes["step"]).astype(float).reshape(-1)
+    v = _np(spikes[key]).astype(float).reshape(-1)
+    keep = np.isfinite(x) & np.isfinite(v)
+    if logy:
+        keep &= v > 0
+    if not keep.any():
+        return 0
+    x, v = x[keep], v[keep]
+    lo, hi = ax.get_ylim()
+    ax.plot(x, v, ls="none", marker="x", ms=3.5, mew=0.9, color=color, zorder=6)
+    vmin, vmax = float(v.min()), float(v.max())
+    if logy:
+        new_lo = min(lo, vmin / 1.3) if lo > 0 else vmin / 1.3
+        new_hi = max(hi, vmax * 1.3)
+    else:
+        span = max(hi - lo, abs(vmax - vmin), 1e-12)
+        new_lo = min(lo, vmin - 0.05 * span)
+        new_hi = max(hi, vmax + 0.05 * span)
+    ax.set_ylim(new_lo, new_hi)
+    return int(v.size)
+
 
 def _series_panel(
     ax,
@@ -2641,6 +2039,7 @@ def _history_dashboard(
     ncols:    int           = 3,
     note:     Optional[str] = None,      # one-line figure footnote (e.g. what a legend role holds)
     labels:   str           = "legend",  # "legend" (in-axes legend) | "direct" (line-end labels)
+    spikes:   Optional[Mapping[str, object]] = None,   # {step, key: [...]} of divergence-spike rows
 ) -> object:
     r"""Small-multiples dashboard over training history: one mini-panel per group of commensurate
     columns. A panel whose every column is absent or all-NaN is dropped (so a run missing a metric
@@ -2651,7 +2050,9 @@ def _history_dashboard(
     A panel may carry its own ``"data"`` history (``{step, key: [...]}``) and ``"xlabel"``; it then
     plots against that step axis instead of the shared one (an eval-cadence long-format table next
     to log-cadence columns). ``labels="direct"`` names each line at its right end instead of drawing
-    a legend (:func:`_labeled_series_panel`), for panels of several series that a legend would cover."""
+    a legend (:func:`_labeled_series_panel`), for panels of several series that a legend would cover.
+    ``spikes`` (the same columns over the divergence-spike rows) is overlaid as crosses on the panels
+    that plot against the shared step axis (:func:`_overlay_spike_markers`)."""
     if labels not in ("legend", "direct"):
         raise ValueError(f"labels must be 'legend' or 'direct', got {labels!r}")
     live = []
@@ -2671,12 +2072,16 @@ def _history_dashboard(
         nrows = (len(live) + ncols - 1) // ncols
         width = MAX_FIGURE_WIDTH_IN if ncols > 1 else MAX_FIGURE_WIDTH_IN / 2.0
         fig, axes = plt.subplots(nrows, ncols, figsize=(width, 2.3 * nrows + 0.35), squeeze=False)
+        marked = 0
         for i, p in enumerate(live):
             ax = axes[i // ncols][i % ncols]
             source = p.get("data", history)
             panel_step = _np(source["step"]).astype(float)
             draw = _labeled_series_panel if labels == "direct" else _series_panel
             draw(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)))
+            if "data" not in p:
+                for key, _, color in p["series"]:
+                    marked += _overlay_spike_markers(ax, spikes, key, color, logy=bool(p.get("logy", False)))
             ax.set(xlabel=p.get("xlabel", "training step"), ylabel=p["ylabel"], title=p["title"])
             if panel_step.size and _set_finite_xlim(ax, panel_step):
                 _step_xaxis(ax)
@@ -2686,6 +2091,8 @@ def _history_dashboard(
         # Direct labels sit in a gutter right of each panel: keep a clear gap before the next
         # column's y label.
         w_pad = 1.8 if labels == "direct" else None
+        if marked:
+            note = SPIKE_MARKER_NOTE if not note else f"{note}; {SPIKE_MARKER_NOTE}"
         if note:
             fig.text(0.01, 0.005, note, fontsize=6, color="#444444", ha="left", va="bottom",
                      wrap=True)
@@ -2959,39 +2366,6 @@ GEOMETRY_HEALTH_COLUMNS = (
     "attn_entropy_min", "attn_entropy_collapsed_heads")
 
 
-@register_figure("estep_quality")
-def plot_estep_quality(
-    history: Dict,                       # step + estep_f_drop / nondecreasing-frac / belief residuals
-
-    *,
-    path:    Optional[str] = None,
-):
-    r"""E-step inference-quality dashboard over training.
-
-    Direct evidence for what the inner E-step contributes per eval: the free-energy drop across the
-    inner loop (``estep_f_drop`` < 0 = F descended), the fraction of inner iterations that did NOT
-    decrease F (a descent-quality readout for parallel mean-field -- EXPECTED nonzero, not a failure
-    flag), and the last-iteration belief-change residuals for ``mu`` / ``Sigma`` / ``phi`` (the
-    convergence certificate). Complements the standalone E-step convergence-trend curve."""
-    panels = [
-        {"title": "E-step free-energy drop", "ylabel": r"$F_{\mathrm{end}}-F_{\mathrm{start}}$",
-         "series": [("estep_f_drop", "F drop", _CB[0])]},
-        {"title": "Inner-loop monotonicity", "ylabel": "nondecreasing fraction",
-         "series": [("estep_f_nondecreasing_frac", "nondecreasing frac", _CB[1])]},
-        {"title": "Configured final movement", "ylabel": "step length", "logy": True, "series": [
-            ("estep_r_mu_last", r"$q_{T-1}\to q_T$: $r_\mu$", _CB[0]),
-            ("estep_r_sigma_last", r"$q_{T-1}\to q_T$: $r_\Sigma$", _CB[1]),
-            ("estep_r_phi_last", r"$q_{T-1}\to q_T$: $r_\phi$", _CB[2])]},
-        {"title": "One-step-ahead fixed-point residual", "ylabel": "residual", "logy": True,
-         "series": [
-            ("estep_fp_mu_rms", r"$q_T\to q_{T+1}$: $\mu$ RMS", _CB[0]),
-            ("estep_fp_sigma_rms", r"$q_T\to q_{T+1}$: $\Sigma$ RMS", _CB[1]),
-            ("estep_fp_phi_rms", r"$q_T\to q_{T+1}$: $\phi$ RMS", _CB[2]),
-            ("estep_fp_kl", r"$\mathrm{KL}(q_{T+1}\Vert q_T)$", _CB[3])]},
-    ]
-    return _history_dashboard(history, panels, "E-step inference quality", path, ncols=4)
-
-
 @register_figure("validation_sanity")
 def plot_validation_sanity(
     history: Dict,                       # step + held-out generalization / positional / attention / geometry columns
@@ -3076,6 +2450,7 @@ def plot_optimizer_geometry(
     history: Dict,                       # step + per-group norms / update ratios, sigma_log moments, legacy role norms
 
     *,
+    spikes:  Optional[Mapping[str, object]] = None,   # the same columns over divergence-spike rows
     path:    Optional[str] = None,
 ):
     r"""Optimizer geometry over training: parameter norms and update scales by parameter group.
@@ -3161,7 +2536,7 @@ def plot_optimizer_geometry(
     title = ("Optimizer geometry with pullback-group phi update" if pullback
              else "Optimizer geometry")
     return _history_dashboard(hist, panels, title, path, ncols=2,
-                              note=None if grouped else _ROLE_NOTE, labels="direct")
+                              note=None if grouped else _ROLE_NOTE, labels="direct", spikes=spikes)
 
 
 # ---------------------------------------------------------------------------
@@ -3707,50 +3082,6 @@ def plot_ln3_symmetry_breaking(
                 width=0.4, color=_CB[2], label="learned")
     axes[2].set(xticks=xs, xticklabels=labels, ylabel="mean attention mass", title="Structured-head scores")
     axes[2].legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-@register_figure("belief_trajectories")
-def plot_belief_trajectories(
-    trace:       Dict,                   # e_step_belief_trace output (mu (T+1,N,K), ...)
-    layer_trace: Optional[Dict] = None,  # across_layer_belief_trace output (d_ai, effective_rank)
-
-    *,
-    path:        Optional[str] = None,
-):
-    r"""F4: belief trajectories across E-step iterations (mean-space path) and across layers (SPD).
-
-    Panel A: a shared-PCA 2-D quiver of the belief means as inference iterates (arrows mu_t ->
-    mu_{t+1}, colored by token position). Panel B: the across-layer cumulative affine-invariant SPD
-    geodesic distance and mean effective rank. The across-training axis is out of scope (needs
-    per-checkpoint replay).
-    """
-    mu = _np(trace["mu"])                                         # (T+1, N, K)
-    t1, n, k = mu.shape
-    flat = mu.reshape(-1, k) - mu.reshape(-1, k).mean(0)
-    _, _, vt = np.linalg.svd(flat, full_matrices=False)
-    proj = (flat @ vt[:2].T).reshape(t1, n, 2)
-    ncol = 2 if layer_trace is not None else 1
-    fig, axes = plt.subplots(1, ncol, figsize=(5.0 * ncol, 4.2), squeeze=False)
-    ax = axes[0][0]
-    cmap = plt.cm.viridis(np.linspace(0, 1, n))
-    for j in range(n):
-        ax.plot(proj[:, j, 0], proj[:, j, 1], "-", color=cmap[j], lw=0.8, alpha=0.7)
-        ax.quiver(proj[:-1, j, 0], proj[:-1, j, 1],
-                  np.diff(proj[:, j, 0]), np.diff(proj[:, j, 1]),
-                  angles="xy", scale_units="xy", scale=1, color=cmap[j], width=0.004, alpha=0.7)
-    ax.scatter(proj[0, :, 0], proj[0, :, 1], s=14, color="#333333", marker="o", label="init")
-    ax.set(xlabel="PC 1", ylabel="PC 2", title="Belief-mean path over E-step iterations")
-    if layer_trace is not None:
-        axb = axes[0][1]
-        layers = np.arange(_np(layer_trace["d_ai"]).size)
-        axb.plot(layers, _np(layer_trace["d_ai"]), "o-", color=_CB[0], label=r"$d_{AI}(\Sigma^0,\Sigma^l)$")
-        axb.set(xlabel="layer", ylabel="cumulative SPD distance", title="Belief geometry vs depth")
-        axc = axb.twinx()
-        axc.plot(layers, _np(layer_trace["effective_rank"]), "s--", color=_CB[1])
-        axc.set_ylabel("mean effective rank", color=_CB[1])
-        axb.legend(fontsize=8, frameon=False, loc="upper left")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -4365,7 +3696,6 @@ def plot_estep_capacity(
     *,
     n_params:          Optional[int] = None,
     wall_time:         Optional[object] = None,
-    divergence_family: str = "renyi",
     evidence:          Optional[Mapping[str, object]] = None,
     path:              Optional[str] = None,
 ):
@@ -4376,7 +3706,7 @@ def plot_estep_capacity(
     shows the compute cost.
     """
     x = _np(n_e_steps)
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    objective_label, objective_units = _KL_AXIS
     evidence = dict(evidence or {})
     fig, ax = plt.subplots(figsize=(5.4, 4.0))
     ax.plot(x, _np(bpc), "o-", color=_CB[0], lw=2, label="val BPC")
@@ -5401,7 +4731,6 @@ def plot_f_ce_relationship(
     arms,                                # list of {n_e_steps, final_f, ce, [label]} (one per n_e_steps cell)
 
     *,
-    divergence_family: str = "renyi",
     path: Optional[str] = None,
 ):
     r"""Final-iterate target-blind objective per token versus held-out CE.
@@ -5409,7 +4738,7 @@ def plot_f_ce_relationship(
     Target blindness establishes structural separation from the prediction objective. It does not
     imply any correlation sign across a finite depth sweep; the displayed correlations are descriptive.
     Points are ordered and annotated by n_e_steps."""
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    objective_label, objective_units = _KL_AXIS
     pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
     ne = np.array([float(a["n_e_steps"]) for a in pts])
     ff = np.array([float(a["final_f"]) for a in pts])
@@ -5737,12 +5066,6 @@ PUB_LABELS: Dict[str, str] = {
     "nonfinite_frac":          "non-finite fraction",
     "attn_entropy_min":        r"min row entropy $\min_{i,h}H(\beta)$",
     "attn_entropy_collapsed_heads": "collapsed-head count",
-    # -- E-step inference quality --
-    "estep_f_drop":            r"E-step $F_{\mathrm{end}}-F_{\mathrm{start}}$",
-    "estep_f_nondecreasing_frac": "E-step nondecreasing fraction",
-    "estep_r_mu_last":         r"E-step residual $r_\mu$ (last)",
-    "estep_r_sigma_last":      r"E-step residual $r_\Sigma$ (last, SPD)",
-    "estep_r_phi_last":        r"E-step residual $r_\phi$ (last)",
     # -- held-out validation sanity --
     "pos_loss_ratio":          r"positional loss ratio $\mathrm{CE}_{\mathrm{last}}/\mathrm{CE}_{\mathrm{first}}$",
     "val_future_leakage":      "causal future leakage (max)",
@@ -6007,64 +5330,3 @@ def plot_pos_extrapolation(
         ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
-
-
-@register_figure("renyi_saturation")
-def plot_renyi_saturation(
-    cells,                               # list of {alpha, attn_entropy, energy_klmax_frac}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""B2/EXP-12: attention entropy H(beta) and the kl_max energy-saturation fraction vs Renyi order.
-
-    alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates the pairwise
-    energy E_ij to kl_max with zero gradient (rising saturation fraction, right panel), which can drive
-    a NON-MONOTONE H(beta)-vs-alpha tail (left panel) -- the saturation diagnostic explaining the
-    entropy curve. alpha=1 (KL) is marked."""
-    cells = sorted(cells, key=lambda c: float(c["alpha"]))
-    a = [float(c["alpha"]) for c in cells]
-    h = [float(c.get("attn_entropy", float("nan"))) for c in cells]
-    s = [float(c.get("energy_klmax_frac", float("nan"))) for c in cells]
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.2))
-    ax1.plot(a, h, "o-", color=_CB[0], lw=1.8)
-    ax1.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5, label=r"$\alpha=1$ (KL)")
-    ax1.set(xlabel=r"Rényi order $\alpha$", ylabel=r"attention entropy H($\beta$)")
-    ax1.set_title("Attention diffuseness vs α")
-    ax1.legend(fontsize=8, frameon=False)
-    ax2.plot(a, s, "s-", color=_CB[1], lw=1.8)
-    ax2.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5)
-    ax2.set(xlabel=r"Rényi order $\alpha$", ylabel="energy kl_max saturation fraction")
-    ax2.set_title("Non-PD saturation vs α (the α>1 tail)")
-    fig.suptitle("Rényi α-attention: entropy + saturation diagnostic (B2/EXP-12)")
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-@register_figure("mu_precond")
-def plot_mu_precond(
-    cells,                               # list of {precond in {fisher,raw}, n_e_steps, ppl}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""B3/EXP-14: validation PPL vs n_e_steps, Fisher natural-gradient vs raw-Euclidean mean step.
-
-    The mu-arm ablation: nat_mu = Sigma*grad_mu (Fisher) vs the raw grad_mu, sigma retraction held
-    fixed. One line per preconditioner; a gap that grows with n_e_steps means the mean-sector Fisher
-    metric is load-bearing for the converged belief."""
-    cells = list(cells)
-    fig, ax = plt.subplots(figsize=(6.2, 4.4))
-    for j, pre in enumerate(("fisher", "raw")):
-        pts = sorted([(float(c["n_e_steps"]), float(c["ppl"])) for c in cells
-                      if str(c["precond"]) == pre], key=lambda t: t[0])
-        if pts:
-            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
-                    color=_CB[j], lw=1.8, label=f"{pre} mean step")
-    ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="validation PPL")
-    ax.set_title("Fisher nat-grad vs raw Euclidean E-step mean")
-    ax.legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-

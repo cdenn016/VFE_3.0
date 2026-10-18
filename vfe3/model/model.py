@@ -160,7 +160,7 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
         kwargs["group_n"] = cfg.group_n
     if cfg.irrep_spec is not None and "irrep_spec" in params:
         kwargs["irrep_spec"] = cfg.irrep_spec
-    if getattr(cfg, "gauge_tying", None) is not None and "tying" in params:
+    if getattr(cfg, "gauge_tying", None) is not None and "tying" in params:   # cfg may be a namespace
         kwargs["tying"] = cfg.gauge_tying
     if arity == 1:
         return builder(cfg.embed_dim, **kwargs)
@@ -179,8 +179,11 @@ _COVARIANCE_SCALE_KEYS: Tuple[str, ...] = (
     "relational_projected_cov_scale", "relational_projected_cov_gram_min_eigenvalue",
     "relational_comparison_map_norm_spread", "relational_input_cov_scale_ratio", "relational_rank_one_residual",
     "relational_rank_one_residual_reference")
+# Row order of the diagonal-route cost-term medians score_term_medians_pre (audit 2026-10-17 item 9).
+_SCORE_TERM_NAMES: Tuple[str, ...] = ("query_constant", "key_logdet", "trace", "mahalanobis")
 CANONICAL_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
-    "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta")
+    "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta",
+    "canonical_self_clamped_frac")
 
 
 @dataclass(frozen=True)
@@ -329,6 +332,8 @@ class VFEModel(nn.Module):
                                 predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
                                 predictive_covariance_fp64_escalation=cfg.predictive_covariance_fp64_escalation,
                                 predictive_covariance_precision=cfg.predictive_covariance_precision,
+                                predictive_covariance_spread_squares=cfg.predictive_covariance_spread_squares,
+                                predictive_covariance_symmetric_pairs=cfg.predictive_covariance_symmetric_pairs,
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
@@ -844,19 +849,36 @@ class VFEModel(nn.Module):
         mu_q:          torch.Tensor,                             # (B, N, K)
         sigma_q:       torch.Tensor,                             # (B, N, K) or (B, N, K, K) the stack's Sigma_q
         encoded_sigma: Optional[torch.Tensor],                   # the stack's input covariance, same layout or diagonal
+        canonical_frame: Optional[CanonicalFrameContext] = None,  # realized U_i (decode_coordinates='reference')
     ) -> torch.Tensor:                                            # the covariance the prior-bank decoder reads
         r"""The covariance the prior-bank decoder reads, selected by ``cfg.decode_covariance``.
 
         ``"belief"`` returns the stack's final :math:`\Sigma_q`, so the logit is the exact
         :math:`-\mathrm{KL}(q^*_i\Vert p_v)/\tau`. ``"encoded"`` returns the token's encoded covariance (the stack's
-        input), and ``"constant"`` returns :math:`\sigma_{\mathrm{init}}I`. Both alternatives keep the trace term
-        :math:`\mathrm{tr}(\Sigma_v^{-1}\Sigma_q)/(2\tau)` of the logit off the covariance the stack builds.
+        input), and ``"constant"`` returns :math:`\sigma_{\mathrm{init}}I` in the coordinates the decoder reads. Both
+        alternatives keep the trace term :math:`\mathrm{tr}(\Sigma_v^{-1}\Sigma_q)/(2\tau)` of the logit off the
+        covariance the stack builds.
+
+        Under ``decode_coordinates='local'`` the constant is :math:`\sigma_{\mathrm{init}}I` in local coordinates.
+        Under ``'reference'`` the decoder pulls the local covariance back to :math:`U_i^{-1}\Sigma U_i^{-\top}`, which
+        for a local :math:`\sigma_{\mathrm{init}}I` is :math:`\sigma_{\mathrm{init}}U_i^{-1}U_i^{-\top}`, frame-dependent
+        unless :math:`U_i` is orthogonal (audit 2026-10-17, item 25). A full layout there therefore returns the local
+        covariance :math:`U_i(\sigma_{\mathrm{init}}I)U_i^\top`, so the decoder reads :math:`\sigma_{\mathrm{init}}I`
+        in reference coordinates (up to rounding) and the logits are invariant under :math:`U_i \to g_iU_i`. A
+        diagonal layout cannot carry :math:`U_iU_i^\top` and returns its moment-matched diagonal, exact for
+        orthogonal and conformal frames; the diagonal family is off the gauge facet in any case.
         """
         mode = self.cfg.decode_covariance
         if mode == "belief":
             return sigma_q
         full = sigma_q.dim() == mu_q.dim() + 1                   # (..., K, K) layout
         if mode == "constant":
+            if self.cfg.decode_coordinates == "reference" and canonical_frame is not None:
+                from vfe3.model.frame_actions import local_covariance
+                K = sigma_q.shape[-1]
+                eye = torch.eye(K, dtype=sigma_q.dtype, device=sigma_q.device)
+                reference = (float(self.cfg.sigma_init) * eye).expand(*mu_q.shape[:-1], K, K)   # (..., N, K, K)
+                return local_covariance(mu_q, reference, canonical_frame, diagonal=not full).to(sigma_q.dtype)
             if full:
                 eye = torch.eye(sigma_q.shape[-1], dtype=sigma_q.dtype, device=sigma_q.device)
                 return (float(self.cfg.sigma_init) * eye).expand_as(sigma_q).contiguous()
@@ -890,7 +912,7 @@ class VFEModel(nn.Module):
         the diagnostic capture's ``initial_belief.sigma`` (audit 2026-10-16 F64).
         """
         if self.cfg.decode_mode != "linear":
-            sigma_q = self._decode_covariance(mu_q, sigma_q, encoded_sigma)
+            sigma_q = self._decode_covariance(mu_q, sigma_q, encoded_sigma, canonical_frame)
         if decode_last:
             last = slice(-1, None)
             mu_q, sigma_q = mu_q[:, last], sigma_q[:, last]
@@ -1211,13 +1233,14 @@ class VFEModel(nn.Module):
         )
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) stack output
         encoded_sigma = encoded_sigma_out["sigma"] if encoded_sigma_out is not None else None
-        if self.cfg.decode_mode != "linear":
-            sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma)   # what the decoder reads
         canonical_frame = (
             cap.get("canonical_frame") if cap is not None else None
         )
         if decode_frame_out is not None:
             canonical_frame = decode_frame_out["frame"]          # realized U_i: the decoder reads (xi, C)
+        if self.cfg.decode_mode != "linear":
+            sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma,   # what the decoder reads
+                                                  canonical_frame)
 
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
         # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
@@ -1364,10 +1387,12 @@ class VFEModel(nn.Module):
             mu_p, sigma_p = cap["final_block_prior"]            # live prior entering the final block
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: final-block E-step output, pre-transform
+            # The self term's own clamp (audit 2026-10-17 item 33): self_kl_max, or the router's kl_max when None.
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
                 fam(q_conv.mu, q_conv.sigma),
                 fam(mu_p, sigma_p),
-                kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
+                kl_max=cfg.kl_max if cfg.self_kl_max is None else cfg.self_kl_max,
+                eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
                 self_div, mode=cfg.lambda_alpha_mode, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
@@ -1610,8 +1635,21 @@ class VFEModel(nn.Module):
         frame_cache: Optional[_FrameFreezeCache] = {} if _share_frame_copies else None
         diagnostic: dict = {}
         capture = {"diagnostic": diagnostic}
-        final_belief, logits = self.forward_beliefs(
-            token_ids, return_logits=return_logits, capture=capture)
+        # The diagonal family's projection loss (audit 2026-10-17 items 3 and 18), formed by each layer's
+        # covariance update from its head blocks during this no-grad forward only.
+        layer_operators = self.relational_operators_by_layer
+        for ops in layer_operators:
+            ops.diagnose_diagonal_projection, ops.diagonal_projection_stats = True, None
+        try:
+            final_belief, logits = self.forward_beliefs(
+                token_ids, return_logits=return_logits, capture=capture)
+        finally:
+            for ops in layer_operators:
+                ops.diagnose_diagonal_projection = False
+        for ops, layer_capture in zip(layer_operators, diagnostic.get("layer_conditional_captures", ())):
+            stats, ops.diagonal_projection_stats = ops.diagonal_projection_stats, None
+            if stats is not None:
+                layer_capture.update({f"relational_diagonal_projection_{key}": value for key, value in stats.items()})
         if return_logits and logits is None:
             raise RuntimeError("diagnostic snapshot requested logits but the decoder returned None")
 
@@ -1793,21 +1831,34 @@ class VFEModel(nn.Module):
         beta:      torch.Tensor,               # (B, H, N, N) router
         support:   torch.Tensor,               # (B, H, N, N) bool causal support
         cap_level: float,
+        cap:       Optional[dict] = None,      # the layer's capture, for the pre-clamp row extremes
     ) -> Dict[str, torch.Tensor]:              # each (H,) float64
         r"""Per-head router-saturation statistics of one layer (audit 2026-10-09 round 2, item 9).
 
         With :math:`S_i` the causal sources of query :math:`i` and the scored rows :math:`|S_i| \ge 2`:
         ``klmax_frac`` is the capped share of the support (the per-head :meth:`_klmax_frac`);
         ``clamped_row_frac`` the share of scored rows whose every entry is capped (the
-        ``_capture_numerics_counts`` rule: such a row routes uniformly with zero router gradient, which
-        happens only under the absolute reference); ``self_weight`` the mean :math:`\beta_{ii}` and
+        ``_capture_numerics_counts`` rule: such a row has zero router gradient and routes by the attention prior
+        alone, :math:`\beta_{ij} \propto e^{\log\pi_{ij}}` (uniform over the sources only under a flat prior such as
+        plain causal; by the ALiBi distance profile under ``causal_alibi``), which happens only under the absolute
+        reference); ``self_weight`` the mean :math:`\beta_{ii}` and
         ``self_argmax_frac`` the share of rows with :math:`\beta_{ii} = \max_{j \in S_i}\beta_{ij}`, both
         over scored rows that admit self (NaN for a head with none, e.g. a ``*_noself`` prior).
+
+        Audit 2026-10-17 item 9: ``capped_mass_mean`` and ``capped_mass_max`` are the mean and maximum over scored
+        rows of the routing mass on capped entries, :math:`m_i = \sum_j \beta_{ij}\mathbb 1[\bar D_{ij} \ge \kappa]`,
+        which bounds the clamp's effect on the row, :math:`\mathrm{TV}(\beta_i, \beta_i^{\text{unclamped}}) \le m_i/(1 -
+        m_i)`; ``raw_row_min_median`` and ``raw_row_gap_median`` are the medians over scored rows of the pre-clamp
+        row minimum and row range (maximum minus minimum) of the admissible finite costs, read from ``cap``
+        (``score_raw_row_min_pre``, ``score_raw_row_max_pre``; NaN when the capture carries none).
         """
         rows = support.sum(dim=-1) >= 2                                       # (B, H, N)
         entries = support & rows.unsqueeze(-1)                                # (B, H, N, N)
         capped = entries & (score >= cap_level)                               # (B, H, N, N)
         clamped = rows & (capped.sum(dim=-1) == entries.sum(dim=-1))          # (B, H, N)
+        n_rows = rows.sum(dim=(0, 2)).double()                                # (H,)
+        mass = (beta.double() * capped).sum(dim=-1)                           # (B, H, N) m_i
+        raw_min, raw_gap = VFEModel._raw_row_extremes(cap, rows)              # (B, H, N) each, NaN off rows
         self_rows = rows & support.diagonal(dim1=-2, dim2=-1)                 # (B, H, N)
         beta_ii = beta.diagonal(dim1=-2, dim2=-1).double()                    # (B, H, N)
         row_max = beta.masked_fill(~support, float("-inf")).amax(dim=-1).double()   # (B, H, N)
@@ -1822,7 +1873,75 @@ class VFEModel(nn.Module):
             "self_argmax_frac": torch.where(
                 n_self > 0, ((beta_ii >= row_max) & self_rows).sum(dim=(0, 2)).double() / n_self.clamp(min=1),
                 nan),
+            "capped_mass_mean": torch.where(n_rows > 0, (mass * rows).sum(dim=(0, 2)) / n_rows.clamp(min=1), nan),
+            "capped_mass_max": torch.where(n_rows > 0, mass.masked_fill(~rows, float("-inf")).amax(dim=(0, 2)), nan),
+            "raw_row_min_median": raw_min.movedim(1, 0).reshape(len(n_rows), -1).nanmedian(dim=-1).values,
+            "raw_row_gap_median": raw_gap.movedim(1, 0).reshape(len(n_rows), -1).nanmedian(dim=-1).values,
         }
+
+    @staticmethod
+    def _raw_row_extremes(
+        cap:  Optional[dict],                  # the layer's capture
+        rows: torch.Tensor,                    # (B, H, N) bool scored rows
+    ) -> Tuple[torch.Tensor, torch.Tensor]:    # (B, H, N) float64 raw row minimum and row range, NaN off rows
+        r"""The pre-clamp row minimum and row range of the kernel router's cost (audit 2026-10-17 item 9).
+
+        Read from ``score_raw_row_min_pre`` and ``score_raw_row_max_pre`` of
+        :func:`vfe3.gradients.relational.relational_predictive_readout`; all NaN when the capture carries none (the
+        minimal agent, the full-link route). Under ``row_min`` and ``query_shifted`` they describe the cost before the
+        reference: under ``query_shifted`` the scorer has already dropped the query-only row constant.
+        """
+        nan = torch.full(rows.shape, float("nan"), dtype=torch.float64, device=rows.device)
+        low = None if cap is None else cap.get("score_raw_row_min_pre")
+        high = None if cap is None else cap.get("score_raw_row_max_pre")
+        if low is None or high is None:
+            return nan, nan
+        low, high = low.double().to(rows.device), high.double().to(rows.device)
+        if low.dim() == rows.dim() - 1:
+            low, high = low.unsqueeze(1), high.unsqueeze(1)                   # (B, 1, N) single head
+        return torch.where(rows, low, nan), torch.where(rows, high - low, nan)
+
+    @staticmethod
+    def _raw_router_cost_statistics(
+        cap:       dict,                       # the layer's capture
+        score:     torch.Tensor,               # (B, H, N, N) clamped routing cost as captured
+        beta:      torch.Tensor,               # (B, H, N, N) router
+        support:   torch.Tensor,               # (B, H, N, N) bool causal support
+        cap_level: float,
+    ) -> Dict[str, float]:
+        r"""Per-layer pre-clamp router-cost and capped-mass columns (audit 2026-10-17 item 9), pooled over heads.
+
+        ``relational_raw_row_{min,gap}_q{10,50,90}``: quantiles over the scored rows of every head of the raw row
+        minimum and row range (:meth:`_raw_row_extremes`), which tell a 129-nat row from a :math:`10^6`-nat one where
+        the clamped cost reads ``kl_max`` for both. ``relational_capped_mass_{mean,max}``: mean and maximum over scored
+        rows of the routing mass on capped entries (:meth:`_router_head_statistics`). The four
+        ``relational_score_term_*_median`` columns are the pooled medians of the diagonal-route cost terms (query
+        constant, key log-determinant, trace, Mahalanobis; ``score_term_medians_pre`` of
+        :func:`vfe3.gradients.relational.relational_score`), NaN on the dense route, which does not form them. A
+        query constant near the cap with a small trace and Mahalanobis median is the saturation of the absolute
+        reference on a quantity the softmax ignores (item 2).
+        """
+        rows = support.sum(dim=-1) >= 2                                       # (B, H, N)
+        raw_min, raw_gap = VFEModel._raw_row_extremes(cap, rows)              # (B, H, N) each
+        levels = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64, device=raw_min.device)
+        out: Dict[str, float] = {}
+        for name, values in (("min", raw_min), ("gap", raw_gap)):
+            finite = values[torch.isfinite(values)]
+            if finite.numel() > 2 ** 24:                                      # torch.quantile's input limit
+                finite = finite[torch.randperm(finite.numel(), device=finite.device)[:2 ** 24]]
+            quantiles = (torch.quantile(finite, levels).tolist() if finite.numel()
+                         else [float("nan")] * 3)
+            for level, value in zip(("q10", "q50", "q90"), quantiles):
+                out[f"relational_raw_row_{name}_{level}"] = float(value)
+        capped = support & rows.unsqueeze(-1) & (score >= cap_level)         # (B, H, N, N)
+        mass = (beta.double() * capped).sum(dim=-1)[rows]                     # (n_rows,) m_i
+        out["relational_capped_mass_mean"] = float(mass.mean()) if mass.numel() else float("nan")
+        out["relational_capped_mass_max"] = float(mass.max()) if mass.numel() else float("nan")
+        medians = cap.get("score_term_medians_pre")                           # (4, H + 1) or absent
+        for index, term in enumerate(_SCORE_TERM_NAMES):
+            out[f"relational_score_term_{term}_median"] = (float(medians[index, -1]) if medians is not None
+                                                            else float("nan"))
+        return out
 
     def _belief_spectrum(self, snapshot: DiagnosticSnapshot, layer_index: int) -> dict:
         r"""Spectrum statistics of layer ``layer_index``'s converged belief covariance."""
@@ -1866,6 +1985,9 @@ class VFEModel(nn.Module):
             "belief_cond_max": float(condition.max()),
             "belief_lam_min": float(spectrum["lam_min"].min()),
             "belief_lam_max": float(spectrum["lam_max"].max()),
+            # Position 0 routes only to itself and receives no routed spread (audit 2026-10-17 item 13).
+            **dict(zip(("belief_lam_min_argmin_position", "belief_lam_min_from_position_1"),
+                       metrics.positional_minimum(spectrum["lam_min"]))),
             "belief_cond_valid_frac": float(spectrum["condition_is_belief"].double().mean()),
             "eff_rank_p5": float(torch.quantile(effective_rank, 0.05)),
             "eff_rank_median": float(torch.quantile(effective_rank, 0.50)),
@@ -1905,6 +2027,50 @@ class VFEModel(nn.Module):
                 for q_cov, k_cov in zip(query_cov, key_cov)]
         return (min(float(eig.min()) for eig in eigs),
                 max(float((eig[..., -1]/eig[..., 0]).max()) for eig in eigs))
+
+    @staticmethod
+    def _projected_cov_positional_minimum(cap: dict) -> Tuple[float, float]:
+        r"""Token position of the smallest projected-covariance eigenvalue of a layer's capture, and the minimum over
+        positions :math:`\ge 1` (:func:`vfe3.metrics.positional_minimum`; audit 2026-10-17 item 13)."""
+        from vfe3 import metrics
+        query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
+        if torch.is_tensor(query_cov):                                       # equal heads: one tensor
+            query_cov, key_cov = [query_cov], [key_cov]
+        per_token = torch.stack([                                            # (runs, ..., N) per-token minima
+            safe_eigvalsh(torch.stack((q_cov, k_cov)).float())[..., 0].amin(dim=-1).amin(dim=0)
+            for q_cov, k_cov in zip(query_cov, key_cov)]).amin(dim=0)
+        return metrics.positional_minimum(per_token)
+
+    @staticmethod
+    def _diagonal_projection_diagnostics(cap: dict) -> Dict[str, float]:
+        r"""The diagonal projection loss of a layer's covariance update (audit 2026-10-17 items 3 and 18).
+
+        ``relational_diagonal_projection_kl`` (mean over tokens, nats) and ``_kl_max`` are
+        :math:`\mathrm{KL}(\mathcal N(m, \Sigma^{\mathrm{blk}}_i)\|\mathcal N(m, \mathrm{diag}\,\Sigma^{\mathrm{blk}}_i))` of the
+        floored head-block moment-matched covariance against the diagonal family's output, and
+        ``relational_diagonal_projection_trace_ratio`` (mean) and ``_trace_ratio_max`` the factor by which the
+        projection changes the reference trace :math:`\operatorname{tr}C` the next layer reads
+        (:func:`vfe3.model.relational_operators._diagonal_projection_statistics`, float64, eval cadence). NaN when
+        the layer's update did not form them (another family, the dense body, the minimal agent).
+        """
+        out = {}
+        for key, name in (("kl_mean", "kl"), ("kl_max", "kl_max"), ("trace_ratio_mean", "trace_ratio"),
+                          ("trace_ratio_max", "trace_ratio_max")):
+            value = cap.get(f"relational_diagonal_projection_{key}")
+            out[f"relational_diagonal_projection_{name}"] = float(value) if value is not None else float("nan")
+        return out
+
+    def _diagonal_projection_layer_extremes(self, snapshot: DiagnosticSnapshot) -> Dict[str, float]:
+        r"""Layer maxima of :meth:`_diagonal_projection_diagnostics` and the first layer attaining each."""
+        rows = [self._diagonal_projection_diagnostics(self._layer_capture(snapshot, layer))
+                for layer in range(self.cfg.n_layers)]
+        out: Dict[str, float] = {}
+        for key in ("relational_diagonal_projection_kl", "relational_diagonal_projection_trace_ratio"):
+            finite = [(row[key], layer) for layer, row in enumerate(rows) if math.isfinite(row[key])]
+            value, layer = (max(finite, key=lambda pair: (pair[0], -pair[1])) if finite
+                            else (float("nan"), float("nan")))
+            out[f"{key}_layer_max"], out[f"{key}_argmax_layer"] = float(value), float(layer)
+        return out
 
     def _covariance_scale_statistics(
         self,
@@ -2089,6 +2255,11 @@ class VFEModel(nn.Module):
         maximum of :meth:`_nonfinite_frac`, the share of the causal support whose raw cost was non-finite before
         the clamp mapped it to ``kl_max``. Beside ``relational_score_klmax_frac_layer_max`` it tells a layer
         saturated by finite costs (zero here) from one whose costs failed.
+
+        Pre-clamp router cost (audit 2026-10-17 item 9; :meth:`_router_head_statistics` per (layer, head)):
+        ``relational_raw_row_min_median_head_max`` is the largest per-head median of the raw row minimum, at
+        ``relational_raw_row_min_median_argmax_{layer,head}``, and ``relational_capped_mass_mean_head_max`` the largest
+        per-head mean routing mass on capped entries.
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
@@ -2105,7 +2276,7 @@ class VFEModel(nn.Module):
                 beta, score = beta.unsqueeze(1), score.unsqueeze(1)
             support = causal_support(beta, snapshot.log_prior)                 # (B, H, N, N) bool
             cap_level = math.inf if minimal_agent else self.cfg.kl_max
-            for key, value in self._router_head_statistics(score, beta, support, cap_level).items():
+            for key, value in self._router_head_statistics(score, beta, support, cap_level, cap).items():
                 heads.setdefault(key, []).append(value)                        # per layer (H,)
             unit_distance.append(self._self_map_unit_distance(self.relational_operators_by_layer[layer_index]))
             if layer_index == n_layers - 1:
@@ -2153,7 +2324,17 @@ class VFEModel(nn.Module):
             flat = int(torch.nan_to_num(table, nan=float("-inf")).reshape(-1).argmax())
             return float(table.reshape(-1)[flat]), float(flat // table.shape[1]), float(flat % table.shape[1])
 
+        # The per-(layer, head) tables themselves, so the dead-router warning can name every head above its threshold
+        # rather than the first one attaining the maximum (audit 2026-10-17 item 34). Host tensors, NaN-padded.
+        tables = {key: torch.nn.utils.rnn.pad_sequence(values, batch_first=True, padding_value=float("nan")).cpu()
+                  for key, values in heads.items()}                                       # (L, H_max) each
+        tables["unit_distance"] = torch.nn.utils.rnn.pad_sequence(
+            [(distance.detach().double().cpu() if distance is not None
+              else torch.full((1,), float("nan"), dtype=torch.float64)) for distance in unit_distance],
+            batch_first=True, padding_value=float("nan"))                                # (L, H_max)
+        self.last_router_head_tables = tables
         clamped, clamped_layer, clamped_head = head_max("clamped_row_frac")
+        raw_min, raw_min_layer, raw_min_head = head_max("raw_row_min_median")
         self_weight, self_layer, self_head = head_max("self_weight")
         capped, capped_layer, capped_head = head_max("klmax_frac")
         locked = (unit_distance[int(self_layer)] if math.isfinite(self_layer) else None)   # (H,) or None
@@ -2173,6 +2354,12 @@ class VFEModel(nn.Module):
                 "relational_self_lock_argmax_head": self_head,
                 "relational_self_lock_unit_distance": (float(locked[int(self_head)]) if locked is not None
                                                        else float("nan")),
+                # pre-clamp router cost and capped routing mass per (layer, head) (audit 2026-10-17 item 9)
+                "relational_raw_row_min_median_head_max": raw_min,
+                "relational_raw_row_min_median_argmax_layer": raw_min_layer,
+                "relational_raw_row_min_median_argmax_head": raw_min_head,
+                "relational_capped_mass_mean_head_max": head_max("capped_mass_mean")[0],
+                **self._diagonal_projection_layer_extremes(snapshot),
                 **extremes_out}
 
     def _canonical_free_energy_diagnostics(
@@ -2204,8 +2391,13 @@ class VFEModel(nn.Module):
         the key laws carry the layer's noise :math:`n_hI`, as its router's do (temperature 1; ``key_noise`` of
         :func:`vfe3.free_energy.canonical_routing_rows`), so :math:`D^h_{ii} > 0` there (audit 2026-10-12 round 2,
         item 16). The self term is the registered
-        form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`, the same
-        ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
+        form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`) evaluated at the layer's
+        input belief, with the divergence unclamped (``kl_max=inf``, as the prior-bank decode ranking evaluates it):
+        under the router's ``kl_max`` it saturated in the collapse regime and reported a clamp rather than the
+        belief (audit 2026-10-17 item 33). ``canonical_self_clamped_frac`` is the share of the input belief's self
+        divergences (per token, or per coordinate under a per-coordinate alpha form) at or above the M-step self
+        term's clamp (``self_kl_max``, else ``kl_max``), where that term has zero gradient. The ``eps`` floor of the
+        closed form still applies. The M-step term itself reads
         the final block's converged output against its prior, which the output evaluation below matches at the
         last layer (item 27). The columns are per-token means over the batch: ``self_coupling``,
         ``self_divergence`` (the unweighted :math:`D(q_i\|p_i)`), ``belief_coupling`` and
@@ -2255,10 +2447,10 @@ class VFEModel(nn.Module):
             r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N)."""
             rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
                                           tau=tau, irrep_dims=list(group.irrep_dims), key_noise=key_noise)
-            self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
+            self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K), unclamped
                 fam(belief.mu.double(), belief.sigma.double()),
                 fam(mu_p.double(), sigma_p.double()),
-                kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
+                kl_max=math.inf, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
                 self_div, mode=cfg.lambda_alpha_mode,
                 b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device))
@@ -2270,6 +2462,8 @@ class VFEModel(nn.Module):
                      "attention_entropy": float(rows.attention_entropy.sum(dim=1).mean())}
             terms["total"] = terms["self_coupling"] + lambda_beta * (
                 terms["belief_coupling"] + terms["attention_entropy"])
+            self_cap = cfg.kl_max if cfg.self_kl_max is None else cfg.self_kl_max   # the M-step self term's clamp
+            terms["self_clamped_frac"] = float((~(self_div < self_cap)).double().mean())   # NaN counts as clamped
             return terms, rows.beta
 
         with torch.autocast(device_type=device.type, enabled=False):
@@ -2281,6 +2475,7 @@ class VFEModel(nn.Module):
                     attention_tau(_as_coeff(cfg.kappa_beta, device), group.irrep_dims, device=device),
                     torch.float64)
             terms, beta_star = evaluate(q, frame_inverse, tau)                 # beta_star (B, H, N, N)
+            clamped_frac = terms.pop("self_clamped_frac")
             terms_out, _ = evaluate(snapshot.layer_converged[layer], frame_inverse, tau)
             scored = support.sum(dim=-1) >= 2                                  # (B, H, N)
             self_rows = scored & support.diagonal(dim1=-2, dim2=-1)            # (B, H, N) rows that admit self
@@ -2294,6 +2489,7 @@ class VFEModel(nn.Module):
                                       else float("nan")),
             "canonical_total_output": terms_out["total"],
             "canonical_total_delta": terms_out["total"] - terms["total"],
+            "canonical_self_clamped_frac": clamped_frac,
         }
 
     def _canonical_frame_inverse(
@@ -2410,6 +2606,7 @@ class VFEModel(nn.Module):
             relational_routing_free_energy=(float("nan") if minimal_agent
                                             else self._routing_free_energy(snapshot, layer_index, score, support)),
         )
+        d.update(self._raw_router_cost_statistics(cap, score, beta, support, cap_level))
         if self.cfg.diagnose_canonical_free_energy:
             d.update(self._canonical_free_energy_diagnostics(snapshot, layer_index, beta, support))
         from vfe3 import metrics
@@ -2541,6 +2738,9 @@ class VFEModel(nn.Module):
         from vfe3 import metrics
         (d["relational_projected_cov_min_eigenvalue"],
          d["relational_projected_cov_max_condition"]) = self._projected_cov_extremes(cap)
+        (d["relational_projected_cov_min_eigenvalue_argmin_position"],
+         d["relational_projected_cov_min_eigenvalue_from_position_1"]) = self._projected_cov_positional_minimum(cap)
+        d.update(self._diagonal_projection_diagnostics(cap))
         d.update(self._covariance_scale_statistics(snapshot, layer_index, cap))
         unit_distance = self._self_map_unit_distance(self.relational_operators_by_layer[layer_index])
         d["relational_link_unit_distance_min"] = (float(unit_distance.min()) if unit_distance is not None
@@ -2582,38 +2782,85 @@ class VFEModel(nn.Module):
         converged covariance (GL(m, C)-invariant, so the frame does not enter). These are statistics
         in the reference trivialization (invariant under a global conjugation, not under the local
         action; see the metrics section note).
+
+        Evaluated on the distinct frame rows :math:`(\phi_i, Y_i)` of the batch and expanded back by occurrence, so
+        each reduction sees exactly the per-token values of a dense evaluation (audit 2026-10-17 item 21). On a basis
+        supported on the head blocks (:func:`vfe3.metrics.head_block_algebra`) the frame is
+        :math:`\bigoplus_h e^{M_h}e^{Y_h}`, so each head block is exponentiated on its own and the log-volumes are
+        exact traces, :math:`\log|\det e^{M_h}e^{Y_h}| = \operatorname{tr}M_h + \operatorname{tr}Y_h`, and
+        :math:`\log|\det U| = \sum_h(\operatorname{tr}M_h + \operatorname{tr}Y_h)`; the eigenvalue moduli and phases
+        of :math:`U` are the union of those of its blocks. Values agree with the dense float64 evaluation to
+        rounding. Any other basis keeps the dense evaluation on the distinct rows.
         """
         from vfe3 import metrics
         group = self.group
+        offsets = [0, *itertools.accumulate(group.irrep_dims)]
         with torch.autocast(device_type=belief.phi.device.type, enabled=False):
-            U = torch.linalg.matrix_exp(group.embed_algebra(belief.phi.double(), dtype=torch.float64))
-            if belief.right_phi is not None:
-                U = U @ torch.linalg.matrix_exp(
-                    group.embed_algebra(belief.right_phi.double(), dtype=torch.float64))
-            U = U.reshape(-1, *U.shape[-2:])                                     # (B N, K, K)
+            n_gen = belief.phi.shape[-1]
+            phi_full = belief.phi.detach().double()
+            right_full = None
+            if belief.right_phi is not None:                                             # may broadcast over batch
+                phi_full, right_full = torch.broadcast_tensors(phi_full, belief.right_phi.detach().double())
+            phi = phi_full.reshape(-1, n_gen)                                            # (B N, n_gen)
+            rows = phi
+            if right_full is not None:
+                rows = torch.cat((phi, right_full.reshape(-1, right_full.shape[-1])), dim=-1)
+            # (R, n_gen [+ n_gen]) distinct frame rows and the (B N,) row of each token: one host read.
+            unique, inverse = torch.unique(rows, dim=0, return_inverse=True)
+            u_phi = unique[:, :n_gen]
+            u_right = unique[:, n_gen:] if belief.right_phi is not None else None
+            left = metrics.head_block_algebra(u_phi, group)
+            right = (metrics.head_block_algebra(u_right, group)
+                     if (left is not None and u_right is not None) else None)
+            if left is not None and (u_right is None or right is not None):
+                blocks: List[torch.Tensor] = []                                            # per head (R, d, d)
+                logdets: List[torch.Tensor] = []                                           # per head (R,)
+                for index, M in enumerate(left):
+                    U_h = torch.linalg.matrix_exp(M)
+                    logdet = M.diagonal(dim1=-2, dim2=-1).sum(-1)
+                    if right is not None:
+                        U_h = U_h @ torch.linalg.matrix_exp(right[index])
+                        logdet = logdet + right[index].diagonal(dim1=-2, dim2=-1).sum(-1)
+                    blocks.append(U_h)
+                    logdets.append(logdet)
+                head_logdet = torch.stack(logdets, dim=-1)                                 # (R, H)
+                volume = head_logdet.sum(-1)                                               # (R,) log|det U|
+            else:
+                U = torch.linalg.matrix_exp(group.embed_algebra(u_phi, dtype=torch.float64))
+                if u_right is not None:
+                    U = U @ torch.linalg.matrix_exp(group.embed_algebra(u_right, dtype=torch.float64))
+                blocks = [U[:, start:stop, start:stop] for start, stop in zip(offsets[:-1], offsets[1:])]
+                head_logdet = torch.stack([torch.linalg.slogdet(block).logabsdet for block in blocks], dim=-1)
+                volume = torch.linalg.slogdet(U).logabsdet
             out = {}
             # Vertex conditioning: the largest head-block condition max_h s_max / s_min of the realized frame, the
             # quantity phi_frame_condition_max bounds (the transports act per head; audit 2026-10-12 round 2,
             # item 13).
-            offsets = [0, *itertools.accumulate(group.irrep_dims)]
             head_cond = []
-            for start, stop in zip(offsets[:-1], offsets[1:]):
-                singular = torch.linalg.svdvals(U[:, start:stop, start:stop])    # (B N, d_h) descending
+            for block in blocks:
+                singular = torch.linalg.svdvals(block)                                     # (R, d_h) descending
                 head_cond.append(singular[..., 0] / singular[..., -1])
-            vertex_cond = torch.stack(head_cond, dim=-1).amax(-1)                # (B N,)
+            vertex_cond = torch.stack(head_cond, dim=-1).amax(-1)[inverse]                 # (B N,)
             out["vertex_cond_median"] = float(torch.quantile(vertex_cond, 0.50))
             out["vertex_cond_p95"] = float(torch.quantile(vertex_cond, 0.95))
             out["vertex_cond_p99"] = float(torch.quantile(vertex_cond, 0.99))
             out["vertex_cond_max"] = float(vertex_cond.max())
-            invariant = metrics.group_gauge_invariant(U, group)
+            # Host LAPACK eigenvalues once per distinct row and head (vfe3.metrics.eigvals_on_host).
+            eigenvalues = [metrics.eigvals_on_host(block) for block in blocks]             # per head (R, d_h)
+            if getattr(group, "skew_symmetric", False):                                    # so_n: total rotation
+                invariant = 0.5 * sum(torch.angle(eig).abs().sum(dim=-1) for eig in eigenvalues)
+            else:                                                                          # GL volume log|det U|
+                invariant = volume
+            invariant = invariant[inverse]                                                 # (B N,)
             out["gauge_invariant_mean"] = float(invariant.mean())
             out["gauge_invariant_spread"] = float(invariant.std(unbiased=False))
-            heads = metrics.per_head_gauge_invariants(U, group.irrep_dims)
-            out["gauge_head_aniso_mean"] = float(heads["anisotropy"].mean())
-            out["gauge_head_logdet_spread"] = float(heads["logdet"].std(unbiased=False))
+            log_modulus = [torch.log(eig.abs().clamp(min=1e-12)) for eig in eigenvalues]
+            anisotropy = torch.stack([lm.amax(dim=-1) - lm.amin(dim=-1) for lm in log_modulus], dim=-1)
+            out["gauge_head_aniso_mean"] = float(anisotropy[inverse].mean())
+            out["gauge_head_logdet_spread"] = float(head_logdet[inverse].std(unbiased=False))
             if group.name == "block_glmc":
-                out["gauge_head_phase_abs_mean"] = float(
-                    metrics.per_head_complex_phase(U, group.irrep_dims).abs().mean())
+                phase = torch.stack([metrics.complex_block_phase(block) for block in blocks], dim=-1)   # (R, H)
+                out["gauge_head_phase_abs_mean"] = float(phase[inverse].abs().mean())
                 sigma = belief.sigma.double()
                 if sigma.dim() == belief.mu.dim():                               # diagonal (..., N, K)
                     sigma = torch.diag_embed(sigma)

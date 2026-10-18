@@ -14,10 +14,8 @@ import pytest
 import torch
 
 import vfe3.geometry.retraction as retraction
-import vfe3.geometry.transport as transport
 import vfe3.relational_scoring as relational_scoring
 from tests.profiles import tiny_config
-from vfe3.belief import BeliefState
 from vfe3.gauge_optim import GaugeManifoldAdamW, stage_pullback_group_candidate
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.phi_preconditioner import pullback_group_direction

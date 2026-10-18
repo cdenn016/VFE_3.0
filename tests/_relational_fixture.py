@@ -4,7 +4,6 @@ import torch
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.geometry.transport import FactoredTransport
-from vfe3.model.relational_operators import RelationalOperators
 
 
 def _fixture() -> tuple:

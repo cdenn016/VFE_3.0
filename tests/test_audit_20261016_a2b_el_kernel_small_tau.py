@@ -9,6 +9,7 @@ Measured here (max over leaves, kernel / torch): before the fix 3.7e-6 / 1.1e-7 
 for K = 8 and 20; after it 3.5e-7 / 1.1e-7 and 8.1e-7 / 8.1e-7. The check runs the Triton interpreter on CPU
 tensors in a subprocess and is skipped where triton is missing.
 """
+from tests.profiles import make_prior_bank
 import json
 import os
 import subprocess
@@ -42,6 +43,7 @@ except Exception as exc:
     print("triton import failed:", exc)
     sys.exit(77)
 import torch
+from tests.profiles import make_prior_bank
 from vfe3.kernels.expected_likelihood import expected_likelihood_ce
 from vfe3.kernels import _expected_likelihood_triton as tk
 from vfe3.model.prior_bank import PriorBank
@@ -50,7 +52,7 @@ assert tk.INTERPRETED
 
 def bank(K, V, tau, seed):
     torch.manual_seed(seed)
-    pb = PriorBank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=16,
+    pb = make_prior_bank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=16,
                    decode_unigram_prior=True, unigram_kappa=0.7, decode_tau=tau)
     with torch.no_grad():
         pb.sigma_log_embed.normal_(0.0, 0.5); pb.mu_embed.normal_(0.0, 1.0); pb.decode_log_scale.fill_(0.2)

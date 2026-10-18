@@ -8,7 +8,6 @@ import torch
 from tests.profiles import tiny_config
 from vfe3.config import config_from_serialized, serialize_config
 from vfe3.model.model import VFEModel
-from vfe3.model.relational_operators import RelationalOperators
 from vfe3.run_artifacts import _relational_artifact_fields
 
 

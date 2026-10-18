@@ -6,7 +6,6 @@ import torch
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.relational import relational_score
-from vfe3.model.relational_operators import RelationalOperators
 
 
 @pytest.mark.parametrize("diagonal", [False, True])

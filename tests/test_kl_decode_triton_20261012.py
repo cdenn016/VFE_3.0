@@ -16,6 +16,7 @@ tests pin:
 
 The interpreter and compile checks run in subprocesses, so the test process never imports triton.
 """
+from tests.profiles import make_prior_bank
 import json
 import os
 import subprocess
@@ -50,7 +51,7 @@ def _bank(mode: str, dtype: torch.dtype, *, V: int, K: int, tau: float = 0.3, si
     """
     torch.manual_seed(seed)
     full = mode == "full_chunked"
-    pb = PriorBank(V, K, 3, decode_mode=mode, family="gaussian_full" if full else "gaussian_diagonal",
+    pb = make_prior_bank(V, K, 3, decode_mode=mode, family="gaussian_full" if full else "gaussian_diagonal",
                    diagonal_covariance=not full, decode_tau=tau, sigma_init=sigma_init, mu_init_std=0.5,
                    decode_unigram_prior=unigram, unigram_kappa=0.7, untie_decode_bank=untie,
                    decode_chunk_size=chunk, decode_ce_triton=triton)
@@ -111,8 +112,8 @@ def _run_script(script: str, env: Dict[str, str]) -> Any:
 
 # ------------------------------------------------------------------------------------- config and records
 
-def test_field_defaults_off_and_is_inactive_off_the_kl_decoders() -> None:
-    assert VFE3Config.decode_ce_triton is False
+def test_field_is_a_bool_and_is_inactive_off_the_kl_decoders() -> None:
+    assert isinstance(VFE3Config.decode_ce_triton, bool)     # the default is pinned by the default snapshot test
     for mode in ("diagonal_chunked", "full_chunked"):
         family = "gaussian_full" if mode == "full_chunked" else "gaussian_diagonal"
         assert "decode_ce_triton" not in tiny_config(decode_mode=mode, family=family).inactive_fields()
@@ -120,10 +121,14 @@ def test_field_defaults_off_and_is_inactive_off_the_kl_decoders() -> None:
         assert "decode_ce_triton" in tiny_config(decode_mode=mode).inactive_fields()
 
 
-def test_launcher_carries_the_field_at_its_default() -> None:
+def test_launcher_carries_a_valid_value_with_its_options() -> None:
+    r"""The launcher's value is the user's; only its validity and the valid-values comment are asserted (audit
+    2026-10-17, item 38)."""
+    import train_vfe3
+
+    assert isinstance(train_vfe3.config["decode_ce_triton"], bool)
     line = next(line for line in (REPO / "train_vfe3.py").read_text(encoding="utf-8").splitlines()
                 if line.strip().startswith("decode_ce_triton"))
-    assert line.split("=")[1].split(",")[0].strip() == "False"
     assert "True | False" in line
 
 
@@ -132,7 +137,7 @@ def test_model_passes_the_toggle_to_the_prior_bank() -> None:
     assert model.prior_bank.decode_ce_triton is True
     assert model.prior_bank.realized_decode_ce_kernel is None
     with pytest.raises(ValueError, match="decode_ce_triton must be bool"):
-        PriorBank(7, 4, 3, decode_ce_triton=1)                       # type: ignore[arg-type]
+        make_prior_bank(7, 4, 3, decode_ce_triton=1)                       # type: ignore[arg-type]
 
 
 def test_realized_kernel_is_recorded_in_summary_on_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,8 +181,8 @@ def test_cpu_tensors_run_the_torch_loop_whatever_the_toggle(mode: str) -> None:
 def test_cpu_route_never_imports_triton() -> None:
     script = """
     import json, sys, torch
-    from vfe3.model.prior_bank import PriorBank
-    pb = PriorBank(11, 3, 3, decode_mode="diagonal_chunked", decode_ce_triton=True)
+    from tests.profiles import make_prior_bank
+    pb = make_prior_bank(11, 3, 3, decode_mode="diagonal_chunked", decode_ce_triton=True)
     mu_q = torch.randn(1, 4, 3, requires_grad=True)
     ce = pb.decode_ce_diagonal_chunked(mu_q, 0.5 + torch.rand(1, 4, 3), torch.tensor([[1, 2, -100, 4]]))
     ce.backward()

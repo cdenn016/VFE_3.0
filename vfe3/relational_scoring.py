@@ -12,7 +12,7 @@ import torch
 from torch.autograd.function import once_differentiable
 from torch.utils.checkpoint import checkpoint
 
-from vfe3.contracts import host_check, host_read
+from vfe3.contracts import describe_offending_entries, host_check, host_read
 from vfe3.runtime import ieee_fp32_matmul
 from vfe3.numerics import (
     FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, triangular_condition_estimate,
@@ -49,6 +49,18 @@ def set_projection_tile_bytes(nbytes: int) -> int:
 def projection_tile_bytes() -> int:
     r"""Return the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes."""
     return _PROJECTION_TILE_BYTES
+
+
+# Token cap of one projection tile (projected_moments, _projected_root_factor) at the default budget.
+_TILE_TOKEN_CAP = 32
+
+
+def _tile_token_cap() -> int:
+    r"""Largest token count of one projection tile: 32 tokens per default budget (``_CHECKPOINT_BYTES``) of
+    ``_PROJECTION_TILE_BYTES``, so the cap is the historical 32 at and below the default and grows in proportion to
+    a raised budget. A fixed 32 left every budget above about 64 MiB without effect on these two loops at the live
+    shape (audit 2026-10-17 item 6); tiles are token independent, so the cap changes only the dispatch count."""
+    return _TILE_TOKEN_CAP * max(1, _PROJECTION_TILE_BYTES // _CHECKPOINT_BYTES)
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float32 shifted CholeskyQR3, or float64 QR where the float32 retry fails, the input is
@@ -260,7 +272,7 @@ def projected_moments(
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.
     if tokens * bytes_per_token > min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
-        step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
+        step = max(1, min(tokens, _tile_token_cap(), _PROJECTION_TILE_BYTES // bytes_per_token))
         means, covariances = [], []
         for start in range(0, tokens, step):
             inverse = (inverse_blocks[..., start:start+step, :, :, :]
@@ -655,7 +667,7 @@ def _projected_root_factor(
     bytes_per_token = math.prod(batch[:-2]) * batch[-1] * r * width * (torch.finfo(dtype).bits // 8)
     if tokens * bytes_per_token <= min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
         return _projected_root_factor_tile(Sigma, inverse, S, dtype, diagonal)
-    step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
+    step = max(1, min(tokens, _tile_token_cap(), _PROJECTION_TILE_BYTES // bytes_per_token))
     factors, failures = [], []
     for start in range(0, tokens, step):
         sigma = (Sigma[..., start:start+step, :, :] if diagonal
@@ -978,6 +990,7 @@ def projected_gaussian_kl(
     gemm_expansion_tol: Optional[float] = None,
     commutant_pairs: Optional[int] = None,
     diagonal_covariance: bool = False,
+    drop_query_constant: bool = False,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute raw KL(q_i || k_j) = (tr(G_j^{-1}G_i) + delta^T G_j^{-1}delta - r + logdet(G_j/G_i))/2.
 
@@ -1037,9 +1050,16 @@ def projected_gaussian_kl(
 
     ``diagonal_covariance=True`` declares that G_q and G_k are structurally diagonal and passes their diagonals,
     shaped like the means: the diagonal route (:func:`_projected_diagonal_kl`; audit 2026-10-10 round 2,
-    item 30), which forms no Gram, factorization or :math:`r^2 + r` GEMM. It has no GEMM fallback
-    (``gemm_expansion_tol`` must be None) and no source recovery (the source tuples and ``commutant_pairs`` are not
-    read): its covariance needs no factorization, so the certificate is that every variance is finite and positive.
+    item 30), which forms no Gram, factorization or :math:`r^2 + r` GEMM. It has no source recovery (the source
+    tuples and ``commutant_pairs`` are not read): its covariance needs no factorization, so the certificate is that
+    every variance is finite and positive. ``gemm_expansion_tol`` acts there as on the dense route, with the diagonal
+    error estimate of :func:`_diagonal_gemm_expansion_error` and direct-difference tiles (audit 2026-10-17 item 11).
+
+    ``drop_query_constant=True`` returns :math:`D_{ij} + \tfrac12(r + \log\det G_i)`, the cost without its query-only
+    row constant :math:`-\tfrac12(r + \log\det G_i)` (``routing_kl_max_reference='query_shifted'``, audit 2026-10-17
+    item 2). The constant is not formed and then subtracted: every route replaces :math:`\log\det G_i` by
+    :math:`-r` in its final sum, so :math:`-r - \log\det G_i` is exactly zero and the query log-determinant carries no
+    gradient. The softmax over :math:`j` is unchanged; the value can be negative.
 
     When no recovery can act (no source tuples, conditioning-triggered recovery off) and ``gemm_expansion_tol`` is
     None, every verdict can only raise, so it goes through :func:`vfe3.contracts.host_check` instead of a host
@@ -1053,9 +1073,9 @@ def projected_gaussian_kl(
     if diagonal_covariance:
         if G_q.shape != a_q.shape or G_k.shape != a_k.shape:
             raise ValueError("diagonal projected covariances must match their means")
-        if gemm_expansion_tol is not None:
-            raise ValueError("the diagonal route has no GEMM fallback; gemm_expansion_tol must be None")
-        return _projected_diagonal_kl(a_q, G_q, a_k, G_k, query_row_constant_grad)
+        return _projected_diagonal_kl(a_q, G_q, a_k, G_k, query_row_constant_grad,
+                                      gemm_expansion_tol=gemm_expansion_tol,
+                                      drop_query_constant=drop_query_constant)
     if G_q.shape != (*a_q.shape, r) or G_k.shape != (*a_k.shape, r):
         raise ValueError("projected covariances must match their means with one additional matrix axis")
     if commutant_pairs is not None and (type(commutant_pairs) is not int or not 0 <= 2 * commutant_pairs <= r):
@@ -1116,7 +1136,11 @@ def projected_gaussian_kl(
             # No recovery can act and no fallback is estimated, so every verdict can only raise
             # (_strict_cholesky raises on a failed factor without a source tuple, and nothing is
             # certificate-flagged with condition recovery off): queue it and take the healthy branch.
-            host_check(torch.cat(verdicts), _healthy_kl_verdict)
+            host_check(torch.cat(verdicts), _healthy_kl_verdict, detail=lambda: "; ".join((   # failure only (item 4)
+                describe_offending_entries(Gq, label="query covariances", positive=False,
+                                           axes=("batch", "token", "head", "row", "column")),
+                describe_offending_entries(Gk, label="key covariances", positive=False,
+                                           axes=("batch", "token", "head", "row", "column")))))
             fallback_slices = []
             chol_q, rec_q = q_status[0], None
             chol_k, rec_k = k_status[0], None
@@ -1204,6 +1228,10 @@ def projected_gaussian_kl(
                 2 * chol_k.to(dtype).diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2))
         else:
             logdet_q_healthy, logdet_k_healthy = logdet_q, logdet_k
+        if drop_query_constant:
+            # Every tile ends in -r - logdet_q, which is then exactly zero: the query-only row constant is dropped.
+            logdet_q = torch.full_like(logdet_q.detach(), -r)                           # (..., H, Nq)
+            logdet_q_healthy = torch.full_like(logdet_q_healthy.detach(), -r)
         nq, nk = aq.shape[-2], ak.shape[-2]
 
         def _tile_steps(element_size: int, per_pair: int, slices: int) -> Tuple[int, int]:
@@ -1377,6 +1405,10 @@ def _projected_diagonal_kl(
     a_k: torch.Tensor,             # (..., Nk, H, r)
     g_k: torch.Tensor,             # (..., Nk, H, r) diagonal key covariances
     query_row_constant_grad: bool,
+
+    *,
+    gemm_expansion_tol: Optional[float] = None,
+    drop_query_constant: bool = False,
 ) -> torch.Tensor:                 # (..., H, Nq, Nk)
     r"""Diagonal route of :func:`projected_gaussian_kl` for structurally diagonal comparison covariances.
 
@@ -1398,8 +1430,15 @@ def _projected_diagonal_kl(
     joins the next mandatory host read, and outside it raises at once. Under ``query_row_constant_grad=False`` the
     query log-determinant, a row constant, carries no gradient, as on the dense route; the query variances still
     reach the trace term with their gradient.
+
+    With ``gemm_expansion_tol`` set (audit 2026-10-17 item 11), a (batch, head) slice whose forward-error estimate
+    :func:`_diagonal_gemm_expansion_error` exceeds it in nats is rescored by direct-difference tiles
+    (:func:`_diagonal_kl_direct_tile`) and counted in :func:`gemm_fallback_slices`. The fallback verdicts join the
+    finiteness verdicts in one host read, which this opt-in adds to a route that otherwise reads nothing.
+    ``drop_query_constant`` is that of :func:`projected_gaussian_kl`.
     """
     dtype = _compute_dtype(a_q, g_q, a_k, g_k)
+    r = a_q.shape[-1]
     with torch.autocast(device_type=a_q.device.type, enabled=False):
         aq, ak = a_q.to(dtype).movedim(-2, -3), a_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
         gq, gk = g_q.to(dtype).movedim(-2, -3), g_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
@@ -1407,10 +1446,60 @@ def _projected_diagonal_kl(
             flags = torch.stack((torch.isfinite(aq).all() & torch.isfinite(ak).all(),
                                  torch.isfinite(gq).all(), (gq > 0).all(),
                                  torch.isfinite(gk).all(), (gk > 0).all()))
-        host_check(flags, _diagonal_kl_verdict)
-        with torch.set_grad_enabled(torch.is_grad_enabled() and query_row_constant_grad):
-            logdet_q = gq.log().sum(-1)                                          # (..., H, Nq)
-        return _ieee_fp32_autograd(_diagonal_kl_expansion, aq, ak, gq, gk, logdet_q)
+        fallback_slices: List[int] = []
+        if gemm_expansion_tol is None:
+            # On a failure only, the note names the count, minimum and first (batch, head, token, coordinate) of
+            # the offending variances (audit 2026-10-17 item 4); the healthy path does no added device work.
+            host_check(flags, _diagonal_kl_verdict, detail=lambda: "; ".join((
+                describe_offending_entries(gq, label="query variances"),
+                describe_offending_entries(gk, label="key variances"))))
+        else:
+            fallback = ~(_diagonal_gemm_expansion_error(aq, ak, gk) <= gemm_expansion_tol)   # (..., H)
+            slice_shape = torch.broadcast_shapes(aq.shape[:-2], ak.shape[:-2])              # (..., H)
+            decisions = host_read(torch.cat((flags, fallback.expand(slice_shape).reshape(-1))))
+            _diagonal_kl_verdict(decisions[:5])
+            fallback_slices = [index for index, flag in enumerate(decisions[5:]) if flag]
+        if drop_query_constant:
+            # -r - logdet_q is then exactly zero in every tile: the query-only row constant is dropped.
+            logdet_q = torch.full(gq.shape[:-1], -float(r), dtype=dtype, device=gq.device)   # (..., H, Nq)
+        else:
+            with torch.set_grad_enabled(torch.is_grad_enabled() and query_row_constant_grad):
+                logdet_q = gq.log().sum(-1)                                      # (..., H, Nq)
+        healthy = _ieee_fp32_autograd(_diagonal_kl_expansion, aq, ak, gq, gk, logdet_q)   # (..., H, Nq, Nk)
+        if not fallback_slices:
+            return healthy
+        global _GEMM_FALLBACK_SLICES
+        _GEMM_FALLBACK_SLICES += len(fallback_slices)
+        grid = healthy.shape                                                    # (..., H, Nq, Nk)
+        nq, nk = grid[-2], grid[-1]
+        index = torch.tensor(fallback_slices, dtype=torch.long, device=healthy.device)
+
+        def _select(t: torch.Tensor, tail: int) -> torch.Tensor:              # (n_fallback, *tail)
+            trailing = t.shape[t.ndim - tail:]
+            return t.expand(*grid[:-2], *trailing).reshape(-1, *trailing).index_select(0, index)
+
+        selected = (_select(aq, 2), _select(ak, 2), _select(gq, 2), _select(gk, 2), _select(logdet_q, 1))
+        # A direct tile holds two (n, I, J, r) pair tensors (the difference and its weighted square).
+        per_pair = aq.element_size() * len(fallback_slices) * 2 * r
+        pair_budget = max(1, _PROJECTION_TILE_BYTES // per_pair)
+        q_step = max(1, min(nq, 32, pair_budget))
+        k_step = max(1, min(nk, pair_budget // q_step))
+        checkpointed = nq > q_step or nk > k_step or nq * nk * per_pair > _CHECKPOINT_BYTES
+        rows = []
+        for i in range(0, nq, q_step):
+            columns = []
+            for j in range(0, nk, k_step):
+                tile_args = (selected[0][:, i:i+q_step], selected[1][:, j:j+k_step],
+                             selected[2][:, i:i+q_step], selected[3][:, j:j+k_step],
+                             selected[4][:, i:i+q_step])
+                if torch.is_grad_enabled() and checkpointed and any(x.requires_grad for x in tile_args):
+                    columns.append(checkpoint(_diagonal_kl_direct_tile, *tile_args,
+                                              use_reentrant=False, preserve_rng_state=False))
+                else:
+                    columns.append(_diagonal_kl_direct_tile(*tile_args))
+            rows.append(torch.cat(columns, dim=-1))
+        direct = torch.cat(rows, dim=-2)                                        # (n_fallback, Nq, Nk)
+        return healthy.reshape(-1, nq, nk).index_copy(0, index, direct.to(healthy.dtype)).reshape(grid)
 
 
 def _diagonal_kl_verdict(host: List[bool]) -> None:
@@ -1456,6 +1545,101 @@ def _diagonal_kl_expansion(
     cross = query @ key.transpose(-1, -2)                                        # (..., H, Nq, Nk)
     key_constant = (b * scaled).sum(-1) + gk.log().sum(-1)                       # (..., H, Nk)
     return .5 * (cross + key_constant.unsqueeze(-2) - r - logdet_q.unsqueeze(-1))
+
+
+@torch.no_grad()
+def diagonal_kl_term_medians(
+    a_q:     torch.Tensor,                       # (..., Nq, H, r) query means as scored
+    g_q:     torch.Tensor,                       # (..., Nq, H, r) diagonal query covariances P(G_i)
+    a_k:     torch.Tensor,                       # (..., Nk, H, r) key means as scored
+    g_k:     torch.Tensor,                       # (..., Nk, H, r) diagonal key covariances P(G_j)
+    support: Optional[torch.Tensor] = None,      # broadcastable to (..., H, Nq, Nk) bool, None = every pair
+) -> torch.Tensor:                               # (4, H + 1) float64 medians over the support
+    r"""Per-head and pooled medians of the four terms of the diagonal-route cost, for diagnostics (audit 2026-10-17 item 9).
+
+    :math:`D_{ij} = c_i + \ell_j + t_{ij} + m_{ij}` with the query constant :math:`c_i = -\tfrac12(r + \sum_k\log g_{ik})`,
+    the key log-determinant :math:`\ell_j = \tfrac12\sum_k\log g_{jk}`, the trace :math:`t_{ij} = \tfrac12\sum_k
+    g_{ik}/g_{jk}` and the Mahalanobis term :math:`m_{ij} = \tfrac12\sum_k(a_{ik} - b_{jk})^2/g_{jk}`, in that row order.
+    Each median runs over the pairs of ``support`` (row terms repeated along their pairs), in float64 from direct
+    differences in query-row tiles of the scorer budget, so no cancellation enters; NaN for a head with no pair.
+    A row constant :math:`c_i` that dominates :math:`D_{ij}` while :math:`t_{ij} + m_{ij}` stays small is the
+    saturation mode of the absolute clamp; a large :math:`m_{ij}` on collapsed key variances is the other one.
+    Columns 0 to H - 1 are the heads; column H pools every head's pairs.
+    """
+    aq, ak = a_q.double().movedim(-2, -3), a_k.double().movedim(-2, -3)          # (..., H, N, r)
+    gq, gk = g_q.double().movedim(-2, -3), g_k.double().movedim(-2, -3)          # (..., H, N, r)
+    r = aq.shape[-1]
+    inverse = gk.reciprocal()                                                    # (..., H, Nk, r)
+    query = -.5 * (r + gq.log().sum(-1))                                         # (..., H, Nq)
+    key = .5 * gk.log().sum(-1)                                                  # (..., H, Nk)
+    trace = .5 * (gq @ inverse.transpose(-1, -2))                                # (..., H, Nq, Nk)
+    nq = aq.shape[-2]
+    per_row = max(1, ak.numel() * 8)                                             # one query row's difference
+    step = max(1, min(nq, _PROJECTION_TILE_BYTES // per_row))
+    mahalanobis = torch.cat([
+        .5 * ((aq[..., i:i + step, :].unsqueeze(-2) - ak.unsqueeze(-3)).square()
+              * inverse.unsqueeze(-3)).sum(-1)
+        for i in range(0, nq, step)], dim=-2)                                    # (..., H, Nq, Nk)
+    grid = mahalanobis.shape
+    mask = (torch.ones(grid, dtype=torch.bool, device=aq.device) if support is None
+            else support.to(aq.device).expand(grid))
+    terms = (query.unsqueeze(-1).expand(grid), key.unsqueeze(-2).expand(grid), trace, mahalanobis)
+
+    def _median(term: torch.Tensor) -> torch.Tensor:                            # (H + 1,)
+        values = term.masked_fill(~mask, float("nan")).movedim(-3, 0).reshape(grid[-3], -1)
+        return torch.cat((values.nanmedian(dim=-1).values, values.reshape(1, -1).nanmedian(dim=-1).values))
+
+    return torch.stack([_median(term) for term in terms])                        # (4, H + 1)
+
+
+@torch.no_grad()
+def _diagonal_gemm_expansion_error(
+    aq: torch.Tensor,  # (..., H, Nq, r) query means
+    ak: torch.Tensor,  # (..., H, Nk, r) key means
+    gk: torch.Tensor,  # (..., H, Nk, r) key variances g_j
+) -> torch.Tensor:     # (..., H) estimated max pair error of the diagonal GEMM, in nats
+    r"""A-priori estimate of the excess forward error of :func:`_diagonal_kl_expansion`, maximized per (batch, head).
+
+    The diagonal case of :func:`_gemm_expansion_error` (audit 2026-10-17 item 11). The expansion forms the mean part
+    of :math:`2\mathrm{KL}_{ij}` as :math:`\sum_k(\alpha_{ik}^2 - 2\alpha_{ik}b_{jk} + b_{jk}^2)/g_{jk}` relative to the
+    first key mean, so its rounding error is bounded by :math:`\gamma\sum_k(|\alpha_{ik}| + |b_{jk}|)^2/g_{jk}`, while
+    the direct tile, which forms :math:`a_{ik} - b_{jk}` first, pays :math:`\gamma\sum_k (a_{ik} - b_{jk})^2/g_{jk}`.
+    With :math:`\rho_j = \max_k 1/g_{jk}`, :math:`A = \max_i\lVert\alpha_i\rVert_2` and
+    :math:`B_j = \lVert b_j\rVert_2`, the slice maximum of the majorant is
+
+    .. math::
+        E = \tfrac12 \sqrt{r} u \max_j \rho_j (A + B_j)^2,
+
+    computed in :math:`O(N r)` per slice with no pair grid. :math:`\sqrt r u` is the probabilistic scale of the
+    accumulated rounding (Higham and Mary, SIAM J. Sci. Comput. 41 (2019) A2815), as on the dense route; the trace
+    term :math:`\sum_k g_{ik}/g_{jk}` sums positive terms on both routes and is excluded. It is an estimate, not a
+    certificate.
+    """
+    r = aq.shape[-1]
+    u = torch.finfo(aq.dtype).eps / 2
+    c = ak[..., :1, :]                                                           # (..., H, 1, r)
+    A = (aq - c).norm(dim=-1).amax(dim=-1)                                       # (..., H)
+    B = (ak - c).norm(dim=-1)                                                    # (..., H, Nk)
+    rho = gk.reciprocal().amax(dim=-1)                                           # (..., H, Nk)
+    return .5 * math.sqrt(r) * u * (rho * (A.unsqueeze(-1) + B).square()).amax(dim=-1)
+
+
+@ieee_fp32_matmul()
+def _diagonal_kl_direct_tile(
+    aq:       torch.Tensor,  # (n, I, r) query means
+    ak:       torch.Tensor,  # (n, J, r) key means
+    gq:       torch.Tensor,  # (n, I, r) query variances
+    gk:       torch.Tensor,  # (n, J, r) key variances
+    logdet_q: torch.Tensor,  # (n, I) sum_k log g_ik, or -r when the query constant is dropped
+) -> torch.Tensor:           # (n, I, J)
+    r"""Direct-difference diagonal KL tile for GEMM fallback slices,
+    :math:`\tfrac12\sum_k[g_{ik}/g_{jk} + (a_{ik} - b_{jk})^2/g_{jk} + \log g_{jk}] - \tfrac12(r + \log\det G_i)`."""
+    inverse = gk.reciprocal()                                                    # (n, J, r)
+    trace = gq @ inverse.transpose(-1, -2)                                       # (n, I, J) positive terms
+    delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)                                  # (n, I, J, r)
+    quadratic = (delta.square() * inverse.unsqueeze(-3)).sum(-1)                 # (n, I, J)
+    return .5 * (trace + quadratic - aq.shape[-1]
+                 + gk.log().sum(-1).unsqueeze(-2) - logdet_q.unsqueeze(-1))
 
 
 @torch.no_grad()
@@ -1554,6 +1738,7 @@ def projected_noisy_query_cost(
     projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
     symmetric_inputs: bool = False,
     commutant_pairs: Optional[int] = None,
+    drop_query_constant: bool = False,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute D_ij = -log N(a_i; b_j, W_ij) - log det(2 pi G_q,i)/2 with W_ij = G_q,i + G_k,j.
 
@@ -1576,7 +1761,8 @@ def projected_noisy_query_cost(
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
     ``symmetric_inputs`` is the bitwise-symmetry certificate of :func:`projected_gaussian_kl`, and
     ``commutant_pairs`` its declaration that the covariances are RoPE-commutant projections, which recovery
-    rebuilds as such.
+    rebuilds as such. ``drop_query_constant=True`` omits the query-only row constant :math:`-\tfrac12\log\det G_{q,i}`
+    (``routing_kl_max_reference='query_shifted'``; the value can then be negative).
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
@@ -1602,6 +1788,8 @@ def projected_noisy_query_cost(
         Gk_work = Gk if rec_k is None else torch.where(rec_k[..., None, None], eye, Gk)
         # Healthy factors round-trip bit-exactly through the cast.
         logdet_q_work = 2 * chol_q.to(dtype).diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
+        if drop_query_constant:
+            logdet_q_work = torch.zeros_like(logdet_q_work.detach())            # (..., H, Nq) constant dropped
         work = (aq.movedim(-2, -3), ak.movedim(-2, -3),             # (..., H, N, r)
                 Gq_work.movedim(-3, -4), Gk_work.movedim(-3, -4),   # (..., H, N, r, r)
                 logdet_q_work)                                      # (..., H, Nq)
@@ -1650,6 +1838,8 @@ def projected_noisy_query_cost(
                      (factor_q @ factor_q.transpose(-1, -2)).movedim(-3, -4),
                      (factor_k @ factor_k.transpose(-1, -2)).movedim(-3, -4),
                      2 * factor_q.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2))
+            if drop_query_constant:
+                exact = (*exact[:4], torch.zeros_like(exact[4]))
             q_rec = (rec_q.movedim(-1, -2) if rec_q is not None                       # (..., H, Nq)
                      else torch.zeros(Gq.shape[:-4] + (Gq.shape[-3], Gq.shape[-4]),
                                       dtype=torch.bool, device=Gq.device))
@@ -1782,6 +1972,7 @@ def projected_mean_distance_cost(
     projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
     symmetric_inputs: bool = False,
     commutant_pairs: Optional[int] = None,
+    drop_query_constant: bool = False,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Covariance-blind control cost D_ij = ||a_i - b_j||^2 / 2 of the projected means.
 
@@ -1791,7 +1982,8 @@ def projected_mean_distance_cost(
     isolates covariance-aware routing: the projected covariances are accepted for signature parity
     with projected_gaussian_kl (as are ``symmetric_inputs`` and ``commutant_pairs``) and are not read, so
     they receive no gradient through routing.
-    D_ij >= 0, so the [0, kl_max] cost bound applies unchanged.
+    D_ij >= 0, so the [0, kl_max] cost bound applies unchanged. The cost has no query-only row constant, so
+    ``drop_query_constant`` is accepted and changes nothing.
 
     The direct differences are kept (no |a|^2 + |b|^2 - 2 a.b expansion, which cancels for nearby
     means); query rows are tiled to the projection byte budget and checkpointed under autograd, so
@@ -1827,7 +2019,8 @@ def _mean_distance_tile(
 
 
 # Routing cost per relational_routing value; every cost takes (a_q, G_q, a_k, G_k, *, projection_q,
-# projection_k, symmetric_inputs, commutant_pairs) and returns (..., H, Nq, Nk) nonnegative costs.
+# projection_k, symmetric_inputs, commutant_pairs, drop_query_constant) and returns (..., H, Nq, Nk) costs,
+# nonnegative unless drop_query_constant removes the query-only row constant.
 ROUTING_COSTS = {
     "gaussian_kl":   projected_gaussian_kl,
     "noisy_query":   projected_noisy_query_cost,

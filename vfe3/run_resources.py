@@ -451,7 +451,8 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
     r"""Throughput quantiles (tokens/s), peak memory, wall time and device of a run directory.
 
     Reads ``metrics.csv`` (``tokens_per_s``, ``train_step_tokens_per_s``, ``pipeline_tokens_per_s``,
-    ``peak_mem_mb``, ``train_step_ms_mean``, ``step``), ``summary.json`` (``wall_time_s``) and
+    ``peak_mem_mb``, ``train_step_ms_mean``, ``step``; the throughput quantiles leave out divergence-spike
+    rows, counted in ``spike_rows_excluded``), ``summary.json`` (``wall_time_s``) and
     ``provenance.json`` (``device_name``); a ``resources.json`` written at finalize, when present, is
     returned under ``"resources_json"``. The training-only time estimate is
     :math:`\sum_r \bar t_r \Delta s_r`, the logged mean step time times the steps in each logging
@@ -463,7 +464,15 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
     if metrics.is_file():
         cols = _read_metric_columns(
             metrics, ("step", "peak_mem_mb", "train_step_ms_mean", *_THROUGHPUT_COLUMNS))
-        out["throughput_tokens_per_s"] = {c: _quantiles(cols[c]) for c in _THROUGHPUT_COLUMNS}
+        # Quantiles over the log and eval rows only: a divergence-spike row closes a short window around one
+        # anomalous step (vfe3.metrics_schema; audit 2026-10-17 item 5). The time estimate below keeps every
+        # row, since the rows' windows partition the run.
+        from vfe3.metrics_schema import metrics_csv_spike_mask
+        spike = metrics_csv_spike_mask(metrics)
+        out["throughput_tokens_per_s"] = {
+            c: _quantiles([v for v, is_spike in zip(cols[c], spike) if not is_spike])
+            for c in _THROUGHPUT_COLUMNS}
+        out["spike_rows_excluded"] = int(sum(spike))
         peak = [v for v in cols["peak_mem_mb"] if math.isfinite(v)]
         out["peak_mem_mb"] = max(peak) if peak else None
         steps = cols["step"]
@@ -479,6 +488,7 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
         out["train_only_hours_estimate"] = seconds / 3600.0 if counted else None
     else:
         out["throughput_tokens_per_s"] = None
+        out["spike_rows_excluded"] = None
         out["peak_mem_mb"] = None
         out["train_only_hours_estimate"] = None
     summary = run_dir / "summary.json"

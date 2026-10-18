@@ -8,6 +8,7 @@ decomposition, and content_link_spectrum (similarity invariants of the relationa
 M_h = O_h T_h).
 """
 
+import itertools
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -543,6 +544,25 @@ def belief_spectrum(
         result["dispersion_label"] = labels["dispersion"]
         result["spectrum_label"] = labels["covariance_spectrum"]
     return result
+
+
+def positional_minimum(
+    values: torch.Tensor,                # (..., N) a per-token statistic, the token position last
+) -> Tuple[float, float]:                # (argmin position, minimum over positions >= 1)
+    r"""Token position of the smallest value and the minimum over positions :math:`\ge 1` (audit 2026-10-17 item 13).
+
+    Position 0 routes only to itself and receives no routed spread, so a minimum over every :math:`(b, i)`, such as
+    ``belief_lam_min`` (:func:`belief_spectrum`'s ``lam_min``) or the projected-covariance minimum, can be set there
+    alone. Non-finite values are skipped; NaN when none is finite (and for the second value at ``N = 1``).
+    """
+    flat = values.detach().double().reshape(-1, values.shape[-1])                       # (rows, N)
+    finite = torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float("inf")))
+    per_position = finite.amin(dim=0)                                                    # (N,)
+    if not bool(torch.isfinite(per_position).any()):
+        return float("nan"), float("nan")
+    tail = per_position[1:]
+    tail_min = float(tail.min()) if tail.numel() and bool(torch.isfinite(tail).any()) else float("nan")
+    return float(per_position.argmin()), tail_min
 
 
 def half_fisher_trace(
@@ -1098,12 +1118,56 @@ def per_head_complex_phase(
     phases = []
     start = 0
     for d in irrep_dims:
-        X = exp_phi[..., start:start + d, start:start + d].to(torch.float64)
-        A = 0.5 * (X[..., 0::2, 0::2] + X[..., 1::2, 1::2])
-        B = 0.5 * (X[..., 1::2, 0::2] - X[..., 0::2, 1::2])
-        phases.append(torch.angle(torch.linalg.det(torch.complex(A, B))))
+        phases.append(complex_block_phase(exp_phi[..., start:start + d, start:start + d]))
         start += d
     return torch.stack(phases, dim=-1)
+
+
+def complex_block_phase(
+    block: torch.Tensor,                 # (..., d, d) one realified GL(m, C) head block, d even
+) -> torch.Tensor:                       # (...) arg det_C in (-pi, pi]
+    r""":math:`\arg\det_{\mathbb{C}}(A + iB)` of one realified head block (:func:`per_head_complex_phase`), float64."""
+    X = block.to(torch.float64)
+    A = 0.5 * (X[..., 0::2, 0::2] + X[..., 1::2, 1::2])
+    B = 0.5 * (X[..., 1::2, 0::2] - X[..., 0::2, 1::2])
+    return torch.angle(torch.linalg.det(torch.complex(A, B)))
+
+
+def head_block_algebra(
+    phi:   torch.Tensor,                 # (..., n_gen) frame coordinates
+    group: GaugeGroup,
+) -> Optional[List[torch.Tensor]]:      # per head (..., d_h, d_h) float64, or None
+    r"""The diagonal head blocks :math:`M_h = \sum_a\phi_aG_a^{(h)}` of :math:`M = \sum_a\phi_aG_a` in float64, or
+    None when the basis is not supported on the ``irrep_dims`` diagonal blocks.
+
+    For such a basis :math:`e^{M} = \bigoplus_h e^{M_h}`, so every per-head frame statistic can be computed on the
+    :math:`(d_h, d_h)` blocks instead of the dense :math:`(K, K)` exponential (audit 2026-10-17 item 21). The
+    canonical elementary ``block_glk`` basis reshapes ``phi``; the other equal-block groups read
+    :meth:`GaugeGroup.head_block_generators`; a single block is the dense embedding; unequal blocks take the
+    diagonal blocks of the dense basis after an exact support check (one host read). The entries equal those of
+    ``group.embed_algebra(phi, dtype=float64)`` on each block.
+    """
+    phi = phi.to(torch.float64)
+    dims = list(group.irrep_dims)
+    layout = group.elementary_block_shape
+    if layout is not None and phi.shape[-1] == layout[0] * layout[1] * layout[1]:
+        H, d = layout
+        blocks = phi.reshape(*phi.shape[:-1], H, d, d)
+        return [blocks[..., h, :, :] for h in range(H)]
+    if len(dims) == 1:
+        return [group.embed_algebra(phi, dtype=torch.float64)]
+    head_blocks = group.head_block_generators()
+    if head_blocks is not None:
+        M = torch.einsum("...a,ahij->...hij", phi,
+                         head_blocks.to(device=phi.device, dtype=torch.float64))                # (..., H, d, d)
+        return [M[..., h, :, :] for h in range(M.shape[-3])]
+    G = group.generators.detach().to(device=phi.device, dtype=torch.float64)                    # (n_gen, K, K)
+    on_block = torch.block_diag(*(torch.ones(d, d, dtype=torch.bool, device=G.device) for d in dims))
+    if bool((G[:, ~on_block] != 0).any()):
+        return None
+    offsets = [0, *itertools.accumulate(dims)]
+    return [torch.einsum("...a,aij->...ij", phi, G[:, start:stop, start:stop])
+            for start, stop in zip(offsets[:-1], offsets[1:])]
 
 
 # --- transport / energy directedness (the ln(3) symmetry-breaking signal) ---

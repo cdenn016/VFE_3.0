@@ -73,8 +73,6 @@ SEMANTIC_ANALYSIS_OPTIONS: Dict[str, object] = {
 }
 
 _SINGLE_RUN_FIGURE_INVENTORY = (
-    "iterate_trajectory.png",
-    "belief_trajectories.png",
     "attention_structure.png",
     "per_layer_diagnostics.png",
     "head_block_norms.png",
@@ -335,8 +333,6 @@ def _decode_workspace_requirements(
     r"""Return dense-matrix dimension, coordinate dimension, and coordinate vocabulary width."""
     width = int(cfg.embed_dim)
     vocab_size = int(cfg.vocab_size)
-    if not cfg.diagonal_covariance and active_decode_mode == "full":
-        return width, None, None
     if active_decode_mode == "expected_likelihood_chunked":
         return None, width, min(vocab_size, int(cfg.decode_chunk_size))
     return None, None, None
@@ -470,7 +466,7 @@ def _prepare_missing_saved_probes(
     for name in pending:
         try:
             if name == "estep_character":
-                record = collect_estep_character(model, tokens, depths=(1,))
+                record = collect_estep_character(model, tokens)
             elif name == "context_sensitivity":
                 record = collect_context_sensitivity(model, tokens)
             else:
@@ -482,6 +478,8 @@ def _prepare_missing_saved_probes(
                                        "sequence_length": int(tokens.shape[1])}
             _write_json_atomic(run_dir / f"{name}.json", record)
             logger.info("refreshed supported probe -> %s", name)
+            if name == "estep_character":                 # single readout: record only, no figure
+                continue
             try:
                 fig = getattr(figs, f"plot_{name}")(record, path=str(run_dir / f"{name}.png"))
                 figs.plt.close(fig)
@@ -762,13 +760,13 @@ def generate_figures(
     figures still run. ``prepare_saved_probes`` persists missing E-step-character, beta-channel,
     context-sensitivity and phi-numerics inputs from the already-loaded model and retained report batch so an isolated on-demand worker
     can render the corresponding finalization figures without a second report replay. ``n_e_steps``
-    overrides the E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure
+    is accepted for caller compatibility and read by no retained figure: the legacy E-step trace
+    figures were removed (audit 2026-10-17 item 71). Returns the figure
     paths actually written (best-effort: a failed figure is logged and omitted).
 
     Figures that are identically trivial on the configured route are not emitted; the reason from
     :func:`vfe3.viz.figures.route_figure_skip_reasons` is logged instead (flat-transport holonomy,
-    the E-step family without E-step iterates, the belief-covariance figures when the covariance is
-    frozen at encode). ``head_block_norms`` (the head x frame-block energy of the interface maps)
+    the belief-covariance figures when the covariance is frozen at encode). ``head_block_norms`` (the head x frame-block energy of the interface maps)
     needs :func:`vfe3.posthoc.maps.head_block_norms` and the relational maps. The eval-cadence
     history figures of :func:`generate_history_figures` are written too.
     """
@@ -898,19 +896,9 @@ def generate_figures(
     # snapshot=None preserves the previous per-extractor best-effort fallback instead of dropping
     # every dependent figure.
     snapshot = _safe(lambda: model.build_diagnostic_snapshot(tok), "diagnostic_snapshot")
-    trace_snapshot = snapshot
-    if (snapshot is not None and n_e_steps is not None
-            and int(n_e_steps) != len(snapshot.trace_states) - 1):
-        trace_snapshot = None
     # Route gates (audit k160 Section 4): figures that are identically trivial on this route are
-    # skipped with a logged reason, and the E-step traces feeding only such figures are not replayed.
+    # skipped with a logged reason.
     skip_reasons = figs.route_figure_skip_reasons(cfg)
-    estep_family_live = "iterate_trajectory" not in skip_reasons
-    trace       = _safe(lambda: extract.e_step_belief_trace(
-        model, tok, n_iter=n_e_steps, snapshot=trace_snapshot),
-        "e_step_belief_trace") if estep_family_live else None
-    layer_trace = _safe(lambda: extract.across_layer_belief_trace(
-        model, tok, snapshot=snapshot), "across_layer_belief_trace") if estep_family_live else None
     cstate = _safe(lambda: extract.readout_state(model, tok, snapshot=snapshot), "readout_state")
     equivariance = _safe(lambda: extract.projected_gauge_equivariance(model, tok),
                          "projected_gauge_equivariance")
@@ -1013,8 +1001,6 @@ def generate_figures(
                                       "batches), not this report's bank")
 
     availability = {
-        "iterate_trajectory":         trace is not None,
-        "belief_trajectories":        trace is not None,
         "attention_structure":        amaps is not None,
         "per_layer_diagnostics":      per_layer is not None,
         "head_block_norms":           block_norms is not None or "head_block_norms" in skip_reasons,
@@ -1048,13 +1034,6 @@ def generate_figures(
         if path is not None:
             written.append(path)
 
-    _emit("iterate_trajectory",
-          lambda p: figs.plot_iterate_trajectory(trace, diagonal=cfg.diagonal_covariance,
-                                                path=p),
-          "iterate_trajectory.png" in planned_figures)
-    _emit("belief_trajectories",
-          lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
-          "belief_trajectories.png" in planned_figures)
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
           "attention_structure.png" in planned_figures)

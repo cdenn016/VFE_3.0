@@ -12,7 +12,7 @@ import dataclasses
 import logging
 import math
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import pytest
 import torch

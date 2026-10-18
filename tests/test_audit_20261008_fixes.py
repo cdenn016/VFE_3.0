@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import vfe3.relational_scoring as scoring
-from tests.test_audit_20261007_opus_fixes import B, H, K, N, V, _cfg, _minimal_agent, _rope_cfg
+from tests.test_audit_20261007_opus_fixes import H, K, N, _cfg, _minimal_agent, _rope_cfg
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.model import VFEModel
 

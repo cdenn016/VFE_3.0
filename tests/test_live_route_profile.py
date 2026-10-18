@@ -6,11 +6,14 @@ shape and run fields to a CPU unit test, and pins the fields the launcher omits 
 route switch in the launcher reaches these checks without an edit here.
 """
 import dataclasses
+import math
 from dataclasses import asdict, fields
+from typing import Any, Callable, Dict, Tuple
 
+import pytest
 import torch
 
-from tests.profiles import _LIVE_TINY, config_values, launcher_values, live_config, live_values
+from tests.profiles import _LIVE_TINY, config_values, launcher_values, live_config, live_kl_max, live_values
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
@@ -42,7 +45,15 @@ def test_live_profile_is_the_launcher_route() -> None:
                 if field.default is not dataclasses.MISSING}
     omitted = {name for name in values if name not in launcher and name not in resized}
     assert {name: (values[name], defaults[name]) for name in omitted if values[name] != defaults[name]} == {}
-    assert live_config().kl_max == 8.0 * live_config().embed_dim
+    # kl_max keeps the launcher's nats per dimension: a launcher number scales by K_tiny / K_launcher, None (8 K)
+    # stays None and resolves to 8 K at the tiny K (audit 2026-10-17, item 38).
+    cfg = live_config()
+    if launcher.get("kl_max") is None:
+        assert values["kl_max"] == 8.0 * cfg.embed_dim
+    else:
+        assert values["kl_max"] == launcher["kl_max"] * cfg.embed_dim / launcher["embed_dim"]
+    assert live_kl_max({"kl_max": 128.0, "embed_dim": 128}) == float(_LIVE_TINY["embed_dim"])
+    assert live_kl_max({"kl_max": None, "embed_dim": 128}) is None
 
 
 def test_live_forward_backward_is_finite() -> None:
@@ -60,23 +71,81 @@ def test_live_forward_backward_is_finite() -> None:
     assert any(bool((g != 0).any()) for g in grads)
 
 
-def test_live_backward_matches_float64_central_differences() -> None:
-    r"""Each trainable parameter's gradient on the live route matches a float64 central difference (audit
-    2026-10-16 F111).
+def _float64_live_model(**overrides: Any) -> VFEModel:
+    r"""The live route in float64 with untied block-norm gains and a random unigram table.
 
-    For one random direction :math:`d_p` per parameter :math:`p`,
-    :math:`(L(p + h d_p) - L(p - h d_p))/(2h) = \langle\nabla_p L, d_p\rangle + O(h^2)`. A wrong custom
-    backward, a missing chain-rule term or a stray detach on the launcher route moves the analytic side away
-    from the difference. The block-norm gains start tied at one; they are moved off the tie so that no
-    maximum over the gains is differentiated at a kink.
+    The block-norm gains start tied at one; they are moved off the tie so that no maximum over the gains is
+    differentiated at a kink. The unigram decode table is filled from random counts, so the unigram bias is
+    nonzero on the checked route (audit 2026-10-17 item 26); an unset table adds zero.
     """
     torch.manual_seed(0)
-    model = VFEModel(live_config()).double()
+    model = VFEModel(live_config(**overrides)).double()
     with torch.no_grad():
         generator = torch.Generator().manual_seed(5)
         for name, p in model.named_parameters():
             if name.endswith("norm.weight"):
                 p.add_(0.01 * torch.randn(p.shape, dtype=p.dtype, generator=generator))
+    bank = model.prior_bank
+    if bank.decode_unigram_prior:
+        counts = torch.randint(0, 50, (bank.vocab_size,), generator=torch.Generator().manual_seed(6))
+        bank.set_unigram_log_prior(counts.double())
+    return model
+
+
+def _richardson_mismatches(
+    loss:   Callable[[], torch.Tensor],
+    params: Dict[str, torch.nn.Parameter],
+
+    *,
+    h:      float = 1e-4,
+    seed:   int   = 2,
+) -> Dict[str, Tuple[float, float, float]]:
+    r"""Parameters whose analytic directional derivative misses a Richardson-extrapolated central difference.
+
+    For one random direction :math:`d_p` per parameter, :math:`D(h) = (L(p + h d_p) - L(p - h d_p))/(2h)
+    = \langle\nabla_p L, d_p\rangle + c h^2 + O(h^4)`, so :math:`R = (4D(h/2) - D(h))/3` removes the
+    :math:`h^2` truncation that a single step cannot tell from a defect (audit 2026-10-17 item 37). The
+    tolerance is :math:`|R - a| \le 10^{-6}\max(|R|, |a|) + \max(10^{-8}, 10^3\varepsilon|L|/h)`, the second
+    term bounding the float64 cancellation in :math:`L(p + h d) - L(p - h d)`. Every ``p.grad`` must already
+    hold :math:`\nabla_p L`.
+    """
+    eps = torch.finfo(torch.float64).eps
+    with torch.no_grad():
+        base = abs(float(loss()))
+    directions = torch.Generator().manual_seed(seed)
+    mismatched: Dict[str, Tuple[float, float, float]] = {}
+    for name, p in params.items():
+        d = torch.randn(p.shape, dtype=p.dtype, generator=directions)
+        original = p.detach().clone()
+
+        def central(step: float) -> float:
+            with torch.no_grad():
+                p.copy_(original + step * d)
+                plus = float(loss())
+                p.copy_(original - step * d)
+                minus = float(loss())
+                p.copy_(original)
+            return (plus - minus) / (2.0 * step)
+
+        richardson = (4.0 * central(h / 2.0) - central(h)) / 3.0
+        analytic = float((p.grad * d).sum())
+        tolerance = 1e-6 * max(abs(richardson), abs(analytic)) + max(1e-8, 1e3 * eps * base / h)
+        if abs(richardson - analytic) > tolerance:
+            mismatched[name] = (richardson, analytic, tolerance)
+    return mismatched
+
+
+@pytest.mark.parametrize("block_norm_covariance", ["passthrough", "pushforward"])
+def test_live_backward_matches_float64_richardson_differences(block_norm_covariance: str) -> None:
+    r"""Each trainable parameter's gradient on the live route matches a float64 Richardson-extrapolated central
+    difference (audit 2026-10-16 F111, 2026-10-17 item 37), under both LayerNorm covariance maps.
+
+    A wrong custom backward, a missing chain-rule term or a stray detach on the launcher route moves the analytic
+    side away from the extrapolated difference, while the :math:`O(h^2)` truncation the pushforward's large third
+    derivative produces at a single step does not.
+    """
+    model = _float64_live_model(block_norm_covariance=block_norm_covariance)
+    assert model.cfg.block_norm_covariance == block_norm_covariance
     tokens, targets = _batch(model.cfg)
 
     def loss() -> torch.Tensor:
@@ -85,23 +154,41 @@ def test_live_backward_matches_float64_central_differences() -> None:
     loss().backward()
     trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
     assert trainable and [name for name, p in trainable.items() if p.grad is None] == []
-    h = 1e-5
-    directions = torch.Generator().manual_seed(2)
-    mismatched = {}
-    for name, p in trainable.items():
-        d = torch.randn(p.shape, dtype=p.dtype, generator=directions)
-        original = p.detach().clone()
-        with torch.no_grad():
-            p.copy_(original + h * d)
-            plus = float(loss())
-            p.copy_(original - h * d)
-            minus = float(loss())
-            p.copy_(original)
-        difference = (plus - minus) / (2.0 * h)
-        analytic = float((p.grad * d).sum())
-        if abs(difference - analytic) > 1e-5 * max(abs(difference), abs(analytic)) + 1e-8:
-            mismatched[name] = (difference, analytic)
-    assert mismatched == {}
+    assert _richardson_mismatches(loss, trainable) == {}
+
+
+def test_live_phi_embed_gradient_under_the_fixed_schedule_exponential(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The CUDA-only fixed-schedule frame exponential, forced onto the CPU live route, gives a ``phi_embed``
+    gradient that matches a Richardson difference with the frames ten times off the identity (audit 2026-10-17
+    item 26).
+
+    ``_frame_matrix_exp`` takes :class:`~vfe3.geometry.transport._FixedScheduleMatrixExp` only on CUDA; the
+    patch applies the same rule on every device, so its custom backward joins the live route here.
+    """
+    from vfe3.geometry import transport
+
+    calls = {"fixed": 0}
+
+    def fixed_schedule(blocks: torch.Tensor, norm_bound: float) -> torch.Tensor:
+        if not math.isfinite(norm_bound) or blocks.dtype not in (torch.float32, torch.float64):
+            return torch.linalg.matrix_exp(blocks)
+        calls["fixed"] += 1
+        return transport._FixedScheduleMatrixExp.apply(blocks, math.sqrt(blocks.shape[-1]) * norm_bound)
+
+    monkeypatch.setattr(transport, "_frame_matrix_exp", fixed_schedule)
+    model = _float64_live_model()
+    phi = model.prior_bank.phi_embed
+    with torch.no_grad():
+        phi.mul_(10.0)
+    tokens, targets = _batch(model.cfg)
+
+    def loss() -> torch.Tensor:
+        return model(tokens, targets)[1]
+
+    loss().backward()
+    assert calls["fixed"] > 0, "the fixed-schedule exponential never ran on the live route"
+    assert phi.grad is not None and bool((phi.grad != 0).any())
+    assert _richardson_mismatches(loss, {"prior_bank.phi_embed": phi}) == {}
 
 
 def test_live_route_is_causal() -> None:

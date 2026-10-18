@@ -19,8 +19,8 @@ Modularity:
         retired generic ``family``/``family_chunked`` modes to the kernel of the family's rank).
 
 Decode seam (PB-14): the authoritative ``reference_decode`` scores logits =
--D_configured(q || pi_v)/tau_eff through the configured family (``self.family``) and divergence
-functional (``self.divergence_family`` at ``self.renyi_order``). The fast diagonal/full kernels are
+-D_configured(q || pi_v)/tau_eff through the configured family (``self.family``) and the KL
+functional (the alpha = 1 member of the Renyi seam). The fast diagonal/full kernels are
 the OPTIMIZED gaussian_* + renyi(alpha=1) implementations. The registry seam is
 honored at the COVARIANCE-STRUCTURE granularity (``DecodeRegistration.covariance_kinds``): a new
 covariance structure is added by writing-and-registering a decode kernel, never by editing a call site. The full kernels score a full q against the intentionally
@@ -38,7 +38,7 @@ import torch
 import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
-from vfe3.config import _REFERENCE_DECODE_MODES, VFE3Config
+from vfe3.config import _REFERENCE_DECODE_MODES
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.frame_actions import frame_matvec, reference_covariance, reference_variances
 
@@ -721,31 +721,30 @@ class PriorBank(nn.Module):
         n_gen:        int,
 
         *,
-        mu_init_std:         float = 0.02,
-        sigma_init:          float = 1.0,
-        phi_scale:           float = 0.01,
-        decode_tau:          float = 1.0,
-        eps:                 float = 1e-6,
-        diagonal_covariance: bool  = True,
-        family:              str   = "gaussian_diagonal",
-        divergence_family:   str   = "renyi",
-        renyi_order:         float = 1.0,
-        encode_mode:         str   = "per_token",
-        decode_mode:         str   = "diagonal_chunked",
-        decode_chunk_size:   int   = 8192,
-        decode_av_precision: Optional[str] = None,
-        decode_ce_checkpoint: str  = "auto",
-        decode_ce_triton:     bool = False,
-        decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
+        # Keywords that mirror a VFE3Config field are required (no defaults), so they cannot drift from the config
+        # (audit 2026-10-17, item 55); VFEModel passes each from cfg.
+        mu_init_std:         float,
+        sigma_init:          float,
+        phi_scale:           float,
+        decode_tau:          float,
+        eps:                 float,
+        family:              str,
+        encode_mode:         str,
+        decode_mode:         str,
+        decode_chunk_size:   int,
+        decode_av_precision: Optional[str],          # None: the module default _DECODE_AV_PRECISION
+        decode_ce_checkpoint: str,
+        decode_ce_triton:     bool,
+        decode_ranking_fp64_escalation: bool,
+        unigram_kappa:        float,
+        decode_unigram_prior: bool,
+        untie_decode_bank:    bool,
+        decode_coordinates:     str,
+        prior_covariance_table: str,
 
-        unigram_kappa:        float = 1.0,
-        decode_unigram_prior: bool  = False,
-        untie_decode_bank:    bool  = False,
-
+        diagonal_covariance: bool  = True,           # derived from the family (VFE3Config.diagonal_covariance)
         irrep_dims:             Optional[List[int]] = None,
         gauge_group_name:       Optional[str]       = None,
-        decode_coordinates:     str                 = "local",
-        prior_covariance_table: str                 = "diagonal",
     ) -> None:
         super().__init__()
         if prior_covariance_table not in PRIOR_COVARIANCE_TABLES:
@@ -788,14 +787,9 @@ class PriorBank(nn.Module):
         self.diagonal_covariance = diagonal_covariance
         # The vocabulary prior and decode variance tables stay diagonal in EVERY family (PB-11).
         self.family = family
-        # divergence_family / renyi_order drive the reference decode (reference_decode): logits =
-        # -D_configured(q||p_v)/tau_eff scored through get_functional(divergence_family) at
-        # alpha=renyi_order. The fast Gaussian kernels hardcode alpha=1 KL. The defaults are the KL
-        # readout every projected route uses: VFEModel passes neither argument, because both config
-        # fields are retired and pinned to renyi at alpha=1, and the divergence seam now implements
-        # only the KL, so any other order raises (audit 2026-10-16 F93).
-        self.divergence_family = divergence_family
-        self.renyi_order = renyi_order
+        # The reference decode scores the KL (the divergence seam implements only alpha = 1, audit
+        # 2026-10-16 F93); the retired divergence_family / renyi_order arguments were removed (audit
+        # 2026-10-17 item 72).
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
@@ -1240,8 +1234,8 @@ class PriorBank(nn.Module):
     ) -> torch.Tensor:                   # (B, N, V) logits = -D_configured(q || pi_v)/tau_eff
         r"""Authoritative reference decode: -D_configured(q_i || pi_v)/tau_eff via the seam.
 
-        Dispatches through the CONFIGURED family (``self.family``) and divergence functional
-        (``self.divergence_family`` at ``self.renyi_order``), broadcasting the seam over the
+        Dispatches through the CONFIGURED family (``self.family``) and the KL functional,
+        broadcasting the seam over the
         vocabulary V in one shot (general but slow, O(B*N*V*K)). This is the same computation the
         registered ``family`` kernel performs, so it stays the oracle for the fast canonical kernels:
         for a canonical gaussian + renyi + alpha=1 config it equals the fused ``diagonal``/``full``
@@ -2387,7 +2381,7 @@ def _family_logits(
     """
     family_cls = get_family(pb.family)
     is_full = family_cls.cov_kind == "full"
-    functional = get_functional(pb.divergence_family)
+    functional = get_functional("renyi")                                    # the KL (alpha = 1)
 
     degenerate = None
     if is_full:
@@ -2407,7 +2401,7 @@ def _family_logits(
         mu_v_all,
         torch.diag_embed(p_sigma_all) if is_full else p_sigma_all,
     )
-    energy = functional(q, p, alpha=pb.renyi_order,
+    energy = functional(q, p, alpha=1.0,
                         kl_max=float("inf"), eps=pb.eps)                    # (B, N, V)
     logits = -energy / tau_eff                                              # (B, N, V)
 
@@ -2425,7 +2419,7 @@ def _decode_family(
     r"""Family/divergence-consistent decode (PB-14): logits = -D_configured(q_i || pi_v)/tau_eff.
 
     Scores the posterior q_i against every vocabulary prior pi_v through the CONFIGURED belief family
-    ``pb.family`` and divergence functional ``pb.divergence_family`` at ``alpha=pb.renyi_order``, so
+    ``pb.family`` and the KL divergence functional (``alpha = 1``), so
     the readout matches the E-step geometry rather than a hardcoded gaussian alpha=1 KL. As in the
     other decode kernels the seam is invoked with ``kl_max=inf`` (a DECODE must preserve the full
     divergence ranking over the vocabulary). The vocabulary prior table is intentionally DIAGONAL in

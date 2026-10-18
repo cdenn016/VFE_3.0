@@ -39,12 +39,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from numbers import Real
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple,
+    Union,
+)
 
 import torch
 
@@ -66,6 +70,7 @@ from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
     get_block_mlp_registration,
 )
+from vfe3.metrics_schema import normalize_metric_row, split_spike_rows
 from vfe3.process_utils import run_process_tree
 from vfe3.runtime import deterministic_state, ieee_fp32_matmul
 
@@ -276,28 +281,6 @@ def _count_finalize_failure(
     if failures is None:
         failures = artifacts.diagnostics_failures = {}
     failures[name] = failures.get(name, 0) + 1
-
-
-def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None) -> Dict[str, object]:
-    """Publish an explicit unavailable record instead of running an incompatible depth/objective probe."""
-    return {
-        "available": False,
-        "probe": probe,
-        "inference_semantics": ("relational_full_link_frozen_filtering"
-                                if cfg is not None and cfg.relational_readout_mode == "full_link_update"
-                                else f"relational_minimal_agent_{cfg.minimal_agent_inference}"
-                                if cfg is not None and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
-                                else "relational_predictive_content"
-                                if cfg is not None and cfg.relational_readout_mode == "predictive_content"
-                                else "projected_attention"),
-        "reason": (("only the configured receiver episode is supported; inference-depth sweeps are unavailable"
-                    if cfg is not None and cfg.relational_readout_mode == "full_link_update"
-                    else "only the configured single readout is supported; inference-depth sweeps are unavailable")
-                   if "depth" in probe or probe == "zero_e_steps_counterfactual"
-                   else "routing and readout do not define the legacy shared stationary free-energy objective"),
-        "points": [],
-        "stages": {},
-    }
 
 
 def _non_vfe_skipped_analyses(model: torch.nn.Module) -> Dict[str, str]:
@@ -1053,21 +1036,7 @@ def _run_attention_maps_isolated(
     r"""Render periodic attention maps in a child that may safely suffer a native plotting abort."""
     try:
         tensor = maps.detach().cpu() if isinstance(maps, torch.Tensor) else torch.as_tensor(maps)
-        if channel == "estep":
-            # (3, L, H, N, N): the E-step's own pattern, the converged re-score, and the prior
-            # alone, stacked so one worker call renders the heatmaps AND the distance profile that
-            # compares them (audit 2026-07-26 R-3). Written to attention_estep/, never to
-            # attention/ -- the shipped maps are left exactly as they are.
-            if tensor.ndim != 5 or tensor.shape[0] != 3:
-                raise ValueError(
-                    f"estep maps must be (3, L, H, N, N); got {tuple(tensor.shape)}"
-                )
-            expected = [
-                run_dir / "attention_estep" / f"step_{step}_layer{layer}_head{head}.png"
-                for layer in range(tensor.shape[1])
-                for head in range(tensor.shape[2])
-            ] + [run_dir / "attention_estep" / f"step_{step}_profile.png"]
-        elif channel == "beta":
+        if channel == "beta":
             if tensor.ndim == 2:
                 tensor = tensor[None, None]
             elif tensor.ndim == 3:
@@ -1169,6 +1138,9 @@ def _selection_semantic_config(
         "trust_resume_checkpoint",
         "log_interval",
         "checkpoint_interval",
+        "checkpoint_keep_last",
+        "checkpoint_at_end",
+        "block_variance_at_log",
         "generate_embedding_figures",
     ):
         normalized.pop(key, None)
@@ -2085,17 +2057,24 @@ class RunArtifacts:
             raise ValueError(f"artifact name must be a regular bare filename, got {name!r}")
         return _write_json_atomic(self.run_dir / name, obj)
 
-    def log_metrics(self, row: Dict[str, float]) -> None:
+    def log_metrics(self, row: Mapping[str, object]) -> None:
         r"""Atomically publish ``metrics.csv`` with one additional rectangular row.
 
         The column set is fixed by the first row; later rows must share those keys so the CSV
         stays rectangular (the training loop emits a homogeneous row each periodic eval).
+
+        Every cell first passes :func:`vfe3.metrics_schema.normalize_metric_cell` (audit 2026-10-17
+        item 31): one-element tensors and NumPy scalars become Python numbers, a bool becomes 0 or 1,
+        ``None`` becomes NaN, and a string in a column the schema declares numeric, a multi-element
+        array or any other object raises ``TypeError`` before anything is written. The file and the
+        in-memory history hold the same normalized values.
 
         NaN cells are written to the file as BLANK (empty string), so an eval-cadence column
         (val_*, generalization_gap, the held-out probes) -- NaN on the denser log-interval rows
         between evals -- shows an empty cell rather than a repeated value or a literal "nan".
         The IN-MEMORY ``self.history`` keeps the raw NaN float so
         the figure pass (which filters on ``math.isfinite``) is unaffected."""
+        row = normalize_metric_row(row)
         fieldnames = list(row) if self._fieldnames is None else list(self._fieldnames)
         if set(row) != set(fieldnames):
             missing = sorted(set(fieldnames) - set(row))
@@ -2124,39 +2103,151 @@ class RunArtifacts:
         self._fieldnames = fieldnames
         self.history.append(dict(row))
 
-    def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
+    def maybe_save_best(
+        self,
+        step:    int,
+        model:   torch.nn.Module,
+        val_ppl: float,
+
+        *,
+        background: bool = False,
+    ) -> bool:
         r"""Record a new minimum and, when enabled, save its config-bound weights.
 
         Atomic (same-dir tmp + ``os.replace``): a crash or Windows lock mid-save can never leave a
-        corrupt/unreadable ``best_model.pt`` where a good one stood."""
+        corrupt/unreadable ``best_model.pt`` where a good one stood.
+
+        ``background`` (audit 2026-10-17 item 68): the weights are copied to host memory here, so the bundle is the
+        state at this call, and ``torch.save`` plus the atomic replace run on a worker thread while training
+        continues. ``best_val_ppl`` and ``best_step`` advance only when the file has been replaced, as on the
+        synchronous path; a failed save is logged and counted under ``diagnostics_failures["best_model_save"]``.
+        Every reader of the record or the file waits first (:meth:`wait_background`; this method,
+        :meth:`save_checkpoint` and the finalizers do). Returns True when a save was published or scheduled."""
+        self.wait_best_save()
         if val_ppl < self.best_val_ppl:
             if not self.save_model_artifacts:
                 self.best_val_ppl = float(val_ppl)
                 self.best_step = int(step)
                 return True
             config = _serialize_run_config(self.cfg)
+            state = (model.state_dict() if not background else
+                     {name: tensor.detach().to("cpu", copy=True) for name, tensor in model.state_dict().items()})
             bundle = {
-                "model_state":        model.state_dict(),
+                "model_state":        state,
                 "config":             config,
                 "config_fingerprint": semantic_config_fingerprint(config),
                 "code_identity_sha256": self.code_identity_sha256,
                 "selection_data_identity": self.selection_data_identity,
             }
-            try:
-                with _unique_sibling_temp(self.best_path) as tmp:
-                    torch.save(bundle, tmp)
-                    _atomic_replace(self.best_path, tmp)
-            except PermissionError as exc:
-                # A reader holding best_model.pt open on Windows (audit 2026-10-08 P1-6): the record is
-                # not advanced, so best_model.pt and best_val_ppl stay consistent and the next eval
-                # that beats the published best retries the save.
-                logging.getLogger(__name__).warning(
-                    "best_model.pt publish at step %d blocked (%s); the previous best is kept", step, exc)
-                return False
-            self.best_val_ppl = float(val_ppl)
-            self.best_step = int(step)
-            return True
+            if background:
+                worker = threading.Thread(target=self._publish_best, args=(bundle, int(step), float(val_ppl), True),
+                                          name=f"best_model_save_step_{int(step)}", daemon=True)
+                self._best_save_thread = worker
+                worker.start()
+                return True
+            return self._publish_best(bundle, int(step), float(val_ppl), False)
         return False
+
+    def _publish_best(
+        self,
+        bundle:     Dict[str, object],
+        step:       int,
+        val_ppl:    float,
+        background: bool,
+    ) -> bool:
+        r"""Write ``bundle`` to ``best_model.pt`` (same-directory temporary and atomic replace) and advance the record."""
+        try:
+            with _unique_sibling_temp(self.best_path) as tmp:
+                torch.save(bundle, tmp)
+                _atomic_replace(self.best_path, tmp)
+        except PermissionError as exc:
+            # A reader holding best_model.pt open on Windows (audit 2026-10-08 P1-6): the record is
+            # not advanced, so best_model.pt and best_val_ppl stay consistent and the next eval
+            # that beats the published best retries the save.
+            logging.getLogger(__name__).warning(
+                "best_model.pt publish at step %d blocked (%s); the previous best is kept", step, exc)
+            return False
+        except Exception as exc:
+            if not background:
+                raise
+            logging.getLogger(__name__).warning(
+                "(best_model.pt save at step %d failed: %s); training continues, the next improving eval retries",
+                step, exc)
+            failures = getattr(self, "diagnostics_failures", None)
+            if isinstance(failures, dict):
+                failures["best_model_save"] = failures.get("best_model_save", 0) + 1
+            return False
+        self.best_val_ppl = float(val_ppl)
+        self.best_step = int(step)
+        return True
+
+    def wait_best_save(self) -> None:
+        r"""Block until a background ``best_model.pt`` save (:meth:`maybe_save_best`) has finished."""
+        worker = getattr(self, "_best_save_thread", None)
+        if worker is not None:
+            worker.join()
+            self._best_save_thread = None
+
+    def submit_figure_work(
+        self,
+        label: str,
+        work:  Callable[[], object],
+    ) -> None:
+        r"""Run ``work`` (an isolated figure subprocess launch) on a worker thread so training does not wait for it.
+
+        The child process keeps its isolation (:func:`_run_attention_maps_isolated`); the thread only waits for it.
+        Jobs run one at a time in submission order, so at most one figure child runs beside training (audit
+        2026-10-17 item 68). :meth:`wait_background` reaps them. A failure is logged, never raised.
+        """
+        queue = getattr(self, "_figure_jobs", None)
+        if queue is None:
+            queue = self._figure_jobs = []
+        previous = queue[-1] if queue else None
+
+        def run() -> None:
+            if previous is not None:
+                previous.join()
+            try:
+                work()
+            except Exception as exc:                              # noqa: BLE001 - figures are best-effort
+                logging.getLogger(__name__).warning("background figure job %s failed (%s)", label, exc)
+
+        worker = threading.Thread(target=run, name=f"figure_{label}", daemon=True)
+        queue.append(worker)
+        worker.start()
+
+    def wait_background(self) -> None:
+        r"""Reap every background job of this run: the ``best_model.pt`` save and the figure workers."""
+        self.wait_best_save()
+        for worker in list(getattr(self, "_figure_jobs", None) or ()):
+            worker.join()
+        self._figure_jobs = []
+
+    def prune_checkpoints(
+        self,
+        keep_last: Optional[int],
+    ) -> List[Path]:
+        r"""Delete all but the ``keep_last`` highest-step ``checkpoints/step_<N>.pt`` of this run directory.
+
+        ``None`` keeps every checkpoint (``checkpoint_keep_last``; audit 2026-10-17 item 48). Only files named
+        ``step_<N>.pt`` in this run's own ``checkpoints/`` are considered. Returns the removed paths.
+        """
+        if keep_last is None or not self.ckpt_dir.is_dir():
+            return []
+        found: List[Tuple[int, Path]] = []
+        for path in self.ckpt_dir.glob("step_*.pt"):
+            stem = path.stem[len("step_"):]
+            if stem.isdigit():
+                found.append((int(stem), path))
+        found.sort()
+        removed: List[Path] = []
+        for _, path in found[:max(0, len(found) - int(keep_last))]:
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError as exc:
+                logging.getLogger(__name__).warning("could not prune checkpoint %s (%s)", path, exc)
+        return removed
 
     def save_attention_maps(
         self,
@@ -2177,41 +2268,6 @@ class RunArtifacts:
             self.run_dir,
             logger or logging.getLogger(__name__),
             channel="beta",
-            step=step,
-        )
-
-    def save_estep_attention_maps(
-        self,
-        step:   int,
-        maps:   'Optional[torch.Tensor]',     # (3, L, H, N, N) entry / converged / prior, or None
-        logger: Optional[logging.Logger] = None,
-    ) -> Optional[List[Path]]:
-        r"""The attention the E-step ACTUALLY used, written beside the shipped maps.
-
-        Writes ``attention_estep/step_<N>_layer<l>_head<h>.png`` (the ENTRY-belief beta -- the
-        pattern the E-step's first iteration aggregated with) plus one
-        ``attention_estep/step_<N>_profile.png`` per step: row-mean beta against key distance
-        ``|i - j|``, with the converged re-score and the attention prior overlaid on the same axes.
-
-        The shipped ``attention/`` heatmaps score at each block's OUTPUT belief, after the E-step
-        has moved it and after ``cg_coupling``/``block_norm`` -- a post-hoc re-score, not the
-        pattern that produced the aggregation (audit 2026-07-26 R-3, measured max row difference
-        1.0 on a trained checkpoint). Both are kept: the converged map is what ``diagnostics``
-        reports, so it stays the reference, and this is the mechanism.
-
-        The profile panel is the one that makes positional pathology legible -- a rotary schedule
-        whose kernel revives at long lag shows up as off-diagonal bumps here that are invisible in
-        a log-scaled heatmap, and a beta that has collapsed onto its prior shows up as the two
-        curves lying on top of each other. ``maps`` is None -> no-op. Errors are logged and
-        swallowed, never fatal to the run.
-        """
-        if maps is None:
-            return None
-        return _run_attention_maps_isolated(
-            maps,
-            self.run_dir,
-            logger or logging.getLogger(__name__),
-            channel="estep",
             step=step,
         )
 
@@ -2244,6 +2300,7 @@ class RunArtifacts:
         """
         if not self.save_model_artifacts:
             raise RuntimeError("model-artifact persistence is disabled for this run")
+        self.wait_best_save()                        # the embedded best-model bundle reads best_model.pt
         step = _require_nonnegative_int(step, "step")
         path = self.ckpt_dir / f"step_{step}.pt"
         rng_state = {
@@ -3749,14 +3806,6 @@ def _cost_model_fields(
     return out
 
 
-def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
-    """Name the endpoint-delta artifact without claiming unproven iterate behavior."""
-    title = "E-step endpoint delta"
-    if evidence.get("descent_evidence"):
-        title += " (descent established)"
-    return {"filename": "estep_endpoint_delta.png", "title": title}
-
-
 
 
 def _scheduler_metadata(
@@ -3941,8 +3990,9 @@ def _resources_record(
     :func:`vfe3.train.train` after the last step. ``peak_gpu_memory_mb`` is the maximum of the
     per-log-window ``peak_mem_mb`` column (train() resets the allocator peak at every log row) and
     the allocator peak since the last reset. Throughput quantiles are over the logged windows of
-    ``tokens_per_s`` (pipeline, includes data loading) and ``train_step_tokens_per_s``; the
-    windows that contain an evaluation are included, so the pipeline quantiles bracket both.
+    ``tokens_per_s`` (pipeline, includes data loading) and ``train_step_tokens_per_s`` on the log and
+    eval rows; the windows that contain an evaluation are included, so the pipeline quantiles bracket
+    both, and divergence-spike rows (:mod:`vfe3.metrics_schema`) are left out.
     """
     record: Dict[str, object] = {
         "device_name": (torch.cuda.get_device_name(device) if device.type == "cuda"
@@ -3967,8 +4017,11 @@ def _resources_record(
     if device.type == "cuda":
         peaks.append(torch.cuda.max_memory_allocated(device) / 1e6)
     record["peak_gpu_memory_mb"] = max(peaks) if peaks else None
+    # Divergence-spike rows close a short pipeline window around one anomalous step; their throughput is not
+    # a sample of the regular windows, so the quantiles read the log and eval rows only (audit 2026-10-17 item 5).
+    regular, _ = split_spike_rows(history, cfg=cfg)
     record["throughput_tokens_per_s"] = {
-        column: _quantile_summary([row.get(column) for row in history])
+        column: _quantile_summary([row.get(column) for row in regular])
         for column in ("tokens_per_s", "train_step_tokens_per_s")
     }
     seen = [row.get("tokens_seen") for row in history
@@ -4025,6 +4078,11 @@ def finalize_run(
     )
 
     logger = logger or logging.getLogger(__name__)
+    # Background best-model saves and figure workers of the training loop finish before anything reads them
+    # (audit 2026-10-17 item 68).
+    wait = getattr(artifacts, "wait_background", None)
+    if callable(wait):
+        wait()
     if device is None:
         device = next(model.parameters()).device
     wall_time, resumed_wall_time = _cumulative_wall_time(artifacts, wall_time)
@@ -4116,14 +4174,9 @@ def finalize_run(
                     "evaluated_step": final_step, **final_val_fields,
                     "decode_tau_eff": decode_tau_eff})
 
-    # Held-out inference-depth counterfactual, always attempted when test metrics are available. This does not replace any selected headline
-    # metric: it is published only under the diagnostic namespace after a complete successful probe.
-    if vfe_model:
-        # Projected routes run one configured readout/receiver episode: there is no depth to zero
-        # and no shared stationary free energy, so both records are published as unavailable.
-        results["diagnostics"]["zero_e_steps_counterfactual"] = _conditional_unavailable_probe("zero_e_steps_counterfactual", cfg=model.cfg)
-        results["diagnostics"]["legacy_reduced_free_energy"] = _conditional_unavailable_probe("legacy_reduced_free_energy", cfg=model.cfg)
-
+    # No inference-depth counterfactual, depth-sensitivity sweep or legacy reduced free energy is recorded:
+    # the projected routes run one configured readout or receiver episode, so there is no depth to vary
+    # and no shared stationary free energy (audit 2026-10-17 item 74).
     depth_loader = val_loader if val_loader is not None else test_loader
     # Mechanism records are standard outputs. The sole figure-policy switch controls only the
     # embedding/clustering family downstream in the isolated report worker; it never suppresses
@@ -4141,23 +4194,11 @@ def finalize_run(
             logger.warning("diagnostic batch unavailable (%s); mechanism probes skipped", exc)
             _count_finalize_failure(artifacts, "mechanism_probe_batch")
     if _depth_tokens is not None:
-        try:
-            _depth_record = collect_estep_depth_sensitivity(
-                model,
-                _depth_tokens,
-                _depth_targets,
-                depths=(0, 1, 2, 3, 5, 8),
-            )
-            artifacts.save_json("estep_depth_sensitivity.json", _depth_record)
-        except Exception as exc:
-            logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
-            _count_finalize_failure(artifacts, "estep_depth_sensitivity")
         _character_record = None
         _beta_record = None
         _context_record = None
         try:
-            _character_record = collect_estep_character(
-                model, _depth_tokens, depths=(1, 2, 3, 5, 8))
+            _character_record = collect_estep_character(model, _depth_tokens)
             artifacts.save_json("estep_character.json", _character_record)
         except Exception as exc:
             logger.warning("estep character probe failed (%s); skipped", exc)
@@ -4271,7 +4312,7 @@ def finalize_run(
         "diagnostics":  results["diagnostics"],
         # No estep_final_iterate_f_per_token / estep_final_f_per_token / estep_iterate_evidence: nothing on the
         # projected routes produces an E-step iterate sequence, so those keys were always null (audit 2026-10-16
-        # F86); the legacy_reduced_free_energy diagnostic records why the shared F is unavailable.
+        # F86).
         "scheduler": _scheduler_metadata(
             min_lr_frac=cfg.min_lr_frac,
             base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
@@ -4357,22 +4398,6 @@ def finalize_run(
     return results
 
 
-@torch.no_grad()
-def collect_estep_depth_sensitivity(
-    model:   torch.nn.Module,
-    tokens:  torch.Tensor,
-    targets: torch.Tensor,
-    depths:  Iterable[int],
-) -> Dict[str, object]:
-    r"""Current-weight inference-depth sensitivity, published as an explicit unavailable record.
-
-    The projected routes run only their configured readout or receiver episode and define no shared
-    free energy, so no depth sweep is executed; ``tokens``, ``targets`` and ``depths`` are accepted
-    for call-site compatibility.
-    """
-    return _conditional_unavailable_probe("collect_estep_depth_sensitivity", cfg=model.cfg)
-
-
 def _log_mechanism_diagnostics(
     logger:    'logging.Logger',
     character: Optional[Dict[str, object]],
@@ -4426,18 +4451,14 @@ def _log_mechanism_diagnostics(
 def collect_estep_character(
     model:  torch.nn.Module,
     tokens: torch.Tensor,
-    depths: Iterable[int],
 ) -> Dict[str, object]:
     r"""How far the configured projected readout or receiver episode moves the belief.
 
     ``rel_displacement`` is :math:`\lVert\mu_q-\mu_p\rVert/\lVert\mu_p\rVert` between the first
     and last captured states of one diagnostic snapshot (pre-transform: before CG, norm
     and MLP). Only the configured depth is measured, so ``depth_sweep_available`` is False and
-    ``cos_dir_vs_step1`` is None; ``depths`` is validated for call-site compatibility.
+    ``cos_dir_vs_step1`` is None.
     """
-    requested = list(depths)
-    if any(type(depth) is not int or depth < 1 for depth in requested):
-        raise ValueError(f"depths must contain integers >= 1, got {requested!r}")
     snapshot = model.build_diagnostic_snapshot(tokens)
     mu_p, mu_q = snapshot.trace_states[0].mu, snapshot.trace_states[-1].mu
     denominator = float(mu_p.norm())
@@ -4815,6 +4836,9 @@ def finalize_validation_run(
     )
 
     logger = logger or logging.getLogger(__name__)
+    wait = getattr(artifacts, "wait_background", None)       # background saves and figure workers (item 68)
+    if callable(wait):
+        wait()
     if device is None:
         device = next(model.parameters()).device
     wall_time, resumed_wall_time = _cumulative_wall_time(artifacts, wall_time)
@@ -5017,6 +5041,11 @@ def finalize_validation_run(
         "n_params":            n_params,
         "terminal_checkpoint": terminal_checkpoint,
         "save_model_artifacts": artifacts.save_model_artifacts,
+        # The realized-update counts, so arms with different skip rates are flagged in every comparison
+        # table, not only in summary.json (audit 2026-10-17 item 29). None without a realized record.
+        "skipped_steps":       dict(getattr(artifacts, "realized_updates", None) or {}).get("skipped_steps"),
+        "accepted_update_frac": dict(getattr(artifacts, "realized_updates", None) or {}).get(
+            "accepted_update_frac"),
     }
 
 
@@ -5382,8 +5411,28 @@ def _pure_path_report(
     }
 
 
+# A metrics.csv cell as the figure pass sees it: a number, or text such as row_kind or relational_semantics.
+HistoryValue = Union[float, int, str]
+
+
+class FigureArtifacts(Protocol):
+    r"""What :func:`_save_figures` reads from its artifacts: a :class:`RunArtifacts` during training, or the
+    ``SimpleNamespace(run_dir, cfg, history)`` the figure worker rebuilds from ``metrics.csv`` (whose ``cfg``
+    can itself be a namespace of raw saved values)."""
+
+    run_dir: Path
+    cfg:     object
+    history: List[Dict[str, HistoryValue]]
+
+
+def _finite_cell(value: object) -> bool:
+    r"""Whether a history cell is a finite real number (not a bool, a text cell or a blank NaN)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def _save_figures(
-    artifacts: RunArtifacts,
+    artifacts: FigureArtifacts,
     losses:    Optional[List[float]],
     logger:    logging.Logger,
 
@@ -5412,10 +5461,13 @@ def _save_figures(
         class _IsolatedFigures:
             r"""Proxy plot calls so one failed renderer cannot abort or leak into the next one."""
 
+            def __init__(self, module: object = raw_figs) -> None:
+                self._module = module
+
             def __getattr__(self, name: str) -> object:
                 if name == "plt":
                     return _SafePyplot()
-                value = getattr(raw_figs, name)
+                value = getattr(self._module, name)
                 if not name.startswith("plot_") or not callable(value):
                     return value
 
@@ -5440,6 +5492,9 @@ def _save_figures(
                     except Exception as exc:
                         for number in set(raw_figs.plt.get_fignums()) - before:
                             raw_figs.plt.close(number)
+                        if isinstance(exc, raw_figs.FigureSkipped):
+                            logger.info("figure %s skipped (%s)", name, exc)
+                            return None
                         logger.warning("figure %s failed (%s); remaining figures continue", name, exc)
                         return None
 
@@ -5456,31 +5511,43 @@ def _save_figures(
         for name, reason in route_skips.items():            # route-trivial: fixed by the config, not news
             logger.debug("figure %s skipped (%s)", name, reason)
 
-        def _aligned(key: str) -> tuple:
-            r"""Aligned (step, value) for a history column, dropping pre-first-eval NaN rows."""
-            xs, ys = [], []
-            for i, r in enumerate(artifacts.history):
-                if key in r and math.isfinite(r[key]):
-                    xs.append(r.get("step", i))
-                    ys.append(r[key])
+        # Divergence-spike rows are forced between the log and eval rows (vfe3.metrics_schema): every
+        # trend below reads the regular rows only, and the gradient-norm, optimizer-geometry and numerics
+        # figures overlay the spike rows as markers (audit 2026-10-17 item 5).
+        history, spike_rows = split_spike_rows(artifacts.history, cfg=getattr(artifacts, "cfg", None))
+
+        def _aligned(key: str) -> Tuple[List[float], List[float]]:
+            r"""Aligned (step, value) for a history column over the regular rows, dropping rows where it is
+            not a finite number (pre-first-eval NaN, a blank or a text cell)."""
+            xs: List[float] = []
+            ys: List[float] = []
+            for i, r in enumerate(history):
+                if _finite_cell(r.get(key)):
+                    xs.append(float(r.get("step", i)))
+                    ys.append(float(r[key]))
             return xs, ys
 
-        def _hist_subset(keys: tuple) -> Optional[Dict]:
-            r"""A ``{step, key: [...]}`` history dict over ``keys`` present (finite on >= 1 row), each a
+        def _subset(rows: Sequence[Mapping[str, HistoryValue]], keys: Sequence[str]) -> Optional[Dict]:
+            r"""A ``{step, key: [...]}`` dict over the ``keys`` finite on at least one of ``rows``, each a
             full-length column with NaN where missing so an eval-cadence key keeps its step alignment and
-            the dashboard masks it per series. Returns None when no key is present (caller skips)."""
-            present = [k for k in keys
-                       if any(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k])
-                              for r in artifacts.history)]
+            the dashboard masks it per series. None when no key is present (caller skips)."""
+            present = [k for k in keys if any(_finite_cell(r.get(k)) for r in rows)]
             if not present:
                 return None
-            cols: Dict = {"step": [r.get("step", i) for i, r in enumerate(artifacts.history)]}
+            cols: Dict = {"step": [r.get("step", i) for i, r in enumerate(rows)]}
             for k in present:
-                cols[k] = [float(r[k]) if (k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]))
-                           else float("nan") for r in artifacts.history]
+                cols[k] = [float(r[k]) if _finite_cell(r.get(k)) else float("nan") for r in rows]
             return cols
 
-        readout_keys = tuple({key for row in artifacts.history for key in row
+        def _hist_subset(keys: tuple) -> Optional[Dict]:
+            r""":func:`_subset` over the regular (non-spike) history rows."""
+            return _subset(history, keys)
+
+        def _spike_subset(keys: tuple) -> Optional[Dict]:
+            r""":func:`_subset` over the divergence-spike rows, for the marker overlays."""
+            return _subset(spike_rows, keys) if spike_rows else None
+
+        readout_keys = tuple({key for row in history for key in row
                               if key.startswith("relational_")})
         if readout_keys:
             # The canonical-F panels read the diagnose_canonical_free_energy columns (NaN otherwise, so
@@ -5519,7 +5586,7 @@ def _save_figures(
             steps_per_epoch = next(
                 (
                     int(r["steps_per_epoch"])
-                    for r in artifacts.history
+                    for r in history
                     if isinstance(r.get("steps_per_epoch"), (int, float))
                     and math.isfinite(float(r["steps_per_epoch"]))
                     and int(r["steps_per_epoch"]) > 0
@@ -5552,9 +5619,11 @@ def _save_figures(
         # norm, belief-covariance conditioning, and the per-eval E-step endpoint delta.
         nx, ny = _aligned("grad_norm")
         if ny:
+            spike_norm = _spike_subset(("grad_norm",))
             fig = figs.plot_trajectory(
                 ny, nx, ylabel=r"$\|\nabla\|_2$ (pre-clip)", title="Gradient norm",
                 color=figs._CB[5 % len(figs._CB)], logy=True, smooth=max(5, len(ny) // 80),
+                markers=((spike_norm["step"], spike_norm["grad_norm"]) if spike_norm else None),
                 path=str(run / "grad_norm.png"))
             figs.plt.close(fig)
         # M-step per-role gradient-norm decomposition (mu / sigma / phi): the parameter-learning
@@ -5565,7 +5634,9 @@ def _save_figures(
         # Per-named-group columns when logged (NaN-padded per series), else the legacy role columns.
         hist_gd = _hist_subset(raw_figs.GRAD_NORM_DECOMPOSITION_COLUMNS)
         if hist_gd:
-            fig = figs.plot_grad_norm_decomposition(hist_gd, path=str(run / "grad_norm_decomposition.png"))
+            fig = figs.plot_grad_norm_decomposition(
+                hist_gd, spikes=_spike_subset(raw_figs.GRAD_NORM_DECOMPOSITION_COLUMNS),
+                path=str(run / "grad_norm_decomposition.png"))
             figs.plt.close(fig)
         # E-step belief-gradient decomposition (mu / sigma / phi): the INFERENCE analogue of the M-step
         # figure above -- ||grad F|| over the belief tuple per inner-loop component, logged by train_step
@@ -5578,13 +5649,13 @@ def _save_figures(
             "estep_grad_norm_phi_microbatch_mean",
         )
         eg_keys = (eg_mean_keys if any(any(k in r for k in eg_mean_keys)
-                                      for r in artifacts.history)
+                                      for r in history)
                    else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
         eg_present = [k for k in eg_keys
-                      if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
+                      if any(_finite_cell(r.get(k)) for r in history)]
         if eg_present and "estep_grad_norm_decomposition" not in route_skips:
-            eg_rows = [r for r in artifacts.history
-                       if all(k in r and math.isfinite(r[k]) for k in eg_present)]
+            eg_rows = [r for r in history
+                       if all(_finite_cell(r.get(k)) for k in eg_present)]
             if eg_rows:
                 hist_eg = {"step": [r.get("step", i) for i, r in enumerate(eg_rows)],
                            **{k: [r[k] for r in eg_rows] for k in eg_present}}
@@ -5598,14 +5669,6 @@ def _save_figures(
                 logy=True, smooth=max(5, len(cy) // 80),
                 path=str(run / "belief_condition.png"))
             figs.plt.close(fig)
-        ex, ey = _aligned("estep_f_drop")
-        if ey:
-            _endpoint_artifact = _estep_endpoint_artifact({})
-            fig = figs.plot_trajectory(
-                ey, ex, ylabel=r"$F_{\mathrm{end}}-F_{\mathrm{start}}$ (inner E-step)",
-                title=_endpoint_artifact["title"], color=figs._CB[2 % len(figs._CB)],
-                median_line=True, path=str(run / _endpoint_artifact["filename"]))
-            figs.plt.close(fig)
         # Free-energy figures: the per-token budget decomposition (snapshot + early/mid/late evolution)
         # and, separately, the final-iterate objective/CE relationship over training. Both need every plotted term
         # finite, so rows before the first eval (NaN val_*) are dropped.
@@ -5613,8 +5676,7 @@ def _save_figures(
 
         def _finite_rows(keys: tuple) -> List[Dict]:
             r"""History rows on which every column of ``keys`` is a finite number."""
-            return [r for r in artifacts.history
-                    if all(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]) for k in keys)]
+            return [r for r in history if all(_finite_cell(r.get(k)) for k in keys)]
 
         def _canonical_rows(rows: List[Dict]) -> bool:
             # On the projected routes the F columns are finite only under diagnose_canonical_free_energy, which
@@ -5673,16 +5735,6 @@ def _save_figures(
                 path=str(run / "geometry_health.png"),
             )
             figs.plt.close(fig)
-        # E-step inference-quality dashboard: the inner-loop F-drop, the nondecreasing fraction, and the
-        # last-iter belief residuals -- the E-step evidence the single estep_f_drop curve does not show.
-        hist_estep = _hist_subset((
-            "estep_f_drop", "estep_f_nondecreasing_frac",
-            "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last",
-            "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms", "estep_fp_phi_rms",
-            "estep_beta_js", "estep_alpha_rms_delta"))
-        if hist_estep and "estep_quality" not in route_skips:
-            fig = figs.plot_estep_quality(hist_estep, path=str(run / "estep_quality.png"))
-            figs.plt.close(fig)
         # Held-out validation-sanity dashboard: the per-eval probes (_val_diagnostics) that were CSV-only
         # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
         hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS)
@@ -5697,7 +5749,23 @@ def _save_figures(
         # accepted factor scale/chart health, per-role weight norms, and gradient-to-weight ratio.
         hist_opt = _hist_subset(raw_figs.OPTIMIZER_GEOMETRY_COLUMNS)
         if hist_opt:
-            fig = figs.plot_optimizer_geometry(hist_opt, path=str(run / "optimizer_geometry.png"))
+            fig = figs.plot_optimizer_geometry(
+                hist_opt, spikes=_spike_subset(raw_figs.OPTIMIZER_GEOMETRY_COLUMNS),
+                path=str(run / "optimizer_geometry.png"))
+            figs.plt.close(fig)
+        # Numerics counters, the decode variance margin and the per-layer block variances (audit 2026-10-17
+        # item 64). Each is drawn only when its inputs exist, so older runs skip both without a warning.
+        from vfe3.viz import diagnostic_figures as raw_diag
+        diag = _IsolatedFigures(raw_diag)
+        hist_num = _hist_subset(raw_diag.NUMERICS_PANEL_COLUMNS)
+        if hist_num:
+            fig = diag.plot_numerics_history(
+                hist_num, spikes=_spike_subset(raw_diag.NUMERICS_PANEL_COLUMNS),
+                path=str(run / "numerics_history.png"))
+            figs.plt.close(fig)
+        block_variance = raw_diag.read_block_variance(run / "diagnostics" / "block_variance.csv")
+        if block_variance is not None:
+            fig = diag.plot_block_variance_history(block_variance, path=str(run / "block_variance_history.png"))
             figs.plt.close(fig)
     except Exception as exc:                                    # never let a plot kill a finished run
         logger.warning("figure generation failed (%s); numeric results are still saved", exc)

@@ -29,6 +29,12 @@ _CONFIG_VALUES: dict[str, Any] = {
     'log_interval': 100,
     'eval_interval': 1500,
     'checkpoint_interval': 15000,
+    'checkpoint_keep_last': None,
+    'checkpoint_at_end': False,
+    'block_variance_at_log': False,
+    'max_failed_step_skips': None,
+    'max_consecutive_skips': None,
+    'loss_spike_skip_nats': None,
     'resume_from': None,
     'trust_resume_checkpoint': False,
     'family': 'gaussian_diagonal',
@@ -97,11 +103,14 @@ _CONFIG_VALUES: dict[str, Any] = {
     'predictive_covariance_checkpoint': False,
     'predictive_covariance_fp64_escalation': False,
     'predictive_covariance_precision': 'fp32',
+    'predictive_covariance_spread_squares': False,
+    'predictive_covariance_symmetric_pairs': False,
     'lambda_alpha_mode': 'state_dependent',
     'b0': 1.0,
     'c0': 1.0,
     'lambda_beta': 1.0,
     'mstep_self_coupling_weight': 0.0,
+    'self_kl_max': None,
     'kappa_beta': 1.0,
     'learn_attention_temperature': False,
     'beta_attention_prior': 'causal_alibi',
@@ -130,6 +139,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'layernorm_affine': True,
     'block_norm_covariance': 'passthrough',
     'block_norm_trace_cap': True,
+    'block_norm_cap_moment_fallback': False,
     'm_layernorm_lr': None,
     'e_q_mu_lr': 0.5,
     'e_q_sigma_lr': 0.015,
@@ -240,7 +250,7 @@ _LIVE_TINY: dict[str, Any] = {
     'max_steps': 10,
     'warmup_steps': 1,
     'block_mlp_expansion': 2,
-    'kl_max': None,                   # the launcher's 8 K, resolved at the tiny K
+    'kl_max': None,                   # None: the launcher's 8 K at the tiny K; a launcher number scales (live_tiny)
     'amp_dtype': None,                # CPU unit tests run in fp32
     'log_interval': 0,                # run-only fields: no unit test reaches the logging or saving of train()
     'eval_interval': 0,
@@ -255,9 +265,28 @@ def launcher_values() -> dict[str, Any]:
     return deepcopy(train_vfe3.config)
 
 
+def live_kl_max(launcher: dict[str, Any]) -> "float | None":
+    r"""The tiny profile's ``kl_max``: :math:`\mathrm{kl\_max}_{\mathrm{launcher}}K_{\mathrm{tiny}}/K_{\mathrm{launcher}}`.
+
+    The divergence clamp scales with the belief dimension (its default is :math:`8K`), so the tiny profile keeps the
+    launcher's nats per dimension and the clamp binds in the same regime. ``None`` (the :math:`8K` default) stays
+    ``None`` (audit 2026-10-17, item 38).
+    """
+    kl_max = launcher.get("kl_max")
+    if kl_max is None:
+        return None
+    return float(kl_max) * _LIVE_TINY['embed_dim'] / launcher["embed_dim"]
+
+
+def live_tiny(launcher: dict[str, Any]) -> dict[str, Any]:
+    """``_LIVE_TINY`` with ``kl_max`` scaled from ``launcher`` (:func:`live_kl_max`)."""
+    return {**_LIVE_TINY, 'kl_max': live_kl_max(launcher)}
+
+
 def live_values(**overrides: Any) -> dict[str, Any]:
     """Return a fresh complete live-route configuration dictionary with local overrides."""
-    return deepcopy({**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher_values(), **_LIVE_TINY, **overrides})
+    launcher = launcher_values()
+    return deepcopy({**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher, **live_tiny(launcher), **overrides})
 
 
 def live_config(**overrides: Any) -> VFE3Config:
@@ -289,3 +318,34 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
                     kl_max_reference=values['routing_kl_max_reference'],
                     rope_comparison_covariance='full')
     return RelationalOperators(*args, **{**baseline, **overrides})
+
+
+# PriorBank's config-mirroring keywords are required (audit 2026-10-17, item 55). Unit tests that build a bank directly
+# take them from this test-owned baseline, the constructor defaults before the keywords became required, so each test
+# states only the keywords it exercises.
+_PRIOR_BANK_BASELINE: dict[str, Any] = {
+    'mu_init_std': 0.02,
+    'sigma_init': 1.0,
+    'phi_scale': 0.01,
+    'decode_tau': 1.0,
+    'eps': 1e-6,
+    'family': 'gaussian_diagonal',
+    'encode_mode': 'per_token',
+    'decode_mode': 'diagonal_chunked',
+    'decode_chunk_size': 8192,
+    'decode_av_precision': None,
+    'decode_ce_checkpoint': 'auto',
+    'decode_ce_triton': False,
+    'decode_ranking_fp64_escalation': False,
+    'unigram_kappa': 1.0,
+    'decode_unigram_prior': False,
+    'untie_decode_bank': False,
+    'decode_coordinates': 'local',
+    'prior_covariance_table': 'diagonal',
+}
+
+
+def make_prior_bank(*args: Any, **overrides: Any) -> Any:
+    """A ``PriorBank`` whose required config-mirroring keywords come from ``_PRIOR_BANK_BASELINE``."""
+    from vfe3.model.prior_bank import PriorBank
+    return PriorBank(*args, **{**_PRIOR_BANK_BASELINE, **overrides})

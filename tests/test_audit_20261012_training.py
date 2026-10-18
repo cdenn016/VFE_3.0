@@ -189,7 +189,7 @@ def test_finalize_probe_failures_reach_summary(tmp_path: Path, monkeypatch: pyte
     def fail(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("probe failure")
 
-    probes = ("estep_depth_sensitivity", "estep_character", "beta_channel_decomposition",
+    probes = ("estep_character", "beta_channel_decomposition",
               "context_sensitivity", "phi_numerics")
     for probe in probes:
         monkeypatch.setattr(ra, f"collect_{probe}", fail)

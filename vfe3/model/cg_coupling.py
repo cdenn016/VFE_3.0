@@ -44,27 +44,24 @@ def cg_moment_energy_rows(
     post_sigma: torch.Tensor,             # (..., N, K) or (..., N, K, K) post-CG covariance
 
     *,
-    renyi_order:       float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
     family:            str   = "gaussian_diagonal",
-    divergence_family: str   = "renyi",
-) -> torch.Tensor:                        # (..., N) D(q_post || q_pre)
-    r"""Per-token post-CG moment divergence D(q_post || q_pre) via the active-family divergence seam.
+) -> torch.Tensor:                        # (..., N) KL(q_post || q_pre)
+    r"""Per-token post-CG moment KL(q_post || q_pre) via the active-family divergence seam.
 
     The q-only CG moment regularizer: the full-K self-divergence of the post-CG belief against its
     pre-CG value (means-only under 'passthrough', mean-and-covariance under 'delta_full'). NOT a
-    second hierarchical total -- it reads only the belief (q) channel, never s/p/h. Divergence- and
-    family-agnostic: ``divergence_family`` selects the functional, ``family`` the covariance kernel.
-    The block passes neither ``divergence_family`` nor ``renyi_order`` (their config fields are retired
-    and pinned to KL), so the live rows are always KL (audit 2026-10-16 F93).
+    second hierarchical total -- it reads only the belief (q) channel, never s/p/h. Family-agnostic:
+    ``family`` selects the covariance kernel; the divergence is the KL (audit 2026-10-16 F93; the
+    retired ``divergence_family`` and ``renyi_order`` keywords were removed, audit 2026-10-17 item 72).
     """
     from vfe3.families.base import get_family
     from vfe3.free_energy import self_divergence
     fam = get_family(family)
     return self_divergence(
         fam(post_mu, post_sigma), fam(pre_mu, pre_sigma),
-        alpha=renyi_order, kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+        kl_max=kl_max, eps=eps,
     )
 
 

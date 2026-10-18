@@ -191,6 +191,19 @@ class VFE3Config:
     #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
     #   group  one set per optimizer group, so one exploding group cannot set the coefficient of the others
     grad_clip_scope:                  str             = "role"
+    # Failed-step recovery (audit 2026-10-17 item 16). None keeps the historical abort: a step whose strictest
+    # precision rung raises before any optimizer update ends the run. N >= 1: up to N such steps over the run are
+    # skipped instead (gradients zeroed, no optimizer or scheduler step, the batch saved under
+    # diagnostics/failed_steps/, counted in metrics.csv failed_step_skips), and a failed evaluation reports NaN
+    # validation with no best-model update; the (N+1)-th failure aborts as before.
+    max_failed_step_skips:            Optional[int]   = None
+    # Abort after this many consecutive rejected updates of any kind (non-finite, failed, loss spike) through the
+    # crash path (diagnostics/crash.json and a resumable checkpoint). None = never abort on consecutive skips.
+    max_consecutive_skips:            Optional[int]   = None
+    # Reject the update of a step whose training loss exceeds the divergence monitor's loss EMA by more than this
+    # many nats (after its 50-step warmup; audit 2026-10-17 item 17), read from the host loss the step already
+    # transfers. Rejections are counted in metrics.csv loss_spike_rejected_updates. None = off.
+    loss_spike_skip_nats:             Optional[float] = None
 
     seed:                             int             = 6
     
@@ -203,6 +216,9 @@ class VFE3Config:
     log_interval:                     int             = 100          # console log every N steps (0 = off)
     eval_interval:                    int             = 1500         # validation every N steps (0 = off)
     checkpoint_interval:              int             = 15000        # resumable checkpoint every N steps (0 = off)
+    checkpoint_keep_last:             Optional[int]   = None         # keep the newest N step checkpoints; None = keep all
+    checkpoint_at_end:                bool            = False        # also write a resumable checkpoint after the last step
+    block_variance_at_log:            bool            = False        # also write diagnostics/block_variance.csv at log steps
     val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
     # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
     # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
@@ -315,7 +331,8 @@ class VFE3Config:
     # "belief" | "encoded" | "constant": the covariance the prior-bank decoder reads (not read by linear)
     #   belief    the stack's final Sigma_q (the exact KL(q* || p_v))
     #   encoded   the token's encoded covariance, the stack's input (passthrough for the decoder only)
-    #   constant  sigma_init I
+    #   constant  sigma_init I, in the decoder's coordinates: under decode_coordinates="reference" the decoder reads
+    #             sigma_init I in reference coordinates, so the logits are frame-invariant (audit 2026-10-17, item 25)
     # The decode logit -KL(q || p_v)/tau contains tr(Sigma_v^-1 Sigma_q)/(2 tau), so under a moment-matched
     # covariance every jump of the Sigma_q the stack builds reaches the cross-entropy (2026-10-11 K=128 spikes).
     decode_covariance:                str             = "belief"
@@ -439,7 +456,7 @@ class VFE3Config:
     #                         per rotating plane, the full non-rotating block, no cross-covariance), so
     #                         R_i P(G) R_i^T = P(G) and only the mean term carries i - j; scored on the Gram route (no
     #                         source-root factor route), or in closed form with no factorization when P(G) is diagonal
-    #                         (rope_fraction = 1) and projected_factorization="gram" and pair_kl_gemm_tol=None
+    #                         (rope_fraction = 1) and projected_factorization="gram"
     #                         (vfe3.gradients.relational._diagonal_comparison_route). only: the kernel readout (not
     #                         minimal_agent)
     rope_mode:                        str             = "none"
@@ -534,7 +551,18 @@ class VFE3Config:
     # The moment-matched covariance floor (scaled by predictive_covariance_floor = f).
     #   prior     f Sigma_p, the token's local prior covariance: frame-free and exactly reference-invariant (since 2026-10-12)
     #   relative  f (tr C_i / K) U_i U_i^T with C_i = U_i^{-1} Sigma_i U_i^{-T}: the earlier floor, relative to the input
-    #             covariance; changes under a non-orthogonal common reference change (kept for testing)
+    #             covariance; changes under a non-orthogonal common reference change (kept for testing). It is
+    #             covariant under the local action U_i -> g_i U_i (tr C_i is invariant). Its bound is relative only: in
+    #             reference coordinates it adds f (tr C_i / K) I >= f lambda_max(C_i) / K, so it bounds the output
+    #             spectrum below by f/K times the input's own scale and has no absolute lower bound; a contraction of
+    #             tr C_i in one layer passes into the next layer's floor, so the bound compounds over depth (a
+    #             per-layer trace ratio r gives r^L, audit 2026-10-17 item 1). In local coordinates the floor's top
+    #             eigenvalue reaches up to f (tr Sigma_i / K) kappa(U_i)^2 for isotropic Sigma_i, an inflation of up to
+    #             about f kappa^2 relative to the scale of Sigma_i on ill-conditioned frames (kappa(U_i) the frame
+    #             condition number)
+    #   max       the larger of the two: elementwise max on the diagonal family, the whitened spectral max
+    #             f Sigma_p^{1/2} max(W, I) Sigma_p^{1/2} (W the relative floor whitened by f Sigma_p) on full layouts;
+    #             keeps the relative floor's scaling with the absolute bound f Sigma_p (audit 2026-10-17 item 1)
     predictive_covariance_floor_mode: str             = "prior"
     # moment_matched / spread_corrected only: Loewner ceiling Sigma^+ <= c * Sigma_p (vfe3.model.covariance_ceiling),
     # the counterpart of the floor; a clamp where it binds, counted in metrics.csv covariance_ceiling_elements. None = off.
@@ -554,6 +582,16 @@ class VFE3Config:
     #   fp64  the whole update (C_i, pooling, sandwich, floor, ceiling) in float64 from float32 beliefs, cast back:
     #         removes the kappa(U)^2 rounding the sign-only escalation misses (audit 2026-10-16 F7); costly
     predictive_covariance_precision:  str             = "fp32"
+    # moment_matched, kernel readout only (audit 2026-10-17 item 12): add the routed spread after the sandwich as the
+    # nonnegative sum of squares sum_h sum_j beta_ij^h (U_i O'_h (v_j^h - m_i^h))^2 (outer products on full layouts)
+    # instead of through the head-pair pooled covariance, where diag(U C^att U^T) cancels it; equal in exact
+    # arithmetic, about N K^2 multiply-adds per token. Not with content_link_edges.
+    predictive_covariance_spread_squares: bool        = False
+    # moment_matched, kernel readout only (audit 2026-10-17 item 19): form the head-pair source and pooled
+    # covariances for h <= g only and double the off-diagonal pairs (diag(U Y U^T) = diag(U Y^T U^T)); equal up to
+    # rounding, about H(H-1)/2 fewer pair contractions. Blockwise route (block frames, equal heads), not with
+    # content_link_edges.
+    predictive_covariance_symmetric_pairs: bool       = False
     attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
 
     ##################################################
@@ -630,6 +668,10 @@ class VFE3Config:
     lambda_beta:                      float                 = 1.0          # weight of the whole belief-coupling block (1 = pure F)
     
     mstep_self_coupling_weight:       float                 = 0.0          # M-step sum_i alpha_i D(q_i* || p_i); 0 = off
+    # None | float > 0 (inf allowed): the divergence clamp of the M-step self-coupling term D(q_i* || p_i); None uses
+    # kl_max, the router's clamp, under which the term saturates (zero gradient) in the collapse regime (audit
+    # 2026-10-17 item 33)
+    self_kl_max:                      Optional[float]       = None
 
     ##################################################
     #   13. Normalization and block handoff
@@ -659,6 +701,10 @@ class VFE3Config:
     # by min(1, K max(gamma^2) / tr) at the sphere bound (audit 2026-10-12 item 1). False skips the cap: the
     # uncapped delta method, which can exceed the bound by orders of magnitude once Sigma is large against s^2.
     block_norm_trace_cap:             bool            = True
+    # block_norm_covariance='pushforward' with the trace cap only (audit 2026-10-17 item 8): on the tokens where the
+    # cap binds return the moment estimate of 'pushforward_moment' instead of the capped delta method, whose shape
+    # is off by up to about 10^3 per coordinate on anisotropic input. False keeps the capped delta method everywhere.
+    block_norm_cap_moment_fallback:   bool            = False
 
     # "local" | "reference"
     #   local      the block norm and block MLP act on mu_i
@@ -878,20 +924,28 @@ class VFE3Config:
     # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
     # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
     kl_max:                           Optional[float] = None
-    # "absolute" | "row_min": what kl_max clamps in the kernel router, projected_predictive and
+    # "absolute" | "row_min" | "query_shifted": what kl_max clamps in the kernel router, projected_predictive and
     # projected_gradient (audit 2026-10-08 P1-4)
-    #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
-    #             (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
-    #   row_min   D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    #   absolute       D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
+    #                  (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
+    #   row_min        D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    #   query_shifted  D_ij - c_i, clamped from above only, with c_i the query-only row constant of the cost
+    #                  (-(r + log det G_i)/2 for the Gaussian KL, -log det G_i / 2 for noisy_query, 0 for
+    #                  mean_distance), which the softmax ignores; beta equals the absolute route's wherever nothing
+    #                  is capped, and shrinking query variances no longer saturate the clamp (audit 2026-10-17 item 2)
     routing_kl_max_reference:         str             = "absolute"
     # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
     # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
-    # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base.
+    # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base on the dense route; the
+    # diagonal comparison route keeps its closed form with its own O(N r) estimate and one host read per layer
+    # (audit 2026-10-17 item 11).
     pair_kl_gemm_tol:                 Optional[float] = None
     # int >= 1. Byte budget, in MiB, of one tile of the relational scorer (projected moments, source-root factor,
     # GEMM-fallback direct pair tiles, mean-distance rows) and of the routed spread's query-row tiles. Larger tiles
-    # dispatch fewer kernels and hold more transient memory; values change only by float32 reduction order, and
-    # loops above 32 MiB stay checkpointed. Keep 32 until a CUDA A/B confirms a gain (audit 2026-10-16 F26).
+    # dispatch fewer kernels, until one tile holds the whole loop, and hold more transient memory; values change only
+    # by float32 reduction order, and loops above 32 MiB stay checkpointed. A projection tile holds at most
+    # 32 * (relational_tile_mib // 32) tokens (audit 2026-10-17 item 6). Keep 32 until a CUDA A/B confirms a gain
+    # (audit 2026-10-16 F26).
     relational_tile_mib:              int             = 32
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
@@ -922,8 +976,8 @@ class VFE3Config:
     #   gram_certified          gram, and also rebuild entries that factor but fail
     #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
     #                           also screens the ADF query covariances; under comparison_invariant with a
-    #                           diagonal P(G) it keeps the dense Gram route in place of the diagonal one, as do
-    #                           cholesky_qr2_certified and any pair_kl_gemm_tol)
+    #                           diagonal P(G) it keeps the dense Gram route in place of the diagonal one, as does
+    #                           cholesky_qr2_certified)
     #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
     #                           eps_32 kappa_1(C) <= 3e-4, or failing outright, in float64 (QR of the
     #                           float64 source root; their pairs leave the GEMM for float64 triangular-solve
@@ -999,9 +1053,15 @@ class VFE3Config:
         from vfe3.model.relational_operators import PREDICTIVE_COVARIANCE_PRECISIONS
         _require(self.predictive_covariance_precision, PREDICTIVE_COVARIANCE_PRECISIONS,
                  "predictive_covariance_precision")
-        if self.predictive_covariance_floor_mode not in ("prior", "relative"):
-            raise ValueError(f"predictive_covariance_floor_mode must be 'prior' or 'relative', "
+        if self.predictive_covariance_floor_mode not in ("prior", "relative", "max"):
+            raise ValueError(f"predictive_covariance_floor_mode must be 'prior', 'relative' or 'max', "
                              f"got {self.predictive_covariance_floor_mode!r}")
+        for name in ("predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
+            if getattr(self, name) and self.content_link_edges != "off":
+                raise ValueError(f"{name} reads the head-pair pooled covariance without edge links; "
+                                 "it requires content_link_edges='off'")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
                 or not math.isfinite(float(self.predictive_covariance_floor))
@@ -1069,6 +1129,11 @@ class VFE3Config:
             self.kl_max = float(8 * self.embed_dim)
         if not self.kl_max > 0.0:
             raise ValueError(f"kl_max must be positive (infinity disables the ceiling), got {self.kl_max}")
+        if self.self_kl_max is not None and (isinstance(self.self_kl_max, bool)
+                                             or not isinstance(self.self_kl_max, Real)
+                                             or not self.self_kl_max > 0.0):
+            raise ValueError(f"self_kl_max must be None or positive (infinity disables the clamp), "
+                             f"got {self.self_kl_max!r}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
             raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
         if (isinstance(self.rope_fraction, bool) or not isinstance(self.rope_fraction, Real)
@@ -1807,7 +1872,7 @@ class VFE3Config:
         from vfe3.geometry.norms import _NORMS
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
-        _require(self.routing_kl_max_reference, ("absolute", "row_min"), "routing_kl_max_reference")
+        _require(self.routing_kl_max_reference, ("absolute", "row_min", "query_shifted"), "routing_kl_max_reference")
         if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
@@ -1854,6 +1919,9 @@ class VFE3Config:
                  "block_norm_covariance")
         if type(self.block_norm_trace_cap) is not bool:
             raise ValueError(f"block_norm_trace_cap must be a bool, got {self.block_norm_trace_cap!r}")
+        if type(self.block_norm_cap_moment_fallback) is not bool:
+            raise ValueError("block_norm_cap_moment_fallback must be a bool, got "
+                             f"{self.block_norm_cap_moment_fallback!r}")
         if self.block_norm_covariance in ("pushforward", "pushforward_moment") and self.norm_type_block == "layernorm":
             # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
             # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
@@ -2050,6 +2118,15 @@ class VFE3Config:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
         if self.checkpoint_interval < 0:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
+        for name in ("checkpoint_keep_last", "max_failed_step_skips", "max_consecutive_skips"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be None or an int >= 1, got {value!r}")
+        if self.loss_spike_skip_nats is not None and (
+                isinstance(self.loss_spike_skip_nats, bool) or not isinstance(self.loss_spike_skip_nats, Real)
+                or not math.isfinite(float(self.loss_spike_skip_nats)) or float(self.loss_spike_skip_nats) <= 0.0):
+            raise ValueError(f"loss_spike_skip_nats must be None or a finite real value > 0, "
+                             f"got {self.loss_spike_skip_nats!r}")
         # max_steps=0 is an empty training loop and warmup_steps<0 is meaningless; warmup_steps=0
         # stays legal. A warmup longer than the run never reaches the peak rate, so the cosine
         # schedule would silently train at a fraction of it. (The plain-int type is gated at the top
@@ -2110,10 +2187,11 @@ class VFE3Config:
                 from vfe3.geometry.rope import rope_commutant_is_diagonal, rope_rotated_pairs
                 d_head = self.embed_dim // self.n_heads
                 if (rope_commutant_is_diagonal(d_head, rope_rotated_pairs(d_head, self.rope_fraction))
-                        and (self.projected_factorization != "gram" or self.pair_kl_gemm_tol is not None)):
+                        and self.projected_factorization != "gram"):
+                    # pair_kl_gemm_tol keeps the diagonal scorer, with its own fallback (audit 2026-10-17 item 11).
                     route_notes.append(
                         f"P(G) is diagonal (rope_fraction={self.rope_fraction!r}), but projected_factorization="
-                        f"{self.projected_factorization!r} with pair_kl_gemm_tol={self.pair_kl_gemm_tol!r} bypasses "
+                        f"{self.projected_factorization!r} bypasses "
                         "the closed-form diagonal comparison scorer for the dense Gram route")
             if route_notes:
                 import warnings
@@ -2230,6 +2308,12 @@ class VFE3Config:
                      "group inherits it")
         if self.grad_clip is None or self.grad_clip == 0:
             mark(("grad_clip_scope",), "only read when grad_clip > 0")
+        if self.checkpoint_interval == 0 and not self.checkpoint_at_end:
+            mark(("checkpoint_keep_last",), "only read when a checkpoint is written (checkpoint_interval > 0 or "
+                 "checkpoint_at_end=True)")
+        if self.log_interval == 0 or self.eval_interval == 0:
+            mark(("block_variance_at_log",), "only read at log steps of a run with evaluation (log_interval > 0 and "
+                 "eval_interval > 0, which build the diagnostic windows)")
         if self.beta_attention_prior not in ("causal_alibi", "causal_alibi_noself"):
             mark(("alibi_slope",), "only read by an alibi attention prior")
         if not self.use_cg_coupling:
@@ -2270,23 +2354,33 @@ class VFE3Config:
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_floor_mode",
                   "predictive_covariance_ceiling", "attention_residual", "predictive_covariance_checkpoint",
-                  "predictive_covariance_fp64_escalation", "predictive_covariance_precision"),
+                  "predictive_covariance_fp64_escalation", "predictive_covariance_precision",
+                  "predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs"),
                  "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
         elif self.predictive_covariance == "passthrough":
             # The minimal agent checkpoints its whole readout (mean included), so only the floor is inert there.
-            mark(("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling")
+            mark(("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling",
+                  "predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs")
                  if minimal_agent
                  else ("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling",
                        "predictive_covariance_checkpoint", "predictive_covariance_fp64_escalation",
-                       "predictive_covariance_precision"),
+                       "predictive_covariance_precision", "predictive_covariance_spread_squares",
+                       "predictive_covariance_symmetric_pairs"),
                  "only read by predictive_covariance='moment_matched' or 'spread_corrected'")
         elif minimal_agent:
-            mark(("predictive_covariance_fp64_escalation", "predictive_covariance_precision"),
+            mark(("predictive_covariance_fp64_escalation", "predictive_covariance_precision",
+                  "predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs"),
                  "only read by predictive_readout='kernel'; the minimal agent recomputes a float32 call in float64 "
                  "on its own readout status (factorization failures, the A^h certificate under a certified "
                  "projected_factorization, and the screen of its floored posterior covariance), unconditionally")
+        if self.family == "gaussian_full":
+            mark(("predictive_covariance_symmetric_pairs",),
+                 "only read by the blockwise covariance body (gaussian_diagonal or gaussian_block on block frames); "
+                 "gaussian_full takes the dense body")
+        if self.mstep_self_coupling_weight == 0.0:
+            mark(("self_kl_max",), "only read by the M-step self-coupling term (mstep_self_coupling_weight > 0)")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
         if not ((self.attention_mode == "projected_predictive" and minimal_agent)
@@ -2355,6 +2449,11 @@ class VFE3Config:
         norm_floor = () if norm_pushes and not mlp_delta_full else ("block_mlp_covariance_floor",)
         if norm_pushes and mlp_delta_full:
             mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
+        if not (self.norm_type_block == "layernorm" and self.block_norm_covariance == "pushforward"
+                and self.block_norm_trace_cap and not mlp_delta_full):
+            mark(("block_norm_cap_moment_fallback",),
+                 "only read by a capped block_norm_covariance='pushforward' (block_norm_trace_cap=True, LayerNorm "
+                 "block norm, no delta_full MLP)")
         if not (self.norm_type_block == "layernorm" and (norm_pushes or mlp_delta_full)):
             mark(("block_norm_trace_cap",), "only read by a LayerNorm covariance pushforward (block_norm_covariance "
                  "'pushforward' or 'pushforward_moment', or block_mlp_covariance='delta_full')")
@@ -2488,14 +2587,19 @@ class VFE3Config:
         # and no M-step prior consumer is enabled. The canonical diagnostic reads each layer's handed-off prior
         # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31). The
         # moment-matched and spread-corrected readouts floor at f * Sigma_p with the layer's prior covariance, so
-        # there the variance handoff is read (audit 2026-10-12 round 2, item 8).
+        # there the variance handoff is read (audit 2026-10-12 round 2, item 8), but only under the prior floor or
+        # a ceiling c * Sigma_p: the relative floor f (tr C_i / K) U_i U_i^T never reads Sigma_p (audit 2026-10-17,
+        # item 23).
         if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
                 and self.cg_energy_weight == 0.0 and not self.diagnose_canonical_free_energy):
             from vfe3.model.minimal_agent import READOUT_COVARIANCES
-            floored = self.predictive_covariance in READOUT_COVARIANCES
+            floored = (self.predictive_covariance in READOUT_COVARIANCES
+                       and (self.predictive_covariance_floor_mode in ("prior", "max")
+                            or self.predictive_covariance_ceiling is not None))
             mark(("prior_handoff_rho",) if floored else ("prior_handoff_rho", "prior_handoff_sigma"),
                  "predictive_content never reads the prior mean"
-                 + ("" if floored else " or, without a moment-matched covariance, the prior covariance")
+                 + ("" if floored else " or, without a moment-matched covariance under the prior floor or a "
+                    "ceiling, the prior covariance")
                  + ", and no M-step prior consumer is enabled; with diagnose_canonical_free_energy=True "
                  "they would feed that log-step diagnostic only")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
@@ -2710,6 +2814,8 @@ def serialize_config(config: VFE3Config) -> dict[str, Any]:
     payload = asdict(config)
     if math.isinf(config.kl_max):
         payload["kl_max"] = "inf"  # Strict JSON has no Infinity number.
+    if config.self_kl_max is not None and math.isinf(config.self_kl_max):
+        payload["self_kl_max"] = "inf"
     if config.gauge_group == "so_n":
         # Basis marker (the irrep_basis field was removed 2026-10-12): config_from_serialized refuses an
         # so_n payload without it, which identifies a save from before 2026-10-05 built in the eigh basis.
@@ -3208,10 +3314,18 @@ def historical_default_pins(
     (``"prior"``). A record without the field is from either era, so no fixed pin is right. 5f5d484 also added
     ``phi_frame_condition_max``, which every later record carries (as ``null`` when off), so a record lacking both
     ran ``"relative"``, and one carrying ``phi_frame_condition_max`` keeps the default ``"prior"``.
+
+    ``block_norm_trace_cap`` (3aeede1, 2026-10-17, default True) has the same era key. The LayerNorm pushforward
+    entered uncapped at 89eedfb (2026-10-10) and the sphere-bound cap was added without a toggle at 5f5d484, so a
+    record lacking both the toggle and ``phi_frame_condition_max`` ran the pushforward (and the ``delta_full``
+    composite) uncapped and is pinned False; one carrying ``phi_frame_condition_max`` keeps the default True
+    (audit 2026-10-17, item 51). Records older than 89eedfb run the pinned passthrough norm, where the cap is inert.
     """
     pins = {name: value for name, value in _HISTORICAL_DEFAULT_PINS.items() if name not in payload}
     if "predictive_covariance_floor_mode" not in payload and "phi_frame_condition_max" not in payload:
         pins["predictive_covariance_floor_mode"] = "relative"
+    if "block_norm_trace_cap" not in payload and "phi_frame_condition_max" not in payload:
+        pins["block_norm_trace_cap"] = False
     return pins
 
 
@@ -3344,6 +3458,8 @@ def config_from_serialized(
     }
     if values.get("kl_max") == "inf":
         values["kl_max"] = math.inf
+    if values.get("self_kl_max") == "inf":
+        values["self_kl_max"] = math.inf
     return VFE3Config(**values)
 
 

@@ -230,7 +230,8 @@ def _route_record(monkeypatch: pytest.MonkeyPatch, ops: torch.nn.Module) -> Dict
     (dict(fraction=.5, d=6), (False, 1, True)),
     (dict(covariance="full"), (False, None, True)),
     (dict(base=None), (False, None, True)),                             # no comparison RoPE
-    (dict(pair_kl_gemm_tol=1e-3), (False, 2, True)),                    # the GEMM fallback keeps the dense route
+    (dict(pair_kl_gemm_tol=1e-3), (True, None, False)),                 # the diagonal route has its own fallback
+                                                                        # (audit 2026-10-17 item 11)
     (dict(recovery=True), (False, 2, True)),                            # condition recovery keeps the dense route
 ])
 def test_diagonal_route_is_selected_exactly_when_P_is_structurally_diagonal(
@@ -281,8 +282,13 @@ def test_diagonal_route_verdict_raises_at_once_or_at_scope_exit() -> None:
             scoring.projected_gaussian_kl(a, g, a, bad, diagonal_covariance=True)
             reached = True
     assert reached
-    with pytest.raises(ValueError, match="no GEMM fallback"):
-        scoring.projected_gaussian_kl(a, g, a, g, diagonal_covariance=True, gemm_expansion_tol=1e-3)
+    # Since audit 2026-10-17 item 11 the diagonal route has its own GEMM fallback, so a tolerance is accepted
+    # and the verdict then joins the fallback's host read: the raise is immediate also inside the scope.
+    with pytest.raises(ValueError, match="not positive definite"):
+        with deferred_host_checks():
+            scoring.projected_gaussian_kl(a, g, a, bad, diagonal_covariance=True, gemm_expansion_tol=1e-3)
+    assert torch.equal(scoring.projected_gaussian_kl(a, g, a, g, diagonal_covariance=True, gemm_expansion_tol=1e-3),
+                       scoring.projected_gaussian_kl(a, g, a, g, diagonal_covariance=True))
 
 
 # ---------------------------------------------------------------------------------------------- #12

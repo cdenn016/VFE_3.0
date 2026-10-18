@@ -320,7 +320,10 @@ def test_comparison_invariant_route_notes_what_the_certified_factorization_does(
     assert not any("comparison_invariant" in message for message in notices())
     assert any("acts as 'gram_certified'" in message
                for message in notices(projected_factorization="cholesky_qr2_certified"))
-    assert any("closed-form diagonal comparison scorer" in message for message in notices(pair_kl_gemm_tol=1e-3))
+    # pair_kl_gemm_tol keeps the diagonal scorer since audit 2026-10-17 item 11; a certified factorization bypasses it.
+    assert not any("closed-form diagonal comparison scorer" in message for message in notices(pair_kl_gemm_tol=1e-3))
+    assert any("closed-form diagonal comparison scorer" in message
+               for message in notices(projected_factorization="gram_certified"))
 
 
 # ---------------------------------------------------------------------------------------- F10, F114, F45

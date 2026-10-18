@@ -7,7 +7,6 @@ a fixed ``pos_phi='frozen'`` factor. Projected rows carry a storage margin, so t
 construction, on checkpoint load and after each accepted step, and its row counts reach the S1 panel D counters.
 Tiny models only (K = 6, two heads of d = 3).
 """
-import json
 import math
 from pathlib import Path
 from typing import Any

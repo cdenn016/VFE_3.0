@@ -16,6 +16,7 @@ decoder) is covariant under block frame changes :math:`g \in \prod_b GL(d_b)`: t
 
 from __future__ import annotations
 
+from tests.profiles import make_prior_bank
 from tests.profiles import test_config
 import warnings
 from typing import Any, Dict
@@ -360,9 +361,9 @@ def test_prior_bank_rejects_reference_decode_outside_its_contract() -> None:
     from vfe3.model.prior_bank import PriorBank
 
     with pytest.raises(ValueError, match="decode_coordinates"):
-        PriorBank(V, 4, 8, decode_mode="expected_likelihood_chunked", decode_coordinates="reference")
+        make_prior_bank(V, 4, 8, decode_mode="expected_likelihood_chunked", decode_coordinates="reference")
     with pytest.raises(ValueError, match="decode_coordinates"):
-        PriorBank(V, 4, 8, decode_mode="linear", decode_coordinates="canonical")
+        make_prior_bank(V, 4, 8, decode_mode="linear", decode_coordinates="canonical")
 
 
 def test_row_12_not_applicable_while_rows_9_to_11_run() -> None:

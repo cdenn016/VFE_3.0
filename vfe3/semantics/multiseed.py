@@ -99,7 +99,9 @@ from vfe3.semantics.common import (
     OKABE_ITO,
     apply_style,
     diagonal_redundancy_status,
+    finite_float as _num,
     markdown_table,
+    nested_get as _get,
     save_figure,
     write_json,
 )
@@ -118,25 +120,6 @@ MARKDOWN_NAME = "MULTISEED_SEMANTICS.md"
 # ----------------------------------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------------------------------
-
-def _get(obj: Any, *keys: Any) -> Any:
-    for key in keys:
-        if isinstance(obj, Mapping) and key in obj:
-            obj = obj[key]
-        elif isinstance(obj, (list, tuple)) and isinstance(key, int) and -len(obj) <= key < len(obj):
-            obj = obj[key]
-        else:
-            return None
-    return obj
-
-
-def _num(value: Any) -> Optional[float]:
-    r"""``float(value)`` for finite real numbers, else ``None``."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
-        return None
-    value = float(value)
-    return value if math.isfinite(value) else None
-
 
 def _diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
     return None if a is None or b is None else a - b

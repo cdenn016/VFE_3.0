@@ -16,7 +16,6 @@ import math
 import shutil
 import warnings
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np

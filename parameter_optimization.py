@@ -79,7 +79,7 @@ config: Dict[str, Any] = dict(
     #################################
 
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
     relational_receiver_measurement = "inverse",     # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     #################################
     #        Initialization
@@ -96,7 +96,7 @@ config: Dict[str, Any] = dict(
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
-    encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
+    encode_mode                       = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position; ~1.5x faster at K=80, currently unablated)
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,  #prior_bank = True temperature
     decode_ce_checkpoint              = "auto",  # "auto" | "auto_aggregate"
@@ -132,7 +132,7 @@ config: Dict[str, Any] = dict(
 
     pos_phi_project_slk       = False,      # per-block trace projection (det Omega = 1)
 
-    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
 
     group_n                   = None,                # so_n only; must stay None for block_glk
     irrep_spec                = None,                # so_n only; must stay None for block_glk
@@ -215,7 +215,7 @@ config: Dict[str, Any] = dict(
     #    Embedding/Priors M-step
     #        Learning Rates
     #################################
-    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
 
     phi_mstep_max_matrix_norm = 12,
     
@@ -247,8 +247,8 @@ config: Dict[str, Any] = dict(
     #################################
 
     layernorm_affine           = False,
-    norm_type_block            = "none",             # "none" | "mahalanobis"
-    block_norm_covariance      = "passthrough",      # "passthrough" (the only value without a 'layernorm' block norm) | "pushforward"
+    norm_type_block            = "none",             # "none" | "layernorm" | "mahalanobis"
+    block_norm_covariance      = "passthrough",      # "passthrough" (the only value without a 'layernorm' block norm) | "pushforward" | "pushforward_moment"
 
     prior_handoff_rho          = 1,                  # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma        = 0.1,                # sigma damping in [0,1] (0.0 = frozen at embedding)
@@ -853,6 +853,8 @@ def _joint_sweep(
             {"label": candidate["label"], **copy.deepcopy(candidate["overrides"])}
             for candidate in candidates
         ],
+        # The candidates are the whole design; no shared baseline cell is added (ablation item 59).
+        "include_baseline": False,
     }
     if len(seeds) > 1:
         sweep["seeds"] = list(seeds)
@@ -891,8 +893,15 @@ def _leaderboard_rows(
     grouped: Dict[str, List[float]] = {
         str(candidate["label"]): [] for candidate in candidates
     }
+    skipped: Dict[str, List[int]] = {str(candidate["label"]): [] for candidate in candidates}
+    accepted: Dict[str, List[float]] = {str(candidate["label"]): [] for candidate in candidates}
     for result in results:
         base_label = _result_base_label(result, candidates)
+        if base_label is not None:
+            if _is_finite_number(result.get("skipped_steps")):
+                skipped[base_label].append(int(float(result["skipped_steps"])))
+            if _is_finite_number(result.get("accepted_update_frac")):
+                accepted[base_label].append(float(result["accepted_update_frac"]))
         value = result.get("primary_val_ppl")
         if (
             base_label is not None
@@ -917,6 +926,11 @@ def _leaderboard_rows(
             "best_primary_val_ppl":     min(values) if values else math.inf,
             "worst_primary_val_ppl":    max(values) if values else math.inf,
             "successful_seeds":         len(values),
+            # realized updates (audit 2026-10-17 item 29): a candidate whose runs rejected updates trained
+            # on another schedule than its config claims
+            "max_skipped_steps":        max(skipped[label]) if skipped[label] else None,
+            "min_accepted_update_frac": min(accepted[label]) if accepted[label] else None,
+            "skipped_updates_flag":     bool(skipped[label]) and max(skipped[label]) > 0,
             "overrides_json":           json.dumps(
                 candidate["overrides"], sort_keys=True, separators=(",", ":")
             ),
@@ -940,6 +954,9 @@ def _write_leaderboard(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "best_primary_val_ppl",
         "worst_primary_val_ppl",
         "successful_seeds",
+        "max_skipped_steps",
+        "min_accepted_update_frac",
+        "skipped_updates_flag",
         "overrides_json",
     ]
     with ablation._unique_sibling_temp(path) as temporary:
@@ -976,23 +993,93 @@ def _unit_parameter_value(
     return (numeric - lo) / (hi - lo)
 
 
+def _additive_residuals(
+    units:  "Any",          # (n, p) normalized search coordinates in [0, 1]
+    values: "Any",          # (n,) responses
+) -> "Any":
+    r"""Residuals of ``values`` after a least-squares additive fit over every enabled coordinate.
+
+    The fit is :math:`y \approx c + \sum_k (a_k u_k + b_k u_k^2)`, a smooth main effect per coordinate,
+    solved by minimum-norm least squares (``numpy.linalg.lstsq``), so an underdetermined design still
+    returns residuals. Removing every main effect first keeps the other coordinates' main effects out
+    of a pair's two-way table (audit 2026-10-17 item 30).
+    """
+    import numpy as np
+
+    u = np.asarray(units, dtype=float)
+    y = np.asarray(values, dtype=float)
+    design = np.concatenate([np.ones((u.shape[0], 1)), u, u * u], axis=1)
+    coefficients, *_ = np.linalg.lstsq(design, y, rcond=None)
+    return y - design @ coefficients
+
+
+def _pair_interaction(
+    x_bins:   Sequence[int],
+    y_bins:   Sequence[int],
+    values:   Sequence[float],
+    n_bins:   int,
+) -> Dict[str, Any]:
+    r"""Binned-median two-way decomposition of ``values`` on one pair of coordinates.
+
+    For populated cell :math:`(i, j)`, :math:`r_{ij} = \tilde v_{ij} - (\tilde v_{i\cdot} + \tilde v_{\cdot j}
+    - \tilde v)` with medians; returns the count-weighted RMS of :math:`r`, its maximum magnitude and the
+    per-cell residuals, counts and medians.
+    """
+    cell_values: Dict[tuple[int, int], List[float]] = {}
+    x_values: Dict[int, List[float]] = {}
+    y_values: Dict[int, List[float]] = {}
+    for x_bin, y_bin, value in zip(x_bins, y_bins, values):
+        cell_values.setdefault((x_bin, y_bin), []).append(float(value))
+        x_values.setdefault(x_bin, []).append(float(value))
+        y_values.setdefault(y_bin, []).append(float(value))
+    overall_median = float(statistics.median(values))
+    cell_counts = [[0] * n_bins for _ in range(n_bins)]
+    cell_residuals: List[List[Optional[float]]] = [[None] * n_bins for _ in range(n_bins)]
+    weighted, total, maximum = 0.0, 0, 0.0
+    for (x_bin, y_bin), members in cell_values.items():
+        residual = (float(statistics.median(members))
+                    - (float(statistics.median(x_values[x_bin])) + float(statistics.median(y_values[y_bin]))
+                       - overall_median))
+        cell_counts[y_bin][x_bin] = len(members)
+        cell_residuals[y_bin][x_bin] = residual
+        weighted += len(members) * residual * residual
+        total += len(members)
+        maximum = max(maximum, abs(residual))
+    return {"rms": math.sqrt(weighted / total), "max": maximum, "populated": len(cell_values),
+            "n": total, "counts": cell_counts, "residuals": cell_residuals}
+
+
 def _interaction_rows(
     rows:          Sequence[Mapping[str, Any]],
     candidates:    Sequence[Mapping[str, Any]],
     search_config: Mapping[str, Any],
     n_bins:        int                           = 4,
+
+    *,
+    n_permutations: int                          = 200,
+    null_quantile:  float                        = 0.95,
+    permutation_seed: int                        = 0,
 ) -> List[Dict[str, Any]]:
-    r"""Rank pairwise departures from an additive median response in PPL units.
+    r"""Rank pairwise departures from an additive response in PPL units, against a permutation null.
 
-    Each enabled parameter is mapped to its normalized search coordinate and binned.
-    For populated cell $(i, j)$, the interaction residual is
+    Each enabled parameter is mapped to its normalized search coordinate :math:`u \in [0, 1]` and binned.
+    The mean validation PPL is first residualized on an additive fit over ALL enabled coordinates
+    (:func:`_additive_residuals`); for each pair the residuals then go through the binned-median two-way
+    decomposition (:func:`_pair_interaction`), and the reported strength ``interaction_rms_ppl`` is the
+    count-weighted RMS of the cell residuals. Without the first step the other coordinates' main effects
+    stay in every pair's cells, so an additive response showed large interactions (audit 2026-10-17
+    item 30).
 
-    $$r_{ij} = \tilde y_{ij} - (\tilde y_{i\cdot} + \tilde y_{\cdot j} - \tilde y),$$
-
-    where each tilde denotes a median. The reported strength is the cell-count-weighted
-    root-mean-square residual. This is a descriptive projection of the sampled search,
-    not a causal effect estimate.
+    Each pair's strength is compared with ``n_permutations`` permutations of the residuals across
+    candidates (seeded by ``permutation_seed``), which keep the design and destroy any association with the
+    coordinates: ``null_q95_rms_ppl`` is the ``null_quantile`` quantile of the pair's null RMS,
+    ``permutation_p`` the fraction of null RMS at or above the observed one (with the observed statistic
+    counted, :math:`(1 + \#\{\ge\}) / (1 + B)`), and ``exceeds_null`` whether the observed RMS is above the
+    quantile. Medians of the raw PPL per cell are kept for display. A descriptive projection of the
+    sampled search, not a causal effect estimate.
     """
+    import numpy as np
+
     if n_bins < 2:
         raise ValueError("n_bins must be at least 2")
 
@@ -1005,80 +1092,62 @@ def _interaction_rows(
         and _is_finite_number(row.get("mean_primary_val_ppl"))
         and math.isfinite(float(row["mean_primary_val_ppl"]))
     }
-    sampled: List[tuple[Dict[str, int], float]] = []
+    sampled: List[tuple[Dict[str, int], List[float], float]] = []
     for candidate in candidates:
         label = str(candidate["label"])
         overrides = candidate.get("overrides", {})
         if label not in row_by_label or not all(name in overrides for name in enabled_names):
             continue
         bins: Dict[str, int] = {}
+        units: List[float] = []
         for name in enabled_names:
             unit = _unit_parameter_value(overrides[name], parameters[name])
             if unit is None or not math.isfinite(unit):
                 break
             bounded = min(1.0, max(0.0, unit))
+            units.append(bounded)
             bins[name] = min(n_bins - 1, int(math.floor(n_bins * bounded)))
         if len(bins) == len(enabled_names):
-            sampled.append((bins, float(row_by_label[label]["mean_primary_val_ppl"])))
+            sampled.append((bins, units, float(row_by_label[label]["mean_primary_val_ppl"])))
+    if not sampled:
+        return []
+
+    raw = [value for _bins, _units, value in sampled]
+    residuals = _additive_residuals([units for _bins, units, _value in sampled], raw)
+    rng = np.random.default_rng(int(permutation_seed))
+    permutations = [rng.permutation(len(sampled)) for _ in range(int(n_permutations))]
 
     interactions: List[Dict[str, Any]] = []
     for x_index, parameter_x in enumerate(enabled_names):
         for parameter_y in enabled_names[x_index + 1:]:
-            cell_values: Dict[tuple[int, int], List[float]] = {}
-            x_values: Dict[int, List[float]] = {}
-            y_values: Dict[int, List[float]] = {}
-            all_values: List[float] = []
-            for bins, value in sampled:
-                x_bin = bins[parameter_x]
-                y_bin = bins[parameter_y]
-                cell_values.setdefault((x_bin, y_bin), []).append(value)
-                x_values.setdefault(x_bin, []).append(value)
-                y_values.setdefault(y_bin, []).append(value)
-                all_values.append(value)
-            if not all_values:
-                continue
-
-            overall_median = float(statistics.median(all_values))
-            cell_medians: List[List[Optional[float]]] = [
-                [None] * n_bins for _ in range(n_bins)
-            ]
-            cell_counts = [[0] * n_bins for _ in range(n_bins)]
-            cell_residuals: List[List[Optional[float]]] = [
-                [None] * n_bins for _ in range(n_bins)
-            ]
-            weighted_squared_residual = 0.0
-            total_count = 0
-            maximum_absolute_residual = 0.0
-            for (x_bin, y_bin), values in cell_values.items():
-                cell_median = float(statistics.median(values))
-                additive = (
-                    float(statistics.median(x_values[x_bin]))
-                    + float(statistics.median(y_values[y_bin]))
-                    - overall_median
-                )
-                residual = cell_median - additive
-                count = len(values)
-                cell_medians[y_bin][x_bin] = cell_median
-                cell_counts[y_bin][x_bin] = count
-                cell_residuals[y_bin][x_bin] = residual
-                weighted_squared_residual += count * residual * residual
-                total_count += count
-                maximum_absolute_residual = max(maximum_absolute_residual, abs(residual))
-
+            x_bins = [bins[parameter_x] for bins, _units, _value in sampled]
+            y_bins = [bins[parameter_y] for bins, _units, _value in sampled]
+            observed = _pair_interaction(x_bins, y_bins, residuals.tolist(), n_bins)
+            null = [_pair_interaction(x_bins, y_bins, residuals[order].tolist(), n_bins)["rms"]
+                    for order in permutations]
+            null_q = float(np.quantile(null, null_quantile)) if null else None
+            exceed = sum(1 for value in null if value >= observed["rms"] - 1e-12)
+            medians: List[List[Optional[float]]] = [[None] * n_bins for _ in range(n_bins)]
+            cells: Dict[tuple[int, int], List[float]] = {}
+            for x_bin, y_bin, value in zip(x_bins, y_bins, raw):
+                cells.setdefault((x_bin, y_bin), []).append(value)
+            for (x_bin, y_bin), members in cells.items():
+                medians[y_bin][x_bin] = float(statistics.median(members))
             interactions.append({
                 "rank":                         0,
                 "parameter_x":                  parameter_x,
                 "parameter_y":                  parameter_y,
-                "interaction_rms_ppl":          math.sqrt(
-                    weighted_squared_residual / total_count
-                ),
-                "max_abs_interaction_ppl":      maximum_absolute_residual,
-                "populated_cells":              len(cell_values),
+                "interaction_rms_ppl":          observed["rms"],
+                "null_q95_rms_ppl":             null_q,
+                "permutation_p":                ((1 + exceed) / (1 + len(null)) if null else None),
+                "exceeds_null":                 (observed["rms"] > null_q if null_q is not None else None),
+                "max_abs_interaction_ppl":      observed["max"],
+                "populated_cells":              observed["populated"],
                 "total_cells":                  n_bins * n_bins,
-                "n_candidates":                 total_count,
-                "_cell_medians":                cell_medians,
-                "_cell_counts":                 cell_counts,
-                "_cell_residuals":              cell_residuals,
+                "n_candidates":                 observed["n"],
+                "_cell_medians":                medians,
+                "_cell_counts":                 observed["counts"],
+                "_cell_residuals":              observed["residuals"],
             })
 
     interactions.sort(key=lambda item: (
@@ -1143,6 +1212,9 @@ def _write_interaction_table(
         "parameter_x",
         "parameter_y",
         "interaction_rms_ppl",
+        "null_q95_rms_ppl",
+        "permutation_p",
+        "exceeds_null",
         "max_abs_interaction_ppl",
         "populated_cells",
         "total_cells",
@@ -1466,7 +1538,9 @@ def _write_sweep_figures(
             axis.set_ylabel(str(interaction["parameter_y"]))
             axis.set_title(
                 f"{interaction['parameter_x']} x {interaction['parameter_y']}\n"
-                f"interaction RMS = {float(interaction['interaction_rms_ppl']):.3f} PPL",
+                f"interaction RMS = {float(interaction['interaction_rms_ppl']):.3f} PPL"
+                + (f" (null q95 {float(interaction['null_q95_rms_ppl']):.3f})"
+                   if interaction.get("null_q95_rms_ppl") is not None else ""),
                 fontsize=9,
             )
             axis.text(
@@ -1486,7 +1560,7 @@ def _write_sweep_figures(
                 shrink=0.84,
                 pad=0.02,
             )
-            colorbar.set_label("Interaction residual (PPL vs additive projection)")
+            colorbar.set_label("Interaction residual (PPL, after the all-coordinate additive fit)")
     else:
         flat_interaction_axes[0].axis("off")
         flat_interaction_axes[0].text(
@@ -1564,9 +1638,11 @@ def _print_leaderboard(rows: Sequence[Mapping[str, Any]], *, limit: int = 10) ->
         mean = float(row["mean_primary_val_ppl"])
         std = float(row["std_primary_val_ppl"])
         rank = "-" if row["rank"] is None else str(int(row["rank"]))
+        flag = (f"  [UNSTABLE: {row['max_skipped_steps']} skipped updates]"
+                if row.get("skipped_updates_flag") else "")
         print(
             f"  {rank:>4}  {str(row['label']):<22}"
-            f"{mean:>12.6f}{std:>12.6f}{int(row['successful_seeds']):>8}"
+            f"{mean:>12.6f}{std:>12.6f}{int(row['successful_seeds']):>8}{flag}"
         )
 
 

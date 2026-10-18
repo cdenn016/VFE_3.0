@@ -1,5 +1,6 @@
 """Unused decode certificates must not allocate bounds or run extra GEMMs."""
 
+from tests.profiles import make_prior_bank
 from collections import Counter
 from typing import Any, Optional
 
@@ -39,7 +40,7 @@ def _bank(
     unigram:    bool = False,
 ) -> PriorBank:
     torch.manual_seed(30)
-    pb = PriorBank(
+    pb = make_prior_bank(
         7, 4, 4, decode_mode="diagonal_chunked", decode_chunk_size=3,
         decode_av_precision=precision, decode_ce_checkpoint=checkpoint,
         decode_ranking_fp64_escalation=False, irrep_dims=[2, 2],
@@ -179,7 +180,7 @@ def test_diagonal_fast_ce_all_ignored_is_a_grad_connected_zero(checkpoint: str) 
 
 
 def test_full_ce_also_skips_unrequested_bound_gemms() -> None:
-    pb = PriorBank(
+    pb = make_prior_bank(
         7, 4, 4, diagonal_covariance=False, family="gaussian_full",
         decode_mode="full_chunked", decode_chunk_size=3, decode_av_precision="fp32",
         decode_ce_checkpoint="never", decode_ranking_fp64_escalation=False,

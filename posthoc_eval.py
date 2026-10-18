@@ -91,7 +91,13 @@ def main() -> None:
 
     from vfe3.posthoc.report import PosthocOptions, run_posthoc
 
-    run_dir = CONFIG["run_dir"]                     # click-to-run: no command-line configuration
+    from pathlib import Path
+
+    from vfe3.paper.runs import find_run_folder
+
+    # click-to-run: no command-line configuration. The entry resolves against this folder, else by its
+    # folder name under vfe3_runs and D:/DATA_KEEP (audit 2026-10-17 item 52).
+    run_dir = find_run_folder(CONFIG["run_dir"], base=Path(__file__).resolve().parent)
     torch.set_num_threads(_THREADS)
     fields = {key: value for key, value in CONFIG.items() if key not in ("run_dir", "out_dir", "threads")}
     options = PosthocOptions(**fields)

@@ -81,16 +81,19 @@ def test_combinations_without_a_covariant_reading_are_refused(config: dict, matc
         fully_gauge_covariant_overrides(config)
 
 
-def test_launcher_switch_defaults_off() -> None:
+def test_launcher_switch_is_a_bool() -> None:
+    r"""The switch's value is the user's; only its validity is asserted (audit 2026-10-17, item 38)."""
+    import ablation
     import train_vfe3
 
-    assert train_vfe3.fully_gauge_covariant is False
+    assert isinstance(train_vfe3.fully_gauge_covariant, bool)
+    assert isinstance(ablation.fully_gauge_covariant, bool)
 
 
 def test_ablation_switch_overrides_the_baseline_and_refuses_breaking_arms(monkeypatch: pytest.MonkeyPatch) -> None:
     import ablation
 
-    assert ablation.fully_gauge_covariant is False
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)
     assert ablation._resolved_sweep_baseline() == ablation.BASELINE_CONFIG          # off: the baseline as written
     config = CASES["diagonal_chunked"]
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config)
