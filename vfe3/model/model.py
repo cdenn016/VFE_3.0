@@ -2153,6 +2153,15 @@ class VFEModel(nn.Module):
             flat = int(torch.nan_to_num(table, nan=float("-inf")).reshape(-1).argmax())
             return float(table.reshape(-1)[flat]), float(flat // table.shape[1]), float(flat % table.shape[1])
 
+        # The per-(layer, head) tables themselves, so the dead-router warning can name every head above its threshold
+        # rather than the first one attaining the maximum (audit 2026-10-17 item 34). Host tensors, NaN-padded.
+        tables = {key: torch.nn.utils.rnn.pad_sequence(values, batch_first=True, padding_value=float("nan")).cpu()
+                  for key, values in heads.items()}                                       # (L, H_max) each
+        tables["unit_distance"] = torch.nn.utils.rnn.pad_sequence(
+            [(distance.detach().double().cpu() if distance is not None
+              else torch.full((1,), float("nan"), dtype=torch.float64)) for distance in unit_distance],
+            batch_first=True, padding_value=float("nan"))                                # (L, H_max)
+        self.last_router_head_tables = tables
         clamped, clamped_layer, clamped_head = head_max("clamped_row_frac")
         self_weight, self_layer, self_head = head_max("self_weight")
         capped, capped_layer, capped_head = head_max("klmax_frac")
@@ -2582,38 +2591,85 @@ class VFEModel(nn.Module):
         converged covariance (GL(m, C)-invariant, so the frame does not enter). These are statistics
         in the reference trivialization (invariant under a global conjugation, not under the local
         action; see the metrics section note).
+
+        Evaluated on the distinct frame rows :math:`(\phi_i, Y_i)` of the batch and expanded back by occurrence, so
+        each reduction sees exactly the per-token values of a dense evaluation (audit 2026-10-17 item 21). On a basis
+        supported on the head blocks (:func:`vfe3.metrics.head_block_algebra`) the frame is
+        :math:`\bigoplus_h e^{M_h}e^{Y_h}`, so each head block is exponentiated on its own and the log-volumes are
+        exact traces, :math:`\log|\det e^{M_h}e^{Y_h}| = \operatorname{tr}M_h + \operatorname{tr}Y_h`, and
+        :math:`\log|\det U| = \sum_h(\operatorname{tr}M_h + \operatorname{tr}Y_h)`; the eigenvalue moduli and phases
+        of :math:`U` are the union of those of its blocks. Values agree with the dense float64 evaluation to
+        rounding. Any other basis keeps the dense evaluation on the distinct rows.
         """
         from vfe3 import metrics
         group = self.group
+        offsets = [0, *itertools.accumulate(group.irrep_dims)]
         with torch.autocast(device_type=belief.phi.device.type, enabled=False):
-            U = torch.linalg.matrix_exp(group.embed_algebra(belief.phi.double(), dtype=torch.float64))
-            if belief.right_phi is not None:
-                U = U @ torch.linalg.matrix_exp(
-                    group.embed_algebra(belief.right_phi.double(), dtype=torch.float64))
-            U = U.reshape(-1, *U.shape[-2:])                                     # (B N, K, K)
+            n_gen = belief.phi.shape[-1]
+            phi_full = belief.phi.detach().double()
+            right_full = None
+            if belief.right_phi is not None:                                             # may broadcast over batch
+                phi_full, right_full = torch.broadcast_tensors(phi_full, belief.right_phi.detach().double())
+            phi = phi_full.reshape(-1, n_gen)                                            # (B N, n_gen)
+            rows = phi
+            if right_full is not None:
+                rows = torch.cat((phi, right_full.reshape(-1, right_full.shape[-1])), dim=-1)
+            # (R, n_gen [+ n_gen]) distinct frame rows and the (B N,) row of each token: one host read.
+            unique, inverse = torch.unique(rows, dim=0, return_inverse=True)
+            u_phi = unique[:, :n_gen]
+            u_right = unique[:, n_gen:] if belief.right_phi is not None else None
+            left = metrics.head_block_algebra(u_phi, group)
+            right = (metrics.head_block_algebra(u_right, group)
+                     if (left is not None and u_right is not None) else None)
+            if left is not None and (u_right is None or right is not None):
+                blocks: List[torch.Tensor] = []                                            # per head (R, d, d)
+                logdets: List[torch.Tensor] = []                                           # per head (R,)
+                for index, M in enumerate(left):
+                    U_h = torch.linalg.matrix_exp(M)
+                    logdet = M.diagonal(dim1=-2, dim2=-1).sum(-1)
+                    if right is not None:
+                        U_h = U_h @ torch.linalg.matrix_exp(right[index])
+                        logdet = logdet + right[index].diagonal(dim1=-2, dim2=-1).sum(-1)
+                    blocks.append(U_h)
+                    logdets.append(logdet)
+                head_logdet = torch.stack(logdets, dim=-1)                                 # (R, H)
+                volume = head_logdet.sum(-1)                                               # (R,) log|det U|
+            else:
+                U = torch.linalg.matrix_exp(group.embed_algebra(u_phi, dtype=torch.float64))
+                if u_right is not None:
+                    U = U @ torch.linalg.matrix_exp(group.embed_algebra(u_right, dtype=torch.float64))
+                blocks = [U[:, start:stop, start:stop] for start, stop in zip(offsets[:-1], offsets[1:])]
+                head_logdet = torch.stack([torch.linalg.slogdet(block).logabsdet for block in blocks], dim=-1)
+                volume = torch.linalg.slogdet(U).logabsdet
             out = {}
             # Vertex conditioning: the largest head-block condition max_h s_max / s_min of the realized frame, the
             # quantity phi_frame_condition_max bounds (the transports act per head; audit 2026-10-12 round 2,
             # item 13).
-            offsets = [0, *itertools.accumulate(group.irrep_dims)]
             head_cond = []
-            for start, stop in zip(offsets[:-1], offsets[1:]):
-                singular = torch.linalg.svdvals(U[:, start:stop, start:stop])    # (B N, d_h) descending
+            for block in blocks:
+                singular = torch.linalg.svdvals(block)                                     # (R, d_h) descending
                 head_cond.append(singular[..., 0] / singular[..., -1])
-            vertex_cond = torch.stack(head_cond, dim=-1).amax(-1)                # (B N,)
+            vertex_cond = torch.stack(head_cond, dim=-1).amax(-1)[inverse]                 # (B N,)
             out["vertex_cond_median"] = float(torch.quantile(vertex_cond, 0.50))
             out["vertex_cond_p95"] = float(torch.quantile(vertex_cond, 0.95))
             out["vertex_cond_p99"] = float(torch.quantile(vertex_cond, 0.99))
             out["vertex_cond_max"] = float(vertex_cond.max())
-            invariant = metrics.group_gauge_invariant(U, group)
+            # Host LAPACK eigenvalues once per distinct row and head (vfe3.metrics.eigvals_on_host).
+            eigenvalues = [metrics.eigvals_on_host(block) for block in blocks]             # per head (R, d_h)
+            if getattr(group, "skew_symmetric", False):                                    # so_n: total rotation
+                invariant = 0.5 * sum(torch.angle(eig).abs().sum(dim=-1) for eig in eigenvalues)
+            else:                                                                          # GL volume log|det U|
+                invariant = volume
+            invariant = invariant[inverse]                                                 # (B N,)
             out["gauge_invariant_mean"] = float(invariant.mean())
             out["gauge_invariant_spread"] = float(invariant.std(unbiased=False))
-            heads = metrics.per_head_gauge_invariants(U, group.irrep_dims)
-            out["gauge_head_aniso_mean"] = float(heads["anisotropy"].mean())
-            out["gauge_head_logdet_spread"] = float(heads["logdet"].std(unbiased=False))
+            log_modulus = [torch.log(eig.abs().clamp(min=1e-12)) for eig in eigenvalues]
+            anisotropy = torch.stack([lm.amax(dim=-1) - lm.amin(dim=-1) for lm in log_modulus], dim=-1)
+            out["gauge_head_aniso_mean"] = float(anisotropy[inverse].mean())
+            out["gauge_head_logdet_spread"] = float(head_logdet[inverse].std(unbiased=False))
             if group.name == "block_glmc":
-                out["gauge_head_phase_abs_mean"] = float(
-                    metrics.per_head_complex_phase(U, group.irrep_dims).abs().mean())
+                phase = torch.stack([metrics.complex_block_phase(block) for block in blocks], dim=-1)   # (R, H)
+                out["gauge_head_phase_abs_mean"] = float(phase[inverse].abs().mean())
                 sigma = belief.sigma.double()
                 if sigma.dim() == belief.mu.dim():                               # diagonal (..., N, K)
                     sigma = torch.diag_embed(sigma)

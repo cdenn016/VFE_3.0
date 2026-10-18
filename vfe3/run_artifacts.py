@@ -39,12 +39,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from numbers import Real
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -1169,6 +1170,9 @@ def _selection_semantic_config(
         "trust_resume_checkpoint",
         "log_interval",
         "checkpoint_interval",
+        "checkpoint_keep_last",
+        "checkpoint_at_end",
+        "block_variance_at_log",
         "generate_embedding_figures",
     ):
         normalized.pop(key, None)
@@ -2124,39 +2128,151 @@ class RunArtifacts:
         self._fieldnames = fieldnames
         self.history.append(dict(row))
 
-    def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
+    def maybe_save_best(
+        self,
+        step:    int,
+        model:   torch.nn.Module,
+        val_ppl: float,
+
+        *,
+        background: bool = False,
+    ) -> bool:
         r"""Record a new minimum and, when enabled, save its config-bound weights.
 
         Atomic (same-dir tmp + ``os.replace``): a crash or Windows lock mid-save can never leave a
-        corrupt/unreadable ``best_model.pt`` where a good one stood."""
+        corrupt/unreadable ``best_model.pt`` where a good one stood.
+
+        ``background`` (audit 2026-10-17 item 68): the weights are copied to host memory here, so the bundle is the
+        state at this call, and ``torch.save`` plus the atomic replace run on a worker thread while training
+        continues. ``best_val_ppl`` and ``best_step`` advance only when the file has been replaced, as on the
+        synchronous path; a failed save is logged and counted under ``diagnostics_failures["best_model_save"]``.
+        Every reader of the record or the file waits first (:meth:`wait_background`; this method,
+        :meth:`save_checkpoint` and the finalizers do). Returns True when a save was published or scheduled."""
+        self.wait_best_save()
         if val_ppl < self.best_val_ppl:
             if not self.save_model_artifacts:
                 self.best_val_ppl = float(val_ppl)
                 self.best_step = int(step)
                 return True
             config = _serialize_run_config(self.cfg)
+            state = (model.state_dict() if not background else
+                     {name: tensor.detach().to("cpu", copy=True) for name, tensor in model.state_dict().items()})
             bundle = {
-                "model_state":        model.state_dict(),
+                "model_state":        state,
                 "config":             config,
                 "config_fingerprint": semantic_config_fingerprint(config),
                 "code_identity_sha256": self.code_identity_sha256,
                 "selection_data_identity": self.selection_data_identity,
             }
-            try:
-                with _unique_sibling_temp(self.best_path) as tmp:
-                    torch.save(bundle, tmp)
-                    _atomic_replace(self.best_path, tmp)
-            except PermissionError as exc:
-                # A reader holding best_model.pt open on Windows (audit 2026-10-08 P1-6): the record is
-                # not advanced, so best_model.pt and best_val_ppl stay consistent and the next eval
-                # that beats the published best retries the save.
-                logging.getLogger(__name__).warning(
-                    "best_model.pt publish at step %d blocked (%s); the previous best is kept", step, exc)
-                return False
-            self.best_val_ppl = float(val_ppl)
-            self.best_step = int(step)
-            return True
+            if background:
+                worker = threading.Thread(target=self._publish_best, args=(bundle, int(step), float(val_ppl), True),
+                                          name=f"best_model_save_step_{int(step)}", daemon=True)
+                self._best_save_thread = worker
+                worker.start()
+                return True
+            return self._publish_best(bundle, int(step), float(val_ppl), False)
         return False
+
+    def _publish_best(
+        self,
+        bundle:     Dict[str, object],
+        step:       int,
+        val_ppl:    float,
+        background: bool,
+    ) -> bool:
+        r"""Write ``bundle`` to ``best_model.pt`` (same-directory temporary and atomic replace) and advance the record."""
+        try:
+            with _unique_sibling_temp(self.best_path) as tmp:
+                torch.save(bundle, tmp)
+                _atomic_replace(self.best_path, tmp)
+        except PermissionError as exc:
+            # A reader holding best_model.pt open on Windows (audit 2026-10-08 P1-6): the record is
+            # not advanced, so best_model.pt and best_val_ppl stay consistent and the next eval
+            # that beats the published best retries the save.
+            logging.getLogger(__name__).warning(
+                "best_model.pt publish at step %d blocked (%s); the previous best is kept", step, exc)
+            return False
+        except Exception as exc:
+            if not background:
+                raise
+            logging.getLogger(__name__).warning(
+                "(best_model.pt save at step %d failed: %s); training continues, the next improving eval retries",
+                step, exc)
+            failures = getattr(self, "diagnostics_failures", None)
+            if isinstance(failures, dict):
+                failures["best_model_save"] = failures.get("best_model_save", 0) + 1
+            return False
+        self.best_val_ppl = float(val_ppl)
+        self.best_step = int(step)
+        return True
+
+    def wait_best_save(self) -> None:
+        r"""Block until a background ``best_model.pt`` save (:meth:`maybe_save_best`) has finished."""
+        worker = getattr(self, "_best_save_thread", None)
+        if worker is not None:
+            worker.join()
+            self._best_save_thread = None
+
+    def submit_figure_work(
+        self,
+        label: str,
+        work:  Callable[[], object],
+    ) -> None:
+        r"""Run ``work`` (an isolated figure subprocess launch) on a worker thread so training does not wait for it.
+
+        The child process keeps its isolation (:func:`_run_attention_maps_isolated`); the thread only waits for it.
+        Jobs run one at a time in submission order, so at most one figure child runs beside training (audit
+        2026-10-17 item 68). :meth:`wait_background` reaps them. A failure is logged, never raised.
+        """
+        queue = getattr(self, "_figure_jobs", None)
+        if queue is None:
+            queue = self._figure_jobs = []
+        previous = queue[-1] if queue else None
+
+        def run() -> None:
+            if previous is not None:
+                previous.join()
+            try:
+                work()
+            except Exception as exc:                              # noqa: BLE001 - figures are best-effort
+                logging.getLogger(__name__).warning("background figure job %s failed (%s)", label, exc)
+
+        worker = threading.Thread(target=run, name=f"figure_{label}", daemon=True)
+        queue.append(worker)
+        worker.start()
+
+    def wait_background(self) -> None:
+        r"""Reap every background job of this run: the ``best_model.pt`` save and the figure workers."""
+        self.wait_best_save()
+        for worker in list(getattr(self, "_figure_jobs", None) or ()):
+            worker.join()
+        self._figure_jobs = []
+
+    def prune_checkpoints(
+        self,
+        keep_last: Optional[int],
+    ) -> List[Path]:
+        r"""Delete all but the ``keep_last`` highest-step ``checkpoints/step_<N>.pt`` of this run directory.
+
+        ``None`` keeps every checkpoint (``checkpoint_keep_last``; audit 2026-10-17 item 48). Only files named
+        ``step_<N>.pt`` in this run's own ``checkpoints/`` are considered. Returns the removed paths.
+        """
+        if keep_last is None or not self.ckpt_dir.is_dir():
+            return []
+        found: List[Tuple[int, Path]] = []
+        for path in self.ckpt_dir.glob("step_*.pt"):
+            stem = path.stem[len("step_"):]
+            if stem.isdigit():
+                found.append((int(stem), path))
+        found.sort()
+        removed: List[Path] = []
+        for _, path in found[:max(0, len(found) - int(keep_last))]:
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError as exc:
+                logging.getLogger(__name__).warning("could not prune checkpoint %s (%s)", path, exc)
+        return removed
 
     def save_attention_maps(
         self,
@@ -2244,6 +2360,7 @@ class RunArtifacts:
         """
         if not self.save_model_artifacts:
             raise RuntimeError("model-artifact persistence is disabled for this run")
+        self.wait_best_save()                        # the embedded best-model bundle reads best_model.pt
         step = _require_nonnegative_int(step, "step")
         path = self.ckpt_dir / f"step_{step}.pt"
         rng_state = {
@@ -4025,6 +4142,11 @@ def finalize_run(
     )
 
     logger = logger or logging.getLogger(__name__)
+    # Background best-model saves and figure workers of the training loop finish before anything reads them
+    # (audit 2026-10-17 item 68).
+    wait = getattr(artifacts, "wait_background", None)
+    if callable(wait):
+        wait()
     if device is None:
         device = next(model.parameters()).device
     wall_time, resumed_wall_time = _cumulative_wall_time(artifacts, wall_time)
@@ -4815,6 +4937,9 @@ def finalize_validation_run(
     )
 
     logger = logger or logging.getLogger(__name__)
+    wait = getattr(artifacts, "wait_background", None)       # background saves and figure workers (item 68)
+    if callable(wait):
+        wait()
     if device is None:
         device = next(model.parameters()).device
     wall_time, resumed_wall_time = _cumulative_wall_time(artifacts, wall_time)

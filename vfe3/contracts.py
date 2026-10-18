@@ -1,5 +1,6 @@
 """Shared type contracts for mutable runtime dictionaries."""
 
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypedDict
@@ -39,12 +40,88 @@ def deferred_host_checks() -> Iterator[None]:
         _DEFERRED_CHECKS = None
 
 
-def host_check(flags: torch.Tensor, verdict: Callable[[List[bool]], None]) -> None:
+def _registering_layer() -> Optional[int]:
+    r"""The ``layer_index`` local of the nearest calling frame that has one (the stack's layer loop), or None.
+
+    Read from the interpreter frames at registration (no device work), so a deferred verdict that raises later can
+    still name the layer that queued it (audit 2026-10-17 item 4). Best effort: a caller without such a local gives
+    None.
+    """
+    frame = sys._getframe(2)
+    while frame is not None:
+        value = frame.f_locals.get("layer_index") if "layer_index" in frame.f_code.co_varnames else None
+        if type(value) is int:
+            return value
+        frame = frame.f_back
+    return None
+
+
+def _with_failure_detail(
+    verdict: Callable[[List[bool]], None],
+    detail:  Callable[[], str],
+    layer:   Optional[int],
+) -> Callable[[List[bool]], None]:
+    r"""``verdict`` that, when it raises, adds ``detail()`` (and the registering layer) to the exception as a note."""
+    def checked(host: List[bool]) -> None:
+        try:
+            verdict(host)
+        except Exception as exc:
+            try:
+                text = detail()
+            except Exception as detail_exc:                     # noqa: BLE001 - never mask the verdict
+                text = f"failure detail unavailable ({type(detail_exc).__name__}: {detail_exc})"
+            exc.add_note((f"registered at layer {layer}: " if layer is not None else "") + text)
+            raise
+    return checked
+
+
+def describe_offending_entries(
+    values:   torch.Tensor,                  # (..., H, N, r) variances, or (..., H, N, r, r) covariances
+    *,
+    label:    str,
+    positive: bool = True,                   # also count entries <= 0 (diagonal variances)
+    axes:     Tuple[str, ...] = ("batch", "head", "token", "coordinate"),
+) -> str:
+    r"""Count, minimum and first location of the non-finite (and, with ``positive``, non-positive) entries.
+
+    Host reads, so only for a failure path (the ``detail`` of :func:`host_check`). The location names the trailing
+    axes of ``values`` by ``axes``; further leading axes are called ``dim``.
+    """
+    with torch.no_grad():
+        data = values.detach()
+        bad = ~torch.isfinite(data)
+        if positive:
+            bad = bad | (data <= 0)
+        count = int(bad.sum())
+        finite = data[torch.isfinite(data)]
+        minimum = float(finite.min()) if finite.numel() else float("nan")
+        where = "none"
+        if count:
+            index = [int(i) for i in torch.nonzero(bad, as_tuple=False)[0].tolist()]
+            names = (["dim"] * (len(index) - len(axes)) + list(axes) if len(index) >= len(axes)
+                     else list(axes)[len(axes) - len(index):])
+            where = ", ".join(f"{name} {position}" for name, position in zip(names, index))
+            first = float(data.reshape(-1)[int(torch.nonzero(bad.reshape(-1), as_tuple=False)[0])])
+            where += f" (value {first:.6g})"
+    return (f"{label}: {count} offending entr{'y' if count == 1 else 'ies'} of {data.numel()} "
+            f"({'non-finite or non-positive' if positive else 'non-finite'}), finite minimum {minimum:.6g}, "
+            f"first at {where}")
+
+
+def host_check(
+    flags:   torch.Tensor,
+    verdict: Callable[[List[bool]], None],
+    detail:  Optional[Callable[[], str]] = None,
+) -> None:
     r"""Run ``verdict(flags.tolist())`` now, or queue it inside :func:`deferred_host_checks`.
 
     ``flags`` is a 1-D boolean tensor and ``verdict`` may only raise; a check whose result selects
-    later computation must read its flags itself.
+    later computation must read its flags itself. ``detail`` (optional) is called only when the verdict raises; its
+    text, with the ``layer_index`` of the registering stack frame when there is one, is added to the exception as a
+    note, so a deferred failure still names where it happened. The success path does no added device work.
     """
+    if detail is not None:
+        verdict = _with_failure_detail(verdict, detail, _registering_layer())
     if _DEFERRED_CHECKS is None:
         verdict(flags.tolist())
         return
