@@ -350,6 +350,7 @@ config = dict(
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" | "query_shifted" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, or D_ij less its query-only row constant)
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
     relational_tile_mib              = 32,         # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
+    relational_diag_moments_kernel   = "torch",    # "torch" | "triton": diagonal comparison route (comparison_invariant) on CUDA: fused Triton diag(G) kernels, no materialized source root
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
     decode_ce_triton                 = False,      # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)

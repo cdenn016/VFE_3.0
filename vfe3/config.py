@@ -947,6 +947,13 @@ class VFE3Config:
     # 32 * (relational_tile_mib // 32) tokens (audit 2026-10-17 item 6). Keep 32 until a CUDA A/B confirms a gain
     # (audit 2026-10-16 F26).
     relational_tile_mib:              int             = 32
+    # "torch" | "triton". Kernel of the diagonal comparison route's projected moments (rope_mode="comparison_invariant"
+    # with a diagonal P(G), gaussian_diagonal family, Gaussian-KL kernel router): "triton" computes diag(G) = sum_k X^2,
+    # X = S U^{-1} Sigma^{1/2}, in fused Triton kernels that keep X in registers and recompute it in backward
+    # (vfe3/kernels/diagonal_moments.py; audit 2026-10-17 item 20), instead of the checkpointed torch tile loop. Same
+    # source-root formula, rounding-level differences. CPU tensors, and shapes the kernels do not take (per-head
+    # variances or frames, frame blocks wider than 64), always run the torch route.
+    relational_diag_moments_kernel:   str             = "torch"
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
 
@@ -1879,6 +1886,7 @@ class VFE3Config:
             raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
         if type(self.relational_tile_mib) is not int or self.relational_tile_mib < 1:
             raise ValueError(f"relational_tile_mib must be an int >= 1 (MiB), got {self.relational_tile_mib!r}")
+        _require(self.relational_diag_moments_kernel, ("torch", "triton"), "relational_diag_moments_kernel")
 
         if self.block_mlp_expansion < 1:
             raise ValueError(
@@ -2501,6 +2509,12 @@ class VFE3Config:
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing in ("gaussian_kl", "noisy_key")):
             mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
+        if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
+                and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"
+                and self.family == "gaussian_diagonal" and self.projected_factorization == "gram"):
+            mark(("relational_diag_moments_kernel",),
+                 "only read by the diagonal comparison route (comparison_invariant Gaussian-KL kernel router on "
+                 "gaussian_diagonal under projected_factorization='gram')")
         if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "noisy_key"):
             mark(("kappa_beta",), "relational_routing='noisy_key' routes at temperature exactly 1: the learned key "
