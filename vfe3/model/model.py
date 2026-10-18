@@ -349,6 +349,7 @@ class VFEModel(nn.Module):
                                 learn_attention_temperature=cfg.learn_attention_temperature,
                                 tie_comparison_maps=cfg.tie_comparison_maps,
                                 block_covariance=_get_family(cfg.family).head_block_covariance,
+                                frame_diagonal=_get_family(cfg.family).frame_diagonal_covariance,
                                 routing_key_noise=cfg.relational_key_noise)
             for layer_index in range(cfg.n_layers)
         ]
@@ -844,6 +845,14 @@ class VFEModel(nn.Module):
             block_diagonal=canonical_frame.block_diagonal,
         )
 
+    def _decoder_reads_frame(self) -> bool:
+        r"""Whether the decoder reads the realized relational frame: ``decode_coordinates='reference'``, or a KL decoder
+        of the frame-diagonal family (``gaussian_frame_diagonal``), whose stored variances are in reference coordinates
+        (:meth:`vfe3.model.prior_bank.PriorBank._frame_diagonal_query`). The linear decoder in local coordinates never
+        does."""
+        return (self.cfg.decode_coordinates == "reference"
+                or (self.prior_bank.frame_diagonal and self.cfg.decode_mode != "linear"))
+
     def _decode_covariance(
         self,
         mu_q:          torch.Tensor,                             # (B, N, K)
@@ -872,6 +881,10 @@ class VFEModel(nn.Module):
         if mode == "belief":
             return sigma_q
         full = sigma_q.dim() == mu_q.dim() + 1                   # (..., K, K) layout
+        if mode == "constant" and self.prior_bank.frame_diagonal:
+            # gaussian_frame_diagonal: the family member c_i = sigma_init, i.e. sigma_init I in reference coordinates
+            # (Sigma_i = sigma_init U_i U_i^T locally) under either decode_coordinates; the decoder reads it through U_i.
+            return torch.full_like(sigma_q, float(self.cfg.sigma_init))
         if mode == "constant":
             if self.cfg.decode_coordinates == "reference" and canonical_frame is not None:
                 from vfe3.model.frame_actions import local_covariance
@@ -1089,8 +1102,12 @@ class VFEModel(nn.Module):
                 ) else None)
             shared_omega, relational_frame, relational_value_frame = self._relational_frames(
                 beliefs, rope, _content_token_ids=content_token_ids)
-            if self.cfg.decode_coordinates == "reference":
-                # The covariant decoder reads (xi, C) through the frame the attention reads.
+            if capture is not None and self.prior_bank.frame_diagonal:
+                # gaussian_frame_diagonal: the M-step self term reads q* and its prior in reference coordinates.
+                capture["relational_frame"] = relational_frame
+            if self._decoder_reads_frame():
+                # The covariant decoder reads (xi, C) through the frame the attention reads; a frame-diagonal family's
+                # KL decoder reads its reference variances through it in either coordinate setting.
                 canonical_frame = relational_frame
                 if capture is not None:
                     capture["canonical_frame"] = canonical_frame
@@ -1217,7 +1234,7 @@ class VFEModel(nn.Module):
         # decode_coordinates='reference' receives the decode frame through a private out-param, so the
         # captureless fast paths (content-factor reuse, mean-only final layer) stay available.
         decode_frame_out: Optional[dict] = (
-            {} if self.cfg.decode_coordinates == "reference" else None)
+            {} if self._decoder_reads_frame() else None)
         # decode_covariance='encoded': the prior-bank decoder reads the stack's input covariance.
         encoded_sigma_out: Optional[dict] = (
             {} if self.cfg.decode_covariance == "encoded" and self.cfg.decode_mode != "linear" else None)
@@ -1387,9 +1404,17 @@ class VFEModel(nn.Module):
             mu_p, sigma_p = cap["final_block_prior"]            # live prior entering the final block
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: final-block E-step output, pre-transform
+            mu_q_self = q_conv.mu
+            if fam.frame_diagonal_covariance:
+                # gaussian_frame_diagonal: q* and its prior share the frame U_i, so the KL is the diagonal KL of the
+                # reference moments (U_i^{-1} mu, c); the family's parameter objects hold those.
+                from vfe3.model.frame_actions import frame_matvec
+                frame = cap["relational_frame"]
+                mu_q_self = frame_matvec(frame.inverse, q_conv.mu, frame.block_diagonal)   # (B, N, K) xi_q
+                mu_p = frame_matvec(frame.inverse, mu_p, frame.block_diagonal)             # (B, N, K) xi_p
             # The self term's own clamp (audit 2026-10-17 item 33): self_kl_max, or the router's kl_max when None.
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
-                fam(q_conv.mu, q_conv.sigma),
+                fam(mu_q_self, q_conv.sigma),
                 fam(mu_p, sigma_p),
                 kl_max=cfg.kl_max if cfg.self_kl_max is None else cfg.self_kl_max,
                 eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
@@ -2444,12 +2469,25 @@ class VFEModel(nn.Module):
 
         def evaluate(belief: BeliefState, frame_inverse: torch.Tensor,
                      tau: 'float | torch.Tensor') -> Tuple[Dict[str, float], torch.Tensor]:
-            r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N)."""
-            rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
+            r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N).
+
+            A frame-diagonal family (``gaussian_frame_diagonal``) is evaluated on its reference moments
+            :math:`(U_i^{-1}\mu_i, c_i)` with the identity frame: :math:`\Omega_{ij}q_j` has covariance
+            :math:`U_i\operatorname{diag}(c_j)U_i^\top`, so every transported pair and the self term share a frame and
+            their KLs are the diagonal KLs of the reference moments."""
+            mu_q, mu_prior, inverse = belief.mu, mu_p, frame_inverse
+            if fam.frame_diagonal_covariance:
+                from vfe3.model.frame_actions import frame_matvec
+                compact = frame_inverse.dim() == belief.mu.dim() + 2
+                mu_q = frame_matvec(frame_inverse, belief.mu.double(), compact)        # (B, N, K) xi_q
+                mu_prior = frame_matvec(frame_inverse, mu_p.double(), compact)          # (B, N, K) xi_p
+                eye = torch.eye(frame_inverse.shape[-1], dtype=frame_inverse.dtype, device=frame_inverse.device)
+                inverse = eye.expand(frame_inverse.shape)
+            rows = canonical_routing_rows(mu_q, belief.sigma, inverse, snapshot.log_prior,
                                           tau=tau, irrep_dims=list(group.irrep_dims), key_noise=key_noise)
             self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K), unclamped
-                fam(belief.mu.double(), belief.sigma.double()),
-                fam(mu_p.double(), sigma_p.double()),
+                fam(mu_q.double(), belief.sigma.double()),
+                fam(mu_prior.double(), sigma_p.double()),
                 kl_max=math.inf, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
                 self_div, mode=cfg.lambda_alpha_mode,

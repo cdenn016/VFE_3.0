@@ -6,7 +6,8 @@ gauge facet of the pure-path report (every ``gauge_flags`` entry of
 transformation :math:`U_i \to g_iU_i` the model then transforms covariantly end to end:
 
 * the learned frames transport (``gauge_transport='on'``) and the family can represent :math:`g\Sigma g^\top`
-  (``gaussian_full`` unless ``gaussian_block`` is chosen);
+  (``gaussian_full`` unless ``gaussian_block`` or ``gaussian_frame_diagonal`` is chosen; the latter stores
+  :math:`c_i = \operatorname{diag}(U_i^{-1}\Sigma_iU_i^{-\top})`, which the action leaves fixed);
 * the block norm and block MLP act as :math:`x \mapsto U_iN(U_i^{-1}x)` (``block_coordinates='reference'``, on
   ``projected_predictive`` only), or are covariant on their own (``canonical_frame``, ``gauge_gate`` with an
   equivariant norm, or no block MLP under the equivariant ``none`` or ``mahalanobis`` norm, where
@@ -78,7 +79,9 @@ def fully_gauge_covariant_overrides(
         "phi_frame_condition_max":   None,
         "lambda_alpha_mode":         "state_dependent",
     }
-    if get("family") not in ("gaussian_full", "gaussian_block"):
+    # gaussian_frame_diagonal keeps its family: its stored reference variances c_i are invariant under the action, and
+    # Sigma_i = U_i diag(c_i) U_i^T moves to g_i Sigma_i g_i^T with the frame.
+    if get("family") not in ("gaussian_full", "gaussian_block", "gaussian_frame_diagonal"):
         wanted["family"] = "gaussian_full"
         # The decoder kernel must match the covariance rank; the second-order linear term is diagonal-only.
         if get("decode_mode") == "diagonal_chunked":

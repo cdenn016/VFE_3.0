@@ -143,7 +143,7 @@ config = dict(
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout) | "gaussian_frame_diagonal" (U diag(c) U^T, diagonal in reference coordinates; kernel readout, coordinate MLP, linear/diagonal_chunked decode)
     prior_covariance_table           = "diagonal",  # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
