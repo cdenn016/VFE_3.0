@@ -535,6 +535,9 @@ class VFE3Config:
     #   prior     f Sigma_p, the token's local prior covariance: frame-free and exactly reference-invariant (since 2026-10-12)
     #   relative  f (tr C_i / K) U_i U_i^T with C_i = U_i^{-1} Sigma_i U_i^{-T}: the earlier floor, relative to the input
     #             covariance; changes under a non-orthogonal common reference change (kept for testing)
+    #   max       the larger of the two: elementwise max on the diagonal family, the whitened spectral max
+    #             f Sigma_p^{1/2} max(W, I) Sigma_p^{1/2} (W the relative floor whitened by f Sigma_p) on full layouts;
+    #             keeps the relative floor's scaling with the absolute bound f Sigma_p (audit 2026-10-17 item 1)
     predictive_covariance_floor_mode: str             = "prior"
     # moment_matched / spread_corrected only: Loewner ceiling Sigma^+ <= c * Sigma_p (vfe3.model.covariance_ceiling),
     # the counterpart of the floor; a clamp where it binds, counted in metrics.csv covariance_ceiling_elements. None = off.
@@ -554,6 +557,16 @@ class VFE3Config:
     #   fp64  the whole update (C_i, pooling, sandwich, floor, ceiling) in float64 from float32 beliefs, cast back:
     #         removes the kappa(U)^2 rounding the sign-only escalation misses (audit 2026-10-16 F7); costly
     predictive_covariance_precision:  str             = "fp32"
+    # moment_matched, kernel readout only (audit 2026-10-17 item 12): add the routed spread after the sandwich as the
+    # nonnegative sum of squares sum_h sum_j beta_ij^h (U_i O'_h (v_j^h - m_i^h))^2 (outer products on full layouts)
+    # instead of through the head-pair pooled covariance, where diag(U C^att U^T) cancels it; equal in exact
+    # arithmetic, about N K^2 multiply-adds per token. Not with content_link_edges.
+    predictive_covariance_spread_squares: bool        = False
+    # moment_matched, kernel readout only (audit 2026-10-17 item 19): form the head-pair source and pooled
+    # covariances for h <= g only and double the off-diagonal pairs (diag(U Y U^T) = diag(U Y^T U^T)); equal up to
+    # rounding, about H(H-1)/2 fewer pair contractions. Blockwise route (block frames, equal heads), not with
+    # content_link_edges.
+    predictive_covariance_symmetric_pairs: bool       = False
     attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
 
     ##################################################
@@ -630,6 +643,10 @@ class VFE3Config:
     lambda_beta:                      float                 = 1.0          # weight of the whole belief-coupling block (1 = pure F)
     
     mstep_self_coupling_weight:       float                 = 0.0          # M-step sum_i alpha_i D(q_i* || p_i); 0 = off
+    # None | float > 0 (inf allowed): the divergence clamp of the M-step self-coupling term D(q_i* || p_i); None uses
+    # kl_max, the router's clamp, under which the term saturates (zero gradient) in the collapse regime (audit
+    # 2026-10-17 item 33)
+    self_kl_max:                      Optional[float]       = None
 
     ##################################################
     #   13. Normalization and block handoff
@@ -659,6 +676,10 @@ class VFE3Config:
     # by min(1, K max(gamma^2) / tr) at the sphere bound (audit 2026-10-12 item 1). False skips the cap: the
     # uncapped delta method, which can exceed the bound by orders of magnitude once Sigma is large against s^2.
     block_norm_trace_cap:             bool            = True
+    # block_norm_covariance='pushforward' with the trace cap only (audit 2026-10-17 item 8): on the tokens where the
+    # cap binds return the moment estimate of 'pushforward_moment' instead of the capped delta method, whose shape
+    # is off by up to about 10^3 per coordinate on anisotropic input. False keeps the capped delta method everywhere.
+    block_norm_cap_moment_fallback:   bool            = False
 
     # "local" | "reference"
     #   local      the block norm and block MLP act on mu_i
@@ -999,9 +1020,15 @@ class VFE3Config:
         from vfe3.model.relational_operators import PREDICTIVE_COVARIANCE_PRECISIONS
         _require(self.predictive_covariance_precision, PREDICTIVE_COVARIANCE_PRECISIONS,
                  "predictive_covariance_precision")
-        if self.predictive_covariance_floor_mode not in ("prior", "relative"):
-            raise ValueError(f"predictive_covariance_floor_mode must be 'prior' or 'relative', "
+        if self.predictive_covariance_floor_mode not in ("prior", "relative", "max"):
+            raise ValueError(f"predictive_covariance_floor_mode must be 'prior', 'relative' or 'max', "
                              f"got {self.predictive_covariance_floor_mode!r}")
+        for name in ("predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
+            if getattr(self, name) and self.content_link_edges != "off":
+                raise ValueError(f"{name} reads the head-pair pooled covariance without edge links; "
+                                 "it requires content_link_edges='off'")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
                 or not math.isfinite(float(self.predictive_covariance_floor))
@@ -1069,6 +1096,11 @@ class VFE3Config:
             self.kl_max = float(8 * self.embed_dim)
         if not self.kl_max > 0.0:
             raise ValueError(f"kl_max must be positive (infinity disables the ceiling), got {self.kl_max}")
+        if self.self_kl_max is not None and (isinstance(self.self_kl_max, bool)
+                                             or not isinstance(self.self_kl_max, Real)
+                                             or not self.self_kl_max > 0.0):
+            raise ValueError(f"self_kl_max must be None or positive (infinity disables the clamp), "
+                             f"got {self.self_kl_max!r}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
             raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
         if (isinstance(self.rope_fraction, bool) or not isinstance(self.rope_fraction, Real)
@@ -1854,6 +1886,9 @@ class VFE3Config:
                  "block_norm_covariance")
         if type(self.block_norm_trace_cap) is not bool:
             raise ValueError(f"block_norm_trace_cap must be a bool, got {self.block_norm_trace_cap!r}")
+        if type(self.block_norm_cap_moment_fallback) is not bool:
+            raise ValueError("block_norm_cap_moment_fallback must be a bool, got "
+                             f"{self.block_norm_cap_moment_fallback!r}")
         if self.block_norm_covariance in ("pushforward", "pushforward_moment") and self.norm_type_block == "layernorm":
             # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
             # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
@@ -2270,23 +2305,33 @@ class VFE3Config:
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_floor_mode",
                   "predictive_covariance_ceiling", "attention_residual", "predictive_covariance_checkpoint",
-                  "predictive_covariance_fp64_escalation", "predictive_covariance_precision"),
+                  "predictive_covariance_fp64_escalation", "predictive_covariance_precision",
+                  "predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs"),
                  "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
         elif self.predictive_covariance == "passthrough":
             # The minimal agent checkpoints its whole readout (mean included), so only the floor is inert there.
-            mark(("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling")
+            mark(("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling",
+                  "predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs")
                  if minimal_agent
                  else ("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling",
                        "predictive_covariance_checkpoint", "predictive_covariance_fp64_escalation",
-                       "predictive_covariance_precision"),
+                       "predictive_covariance_precision", "predictive_covariance_spread_squares",
+                       "predictive_covariance_symmetric_pairs"),
                  "only read by predictive_covariance='moment_matched' or 'spread_corrected'")
         elif minimal_agent:
-            mark(("predictive_covariance_fp64_escalation", "predictive_covariance_precision"),
+            mark(("predictive_covariance_fp64_escalation", "predictive_covariance_precision",
+                  "predictive_covariance_spread_squares", "predictive_covariance_symmetric_pairs"),
                  "only read by predictive_readout='kernel'; the minimal agent recomputes a float32 call in float64 "
                  "on its own readout status (factorization failures, the A^h certificate under a certified "
                  "projected_factorization, and the screen of its floored posterior covariance), unconditionally")
+        if self.family == "gaussian_full":
+            mark(("predictive_covariance_symmetric_pairs",),
+                 "only read by the blockwise covariance body (gaussian_diagonal or gaussian_block on block frames); "
+                 "gaussian_full takes the dense body")
+        if self.mstep_self_coupling_weight == 0.0:
+            mark(("self_kl_max",), "only read by the M-step self-coupling term (mstep_self_coupling_weight > 0)")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
         if not ((self.attention_mode == "projected_predictive" and minimal_agent)
@@ -2355,6 +2400,11 @@ class VFE3Config:
         norm_floor = () if norm_pushes and not mlp_delta_full else ("block_mlp_covariance_floor",)
         if norm_pushes and mlp_delta_full:
             mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
+        if not (self.norm_type_block == "layernorm" and self.block_norm_covariance == "pushforward"
+                and self.block_norm_trace_cap and not mlp_delta_full):
+            mark(("block_norm_cap_moment_fallback",),
+                 "only read by a capped block_norm_covariance='pushforward' (block_norm_trace_cap=True, LayerNorm "
+                 "block norm, no delta_full MLP)")
         if not (self.norm_type_block == "layernorm" and (norm_pushes or mlp_delta_full)):
             mark(("block_norm_trace_cap",), "only read by a LayerNorm covariance pushforward (block_norm_covariance "
                  "'pushforward' or 'pushforward_moment', or block_mlp_covariance='delta_full')")
@@ -2710,6 +2760,8 @@ def serialize_config(config: VFE3Config) -> dict[str, Any]:
     payload = asdict(config)
     if math.isinf(config.kl_max):
         payload["kl_max"] = "inf"  # Strict JSON has no Infinity number.
+    if config.self_kl_max is not None and math.isinf(config.self_kl_max):
+        payload["self_kl_max"] = "inf"
     if config.gauge_group == "so_n":
         # Basis marker (the irrep_basis field was removed 2026-10-12): config_from_serialized refuses an
         # so_n payload without it, which identifies a save from before 2026-10-05 built in the eigh basis.
@@ -3344,6 +3396,8 @@ def config_from_serialized(
     }
     if values.get("kl_max") == "inf":
         values["kl_max"] = math.inf
+    if values.get("self_kl_max") == "inf":
+        values["self_kl_max"] = math.inf
     return VFE3Config(**values)
 
 

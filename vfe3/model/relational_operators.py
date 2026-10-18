@@ -116,9 +116,109 @@ def _centered_spread(
     return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-4)
 
 
+def _spread_squares_tile(
+    b:      torch.Tensor,  # (..., H, I, N) routing rows of the tile
+    values: torch.Tensor,  # (..., N, H, d) source values v_j^h
+    mean:   torch.Tensor,  # (..., I, H, d) routed means of the tile's rows
+    lift:   torch.Tensor,  # (..., I, H, A, d) per-row maps W_ih = U_i O'_h, A output coordinates
+    layout: str,           # "diag" | "blocks" | "full"
+    block:  int,           # head-block size of the "blocks" layout
+) -> torch.Tensor:         # (..., I, A), (..., I, A/block, block, block) or (..., I, A, A)
+    r"""One query-row tile of :func:`_spread_squares`."""
+    diff = values.unsqueeze(-4) - mean.unsqueeze(-3)                          # (..., I, N, H, d) v_j - m_i
+    w = torch.einsum("...ihas,...ijhs->...ijha", lift, diff)                   # (..., I, N, H, A) W_ih (v_j - m_i)
+    weight = b.movedim(-3, -1)                                                 # (..., I, N, H) beta_ij^h
+    if layout == "diag":
+        return torch.einsum("...ijh,...ijha->...ia", weight, w.square())      # (..., I, A)
+    if layout == "blocks":
+        w = w.reshape(*w.shape[:-1], w.shape[-1] // block, block)              # (..., I, N, H, A/block, block)
+        return torch.einsum("...ijh,...ijhls,...ijhlt->...ilst", weight, w, w)
+    return torch.einsum("...ijh,...ijha,...ijhc->...iac", weight, w, w)       # (..., I, A, A)
+
+
+def _spread_squares(
+    b:      torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
+    values: torch.Tensor,  # (..., N, H, d) source values v_j^h
+    mean:   torch.Tensor,  # (..., N, H, d) routed means m_i^h
+    lift:   torch.Tensor,  # (..., N, H, A, d) per-receiver maps W_ih = U_i O'_h (broadcastable over the batch)
+    layout: str,           # "diag" | "blocks" | "full"
+    block:  int = 1,       # head-block size of the "blocks" layout
+) -> torch.Tensor:         # (..., N, A), (..., N, A/block, block, block) or (..., N, A, A)
+    r"""The routed spread after the sandwich as a sum of squares (``predictive_covariance_spread_squares``).
+
+    .. math::
+        \bigl[U_i\textstyle\sum_hO'_hS_i^hO_h'^\top U_i^\top\bigr]_{kk}
+            = \sum_h\sum_j\beta_{ij}^h\bigl((U_iO'_h(v_j^h - m_i^h))_k\bigr)^2,
+
+    nonnegative by construction (audit 2026-10-17 item 12), and its outer-product form on the head-block and full
+    layouts, positive semidefinite by construction. It equals the centered spread of :func:`_centered_spread` sent
+    through the sandwich in exact arithmetic up to the second-order term :math:`\delta_i\delta_i^\top` of the computed
+    mean's rounding. Through the pooled head-pair covariance the spread enters
+    :math:`\mathrm{diag}(U_iC^{\mathrm{att}}_iU_i^\top)` after :math:`U_i` has undone :math:`U_i^{-1}`, which cancels
+    and amplifies its float32 rounding by about :math:`\kappa(U_i)^2`; here the squares are formed after the frame
+    acts. Query rows are tiled and checkpointed as in :func:`_centered_spread`; about :math:`NK^2` multiply-adds per
+    token on block frames.
+    """
+    N = b.shape[-2]
+    A = lift.shape[-2]
+    per_row = max(1, N * values.shape[-2] * A * values.element_size())
+    step = max(1, min(N, _SPREAD_TILE_BYTES // per_row))
+    lift = torch.broadcast_to(lift, (*mean.shape[:-2], *lift.shape[-3:]))     # (..., N, H, A, d)
+    tiles = []
+    for i in range(0, N, step):
+        args = (b[..., i:i + step, :], values, mean[..., i:i + step, :, :], lift[..., i:i + step, :, :, :])
+        if (torch.is_grad_enabled() and (step < N or N * per_row > _SPREAD_CHECKPOINT_BYTES)
+                and any(x.requires_grad for x in args)):
+            tiles.append(checkpoint(_spread_squares_tile, *args, layout, block, use_reentrant=False,
+                                    preserve_rng_state=False))
+        else:
+            tiles.append(_spread_squares_tile(*args, layout, block))
+    axis = -2 if layout == "diag" else (-4 if layout == "blocks" else -3)
+    return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=axis)
+
+
+def _diagonal_projection_statistics(
+    blocks: torch.Tensor,    # (..., N, H, d, d) head blocks S_ll = U_l [C^att]_ll U_l^T (+ spread), float64
+    inverse: torch.Tensor,   # (..., N, H, d, d) U_{i,l}^{-1}, float64 (broadcastable)
+    floor:  torch.Tensor,    # (..., N, K) the diagonal floor added in local coordinates
+) -> Dict[str, torch.Tensor]:  # 0-d float64 tensors (no host read)
+    r"""What the diagonal M-projection of the moment-matched update discards (audit 2026-10-17 items 3 and 18).
+
+    With the head-block Gaussian :math:`\Sigma^{\mathrm{blk}}_i = \bigoplus_l(S_{ll} + \mathrm{diag}(F_{i,l}))` and its
+    diagonal :math:`q_i = \mathrm{diag}(\Sigma^{\mathrm{blk}}_i)` (the diagonal family's output),
+
+    .. math::
+        \mathrm{KL}\bigl(\mathcal N(m, \Sigma^{\mathrm{blk}}_i)\,\|\,\mathcal N(m, \mathrm{diag}\,q_i)\bigr)
+            = \tfrac12\sum_l\Bigl[\sum_{k\in l}\log q_{i,k} - \log\det(S_{ll} + \mathrm{diag}F_{i,l})\Bigr] \ge 0,
+
+    zero exactly when every head block is diagonal (at :math:`\kappa(U_i) = 1` with isotropic content). The reference
+    trace ratio is :math:`\operatorname{tr}(U_i^{-1}\mathrm{diag}(S)U_i^{-\top})/\operatorname{tr}(U_i^{-1}SU_i^{-\top})`
+    over the head blocks without the floor: the factor by which the projection changes the next layer's reference
+    trace, up to about :math:`\kappa(U_i)^2` (the depth inflation of item 3). Means and maxima over tokens; a token
+    whose block does not factor gives NaN.
+    """
+    H, d = blocks.shape[-3], blocks.shape[-1]
+    floor_h = floor.reshape(*floor.shape[:-1], H, d)                                   # (..., N, H, d)
+    floored = blocks + torch.diag_embed(floor_h)                                       # (..., N, H, d, d)
+    diag = torch.diagonal(floored, dim1=-2, dim2=-1)                                   # (..., N, H, d) q_i
+    chol, info = torch.linalg.cholesky_ex(floored)
+    logdet = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum(dim=-1)        # (..., N, H)
+    logdet = torch.where(info == 0, logdet, torch.full_like(logdet, float("nan")))
+    kl = 0.5 * (torch.log(diag).sum(dim=-1) - logdet).sum(dim=-1)                     # (..., N)
+    columns = inverse.square().sum(dim=-2)                                             # (..., N, H, d) ||U^-1_{:,k}||^2
+    projected = (torch.diagonal(blocks, dim1=-2, dim2=-1) * columns).sum(dim=(-2, -1))  # (..., N)
+    reference = torch.diagonal(inverse @ blocks @ inverse.transpose(-1, -2),
+                               dim1=-2, dim2=-1).sum(dim=(-2, -1))                     # (..., N)
+    ratio = projected / reference
+    return {"kl_mean": kl.mean(), "kl_max": kl.max(), "trace_ratio_mean": ratio.mean(),
+            "trace_ratio_max": ratio.max()}
+
+
 # "prior": f Sigma_p (frame-free, reference-invariant); "relative": f (tr C_i / K) U_i U_i^T, the floor before
-# October 12, 2026, relative to the input covariance C_i = U_i^{-1} Sigma_i U_i^{-T} (not reference-invariant).
-PREDICTIVE_COVARIANCE_FLOOR_MODES = ("prior", "relative")
+# October 12, 2026, relative to the input covariance C_i = U_i^{-1} Sigma_i U_i^{-T} (not reference-invariant);
+# "max": the larger of the two (audit 2026-10-17 item 1), elementwise on the diagonal family and the whitened spectral
+# max on full layouts (RelationalOperators.floor_term).
+PREDICTIVE_COVARIANCE_FLOOR_MODES = ("prior", "relative", "max")
 
 # Compute precision of the kernel moment-matched covariance (audit 2026-10-16, F7). "fp32": the beliefs' precision
 # (float32 beliefs compute in float32 at IEEE GEMMs); "fp64": the whole update (C_i, the head-pair pooling, the
@@ -406,6 +506,30 @@ def _validate_latent_links(
         raise ValueError(f"content_link_loop_window must be None or an int >= 1, got {window!r}")
 
 
+def _whitened_max(
+    prior:    torch.Tensor,     # (..., K, K) SPD floor P = f Sigma_p
+    relative: torch.Tensor,     # (..., K, K) PSD relative floor R
+) -> torch.Tensor:              # (..., K, K) P^{1/2} max(P^{-1/2} R P^{-1/2}, I) P^{1/2}, symmetrized
+    r"""A Loewner upper bound of :math:`P` and :math:`R` through the whitened spectral max (floor mode ``"max"``).
+
+    With :math:`P = LL^\top` (Cholesky) and :math:`W = L^{-1}RL^{-\top} = V\Lambda V^\top`,
+
+    .. math::
+        M = LV\max(\Lambda, I)V^\top L^\top \succeq LL^\top = P, \qquad M \succeq LWL^\top = R,
+
+    equal to :math:`P` where :math:`R \preceq P` and to :math:`R` where :math:`R \succeq P`, and the elementwise
+    max when both are diagonal. The spectral clip is differentiated by its Loewner adjoint
+    (:func:`vfe3.geometry.retraction._symmetric_spectral_map`), finite on the degenerate spectrum the clip creates.
+    """
+    from vfe3.geometry.retraction import _symmetric_spectral_map
+    L = torch.linalg.cholesky(prior)                                                  # (..., K, K)
+    X = torch.linalg.solve_triangular(L, relative, upper=False)                        # L^{-1} R
+    W = torch.linalg.solve_triangular(L, X.transpose(-1, -2), upper=False)            # L^{-1} R L^{-T}
+    clipped = _symmetric_spectral_map(W, "project", lower=1.0)                         # V max(Lambda, 1) V^T
+    out = L @ clipped @ L.transpose(-1, -2)
+    return 0.5 * (out + out.transpose(-1, -2))
+
+
 class RelationalOperators(nn.Module):
     r"""Full-width comparison maps S_Q, S_K and content B=OT.
 
@@ -501,6 +625,8 @@ class RelationalOperators(nn.Module):
         predictive_covariance_checkpoint: bool = False,
         predictive_covariance_fp64_escalation: bool = False,
         predictive_covariance_precision: str = "fp32",
+        predictive_covariance_spread_squares: bool = False,
+        predictive_covariance_symmetric_pairs: bool = False,
         content_link_edges:    str   = "off",
         content_link_edge_rank: int  = 4,
         content_link_latent:   bool  = False,
@@ -641,6 +767,22 @@ class RelationalOperators(nn.Module):
                                  f"head sizes {self.irrep_dims} (a mixed so_n irrep tower)")
         self.content_link_edges = content_link_edges
         self.content_link_edge_rank = content_link_edge_rank
+        for name, value in (("predictive_covariance_spread_squares", predictive_covariance_spread_squares),
+                            ("predictive_covariance_symmetric_pairs", predictive_covariance_symmetric_pairs)):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be bool, got {value!r}")
+            if value and content_link_edges != "off":
+                raise ValueError(f"{name} requires content_link_edges='off' (the edge corrections read the pooled "
+                                 "head-pair covariance with its spread and every pair)")
+        # Plain attributes, not state (audit 2026-10-17 items 12 and 19).
+        self.predictive_covariance_spread_squares = predictive_covariance_spread_squares
+        self.predictive_covariance_symmetric_pairs = predictive_covariance_symmetric_pairs
+        # Diagnostic capture of the diagonal family's projection loss (audit 2026-10-17 items 3 and 18): set by
+        # VFEModel.build_diagnostic_snapshot around its no-grad forward; the update then stores
+        # diagonal_projection_stats (plain attributes, never state).
+        self.diagnose_diagonal_projection = False
+        self.diagonal_projection_stats: Optional[Dict[str, torch.Tensor]] = None
+        self._projection_stash: Optional[Dict[str, torch.Tensor]] = None
         _validate_latent_links(content_link_edges, content_link_latent, content_link_latent_steps,
                                content_link_latent_sigma, content_link_latent_damping,
                                content_link_loop_weight, content_link_loop_window)
@@ -979,9 +1121,9 @@ class RelationalOperators(nn.Module):
         self,
         floor_anchor: Optional[torch.Tensor],      # the local prior covariance Sigma_p, sigma's layout (broadcastable)
         sigma:        torch.Tensor,                # (..., N, K) or (..., N, K, K) the covariance being floored
-        frame:        Optional[CanonicalFrameContext] = None,   # required under floor_mode="relative"
-        diagonal:     bool = True,                 # sigma is (..., N, K) diagonal (read under floor_mode="relative")
-    ) -> torch.Tensor:                             # sigma's shape and dtype: f Sigma_p (or the relative floor)
+        frame:        Optional[CanonicalFrameContext] = None,   # required under floor_mode="relative" or "max"
+        diagonal:     bool = True,                 # sigma is (..., N, K) diagonal (read under "relative" and "max")
+    ) -> torch.Tensor:                             # sigma's shape and dtype: f Sigma_p (or the relative or max floor)
         r"""The prior-anchored covariance floor :math:`f\,\Sigma_{p,i}` of the moment-matched readouts.
 
         Under ``predictive_covariance_floor_mode="relative"`` it is instead :meth:`relative_floor_term`, the floor used
@@ -994,13 +1136,29 @@ class RelationalOperators(nn.Module):
         :math:`f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top`, which changed under a non-orthogonal :math:`a` because
         :math:`\operatorname{tr}(a^{-1}Ca^{-\top}) \ne \operatorname{tr}C` (audit 2026-10-12, item 4 and T5). It does not
         compound with depth: every layer's output is at least :math:`f\,\Sigma_{p,i}` whatever the input was.
+
+        Under ``"max"`` (audit 2026-10-17 item 1) it is the larger of the relative floor :math:`R_i` and
+        :math:`P_i = f\Sigma_{p,i}`: on the diagonal family the elementwise :math:`\max(R_{i,k}, P_{i,k})`, and on a full
+        layout the whitened spectral max of :func:`_whitened_max`,
+
+        .. math::
+            P_i^{1/2}\max\bigl(P_i^{-1/2}R_iP_i^{-1/2}, I\bigr)P_i^{1/2} \succeq P_i, R_i,
+
+        which is the elementwise max when both are diagonal. The floor then keeps the relative floor's scaling with
+        the input covariance and the absolute lower bound :math:`f\Sigma_{p,i}`, so the output cannot fall below
+        :math:`f\Sigma_{p,i}` however the relative floor compounds as :math:`f^\ell` through depth.
         """
-        if self.predictive_covariance_floor_mode == "relative":
+        mode = self.predictive_covariance_floor_mode
+        if mode == "relative":
             return self.relative_floor_term(sigma, frame, diagonal)
         if floor_anchor is None:
             raise ValueError("the moment-matched covariance needs floor_anchor, the local prior covariance Sigma_p of "
                              "each token (the covariance floor is f * Sigma_p)")
-        return torch.broadcast_to(self.predictive_covariance_floor * floor_anchor.to(sigma.dtype), sigma.shape)
+        prior = torch.broadcast_to(self.predictive_covariance_floor * floor_anchor.to(sigma.dtype), sigma.shape)
+        if mode == "prior":
+            return prior
+        relative = self.relative_floor_term(sigma, frame, diagonal)
+        return torch.maximum(relative, prior) if diagonal else _whitened_max(prior, relative)
 
     def relative_floor_term(
         self,
@@ -1015,29 +1173,46 @@ class RelationalOperators(nn.Module):
         covariance, so the output stays above :math:`f` times the input's mean reference variance however the
         covariance grows through depth, but it changes under a non-orthogonal common reference change
         :math:`U_i \to U_ia` because :math:`\operatorname{tr}(a^{-1}Ca^{-\top}) \ne \operatorname{tr}C` (audit
-        2026-10-12, item 4). A diagonal family reads :math:`\mathrm{diag}(U_iU_i^\top)`.
+        2026-10-12, item 4). A diagonal family reads :math:`\mathrm{diag}(U_iU_i^\top)`. It has no absolute lower bound:
+        on the diagonal family :math:`\operatorname{tr}C_i \ge \sigma_{\min}\lVert U_i^{-1}\rVert_F^2` and
+        :math:`\mathrm{diag}(U_iU_i^\top)_a\lVert U_i^{-1}\rVert_F^2 \ge 1` (Cauchy-Schwarz on
+        :math:`(U_iU_i^{-1})_{aa} = 1`), so it guarantees only :math:`f\sigma_{\min}/K` per coordinate, which compounds
+        as :math:`f^\ell` through depth (audit 2026-10-17 items 1 and 18).
+
+        For a diagonal :math:`\Sigma_i = \mathrm{diag}(\sigma_i)` the trace and the diagonal are read from frame norms
+        (audit 2026-10-17 item 36), equal to the products in exact arithmetic,
+
+        .. math::
+            \operatorname{tr}C_i = \sum_k\sigma_{i,k}\lVert(U_i^{-1})_{:,k}\rVert^2,
+            \qquad \mathrm{diag}(U_iU_i^\top)_a = \lVert(U_i)_{a,:}\rVert^2,
+
+        with no :math:`d\times d` product; a full :math:`\Sigma_i` forms :math:`C_i`.
         """
         if frame is None:
-            raise ValueError("predictive_covariance_floor_mode='relative' needs the frame of the floored covariance")
-        C = self._reference_covariance(sigma, frame, sigma.dtype, diagonal=diagonal)   # blocks or (..., N, K, K)
-        blocks = frame.block_diagonal and diagonal                                     # C is (..., N, H, d, d)
-        trace = torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=(-2, -1) if blocks else -1)
-        scale = trace / sigma.shape[-1]                                                # (..., N) tr(C_i)/K
+            raise ValueError("predictive_covariance_floor_mode='relative' or 'max' needs the frame of the floored "
+                             "covariance")
         forward = frame.forward.to(sigma.dtype)
+        if diagonal:
+            inverse = frame.inverse.to(sigma.dtype)
+            columns = inverse.square().sum(dim=-2)                                         # (..., N, [H,] d|K) ||U^-1_{:,k}||^2
+            rows = forward.square().sum(dim=-1)                                            # (..., N, [H,] d|K) ||U_{a,:}||^2
+            if frame.block_diagonal:
+                columns, rows = columns.flatten(-2), rows.flatten(-2)                      # (..., N, K)
+            trace = (sigma * columns).sum(dim=-1)                                          # (..., N) tr C_i
+            scale = trace[..., None] / sigma.shape[-1]                                     # (..., N, 1)
+            return torch.broadcast_to(self.predictive_covariance_floor * scale * rows, sigma.shape).to(sigma.dtype)
+        C = self._reference_covariance(sigma, frame, sigma.dtype, diagonal=False)          # (..., N, K, K)
+        scale = torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=-1) / sigma.shape[-1]          # (..., N) tr(C_i)/K
         if frame.block_diagonal:
             gram = forward @ forward.transpose(-1, -2)                                     # (..., N, H, d, d)
-            if diagonal:
-                base = torch.diagonal(gram, dim1=-2, dim2=-1).flatten(-2)                  # (..., N, K)
-            else:
-                H = gram.shape[-3]
-                eye_h = torch.eye(H, dtype=gram.dtype, device=gram.device)
-                base = torch.einsum("...hab,hg->...hagb", gram, eye_h).reshape(*gram.shape[:-3], H * gram.shape[-1],
-                                                                                 H * gram.shape[-1])   # (..., N, K, K)
+            H = gram.shape[-3]
+            eye_h = torch.eye(H, dtype=gram.dtype, device=gram.device)
+            base = torch.einsum("...hab,hg->...hagb", gram, eye_h).reshape(*gram.shape[:-3], H * gram.shape[-1],
+                                                                             H * gram.shape[-1])   # (..., N, K, K)
         else:
-            gram = forward @ forward.transpose(-1, -2)                                     # (..., N, K, K)
-            base = torch.diagonal(gram, dim1=-2, dim2=-1) if diagonal else gram
-        scale = scale[..., None] if diagonal else scale[..., None, None]
-        return torch.broadcast_to(self.predictive_covariance_floor * scale * base, sigma.shape).to(sigma.dtype)
+            base = forward @ forward.transpose(-1, -2)                                     # (..., N, K, K)
+        return torch.broadcast_to(self.predictive_covariance_floor * scale[..., None, None] * base,
+                                  sigma.shape).to(sigma.dtype)
 
     def ceiling_term(
         self,
@@ -1367,7 +1542,16 @@ class RelationalOperators(nn.Module):
             receive = edge_links.receive_heads(edges, len(self.irrep_dims))
         extra = () if edges is None else (edges,)
         diagonal = sigma.dim() == mu.dim()
-        sigma_plus = self._kernel_covariance(mu, sigma, beta, frame, receive, extra) + floor   # f Sigma_p, local
+        # Diagnostic capture of the diagonal projection loss (no-grad diagnostic forwards only; items 3 and 18).
+        stash = ({} if self.diagnose_diagonal_projection and diagonal and not torch.is_grad_enabled() else None)
+        self._projection_stash = stash
+        try:
+            sigma_plus = self._kernel_covariance(mu, sigma, beta, frame, receive, extra) + floor   # f Sigma_p, local
+        finally:
+            self._projection_stash = None
+        if stash:
+            self.diagonal_projection_stats = _diagonal_projection_statistics(
+                stash["blocks"], stash["inverse"], floor.detach().double())
         if self.predictive_covariance_fp64_escalation and sigma_plus.dtype != torch.float64:
             sigma_plus = self._escalate_failed_sequences(sigma_plus, floor, mu, sigma, beta, frame, receive, extra,
                                                          diagonal)
@@ -1561,19 +1745,25 @@ class RelationalOperators(nn.Module):
             T_rows = T_blocks.permute(2, 0, 1, 3).reshape(H, H * d, d)                # (m, [h, s], k)
             TC = _per_block_bmm(T_rows, C_cols).view(H, H, d, *C.shape[:-3], d)       # (m, h, s, ..., n, t)
             TC = TC.permute(*range(3, nl + 4), 1, 0, 2, nl + 4)                        # (..., N, H, H, d, d) T_h^{(m)} C_{i,m}
-            source = torch.einsum("...nhmsk,gtmk->...nhgst", TC, T_blocks)            # (..., N, H, H, d, d) T_h C_i T_g^T
-            c = torch.einsum("...hij,...gij->...hgij", b, b)
-            c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
-            pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)            # (..., N, H, H, d, d)
             mean = torch.einsum("...hij,...jhs->...ihs", b, values)                    # (..., N, H, d)
-            spread = _centered_spread(b, values, mean)                                 # (..., N, H, d, d)
-            pooled.diagonal(dim1=-4, dim2=-3).add_(spread.movedim(-3, -1))            # P_hh += S^h, in place
-            lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)             # (..., N, H, K, d) sum_h O'_h P_hg
-            lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                       # (..., N, g, l, k, t)
-            rows = lifted.permute(nl + 2, *range(nl + 1), nl + 3, nl + 1, nl + 4)      # (l, ..., n, k, g, t)
-            O_cols = O_blocks.permute(1, 0, 3, 2).reshape(H, H * d, d)                # (l, [g, t], m)
-            C_att = _per_block_bmm(rows.reshape(H, -1, H * d), O_cols)                 # (l, [..., n, k], m)
-            C_att = C_att.view(H, *C.shape[:-3], d, d).movedim(0, -3)                  # (..., N, H, d, d) blocks [ll]
+            squares = self.predictive_covariance_spread_squares
+            spread = None if squares else _centered_spread(b, values, mean)            # (..., N, H, d, d)
+            if self.predictive_covariance_symmetric_pairs:
+                C_att = self._symmetric_pair_blocks(TC, T_blocks, O_blocks, b, spread)  # (..., N, H, d, d), not symmetric
+                c = source = pooled = None                                             # edges are refused here
+            else:
+                source = torch.einsum("...nhmsk,gtmk->...nhgst", TC, T_blocks)        # (..., N, H, H, d, d) T_h C_i T_g^T
+                c = torch.einsum("...hij,...gij->...hgij", b, b)
+                c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
+                pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)        # (..., N, H, H, d, d)
+                if spread is not None:
+                    pooled.diagonal(dim1=-4, dim2=-3).add_(spread.movedim(-3, -1))    # P_hh += S^h, in place
+                lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)         # (..., N, H, K, d) sum_h O'_h P_hg
+                lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                   # (..., N, g, l, k, t)
+                rows = lifted.permute(nl + 2, *range(nl + 1), nl + 3, nl + 1, nl + 4)  # (l, ..., n, k, g, t)
+                O_cols = O_blocks.permute(1, 0, 3, 2).reshape(H, H * d, d)            # (l, [g, t], m)
+                C_att = _per_block_bmm(rows.reshape(H, -1, H * d), O_cols)             # (l, [..., n, k], m)
+                C_att = C_att.view(H, *C.shape[:-3], d, d).movedim(0, -3)              # (..., N, H, d, d) blocks [ll]
             if edges is not None:
                 # [g_i F (P^ + R Sigma~ R^T + A X + X^T A^T + A Y A^T) F^T g_i^T]_ll (edge_links).
                 A_hat, X_hat, Y = edge_links.edge_covariance_factors(edges, b, c, source, values, mean)
@@ -1591,13 +1781,67 @@ class RelationalOperators(nn.Module):
                 if edges is not None:                                                  # blocks of sum_h beta_ii M_h^{ii} C_i
                     cross = edge_links.edge_residual_cross_blocks(edges, A_hat, self_weight, TC, cross)
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
+            stash = self._projection_stash
+            if squares:
+                # W_ih = U_{i,l} O_h^{(l)} stacked over l: (..., N, H(h), H(l) d, d); the spread after the sandwich.
+                lift = torch.einsum("...lak,hlks->...hlas", forward, O_blocks).flatten(-3, -2)
+                layout = "blocks" if (block or stash is not None) else "diag"
+                spread_out = _spread_squares(b, values, mean, lift, layout, d)        # (..., N, H, d, d) or (..., N, K)
             if block:
                 blocks = forward @ C_att @ forward.transpose(-1, -2)                   # (..., N, H, d, d) U_l [C_att]_ll U_l^T
                 blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
+                if squares:
+                    blocks = blocks + spread_out
                 result = torch.einsum("...hab,hg->...hagb", blocks, eye_h).reshape(*sigma.shape)   # (..., N, K, K)
                 return result.to(sigma.dtype)
+            if stash is not None:
+                with torch.no_grad():
+                    wide = forward.detach().double()
+                    blocks = wide @ C_att.detach().double() @ wide.transpose(-1, -2)    # (..., N, H, d, d) S_ll
+                    blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
+                    if squares:
+                        blocks = blocks + spread_out.detach().double()
+                    stash["blocks"], stash["inverse"] = blocks, inverse.detach().double()
             result = ((forward @ C_att) * forward).sum(dim=-1)                         # (..., N, H, d) diag(U C U^T)
+            if squares:
+                result = result + (torch.diagonal(spread_out, dim1=-2, dim2=-1) if spread_out.dim() == result.dim() + 1
+                                   else spread_out.reshape(result.shape))
         return result.flatten(-2).to(sigma.dtype)
+
+    def _symmetric_pair_blocks(
+        self,
+        TC:       torch.Tensor,            # (..., N, H, H, d, d) [h, m] = T_h^{(m)} C_{i,m}
+        T_blocks: torch.Tensor,            # (H, d, H, d) [g, t, m, k] = T_g^{(m)}[t, k]
+        O_blocks: torch.Tensor,            # (H, H, d, d) [h, l, k, s] = O_h^{(l)}[k, s]
+        b:        torch.Tensor,            # (..., H, N, N) routing weights
+        spread:   Optional[torch.Tensor],  # (..., N, H, d, d) centered spread S^h, or None (added after the sandwich)
+    ) -> torch.Tensor:                     # (..., N, H, d, d) Y_ll with diag(U_l Y_ll U_l^T) = that of [C^att]_ll
+        r"""The pooled head-pair term over :math:`h \le g` only (``predictive_covariance_symmetric_pairs``).
+
+        :math:`T_gC_iT_h^\top = (T_hC_iT_g^\top)^\top` and :math:`c^{gh}_{ij} = c^{hg}_{ij}`, so the pooled
+        :math:`P_{i,gh} = P_{i,hg}^\top` and the :math:`(g, h)` term of :math:`[C^{\mathrm{att}}_i]_{ll}` is the transpose
+        of the :math:`(h, g)` term. Since :math:`\mathrm{diag}(UYU^\top) = \mathrm{diag}(UY^\top U^\top)` and the
+        head-block readout symmetrizes,
+
+        .. math::
+            Y_{ll} = \sum_hO_h^{(l)}P_{i,hh}O_h^{(l)\top} + 2\sum_{h<g}O_h^{(l)}P_{i,hg}O_g^{(l)\top}
+
+        gives the same diagonal and the same symmetric part as the all-pair sum (audit 2026-10-17 item 19), from
+        :math:`H(H+1)/2` of the :math:`H^2` source and pooled pairs. :math:`Y_{ll}` itself is not symmetric.
+        """
+        H = TC.shape[-4]
+        h_idx, g_idx = torch.triu_indices(H, H, device=TC.device)                    # (P,) pairs h <= g, row-major
+        TC_p = TC.index_select(-4, h_idx)                                              # (..., N, P, H, d, d)
+        source = torch.einsum("...npmsk,ptmk->...npst", TC_p, T_blocks[g_idx])       # (..., N, P, d, d) T_h C_i T_g^T
+        b_h, b_g = b.index_select(-3, h_idx), b.index_select(-3, g_idx)               # (..., P, N, N)
+        same = (h_idx == g_idx).to(b.dtype)[:, None, None]                             # (P, 1, 1)
+        c = same * b_h + (1.0 - same) * (2.0 * b_h * b_g)                              # beta^h, or 2 beta^h beta^g
+        pooled = torch.einsum("...pij,...jpst->...ipst", c, source)                   # (..., N, P, d, d)
+        if spread is not None:
+            diagonal_pairs = (h_idx == g_idx).nonzero().flatten()                      # (H,) the pairs (h, h), in h order
+            pooled = pooled.index_add(-3, diagonal_pairs, spread)                       # P_hh += S^h
+        left = torch.einsum("plks,...npst->...nplkt", O_blocks[h_idx], pooled)        # (..., N, P, H, d, d) O_h^{(l)} P_hg
+        return torch.einsum("...nplkt,plmt->...nlkm", left, O_blocks[g_idx])          # (..., N, H, d, d)
 
     def _predictive_covariance_update_dense(
         self,
@@ -1644,7 +1888,7 @@ class RelationalOperators(nn.Module):
             b_runs = [self._head_slice(b, run, -3) for run in range(len(self.runs))]   # (..., n_r, N, N)
             TC_runs = [torch.einsum("hsk,...nkm->...nhsm", T_hat, C)               # (..., N, n_r, d_r, K)
                        for T_hat in T_runs]
-            C_att = None
+            C_att = squares_out = None
             for r, (T_r, O_r, b_r, TC) in enumerate(zip(T_runs, O_runs, b_runs, TC_runs)):
                 for g, (T_g, O_g, b_g) in enumerate(zip(T_runs, O_runs, b_runs)):
                     source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_g)       # (..., N, n_r, n_g, d_r, d_g)
@@ -1657,8 +1901,14 @@ class RelationalOperators(nn.Module):
                     if r == g:
                         values = torch.einsum("hsk,...nk->...nhs", T_r, xi)        # (..., N, n_r, d_r)
                         mean = torch.einsum("...hij,...jhs->...ihs", b_r, values)  # (..., N, n_r, d_r)
-                        spread = _centered_spread(b_r, values, mean)               # (..., N, n_r, d_r, d_r)
-                        pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
+                        if self.predictive_covariance_spread_squares:
+                            # The spread after the sandwich (audit 2026-10-17 item 12): W_ih = U_i O'_h.
+                            lift = torch.einsum("...ak,hks->...has", forward, O_r)  # (..., N, n_r, K, d_r)
+                            term = _spread_squares(b_r, values, mean, lift, "diag" if diagonal else "full")
+                            squares_out = term if squares_out is None else squares_out + term
+                        else:
+                            spread = _centered_spread(b_r, values, mean)           # (..., N, n_r, d_r, d_r)
+                            pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
                     lifted = torch.einsum("hks,...nhgst->...ngkt", O_r, pooled)   # (..., N, n_g, K, d_g)
                     term = torch.einsum("...ngkt,gmt->...nkm", lifted, O_g)        # (..., N, K, K)
                     C_att = term if C_att is None else C_att + term
@@ -1683,6 +1933,8 @@ class RelationalOperators(nn.Module):
             result = 0.5 * (result + result.transpose(-1, -2))
             if diagonal:
                 result = torch.diagonal(result, dim1=-2, dim2=-1)
+            if squares_out is not None:
+                result = result + (squares_out if diagonal else 0.5 * (squares_out + squares_out.transpose(-1, -2)))
         return result.to(sigma.dtype)
 
     @staticmethod

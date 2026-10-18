@@ -180,7 +180,8 @@ _COVARIANCE_SCALE_KEYS: Tuple[str, ...] = (
     "relational_comparison_map_norm_spread", "relational_input_cov_scale_ratio", "relational_rank_one_residual",
     "relational_rank_one_residual_reference")
 CANONICAL_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
-    "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta")
+    "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta",
+    "canonical_self_clamped_frac")
 
 
 @dataclass(frozen=True)
@@ -329,6 +330,8 @@ class VFEModel(nn.Module):
                                 predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
                                 predictive_covariance_fp64_escalation=cfg.predictive_covariance_fp64_escalation,
                                 predictive_covariance_precision=cfg.predictive_covariance_precision,
+                                predictive_covariance_spread_squares=cfg.predictive_covariance_spread_squares,
+                                predictive_covariance_symmetric_pairs=cfg.predictive_covariance_symmetric_pairs,
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
@@ -1364,10 +1367,12 @@ class VFEModel(nn.Module):
             mu_p, sigma_p = cap["final_block_prior"]            # live prior entering the final block
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: final-block E-step output, pre-transform
+            # The self term's own clamp (audit 2026-10-17 item 33): self_kl_max, or the router's kl_max when None.
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
                 fam(q_conv.mu, q_conv.sigma),
                 fam(mu_p, sigma_p),
-                kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
+                kl_max=cfg.kl_max if cfg.self_kl_max is None else cfg.self_kl_max,
+                eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
                 self_div, mode=cfg.lambda_alpha_mode, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
@@ -1610,8 +1615,21 @@ class VFEModel(nn.Module):
         frame_cache: Optional[_FrameFreezeCache] = {} if _share_frame_copies else None
         diagnostic: dict = {}
         capture = {"diagnostic": diagnostic}
-        final_belief, logits = self.forward_beliefs(
-            token_ids, return_logits=return_logits, capture=capture)
+        # The diagonal family's projection loss (audit 2026-10-17 items 3 and 18), formed by each layer's
+        # covariance update from its head blocks during this no-grad forward only.
+        layer_operators = self.relational_operators_by_layer
+        for ops in layer_operators:
+            ops.diagnose_diagonal_projection, ops.diagonal_projection_stats = True, None
+        try:
+            final_belief, logits = self.forward_beliefs(
+                token_ids, return_logits=return_logits, capture=capture)
+        finally:
+            for ops in layer_operators:
+                ops.diagnose_diagonal_projection = False
+        for ops, layer_capture in zip(layer_operators, diagnostic.get("layer_conditional_captures", ())):
+            stats, ops.diagonal_projection_stats = ops.diagonal_projection_stats, None
+            if stats is not None:
+                layer_capture.update({f"relational_diagonal_projection_{key}": value for key, value in stats.items()})
         if return_logits and logits is None:
             raise RuntimeError("diagnostic snapshot requested logits but the decoder returned None")
 
@@ -1866,6 +1884,9 @@ class VFEModel(nn.Module):
             "belief_cond_max": float(condition.max()),
             "belief_lam_min": float(spectrum["lam_min"].min()),
             "belief_lam_max": float(spectrum["lam_max"].max()),
+            # Position 0 routes only to itself and receives no routed spread (audit 2026-10-17 item 13).
+            **dict(zip(("belief_lam_min_argmin_position", "belief_lam_min_from_position_1"),
+                       metrics.positional_minimum(spectrum["lam_min"]))),
             "belief_cond_valid_frac": float(spectrum["condition_is_belief"].double().mean()),
             "eff_rank_p5": float(torch.quantile(effective_rank, 0.05)),
             "eff_rank_median": float(torch.quantile(effective_rank, 0.50)),
@@ -1905,6 +1926,50 @@ class VFEModel(nn.Module):
                 for q_cov, k_cov in zip(query_cov, key_cov)]
         return (min(float(eig.min()) for eig in eigs),
                 max(float((eig[..., -1]/eig[..., 0]).max()) for eig in eigs))
+
+    @staticmethod
+    def _projected_cov_positional_minimum(cap: dict) -> Tuple[float, float]:
+        r"""Token position of the smallest projected-covariance eigenvalue of a layer's capture, and the minimum over
+        positions :math:`\ge 1` (:func:`vfe3.metrics.positional_minimum`; audit 2026-10-17 item 13)."""
+        from vfe3 import metrics
+        query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
+        if torch.is_tensor(query_cov):                                       # equal heads: one tensor
+            query_cov, key_cov = [query_cov], [key_cov]
+        per_token = torch.stack([                                            # (runs, ..., N) per-token minima
+            safe_eigvalsh(torch.stack((q_cov, k_cov)).float())[..., 0].amin(dim=-1).amin(dim=0)
+            for q_cov, k_cov in zip(query_cov, key_cov)]).amin(dim=0)
+        return metrics.positional_minimum(per_token)
+
+    @staticmethod
+    def _diagonal_projection_diagnostics(cap: dict) -> Dict[str, float]:
+        r"""The diagonal projection loss of a layer's covariance update (audit 2026-10-17 items 3 and 18).
+
+        ``relational_diagonal_projection_kl`` (mean over tokens, nats) and ``_kl_max`` are
+        :math:`\mathrm{KL}(\mathcal N(m, \Sigma^{\mathrm{blk}}_i)\|\mathcal N(m, \mathrm{diag}\,\Sigma^{\mathrm{blk}}_i))` of the
+        floored head-block moment-matched covariance against the diagonal family's output, and
+        ``relational_diagonal_projection_trace_ratio`` (mean) and ``_trace_ratio_max`` the factor by which the
+        projection changes the reference trace :math:`\operatorname{tr}C` the next layer reads
+        (:func:`vfe3.model.relational_operators._diagonal_projection_statistics`, float64, eval cadence). NaN when
+        the layer's update did not form them (another family, the dense body, the minimal agent).
+        """
+        out = {}
+        for key, name in (("kl_mean", "kl"), ("kl_max", "kl_max"), ("trace_ratio_mean", "trace_ratio"),
+                          ("trace_ratio_max", "trace_ratio_max")):
+            value = cap.get(f"relational_diagonal_projection_{key}")
+            out[f"relational_diagonal_projection_{name}"] = float(value) if value is not None else float("nan")
+        return out
+
+    def _diagonal_projection_layer_extremes(self, snapshot: DiagnosticSnapshot) -> Dict[str, float]:
+        r"""Layer maxima of :meth:`_diagonal_projection_diagnostics` and the first layer attaining each."""
+        rows = [self._diagonal_projection_diagnostics(self._layer_capture(snapshot, layer))
+                for layer in range(self.cfg.n_layers)]
+        out: Dict[str, float] = {}
+        for key in ("relational_diagonal_projection_kl", "relational_diagonal_projection_trace_ratio"):
+            finite = [(row[key], layer) for layer, row in enumerate(rows) if math.isfinite(row[key])]
+            value, layer = (max(finite, key=lambda pair: (pair[0], -pair[1])) if finite
+                            else (float("nan"), float("nan")))
+            out[f"{key}_layer_max"], out[f"{key}_argmax_layer"] = float(value), float(layer)
+        return out
 
     def _covariance_scale_statistics(
         self,
@@ -2173,6 +2238,7 @@ class VFEModel(nn.Module):
                 "relational_self_lock_argmax_head": self_head,
                 "relational_self_lock_unit_distance": (float(locked[int(self_head)]) if locked is not None
                                                        else float("nan")),
+                **self._diagonal_projection_layer_extremes(snapshot),
                 **extremes_out}
 
     def _canonical_free_energy_diagnostics(
@@ -2204,8 +2270,13 @@ class VFEModel(nn.Module):
         the key laws carry the layer's noise :math:`n_hI`, as its router's do (temperature 1; ``key_noise`` of
         :func:`vfe3.free_energy.canonical_routing_rows`), so :math:`D^h_{ii} > 0` there (audit 2026-10-12 round 2,
         item 16). The self term is the registered
-        form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`, the same
-        ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
+        form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`) evaluated at the layer's
+        input belief, with the divergence unclamped (``kl_max=inf``, as the prior-bank decode ranking evaluates it):
+        under the router's ``kl_max`` it saturated in the collapse regime and reported a clamp rather than the
+        belief (audit 2026-10-17 item 33). ``canonical_self_clamped_frac`` is the share of the input belief's self
+        divergences (per token, or per coordinate under a per-coordinate alpha form) at or above the M-step self
+        term's clamp (``self_kl_max``, else ``kl_max``), where that term has zero gradient. The ``eps`` floor of the
+        closed form still applies. The M-step term itself reads
         the final block's converged output against its prior, which the output evaluation below matches at the
         last layer (item 27). The columns are per-token means over the batch: ``self_coupling``,
         ``self_divergence`` (the unweighted :math:`D(q_i\|p_i)`), ``belief_coupling`` and
@@ -2255,10 +2326,10 @@ class VFEModel(nn.Module):
             r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N)."""
             rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
                                           tau=tau, irrep_dims=list(group.irrep_dims), key_noise=key_noise)
-            self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
+            self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K), unclamped
                 fam(belief.mu.double(), belief.sigma.double()),
                 fam(mu_p.double(), sigma_p.double()),
-                kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
+                kl_max=math.inf, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
                 self_div, mode=cfg.lambda_alpha_mode,
                 b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device))
@@ -2270,6 +2341,8 @@ class VFEModel(nn.Module):
                      "attention_entropy": float(rows.attention_entropy.sum(dim=1).mean())}
             terms["total"] = terms["self_coupling"] + lambda_beta * (
                 terms["belief_coupling"] + terms["attention_entropy"])
+            self_cap = cfg.kl_max if cfg.self_kl_max is None else cfg.self_kl_max   # the M-step self term's clamp
+            terms["self_clamped_frac"] = float((~(self_div < self_cap)).double().mean())   # NaN counts as clamped
             return terms, rows.beta
 
         with torch.autocast(device_type=device.type, enabled=False):
@@ -2281,6 +2354,7 @@ class VFEModel(nn.Module):
                     attention_tau(_as_coeff(cfg.kappa_beta, device), group.irrep_dims, device=device),
                     torch.float64)
             terms, beta_star = evaluate(q, frame_inverse, tau)                 # beta_star (B, H, N, N)
+            clamped_frac = terms.pop("self_clamped_frac")
             terms_out, _ = evaluate(snapshot.layer_converged[layer], frame_inverse, tau)
             scored = support.sum(dim=-1) >= 2                                  # (B, H, N)
             self_rows = scored & support.diagonal(dim1=-2, dim2=-1)            # (B, H, N) rows that admit self
@@ -2294,6 +2368,7 @@ class VFEModel(nn.Module):
                                       else float("nan")),
             "canonical_total_output": terms_out["total"],
             "canonical_total_delta": terms_out["total"] - terms["total"],
+            "canonical_self_clamped_frac": clamped_frac,
         }
 
     def _canonical_frame_inverse(
@@ -2541,6 +2616,9 @@ class VFEModel(nn.Module):
         from vfe3 import metrics
         (d["relational_projected_cov_min_eigenvalue"],
          d["relational_projected_cov_max_condition"]) = self._projected_cov_extremes(cap)
+        (d["relational_projected_cov_min_eigenvalue_argmin_position"],
+         d["relational_projected_cov_min_eigenvalue_from_position_1"]) = self._projected_cov_positional_minimum(cap)
+        d.update(self._diagonal_projection_diagnostics(cap))
         d.update(self._covariance_scale_statistics(snapshot, layer_index, cap))
         unit_distance = self._self_map_unit_distance(self.relational_operators_by_layer[layer_index])
         d["relational_link_unit_distance_min"] = (float(unit_distance.min()) if unit_distance is not None
