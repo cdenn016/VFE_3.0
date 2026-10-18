@@ -80,12 +80,6 @@ def test_geometry_health_renders():
     fig = figs.plot_geometry_health(h); assert fig is not None; plt.close(fig)
 
 
-def test_estep_quality_renders():
-    h = _hist(("estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
-               "estep_r_phi_last"))
-    fig = figs.plot_estep_quality(h); assert fig is not None; plt.close(fig)
-
-
 def test_validation_sanity_renders_with_eval_cadence_gaps():
     # eval-cadence columns are NaN on non-eval rows; the dashboard must mask per series and still render.
     h = _hist(("generalization_gap", "pos_loss_ratio", "val_future_leakage", "val_row_sum_error",
@@ -112,7 +106,6 @@ def test_ppl_offset_renders():
 
 def test_new_figures_registered():
     for name, fn in (("geometry_health", figs.plot_geometry_health),
-                     ("estep_quality", figs.plot_estep_quality),
                      ("validation_sanity", figs.plot_validation_sanity),
                      ("optimizer_geometry", figs.plot_optimizer_geometry),
                      ("ppl_offset", figs.plot_ppl_offset)):
@@ -133,7 +126,7 @@ def test_save_figures_emits_dashboards(tmp_path):
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
     keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
-            "estep_f_drop", "estep_r_mu_last", "generalization_gap", "val_holonomy_wilson",
+            "generalization_gap", "val_holonomy_wilson",
             "phi_ridge_direction_cosine_mean", "weight_norm_mu", "grad_norm_mu")
     art.history = [{"step": s, **{k: 1.0 / (s + 1) + 0.1 for k in keys}} for s in range(12)]
     _save_figures(art, [3.0, 2.5], logging.getLogger("test"))

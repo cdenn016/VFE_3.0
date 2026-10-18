@@ -355,27 +355,15 @@ class FigureSkipped(RuntimeError):
     """
 
 
-def has_estep_iterates(cfg: object) -> bool:
-    r"""Whether the legacy shared-objective E-step figure family applies.
-
-    These figures trace the legacy shared-objective E-step. Predictive attention is a readout;
-    projected-gradient receiver iterations have a frozen incoming router and a separate receiver
-    objective, so the legacy trajectory and objective probes do not apply to either retained mode.
-    """
-    return False
-
-
 def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     r"""Skip reasons for figures that are identically trivial on the configured route.
 
     Returns ``{figure_name: reason}``; a name absent from the result is emitted normally. The single
     source of the route gates of audit k160 Section 4, used by :mod:`vfe3.viz.report` and available to
-    the training-time emitters (``attention_estep``, ``estep_*``, ``belief_condition``).
+    the training-time emitters (``belief_condition``).
 
     * ``holonomy_curvature`` always: the projected routes run flat transport, whose holonomy is the
       identity by construction, so the figure plots float32 roundoff.
-    * The legacy E-step family when :func:`has_estep_iterates` is false: the retained routes use
-      predictive readout or a frozen-router receiver objective rather than that shared objective.
     * ``belief_spectrum``, ``spd_ellipses`` and ``belief_condition`` when the covariance is frozen at
       encode (:func:`vfe3.metrics.covariance_frozen_at_encode`): they would describe the decayed
       token table, not beliefs.
@@ -385,13 +373,6 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     reasons["holonomy_curvature"] = (
         "flat transport: holonomy is the identity by construction, so the figure would "
         "plot float32 roundoff")
-    if not has_estep_iterates(cfg):
-        reason = (f"attention_mode={getattr(cfg, 'attention_mode', 'projected_predictive')!r}: "
-                  "legacy shared-objective E-step probes do not apply")
-        for name in ("iterate_trajectory", "belief_trajectories",
-                     "estep_character", "estep_quality", "estep_grad_norm_decomposition",
-                     "attention_estep"):
-            reasons[name] = reason
     if metrics.covariance_frozen_at_encode(cfg):
         reason = ("covariance frozen at encode: Sigma is the input-token table row, not a belief "
                   "covariance")
@@ -2126,60 +2107,6 @@ def plot_estep_grad_norm_decomposition(
         r"E-step $\|\nabla F\|_2$ (per component)", path)
 
 
-@register_figure("estep_convergence")
-@register_figure("iterate_trajectory")
-def plot_iterate_trajectory(
-    trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi
-
-    *,
-    diagonal:          Optional[bool] = None,
-    divergence_family: str = "renyi",
-    evidence:           Optional[Mapping[str, object]] = None,
-    path:               Optional[str] = None,
-):
-    r"""Belief motion across the configured E-step iterate trajectory.
-
-    The projected routes compute routing and readout in distinct conditional stages and define no shared free
-    energy, so panel A states that and the trace carries no free-energy series (audit 2026-10-16 F92). Panel B
-    is the per-iteration step length of the captured states, shown without treating small final movement as
-    convergence unless structured evidence establishes it.
-    """
-    from vfe3 import metrics
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
-    evidence = dict(evidence or {})
-    if diagonal is None:
-        diagonal = trace.get("diagonal_covariance")
-    res = metrics.estep_residuals(trace["mu"], trace["sigma"], trace["phi"], diagonal=diagonal)
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
-    axes[0].text(0.5, 0.5,
-                 "Shared free energy unavailable\nRouting and readout use distinct stages.\n"
-                 "The captured state movement is shown at right.",
-                 ha="center", va="center", transform=axes[0].transAxes, fontsize=9)
-    axes[0].set_axis_off()
-    trajectory_title = "E-step iterate trajectory"
-    if evidence.get("fixed_point_evidence"):
-        trajectory_title += " (fixed point established)"
-    elif evidence.get("descent_evidence"):
-        trajectory_title += " (descent established)"
-    axes[0].set(xlabel="E-step inner iteration",
-                ylabel=_objective_axis_text(objective_label, objective_units),
-                title=trajectory_title)
-    t = np.arange(1, _np(res["r_mu"]).shape[0] + 1)
-    _median_band(axes[1], t, _np(res["r_mu"]), _CB[0], r"$r_\mu$")
-    _median_band(axes[1], t, _np(res["r_sigma"]), _CB[1], r"$r_\Sigma$ (SPD)")
-    _median_band(axes[1], t, _np(res["r_phi"]), _CB[2], r"$r_\phi$")
-    if any(np.any(_np(res[key]) > 0) for key in ("r_mu", "r_sigma", "r_phi")):
-        axes[1].set_yscale("log")
-    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length",
-                title="Final-iterate movement")
-    axes[1].legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-plot_estep_convergence = plot_iterate_trajectory
-
-
 def _unavailable_probe_figure(record: Mapping[str, object], path: Optional[str]) -> object:
     """Render the recorded reason instead of an empty chart or an incorrect missing-data claim."""
     import textwrap
@@ -2189,53 +2116,6 @@ def _unavailable_probe_figure(record: Mapping[str, object], path: Optional[str])
     ax.text(0.5, 0.35, textwrap.fill(str(record.get("reason", "probe unavailable")), 66),
             ha="center", va="center", fontsize=9, transform=ax.transAxes)
     ax.set_axis_off()
-    return _save(fig, path)
-
-
-@register_figure("estep_character")
-def plot_estep_character(
-    record: Mapping[str, object],
-
-    *,
-    path:   Optional[str] = None,
-):
-    r"""Plot how far the belief E-step moves the belief with depth.
-
-    The relative belief displacement per depth, with the direction cosine against the first step
-    in the title. A flat displacement curve is one aggregation, not convergent inference.
-
-    Raises :class:`FigureSkipped` when the probe is unavailable or covers only the single configured
-    readout (``depth_sweep_available`` false): there are no E-step iterates, and the one point is
-    the layer-0 message-to-prior ratio, which ``diagnostics/residual_ratio.csv`` reports per layer and
-    per token.
-    """
-    if record.get("available") is False:
-        raise FigureSkipped(str(record.get("reason", "E-step character probe unavailable")))
-    if record.get("depth_sweep_available") is False:
-        raise FigureSkipped(
-            "single configured readout: no E-step iterates; the layer-0 message-to-prior ratio is "
-            "reported per layer by diagnostics/residual_ratio.csv")
-    points = [p for p in record.get("points", []) if p.get("rel_displacement") is not None]
-    fig, ax_move = plt.subplots(figsize=(5.6, 3.6))
-    if not points:
-        ax_move.text(0.5, 0.5, "no belief displacement recorded", ha="center", va="center",
-                     transform=ax_move.transAxes, fontsize=9)
-        ax_move.set_axis_off()
-        return _save(fig, path)
-    depths = np.asarray([p["belief_depth"] for p in points], dtype=float)
-    displacement = np.asarray([p["rel_displacement"] for p in points], dtype=float)
-    ax_move.plot(depths, displacement, "o-", color=_CB[0], label=r"$\|\Delta\mu\|/\|\mu_p\|$")
-    trained_depth = float(record.get("trained_depth", np.nan))
-    if np.isfinite(trained_depth):
-        ax_move.axvline(trained_depth, color="#555555", ls=":", lw=1.0, label="trained depth")
-    cosines = [p.get("cos_dir_vs_step1") for p in points if p.get("cos_dir_vs_step1") is not None]
-    if cosines:
-        ax_move.set_title(f"E-step character  (cos(dir, step 1) = {cosines[-1]:+.3f})")
-    else:
-        ax_move.set_title("E-step character")
-    ax_move.set(xlabel="belief E-step iterations", ylabel="relative belief displacement")
-    ax_move.legend(frameon=False, fontsize=8, loc="center right")
-    fig.tight_layout()
     return _save(fig, path)
 
 
@@ -2959,39 +2839,6 @@ GEOMETRY_HEALTH_COLUMNS = (
     "attn_entropy_min", "attn_entropy_collapsed_heads")
 
 
-@register_figure("estep_quality")
-def plot_estep_quality(
-    history: Dict,                       # step + estep_f_drop / nondecreasing-frac / belief residuals
-
-    *,
-    path:    Optional[str] = None,
-):
-    r"""E-step inference-quality dashboard over training.
-
-    Direct evidence for what the inner E-step contributes per eval: the free-energy drop across the
-    inner loop (``estep_f_drop`` < 0 = F descended), the fraction of inner iterations that did NOT
-    decrease F (a descent-quality readout for parallel mean-field -- EXPECTED nonzero, not a failure
-    flag), and the last-iteration belief-change residuals for ``mu`` / ``Sigma`` / ``phi`` (the
-    convergence certificate). Complements the standalone E-step convergence-trend curve."""
-    panels = [
-        {"title": "E-step free-energy drop", "ylabel": r"$F_{\mathrm{end}}-F_{\mathrm{start}}$",
-         "series": [("estep_f_drop", "F drop", _CB[0])]},
-        {"title": "Inner-loop monotonicity", "ylabel": "nondecreasing fraction",
-         "series": [("estep_f_nondecreasing_frac", "nondecreasing frac", _CB[1])]},
-        {"title": "Configured final movement", "ylabel": "step length", "logy": True, "series": [
-            ("estep_r_mu_last", r"$q_{T-1}\to q_T$: $r_\mu$", _CB[0]),
-            ("estep_r_sigma_last", r"$q_{T-1}\to q_T$: $r_\Sigma$", _CB[1]),
-            ("estep_r_phi_last", r"$q_{T-1}\to q_T$: $r_\phi$", _CB[2])]},
-        {"title": "One-step-ahead fixed-point residual", "ylabel": "residual", "logy": True,
-         "series": [
-            ("estep_fp_mu_rms", r"$q_T\to q_{T+1}$: $\mu$ RMS", _CB[0]),
-            ("estep_fp_sigma_rms", r"$q_T\to q_{T+1}$: $\Sigma$ RMS", _CB[1]),
-            ("estep_fp_phi_rms", r"$q_T\to q_{T+1}$: $\phi$ RMS", _CB[2]),
-            ("estep_fp_kl", r"$\mathrm{KL}(q_{T+1}\Vert q_T)$", _CB[3])]},
-    ]
-    return _history_dashboard(history, panels, "E-step inference quality", path, ncols=4)
-
-
 @register_figure("validation_sanity")
 def plot_validation_sanity(
     history: Dict,                       # step + held-out generalization / positional / attention / geometry columns
@@ -3707,50 +3554,6 @@ def plot_ln3_symmetry_breaking(
                 width=0.4, color=_CB[2], label="learned")
     axes[2].set(xticks=xs, xticklabels=labels, ylabel="mean attention mass", title="Structured-head scores")
     axes[2].legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-@register_figure("belief_trajectories")
-def plot_belief_trajectories(
-    trace:       Dict,                   # e_step_belief_trace output (mu (T+1,N,K), ...)
-    layer_trace: Optional[Dict] = None,  # across_layer_belief_trace output (d_ai, effective_rank)
-
-    *,
-    path:        Optional[str] = None,
-):
-    r"""F4: belief trajectories across E-step iterations (mean-space path) and across layers (SPD).
-
-    Panel A: a shared-PCA 2-D quiver of the belief means as inference iterates (arrows mu_t ->
-    mu_{t+1}, colored by token position). Panel B: the across-layer cumulative affine-invariant SPD
-    geodesic distance and mean effective rank. The across-training axis is out of scope (needs
-    per-checkpoint replay).
-    """
-    mu = _np(trace["mu"])                                         # (T+1, N, K)
-    t1, n, k = mu.shape
-    flat = mu.reshape(-1, k) - mu.reshape(-1, k).mean(0)
-    _, _, vt = np.linalg.svd(flat, full_matrices=False)
-    proj = (flat @ vt[:2].T).reshape(t1, n, 2)
-    ncol = 2 if layer_trace is not None else 1
-    fig, axes = plt.subplots(1, ncol, figsize=(5.0 * ncol, 4.2), squeeze=False)
-    ax = axes[0][0]
-    cmap = plt.cm.viridis(np.linspace(0, 1, n))
-    for j in range(n):
-        ax.plot(proj[:, j, 0], proj[:, j, 1], "-", color=cmap[j], lw=0.8, alpha=0.7)
-        ax.quiver(proj[:-1, j, 0], proj[:-1, j, 1],
-                  np.diff(proj[:, j, 0]), np.diff(proj[:, j, 1]),
-                  angles="xy", scale_units="xy", scale=1, color=cmap[j], width=0.004, alpha=0.7)
-    ax.scatter(proj[0, :, 0], proj[0, :, 1], s=14, color="#333333", marker="o", label="init")
-    ax.set(xlabel="PC 1", ylabel="PC 2", title="Belief-mean path over E-step iterations")
-    if layer_trace is not None:
-        axb = axes[0][1]
-        layers = np.arange(_np(layer_trace["d_ai"]).size)
-        axb.plot(layers, _np(layer_trace["d_ai"]), "o-", color=_CB[0], label=r"$d_{AI}(\Sigma^0,\Sigma^l)$")
-        axb.set(xlabel="layer", ylabel="cumulative SPD distance", title="Belief geometry vs depth")
-        axc = axb.twinx()
-        axc.plot(layers, _np(layer_trace["effective_rank"]), "s--", color=_CB[1])
-        axc.set_ylabel("mean effective rank", color=_CB[1])
-        axb.legend(fontsize=8, frameon=False, loc="upper left")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -5737,12 +5540,6 @@ PUB_LABELS: Dict[str, str] = {
     "nonfinite_frac":          "non-finite fraction",
     "attn_entropy_min":        r"min row entropy $\min_{i,h}H(\beta)$",
     "attn_entropy_collapsed_heads": "collapsed-head count",
-    # -- E-step inference quality --
-    "estep_f_drop":            r"E-step $F_{\mathrm{end}}-F_{\mathrm{start}}$",
-    "estep_f_nondecreasing_frac": "E-step nondecreasing fraction",
-    "estep_r_mu_last":         r"E-step residual $r_\mu$ (last)",
-    "estep_r_sigma_last":      r"E-step residual $r_\Sigma$ (last, SPD)",
-    "estep_r_phi_last":        r"E-step residual $r_\phi$ (last)",
     # -- held-out validation sanity --
     "pos_loss_ratio":          r"positional loss ratio $\mathrm{CE}_{\mathrm{last}}/\mathrm{CE}_{\mathrm{first}}$",
     "val_future_leakage":      "causal future leakage (max)",

@@ -99,9 +99,10 @@ def _write_residual_ratio(path: Path, steps=(30, 60, 90), n_layers=3, ln=True) -
 # (1) route gates
 # ---------------------------------------------------------------------------
 
-_ESTEP_FAMILY = {"iterate_trajectory", "belief_trajectories",
-                 "estep_character", "estep_quality", "estep_grad_norm_decomposition",
-                 "attention_estep"}
+# The legacy E-step figure family was removed (audit 2026-10-17 item 71); estep_grad_norm_decomposition
+# is kept and ungated because full_link fills its columns.
+_REMOVED_ESTEP_FAMILY = ("iterate_trajectory", "belief_trajectories", "estep_character", "estep_quality")
+_ESTEP_FAMILY = {*_REMOVED_ESTEP_FAMILY, "estep_grad_norm_decomposition", "attention_estep"}
 _SIGMA_FAMILY = {"belief_spectrum", "spd_ellipses", "belief_condition"}
 
 
@@ -111,39 +112,33 @@ def test_route_gates_flat_projected_frozen():
                      gauge_group="block_glk")
     reasons = figs.route_figure_skip_reasons(cfg)
     assert "flat" in reasons["holonomy_curvature"]
-    assert _ESTEP_FAMILY <= set(reasons)
-    assert "projected_predictive" in reasons["iterate_trajectory"]
+    assert _ESTEP_FAMILY.isdisjoint(reasons)
     assert _SIGMA_FAMILY <= set(reasons)
     assert "frozen at encode" in reasons["belief_spectrum"]
-    assert not figs.has_estep_iterates(cfg)
+    assert not hasattr(figs, "has_estep_iterates")
 
 
-def test_route_gates_gradient_keeps_sigma_but_skips_legacy_objective_figures() -> None:
+def test_route_gates_gradient_keeps_sigma_and_estep_gradient_figure() -> None:
     cfg = SimpleNamespace(attention_mode="projected_gradient", n_e_steps=2,
                           skip_belief_sigma_update=False)
     reasons = figs.route_figure_skip_reasons(cfg)
-    assert _ESTEP_FAMILY <= set(reasons)
+    assert "estep_grad_norm_decomposition" not in reasons
     assert _SIGMA_FAMILY.isdisjoint(reasons)
-    assert not figs.has_estep_iterates(cfg)
 
 
 def test_route_gates_zero_estep_and_frozen_gradient() -> None:
     cfg = SimpleNamespace(attention_mode="projected_gradient", n_e_steps=0,
                           skip_belief_sigma_update=True)
     reasons = figs.route_figure_skip_reasons(cfg)
-    assert "legacy shared-objective E-step probes do not apply" in reasons["iterate_trajectory"]
+    assert _ESTEP_FAMILY.isdisjoint(reasons)
     assert _SIGMA_FAMILY <= set(reasons) and "holonomy_curvature" in reasons
 
 
-def test_estep_probe_figures_skip_instead_of_drawing_placeholders(tmp_path):
-    unavailable = {"available": False, "reason": "only the configured single readout is supported"}
-    with pytest.raises(figs.FigureSkipped, match="single readout"):
-        figs.plot_estep_character(unavailable, path=str(tmp_path / "c.png"))
-    single = {"available": True, "depth_sweep_available": False,
-              "points": [{"belief_depth": 1, "rel_displacement": 737.0}]}
-    with pytest.raises(figs.FigureSkipped, match="residual_ratio"):
-        figs.plot_estep_character(single, path=str(tmp_path / "c.png"))
-    assert not list(tmp_path.iterdir())
+def test_legacy_estep_figures_are_removed() -> None:
+    for name in _REMOVED_ESTEP_FAMILY:
+        assert not hasattr(figs, f"plot_{name}"), name
+        assert name not in figs._FIGURES, name
+    assert callable(figs.plot_estep_grad_norm_decomposition)
 
 
 def test_write_figure_logs_skip_reason_and_writes_nothing(tmp_path, caplog):
@@ -183,13 +178,12 @@ def test_report_gates_route_trivial_figures_and_emits_history_figures(tmp_path, 
                                           loader=[(tokens, targets)], device=torch.device("cpu"),
                                           max_sequences=1)
     names = {path.name for path in written}
-    assert called == []                          # the E-step traces are not replayed on this route
-    for name in ("holonomy_curvature", "iterate_trajectory", "belief_trajectories",
-                 "belief_spectrum", "spd_ellipses"):
+    assert called == []                          # no E-step trace is replayed for the report
+    for name in ("holonomy_curvature", "belief_spectrum", "spd_ellipses"):
         assert f"{name}.png" not in names
         assert f"figure '{name}' skipped (" in caplog.text
+    assert {"iterate_trajectory.png", "belief_trajectories.png"}.isdisjoint(names)
     assert "flat transport: holonomy is the identity" in caplog.text
-    assert "legacy shared-objective E-step probes do not apply" in caplog.text
     assert {"head_block_norms.png", "numerical_trust.png", "per_layer_diagnostics.png",
             "sigma_ce_scatter.png", "reliability_diagram.png"} <= names
     assert {f"{name}.png" for name in report.HISTORY_FIGURES} <= names

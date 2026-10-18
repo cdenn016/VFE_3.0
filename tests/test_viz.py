@@ -22,11 +22,9 @@ from vfe3.viz.figures import (
     plot_attention_heatmap,
     plot_attention_structure,
     plot_belief_spectrum,
-    plot_belief_trajectories,
     plot_capacity_scaling,
     plot_covariance_ellipses,
     plot_estep_capacity,
-    plot_estep_convergence,
     plot_free_energy_codescent,
     plot_free_energy_decomposition,
     plot_gauge_equivariance,
@@ -402,19 +400,6 @@ def test_plot_estep_grad_norm_decomposition_saves(tmp_path):
     assert callable(get_figure("estep_grad_norm_decomposition"))
 
 
-def test_plot_estep_convergence_saves(tmp_path):
-    T, N, K, _ = _T()
-    trace = {"mu": torch.randn(T, N, K).cumsum(0), "sigma": torch.rand(T, N, K) + 0.3,
-             "phi": torch.randn(T, N, 2)}
-    p = tmp_path / "f2.png"
-    fig = plot_estep_convergence(trace, path=str(p))
-    titles = [axis.get_title().lower() for axis in fig.axes]
-    assert not any("convergence" in title or "fixed point" in title or "descent" in title
-                   for title in titles)
-    plt.close(fig)
-    assert _saved_nonempty(p)
-
-
 def test_plot_ln3_symmetry_breaking_saves(tmp_path):
     _, N, K, H = _T()
     def arm():
@@ -422,15 +407,6 @@ def test_plot_ln3_symmetry_breaking_saves(tmp_path):
                 "omega": torch.randn(N, N, K, K), "beta": torch.softmax(torch.randn(H, N, N), dim=-1)}
     p = tmp_path / "f3.png"
     fig = plot_ln3_symmetry_breaking(arm(), arm(), period=3, path=str(p)); plt.close(fig)
-    assert _saved_nonempty(p)
-
-
-def test_plot_belief_trajectories_saves(tmp_path):
-    T, N, K, _ = _T()
-    trace = {"mu": torch.randn(T, N, K).cumsum(0), "sigma": torch.rand(T, N, K) + 0.3, "phi": torch.randn(T, N, 2)}
-    layer = {"d_ai": torch.tensor([0.0, 0.5, 0.9]), "effective_rank": torch.tensor([3.0, 2.5, 2.0])}
-    p = tmp_path / "f4.png"
-    fig = plot_belief_trajectories(trace, layer, path=str(p)); plt.close(fig)
     assert _saved_nonempty(p)
 
 

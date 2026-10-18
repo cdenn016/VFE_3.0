@@ -41,10 +41,6 @@ def test_predictive_trace_uses_real_states_without_conditional_costs() -> None:
     torch.testing.assert_close(state["sigma"], snapshot.layer_converged[0].sigma[0])
     torch.testing.assert_close(state["energy"], snapshot.conditional_capture["score_energy_pre"])
     assert "selfdiv_klmax_frac" not in state["guard"]
-    fig = figures.plot_iterate_trajectory(trace)
-    assert any("unavailable" in t.get_text().lower() for ax in fig.axes for t in ax.texts)
-    assert fig.axes[-1].lines
-    figures.plt.close(fig)
 
 
 def test_predictive_mechanism_probes_use_configured_forward() -> None:
@@ -52,7 +48,7 @@ def test_predictive_mechanism_probes_use_configured_forward() -> None:
     tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
     before = {k: v.clone() for k, v in model.state_dict().items()}
     rng = torch.get_rng_state().clone()
-    character = collect_estep_character(model, tokens, depths=[1, 2, 4])
+    character = collect_estep_character(model, tokens)
     assert character["available"] is True
     assert [p["belief_depth"] for p in character["points"]] == [1]
     assert "pair_precision_share" not in character["points"][0]
@@ -152,7 +148,7 @@ def test_existing_unavailable_probes_are_refreshed_without_changing_valid_record
         record = json.loads((tmp_path / f"{name}.json").read_text())
         assert record["available"] is True
         assert record["report_replay"]["split"] == "test"
-        if name == "estep_character":                 # single readout: record kept, figure skipped
+        if name == "estep_character":                 # single readout: record kept, no figure
             assert not (tmp_path / f"{name}.png").exists()
         else:
             assert (tmp_path / f"{name}.png").stat().st_size > 0

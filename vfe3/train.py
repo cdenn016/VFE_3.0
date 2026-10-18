@@ -1570,10 +1570,6 @@ _VAL_DIAG_KEYS = (
     "val_attn_collapsed_heads",        # per-head mean over the diagnostic windows (_collapsed_head_count)
     "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
-    "estep_f_drop", "estep_f_nondecreasing_frac", "estep_f_comparisons",
-    "estep_r_mu_last", "estep_r_sigma_last",
-    "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
-    "estep_fp_phi_rms", "estep_beta_js", "estep_alpha_rms_delta",
     "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_gauge_invariant_spread",
@@ -3529,9 +3525,9 @@ def _val_diagnostics_one(
     ``val_inner_alignment_energy_total``), because routing plus readout does not define the shared
     stationary objective (``diagnose_canonical_free_energy`` fills them, per token, with the canonical
     free energy at the beliefs the last router read, and adds ``val_canonical_beta_tv``,
-    ``val_canonical_self_weight``, ``val_canonical_total_output`` and ``val_canonical_total_delta``); the E-step
-    certificate (``estep_*`` except ``estep_f_comparisons = 0``),
-    because the route performs one pre-update readout with no iterate sequence.
+    ``val_canonical_self_weight``, ``val_canonical_total_output`` and ``val_canonical_total_delta``).
+    No E-step certificate column is written, because the route performs one pre-update readout with
+    no iterate sequence (audit 2026-10-17 item 71).
     """
     import torch.nn.functional as F
 
@@ -3559,8 +3555,6 @@ def _val_diagnostics_one(
                    val_belief_coupling=vd["belief_coupling"], val_attention_entropy=vd["attention_entropy"],
                    val_inner_alignment_energy_total=vd["total"])
         out.update({f"val_{key}": vd[key] for key in CANONICAL_DIAGNOSTIC_KEYS})
-    out["estep_f_comparisons"] = 0.0
-    out["estep_f_drop"] = float("nan")
     if diagnostic_targets is not None:
         out["val_relational_snapshot_ce"] = float(F.cross_entropy(
             snapshot.logits.reshape(-1, snapshot.logits.shape[-1]).float(),
@@ -3609,33 +3603,10 @@ def _save_eval_attention_maps(
     that measured DIFFERENT objects under the same name. Entry is the beta the forward actually used
     (measured TV(forward, converged) up to 0.96 per row, TV(forward, entry) == 0.0), so the figure
     follows the metric rather than the other way round. Scoring at entry cannot come from a snapshot,
-    hence the replay; the converged and prior arms remain available under ``attention_estep/``.
-
-    The ``attention_estep/`` set is a REPLAY (audit 2026-07-26 R-3) for the same reason. A replay
-    failure is swallowed like every other figure -- the shipped maps and the run itself do not
-    depend on it.
+    hence the replay.
     """
     entry_maps = model.attention_maps(token_ids, score_at="entry")
     artifacts.save_attention_maps(step, entry_maps, logger=logger)
-    try:
-        from vfe3.viz.figures import route_figure_skip_reasons
-
-        skip = route_figure_skip_reasons(model.cfg).get("attention_estep")
-    except Exception:                                        # noqa: BLE001 - no gate: replay as before
-        skip = None
-    if skip is not None:
-        logger.info("attention_estep skipped (%s)", skip)
-        return
-    try:
-        estep_maps = torch.stack([
-            entry_maps,
-            model.attention_maps(token_ids, score_at="converged"),
-            model.attention_maps(token_ids, score_at="prior"),
-        ])                                                   # (3, L, H, N, N)
-    except Exception as exc:                                 # noqa: BLE001 - figures are best-effort
-        logger.warning("E-step attention replay failed (%s); attention_estep skipped", exc)
-        return
-    artifacts.save_estep_attention_maps(step, estep_maps, logger=logger)
 
 
 class TrainingTerminalState(NamedTuple):

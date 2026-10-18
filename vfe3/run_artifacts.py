@@ -278,28 +278,6 @@ def _count_finalize_failure(
     failures[name] = failures.get(name, 0) + 1
 
 
-def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None) -> Dict[str, object]:
-    """Publish an explicit unavailable record instead of running an incompatible depth/objective probe."""
-    return {
-        "available": False,
-        "probe": probe,
-        "inference_semantics": ("relational_full_link_frozen_filtering"
-                                if cfg is not None and cfg.relational_readout_mode == "full_link_update"
-                                else f"relational_minimal_agent_{cfg.minimal_agent_inference}"
-                                if cfg is not None and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
-                                else "relational_predictive_content"
-                                if cfg is not None and cfg.relational_readout_mode == "predictive_content"
-                                else "projected_attention"),
-        "reason": (("only the configured receiver episode is supported; inference-depth sweeps are unavailable"
-                    if cfg is not None and cfg.relational_readout_mode == "full_link_update"
-                    else "only the configured single readout is supported; inference-depth sweeps are unavailable")
-                   if "depth" in probe or probe == "zero_e_steps_counterfactual"
-                   else "routing and readout do not define the legacy shared stationary free-energy objective"),
-        "points": [],
-        "stages": {},
-    }
-
-
 def _non_vfe_skipped_analyses(model: torch.nn.Module) -> Dict[str, str]:
     r"""The VFE-only finalize analyses a model of another family skips, each with its reason."""
     family = model_family_of(model)
@@ -1053,21 +1031,7 @@ def _run_attention_maps_isolated(
     r"""Render periodic attention maps in a child that may safely suffer a native plotting abort."""
     try:
         tensor = maps.detach().cpu() if isinstance(maps, torch.Tensor) else torch.as_tensor(maps)
-        if channel == "estep":
-            # (3, L, H, N, N): the E-step's own pattern, the converged re-score, and the prior
-            # alone, stacked so one worker call renders the heatmaps AND the distance profile that
-            # compares them (audit 2026-07-26 R-3). Written to attention_estep/, never to
-            # attention/ -- the shipped maps are left exactly as they are.
-            if tensor.ndim != 5 or tensor.shape[0] != 3:
-                raise ValueError(
-                    f"estep maps must be (3, L, H, N, N); got {tuple(tensor.shape)}"
-                )
-            expected = [
-                run_dir / "attention_estep" / f"step_{step}_layer{layer}_head{head}.png"
-                for layer in range(tensor.shape[1])
-                for head in range(tensor.shape[2])
-            ] + [run_dir / "attention_estep" / f"step_{step}_profile.png"]
-        elif channel == "beta":
+        if channel == "beta":
             if tensor.ndim == 2:
                 tensor = tensor[None, None]
             elif tensor.ndim == 3:
@@ -2177,41 +2141,6 @@ class RunArtifacts:
             self.run_dir,
             logger or logging.getLogger(__name__),
             channel="beta",
-            step=step,
-        )
-
-    def save_estep_attention_maps(
-        self,
-        step:   int,
-        maps:   'Optional[torch.Tensor]',     # (3, L, H, N, N) entry / converged / prior, or None
-        logger: Optional[logging.Logger] = None,
-    ) -> Optional[List[Path]]:
-        r"""The attention the E-step ACTUALLY used, written beside the shipped maps.
-
-        Writes ``attention_estep/step_<N>_layer<l>_head<h>.png`` (the ENTRY-belief beta -- the
-        pattern the E-step's first iteration aggregated with) plus one
-        ``attention_estep/step_<N>_profile.png`` per step: row-mean beta against key distance
-        ``|i - j|``, with the converged re-score and the attention prior overlaid on the same axes.
-
-        The shipped ``attention/`` heatmaps score at each block's OUTPUT belief, after the E-step
-        has moved it and after ``cg_coupling``/``block_norm`` -- a post-hoc re-score, not the
-        pattern that produced the aggregation (audit 2026-07-26 R-3, measured max row difference
-        1.0 on a trained checkpoint). Both are kept: the converged map is what ``diagnostics``
-        reports, so it stays the reference, and this is the mechanism.
-
-        The profile panel is the one that makes positional pathology legible -- a rotary schedule
-        whose kernel revives at long lag shows up as off-diagonal bumps here that are invisible in
-        a log-scaled heatmap, and a beta that has collapsed onto its prior shows up as the two
-        curves lying on top of each other. ``maps`` is None -> no-op. Errors are logged and
-        swallowed, never fatal to the run.
-        """
-        if maps is None:
-            return None
-        return _run_attention_maps_isolated(
-            maps,
-            self.run_dir,
-            logger or logging.getLogger(__name__),
-            channel="estep",
             step=step,
         )
 
@@ -3749,14 +3678,6 @@ def _cost_model_fields(
     return out
 
 
-def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
-    """Name the endpoint-delta artifact without claiming unproven iterate behavior."""
-    title = "E-step endpoint delta"
-    if evidence.get("descent_evidence"):
-        title += " (descent established)"
-    return {"filename": "estep_endpoint_delta.png", "title": title}
-
-
 
 
 def _scheduler_metadata(
@@ -4116,14 +4037,9 @@ def finalize_run(
                     "evaluated_step": final_step, **final_val_fields,
                     "decode_tau_eff": decode_tau_eff})
 
-    # Held-out inference-depth counterfactual, always attempted when test metrics are available. This does not replace any selected headline
-    # metric: it is published only under the diagnostic namespace after a complete successful probe.
-    if vfe_model:
-        # Projected routes run one configured readout/receiver episode: there is no depth to zero
-        # and no shared stationary free energy, so both records are published as unavailable.
-        results["diagnostics"]["zero_e_steps_counterfactual"] = _conditional_unavailable_probe("zero_e_steps_counterfactual", cfg=model.cfg)
-        results["diagnostics"]["legacy_reduced_free_energy"] = _conditional_unavailable_probe("legacy_reduced_free_energy", cfg=model.cfg)
-
+    # No inference-depth counterfactual, depth-sensitivity sweep or legacy reduced free energy is recorded:
+    # the projected routes run one configured readout or receiver episode, so there is no depth to vary
+    # and no shared stationary free energy (audit 2026-10-17 item 74).
     depth_loader = val_loader if val_loader is not None else test_loader
     # Mechanism records are standard outputs. The sole figure-policy switch controls only the
     # embedding/clustering family downstream in the isolated report worker; it never suppresses
@@ -4141,23 +4057,11 @@ def finalize_run(
             logger.warning("diagnostic batch unavailable (%s); mechanism probes skipped", exc)
             _count_finalize_failure(artifacts, "mechanism_probe_batch")
     if _depth_tokens is not None:
-        try:
-            _depth_record = collect_estep_depth_sensitivity(
-                model,
-                _depth_tokens,
-                _depth_targets,
-                depths=(0, 1, 2, 3, 5, 8),
-            )
-            artifacts.save_json("estep_depth_sensitivity.json", _depth_record)
-        except Exception as exc:
-            logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
-            _count_finalize_failure(artifacts, "estep_depth_sensitivity")
         _character_record = None
         _beta_record = None
         _context_record = None
         try:
-            _character_record = collect_estep_character(
-                model, _depth_tokens, depths=(1, 2, 3, 5, 8))
+            _character_record = collect_estep_character(model, _depth_tokens)
             artifacts.save_json("estep_character.json", _character_record)
         except Exception as exc:
             logger.warning("estep character probe failed (%s); skipped", exc)
@@ -4271,7 +4175,7 @@ def finalize_run(
         "diagnostics":  results["diagnostics"],
         # No estep_final_iterate_f_per_token / estep_final_f_per_token / estep_iterate_evidence: nothing on the
         # projected routes produces an E-step iterate sequence, so those keys were always null (audit 2026-10-16
-        # F86); the legacy_reduced_free_energy diagnostic records why the shared F is unavailable.
+        # F86).
         "scheduler": _scheduler_metadata(
             min_lr_frac=cfg.min_lr_frac,
             base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
@@ -4357,22 +4261,6 @@ def finalize_run(
     return results
 
 
-@torch.no_grad()
-def collect_estep_depth_sensitivity(
-    model:   torch.nn.Module,
-    tokens:  torch.Tensor,
-    targets: torch.Tensor,
-    depths:  Iterable[int],
-) -> Dict[str, object]:
-    r"""Current-weight inference-depth sensitivity, published as an explicit unavailable record.
-
-    The projected routes run only their configured readout or receiver episode and define no shared
-    free energy, so no depth sweep is executed; ``tokens``, ``targets`` and ``depths`` are accepted
-    for call-site compatibility.
-    """
-    return _conditional_unavailable_probe("collect_estep_depth_sensitivity", cfg=model.cfg)
-
-
 def _log_mechanism_diagnostics(
     logger:    'logging.Logger',
     character: Optional[Dict[str, object]],
@@ -4426,18 +4314,14 @@ def _log_mechanism_diagnostics(
 def collect_estep_character(
     model:  torch.nn.Module,
     tokens: torch.Tensor,
-    depths: Iterable[int],
 ) -> Dict[str, object]:
     r"""How far the configured projected readout or receiver episode moves the belief.
 
     ``rel_displacement`` is :math:`\lVert\mu_q-\mu_p\rVert/\lVert\mu_p\rVert` between the first
     and last captured states of one diagnostic snapshot (pre-transform: before CG, norm
     and MLP). Only the configured depth is measured, so ``depth_sweep_available`` is False and
-    ``cos_dir_vs_step1`` is None; ``depths`` is validated for call-site compatibility.
+    ``cos_dir_vs_step1`` is None.
     """
-    requested = list(depths)
-    if any(type(depth) is not int or depth < 1 for depth in requested):
-        raise ValueError(f"depths must contain integers >= 1, got {requested!r}")
     snapshot = model.build_diagnostic_snapshot(tokens)
     mu_p, mu_q = snapshot.trace_states[0].mu, snapshot.trace_states[-1].mu
     denominator = float(mu_p.norm())
@@ -5582,7 +5466,7 @@ def _save_figures(
                    else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
         eg_present = [k for k in eg_keys
                       if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
-        if eg_present and "estep_grad_norm_decomposition" not in route_skips:
+        if eg_present:
             eg_rows = [r for r in artifacts.history
                        if all(k in r and math.isfinite(r[k]) for k in eg_present)]
             if eg_rows:
@@ -5597,14 +5481,6 @@ def _save_figures(
                 title="Belief covariance conditioning", color=figs._CB[4 % len(figs._CB)],
                 logy=True, smooth=max(5, len(cy) // 80),
                 path=str(run / "belief_condition.png"))
-            figs.plt.close(fig)
-        ex, ey = _aligned("estep_f_drop")
-        if ey:
-            _endpoint_artifact = _estep_endpoint_artifact({})
-            fig = figs.plot_trajectory(
-                ey, ex, ylabel=r"$F_{\mathrm{end}}-F_{\mathrm{start}}$ (inner E-step)",
-                title=_endpoint_artifact["title"], color=figs._CB[2 % len(figs._CB)],
-                median_line=True, path=str(run / _endpoint_artifact["filename"]))
             figs.plt.close(fig)
         # Free-energy figures: the per-token budget decomposition (snapshot + early/mid/late evolution)
         # and, separately, the final-iterate objective/CE relationship over training. Both need every plotted term
@@ -5672,16 +5548,6 @@ def _save_figures(
                 family=getattr(getattr(artifacts, "cfg", None), "family", None),
                 path=str(run / "geometry_health.png"),
             )
-            figs.plt.close(fig)
-        # E-step inference-quality dashboard: the inner-loop F-drop, the nondecreasing fraction, and the
-        # last-iter belief residuals -- the E-step evidence the single estep_f_drop curve does not show.
-        hist_estep = _hist_subset((
-            "estep_f_drop", "estep_f_nondecreasing_frac",
-            "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last",
-            "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms", "estep_fp_phi_rms",
-            "estep_beta_js", "estep_alpha_rms_delta"))
-        if hist_estep and "estep_quality" not in route_skips:
-            fig = figs.plot_estep_quality(hist_estep, path=str(run / "estep_quality.png"))
             figs.plt.close(fig)
         # Held-out validation-sanity dashboard: the per-eval probes (_val_diagnostics) that were CSV-only
         # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
