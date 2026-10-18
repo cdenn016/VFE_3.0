@@ -459,7 +459,10 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
     assert any("Sample:" in r.message for r in caplog.records)
 
 
-def test_train_vfe3_clickrun_importable_and_runs_one_step(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_train_vfe3_imports_and_a_local_operating_point_runs_one_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The launcher module imports, and its config construction runs one step on a local test operating point that
+    replaces ``train_vfe3.config``; the launcher dictionary itself is not read here (the live route is covered by
+    tests/test_live_route_profile.py; audit 2026-10-17, item 42)."""
     import train_vfe3
 
     # Exercise the launcher's config construction with a complete local operating point.

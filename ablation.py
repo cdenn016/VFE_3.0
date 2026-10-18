@@ -344,17 +344,17 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-    predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)
+    predictive_covariance            = 'moment_matched',  # "passthrough" | "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) | "spread_corrected" (minimal_agent mean_field: plus the label spread)
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
         
-    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
+    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_query: projected_predictive only; noisy_key: kernel readout, temperature 1)
     relational_receiver_measurement  = "inverse",             # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
-    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
+    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
     minimal_agent_inference          = "mean_field",         # "exact" | "mean_field" (minimal_agent only)
@@ -424,7 +424,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #          Gauge Group
     #################################
     gauge_transport                  = "on",           # "on" | "off" | "frozen" (random fixed frame)
-    gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "block_so" | "block_co" | "block_glmc" (block_glmc: even d_head)
+    gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
     gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
     
     group_n                          = None,                # so_n only: the N of SO(N), int >= 2; None for every other group
@@ -1791,6 +1791,37 @@ def _require_gauge_covariant(cfg: VFE3Config) -> None:
         failures = gauge_covariance_failures(cfg)
         if failures:
             raise ValueError(f"fully_gauge_covariant=True: this arm breaks gauge covariance ({', '.join(failures)})")
+
+
+def baseline_default_divergence(
+    launcher: Optional[Dict[str, Any]] = None,   # train_vfe3.config; None imports it
+) -> Dict[str, Tuple[Any, Any]]:                 # field -> (VFE3Config default the baseline runs, launcher value)
+    r"""Fields ``BASELINE_CONFIG`` omits, so that it runs the ``VFE3Config`` default, while the launcher
+    ``train_vfe3.config`` sets a different value (audit 2026-10-17, item 53).
+
+    Neither dictionary is changed; :func:`main` prints the result at startup so that the divergence between the two
+    entry points is not silent.
+    """
+    if launcher is None:
+        import train_vfe3
+        launcher = train_vfe3.config
+    defaults = {f.name: f.default for f in dataclass_fields(VFE3Config) if f.default is not MISSING}
+    return {name: (defaults[name], value) for name, value in launcher.items()
+            if name in defaults and name not in BASELINE_CONFIG and value != defaults[name]}
+
+
+def _print_baseline_default_divergence() -> None:
+    r"""Print :func:`baseline_default_divergence` at startup (a note, never a refusal)."""
+    try:
+        divergence = baseline_default_divergence()
+    except Exception as exc:                     # the launcher could not be imported: say so and go on
+        print(f"  note: could not compare BASELINE_CONFIG with train_vfe3.config ({type(exc).__name__}: {exc})")
+        return
+    if divergence:
+        print("  note: BASELINE_CONFIG omits these fields and runs the VFE3Config default, while "
+              "train_vfe3.config sets another value:")
+        for name, (default, value) in sorted(divergence.items()):
+            print(f"    {name}: default {default!r} (ablation) vs {value!r} (train_vfe3)")
 
 
 def _resolved_sweep_baseline() -> Dict[str, Any]:
@@ -5493,6 +5524,7 @@ def main() -> int:
     print(f"\nVFE_3.0 ablation suite\n  device:  {device}\n  dataset: {CONFIG['dataset']}"
           f"\n  output:  {output_dir}\n  seed:    {CONFIG['seed']}"
           f"\n  sweeps:  {', '.join(sweep_names)}")
+    _print_baseline_default_divergence()
 
     current_cohort: Optional[Dict[str, object]] = None
     incomplete_sweeps: List[str] = []

@@ -1,4 +1,5 @@
 """Tiny regressions for explicit decoder memory and numerical tradeoffs."""
+from tests.profiles import make_prior_bank
 import math
 from unittest.mock import patch
 
@@ -17,7 +18,7 @@ MODES = ("diagonal_chunked", "full_chunked", "expected_likelihood_chunked")
 
 def _bank(mode: str, **kwargs: object) -> PriorBank:
     full = mode == "full_chunked"
-    return PriorBank(7, 2, 3, family="gaussian_full" if full else "gaussian_diagonal",
+    return make_prior_bank(7, 2, 3, family="gaussian_full" if full else "gaussian_diagonal",
                      diagonal_covariance=not full, decode_mode=mode, decode_chunk_size=4,
                      decode_av_precision="fp32", decode_ranking_fp64_escalation=False, **kwargs)
 

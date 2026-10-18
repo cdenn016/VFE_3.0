@@ -19,7 +19,13 @@ transformation :math:`U_i \to g_iU_i` the model then transforms covariantly end 
 
 The content links are not touched: ``content_link_chart``, ``content_link_edges`` (the Lie-algebra links
 :math:`L_{ij}`) and the latent-link settings stay as configured. Neither are the routing, the attention prior, the
-readout, the predictive covariance, the learning rates or the numerics.
+readout, the predictive covariance and its floor, the decode covariance, the learning rates or the numerics. Both
+floors are covariant under the declared action: the prior floor :math:`f\Sigma_{p,i}` moves with the prior, and the
+relative floor :math:`f\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` has an invariant :math:`\operatorname{tr}C_i`
+and so maps to :math:`g_i(\cdot)g_i^\top`; the relative floor fails only under a non-orthogonal global right
+action :math:`U_i \to U_ia`, which the switch does not declare (audit 2026-10-17, item 43). Under
+``decode_coordinates='reference'`` the decode covariance ``"constant"`` is :math:`\sigma_{\mathrm{init}}I` in
+reference coordinates, so it is invariant as well (audit 2026-10-17, item 25).
 
 :func:`gauge_covariance_failures` re-derives the gauge flags from the resolved config, so a launcher can refuse a
 run the overrides did not make covariant.
@@ -70,7 +76,6 @@ def fully_gauge_covariant_overrides(
         "sigma_max":                 None,
         "phi_mstep_max_matrix_norm": None,
         "phi_frame_condition_max":   None,
-        "predictive_covariance_floor_mode": "prior",
         "lambda_alpha_mode":         "state_dependent",
     }
     if get("family") not in ("gaussian_full", "gaussian_block"):
@@ -122,11 +127,15 @@ def fully_gauge_covariant_overrides(
     if (family in ("gaussian_full", "gaussian_block") and norm == "layernorm"
             and get("block_norm_covariance") == "pushforward"):
         # A warning, not an override: the switch never changes the covariance estimator (audit 2026-10-16 F2).
+        capped = get("block_norm_trace_cap")
         warnings.warn(
             "fully_gauge_covariant: block_norm_covariance='pushforward' with the full or head-block family keeps the "
-            "capped delta-method LayerNorm pushforward, which is near rank one (condition number about 1e7, "
+            + ("capped" if capped else "uncapped (block_norm_trace_cap=False)")
+            + " delta-method LayerNorm pushforward, which is near rank one (condition number about 1e7, "
             "float32-indefinite) where Sigma/s^2 >> 1, as at the launcher's initialization; "
-            "block_norm_covariance='pushforward_moment' is the moment estimate there (audit 2026-10-16 F2)",
+            "block_norm_covariance='pushforward_moment' is the moment estimate there (audit 2026-10-16 F2"
+            + ("" if capped else "; without the cap the delta method is unbounded there, audit 2026-10-17 item 7")
+            + ")",
             stacklevel=2)
     return {key: value for key, value in wanted.items() if get(key) != value}
 

@@ -6,6 +6,7 @@ isolated kernels. The toggles are family='gaussian_full' + decode_mode='full_chu
 (diagonal_covariance is a derived read-only property of family).
 """
 
+from tests.profiles import make_prior_bank
 from tests.profiles import test_config
 import pytest
 import torch
@@ -121,7 +122,7 @@ def _spd_batch(B, N, K, gen):
 def test_family_decode_matches_direct_functional_full_gaussian(alpha):
     g = torch.Generator().manual_seed(0)
     V, K, n_gen = 7, 3, 4
-    pb = PriorBank(V, K, n_gen, decode_tau=1.2, family="gaussian_full",
+    pb = make_prior_bank(V, K, n_gen, decode_tau=1.2, family="gaussian_full",
                    renyi_order=alpha, decode_mode="full_chunked",
                    diagonal_covariance=False)
     with torch.no_grad():

@@ -1,5 +1,6 @@
 """Tiny CPU regressions for the September 22 audit remediation."""
 
+from tests.profiles import make_prior_bank
 from tests.profiles import config_values, test_config
 import json
 import math
@@ -53,7 +54,7 @@ def test_fp64_decode_policy_preserves_completed_logits(mode: str) -> None:
     from vfe3.model.prior_bank import PriorBank
     full = mode == "full_chunked"
     torch.manual_seed(711)
-    bank = PriorBank(5, 5, 9, decode_tau=1.7, diagonal_covariance=not full,
+    bank = make_prior_bank(5, 5, 9, decode_tau=1.7, diagonal_covariance=not full,
                      family="gaussian_full" if full else "gaussian_diagonal", decode_mode=mode,
                      decode_chunk_size=2, decode_ce_checkpoint="off", decode_unigram_prior=True,
                      unigram_kappa=0.37, irrep_dims=[2, 3])

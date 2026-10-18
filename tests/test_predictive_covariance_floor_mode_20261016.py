@@ -8,7 +8,7 @@ the full family, through the update and the config.
 import pytest
 import torch
 
-from tests.profiles import tiny_config
+from tests.profiles import test_config, tiny_config
 from tests.test_blockwise_moment_matched_20261004 import _case
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
@@ -68,9 +68,11 @@ def test_relative_mode_needs_the_frame() -> None:
 
 
 def test_config_default_validation_and_wiring() -> None:
-    assert VFE3Config().predictive_covariance_floor_mode == "prior"
+    for mode in ("prior", "relative"):
+        assert test_config(attention_mode="projected_predictive", predictive_covariance="moment_matched",
+                           predictive_covariance_floor_mode=mode).predictive_covariance_floor_mode == mode
     with pytest.raises(ValueError, match="predictive_covariance_floor_mode"):
-        VFE3Config(predictive_covariance_floor_mode="absolute")
+        test_config(attention_mode="projected_predictive", predictive_covariance="moment_matched", predictive_covariance_floor_mode="absolute")
     cfg = tiny_config(attention_mode="projected_predictive", predictive_covariance="moment_matched",
                       predictive_covariance_floor_mode="relative", generate_embedding_figures=False)
     assert "predictive_covariance_floor_mode" not in cfg.inactive_fields()

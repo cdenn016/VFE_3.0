@@ -164,7 +164,7 @@ config = dict(
     #################################
 
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
 
 
     #################################
@@ -185,7 +185,7 @@ config = dict(
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
-    encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
+    encode_mode                       = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position; ~1.5x faster at K=80, currently unablated)
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,       #prior_bank = True temperature
 
@@ -211,7 +211,7 @@ config = dict(
     gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
                                               #   | "off" (Omega=I exactly) | "frozen" (random fixed frame)
 
-    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
 
     group_n                   = None,                # so_n only; must stay None for block_glk
     irrep_spec                = None,                # so_n only; must stay None for block_glk
@@ -281,7 +281,7 @@ config = dict(
     #    Embedding/Priors M-step
     #        Learning Rates
     #################################
-    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
 
     transport_chart_max_norm  = 18,
     phi_mstep_max_matrix_norm = 12,

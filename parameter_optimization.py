@@ -79,7 +79,7 @@ config: Dict[str, Any] = dict(
     #################################
 
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
     relational_receiver_measurement = "inverse",     # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     #################################
     #        Initialization
@@ -96,7 +96,7 @@ config: Dict[str, Any] = dict(
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
-    encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
+    encode_mode                       = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position; ~1.5x faster at K=80, currently unablated)
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,  #prior_bank = True temperature
     decode_ce_checkpoint              = "auto",  # "auto" | "auto_aggregate"
@@ -132,7 +132,7 @@ config: Dict[str, Any] = dict(
 
     pos_phi_project_slk       = False,      # per-block trace projection (det Omega = 1)
 
-    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
 
     group_n                   = None,                # so_n only; must stay None for block_glk
     irrep_spec                = None,                # so_n only; must stay None for block_glk
@@ -215,7 +215,7 @@ config: Dict[str, Any] = dict(
     #    Embedding/Priors M-step
     #        Learning Rates
     #################################
-    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
 
     phi_mstep_max_matrix_norm = 12,
     
@@ -247,8 +247,8 @@ config: Dict[str, Any] = dict(
     #################################
 
     layernorm_affine           = False,
-    norm_type_block            = "none",             # "none" | "mahalanobis"
-    block_norm_covariance      = "passthrough",      # "passthrough" (the only value without a 'layernorm' block norm) | "pushforward"
+    norm_type_block            = "none",             # "none" | "layernorm" | "mahalanobis"
+    block_norm_covariance      = "passthrough",      # "passthrough" (the only value without a 'layernorm' block norm) | "pushforward" | "pushforward_moment"
 
     prior_handoff_rho          = 1,                  # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma        = 0.1,                # sigma damping in [0,1] (0.0 = frozen at embedding)

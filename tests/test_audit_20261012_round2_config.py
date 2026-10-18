@@ -52,18 +52,23 @@ def test_paper_arms_read_the_resolved_stored_covariance_decay(weight_decay: floa
     assert (pa._decay_absent(cfg) is None) == (label == "decayed")
 
 
-def test_launchers_leave_kl_max_to_its_eight_k_resolution() -> None:
+def test_launchers_give_a_valid_kl_max() -> None:
+    r"""Each launcher's ``kl_max`` is valid: ``None`` (resolved to :math:`8K`) or a positive number. The value is the
+    user's to choose; only its validity is asserted (audit 2026-10-17, item 38)."""
     import ablation
     import parameter_optimization
     import scaling
     import train_vfe3
     default = VFE3Config.__dataclass_fields__["kl_max"].default
-    assert default is None and test_config(kl_max=None, embed_dim=4).kl_max == 8.0 * 4   # None resolves to 8 K
+    assert test_config(kl_max=None, embed_dim=4).kl_max == 8.0 * 4                       # None resolves to 8 K
     for launcher in (train_vfe3.config, ablation.BASELINE_CONFIG, scaling.config, parameter_optimization.config):
         # A launcher that omits the key runs at the default (audit 2026-10-16 F113: the omitted key raised KeyError).
-        assert launcher.get("kl_max", default) is None
+        value = launcher.get("kl_max", default)
+        assert value is None or (not isinstance(value, bool) and float(value) > 0.0)
+        assert test_config(kl_max=value, embed_dim=4).kl_max > 0.0
     for cell in scaling.build_standard_routes({"widths": [20, 40], "depths": [1], "train_steps": [10]})["width"]:
-        assert "kl_max" not in cell["overrides"]
+        value = cell["overrides"].get("kl_max")
+        assert value is None or float(value) > 0.0
 
 
 def test_warmup_longer_than_the_run_is_refused() -> None:

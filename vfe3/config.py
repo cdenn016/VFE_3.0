@@ -315,7 +315,8 @@ class VFE3Config:
     # "belief" | "encoded" | "constant": the covariance the prior-bank decoder reads (not read by linear)
     #   belief    the stack's final Sigma_q (the exact KL(q* || p_v))
     #   encoded   the token's encoded covariance, the stack's input (passthrough for the decoder only)
-    #   constant  sigma_init I
+    #   constant  sigma_init I, in the decoder's coordinates: under decode_coordinates="reference" the decoder reads
+    #             sigma_init I in reference coordinates, so the logits are frame-invariant (audit 2026-10-17, item 25)
     # The decode logit -KL(q || p_v)/tau contains tr(Sigma_v^-1 Sigma_q)/(2 tau), so under a moment-matched
     # covariance every jump of the Sigma_q the stack builds reaches the cross-entropy (2026-10-11 K=128 spikes).
     decode_covariance:                str             = "belief"
@@ -534,7 +535,15 @@ class VFE3Config:
     # The moment-matched covariance floor (scaled by predictive_covariance_floor = f).
     #   prior     f Sigma_p, the token's local prior covariance: frame-free and exactly reference-invariant (since 2026-10-12)
     #   relative  f (tr C_i / K) U_i U_i^T with C_i = U_i^{-1} Sigma_i U_i^{-T}: the earlier floor, relative to the input
-    #             covariance; changes under a non-orthogonal common reference change (kept for testing)
+    #             covariance; changes under a non-orthogonal common reference change (kept for testing). It is
+    #             covariant under the local action U_i -> g_i U_i (tr C_i is invariant). Its bound is relative only: in
+    #             reference coordinates it adds f (tr C_i / K) I >= f lambda_max(C_i) / K, so it bounds the output
+    #             spectrum below by f/K times the input's own scale and has no absolute lower bound; a contraction of
+    #             tr C_i in one layer passes into the next layer's floor, so the bound compounds over depth (a
+    #             per-layer trace ratio r gives r^L, audit 2026-10-17 item 1). In local coordinates the floor's top
+    #             eigenvalue reaches up to f (tr Sigma_i / K) kappa(U_i)^2 for isotropic Sigma_i, an inflation of up to
+    #             about f kappa^2 relative to the scale of Sigma_i on ill-conditioned frames (kappa(U_i) the frame
+    #             condition number)
     #   max       the larger of the two: elementwise max on the diagonal family, the whitened spectral max
     #             f Sigma_p^{1/2} max(W, I) Sigma_p^{1/2} (W the relative floor whitened by f Sigma_p) on full layouts;
     #             keeps the relative floor's scaling with the absolute bound f Sigma_p (audit 2026-10-17 item 1)
@@ -2547,14 +2556,19 @@ class VFE3Config:
         # and no M-step prior consumer is enabled. The canonical diagnostic reads each layer's handed-off prior
         # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31). The
         # moment-matched and spread-corrected readouts floor at f * Sigma_p with the layer's prior covariance, so
-        # there the variance handoff is read (audit 2026-10-12 round 2, item 8).
+        # there the variance handoff is read (audit 2026-10-12 round 2, item 8), but only under the prior floor or
+        # a ceiling c * Sigma_p: the relative floor f (tr C_i / K) U_i U_i^T never reads Sigma_p (audit 2026-10-17,
+        # item 23).
         if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
                 and self.cg_energy_weight == 0.0 and not self.diagnose_canonical_free_energy):
             from vfe3.model.minimal_agent import READOUT_COVARIANCES
-            floored = self.predictive_covariance in READOUT_COVARIANCES
+            floored = (self.predictive_covariance in READOUT_COVARIANCES
+                       and (self.predictive_covariance_floor_mode in ("prior", "max")
+                            or self.predictive_covariance_ceiling is not None))
             mark(("prior_handoff_rho",) if floored else ("prior_handoff_rho", "prior_handoff_sigma"),
                  "predictive_content never reads the prior mean"
-                 + ("" if floored else " or, without a moment-matched covariance, the prior covariance")
+                 + ("" if floored else " or, without a moment-matched covariance under the prior floor or a "
+                    "ceiling, the prior covariance")
                  + ", and no M-step prior consumer is enabled; with diagnose_canonical_free_energy=True "
                  "they would feed that log-step diagnostic only")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
@@ -3269,10 +3283,18 @@ def historical_default_pins(
     (``"prior"``). A record without the field is from either era, so no fixed pin is right. 5f5d484 also added
     ``phi_frame_condition_max``, which every later record carries (as ``null`` when off), so a record lacking both
     ran ``"relative"``, and one carrying ``phi_frame_condition_max`` keeps the default ``"prior"``.
+
+    ``block_norm_trace_cap`` (3aeede1, 2026-10-17, default True) has the same era key. The LayerNorm pushforward
+    entered uncapped at 89eedfb (2026-10-10) and the sphere-bound cap was added without a toggle at 5f5d484, so a
+    record lacking both the toggle and ``phi_frame_condition_max`` ran the pushforward (and the ``delta_full``
+    composite) uncapped and is pinned False; one carrying ``phi_frame_condition_max`` keeps the default True
+    (audit 2026-10-17, item 51). Records older than 89eedfb run the pinned passthrough norm, where the cap is inert.
     """
     pins = {name: value for name, value in _HISTORICAL_DEFAULT_PINS.items() if name not in payload}
     if "predictive_covariance_floor_mode" not in payload and "phi_frame_condition_max" not in payload:
         pins["predictive_covariance_floor_mode"] = "relative"
+    if "block_norm_trace_cap" not in payload and "phi_frame_condition_max" not in payload:
+        pins["block_norm_trace_cap"] = False
     return pins
 
 
