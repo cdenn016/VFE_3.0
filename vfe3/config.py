@@ -439,7 +439,7 @@ class VFE3Config:
     #                         per rotating plane, the full non-rotating block, no cross-covariance), so
     #                         R_i P(G) R_i^T = P(G) and only the mean term carries i - j; scored on the Gram route (no
     #                         source-root factor route), or in closed form with no factorization when P(G) is diagonal
-    #                         (rope_fraction = 1) and projected_factorization="gram" and pair_kl_gemm_tol=None
+    #                         (rope_fraction = 1) and projected_factorization="gram"
     #                         (vfe3.gradients.relational._diagonal_comparison_route). only: the kernel readout (not
     #                         minimal_agent)
     rope_mode:                        str             = "none"
@@ -878,20 +878,28 @@ class VFE3Config:
     # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
     # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
     kl_max:                           Optional[float] = None
-    # "absolute" | "row_min": what kl_max clamps in the kernel router, projected_predictive and
+    # "absolute" | "row_min" | "query_shifted": what kl_max clamps in the kernel router, projected_predictive and
     # projected_gradient (audit 2026-10-08 P1-4)
-    #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
-    #             (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
-    #   row_min   D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    #   absolute       D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
+    #                  (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
+    #   row_min        D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    #   query_shifted  D_ij - c_i, clamped from above only, with c_i the query-only row constant of the cost
+    #                  (-(r + log det G_i)/2 for the Gaussian KL, -log det G_i / 2 for noisy_query, 0 for
+    #                  mean_distance), which the softmax ignores; beta equals the absolute route's wherever nothing
+    #                  is capped, and shrinking query variances no longer saturate the clamp (audit 2026-10-17 item 2)
     routing_kl_max_reference:         str             = "absolute"
     # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
     # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
-    # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base.
+    # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base on the dense route; the
+    # diagonal comparison route keeps its closed form with its own O(N r) estimate and one host read per layer
+    # (audit 2026-10-17 item 11).
     pair_kl_gemm_tol:                 Optional[float] = None
     # int >= 1. Byte budget, in MiB, of one tile of the relational scorer (projected moments, source-root factor,
     # GEMM-fallback direct pair tiles, mean-distance rows) and of the routed spread's query-row tiles. Larger tiles
-    # dispatch fewer kernels and hold more transient memory; values change only by float32 reduction order, and
-    # loops above 32 MiB stay checkpointed. Keep 32 until a CUDA A/B confirms a gain (audit 2026-10-16 F26).
+    # dispatch fewer kernels, until one tile holds the whole loop, and hold more transient memory; values change only
+    # by float32 reduction order, and loops above 32 MiB stay checkpointed. A projection tile holds at most
+    # 32 * (relational_tile_mib // 32) tokens (audit 2026-10-17 item 6). Keep 32 until a CUDA A/B confirms a gain
+    # (audit 2026-10-16 F26).
     relational_tile_mib:              int             = 32
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
@@ -922,8 +930,8 @@ class VFE3Config:
     #   gram_certified          gram, and also rebuild entries that factor but fail
     #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
     #                           also screens the ADF query covariances; under comparison_invariant with a
-    #                           diagonal P(G) it keeps the dense Gram route in place of the diagonal one, as do
-    #                           cholesky_qr2_certified and any pair_kl_gemm_tol)
+    #                           diagonal P(G) it keeps the dense Gram route in place of the diagonal one, as does
+    #                           cholesky_qr2_certified)
     #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
     #                           eps_32 kappa_1(C) <= 3e-4, or failing outright, in float64 (QR of the
     #                           float64 source root; their pairs leave the GEMM for float64 triangular-solve
@@ -1807,7 +1815,7 @@ class VFE3Config:
         from vfe3.geometry.norms import _NORMS
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
-        _require(self.routing_kl_max_reference, ("absolute", "row_min"), "routing_kl_max_reference")
+        _require(self.routing_kl_max_reference, ("absolute", "row_min", "query_shifted"), "routing_kl_max_reference")
         if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
@@ -2110,10 +2118,11 @@ class VFE3Config:
                 from vfe3.geometry.rope import rope_commutant_is_diagonal, rope_rotated_pairs
                 d_head = self.embed_dim // self.n_heads
                 if (rope_commutant_is_diagonal(d_head, rope_rotated_pairs(d_head, self.rope_fraction))
-                        and (self.projected_factorization != "gram" or self.pair_kl_gemm_tol is not None)):
+                        and self.projected_factorization != "gram"):
+                    # pair_kl_gemm_tol keeps the diagonal scorer, with its own fallback (audit 2026-10-17 item 11).
                     route_notes.append(
                         f"P(G) is diagonal (rope_fraction={self.rope_fraction!r}), but projected_factorization="
-                        f"{self.projected_factorization!r} with pair_kl_gemm_tol={self.pair_kl_gemm_tol!r} bypasses "
+                        f"{self.projected_factorization!r} bypasses "
                         "the closed-form diagonal comparison scorer for the dense Gram route")
             if route_notes:
                 import warnings

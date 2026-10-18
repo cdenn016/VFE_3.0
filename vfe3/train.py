@@ -1592,6 +1592,14 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     # (VFEModel._nonfinite_frac, VFEModel._routing_free_energy; audit 2026-10-16 F10, F114)
     "val_relational_score_nonfinite_frac", "val_relational_score_nonfinite_frac_layer_max",
     "val_relational_routing_free_energy",
+    # pre-clamp router cost, cost-term medians and capped routing mass (VFEModel._raw_router_cost_statistics and
+    # _layer_guard_maxima; audit 2026-10-17 item 9)
+    *(f"val_relational_raw_row_{name}_{level}" for name in ("min", "gap") for level in ("q10", "q50", "q90")),
+    "val_relational_capped_mass_mean", "val_relational_capped_mass_max",
+    *(f"val_relational_score_term_{term}_median"
+      for term in ("query_constant", "key_logdet", "trace", "mahalanobis")),
+    "val_relational_raw_row_min_median_head_max", "val_relational_raw_row_min_median_argmax_layer",
+    "val_relational_raw_row_min_median_argmax_head", "val_relational_capped_mass_mean_head_max",
     # per-(layer, head) router saturation, maxima over layers and heads (VFEModel._layer_guard_maxima)
     "val_relational_score_klmax_frac_head_max",
     "val_relational_clamped_row_frac_head_max", "val_relational_clamped_row_frac_argmax_layer",

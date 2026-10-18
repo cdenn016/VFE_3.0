@@ -179,6 +179,8 @@ _COVARIANCE_SCALE_KEYS: Tuple[str, ...] = (
     "relational_projected_cov_scale", "relational_projected_cov_gram_min_eigenvalue",
     "relational_comparison_map_norm_spread", "relational_input_cov_scale_ratio", "relational_rank_one_residual",
     "relational_rank_one_residual_reference")
+# Row order of the diagonal-route cost-term medians score_term_medians_pre (audit 2026-10-17 item 9).
+_SCORE_TERM_NAMES: Tuple[str, ...] = ("query_constant", "key_logdet", "trace", "mahalanobis")
 CANONICAL_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta")
 
@@ -1793,6 +1795,7 @@ class VFEModel(nn.Module):
         beta:      torch.Tensor,               # (B, H, N, N) router
         support:   torch.Tensor,               # (B, H, N, N) bool causal support
         cap_level: float,
+        cap:       Optional[dict] = None,      # the layer's capture, for the pre-clamp row extremes
     ) -> Dict[str, torch.Tensor]:              # each (H,) float64
         r"""Per-head router-saturation statistics of one layer (audit 2026-10-09 round 2, item 9).
 
@@ -1803,11 +1806,21 @@ class VFEModel(nn.Module):
         happens only under the absolute reference); ``self_weight`` the mean :math:`\beta_{ii}` and
         ``self_argmax_frac`` the share of rows with :math:`\beta_{ii} = \max_{j \in S_i}\beta_{ij}`, both
         over scored rows that admit self (NaN for a head with none, e.g. a ``*_noself`` prior).
+
+        Audit 2026-10-17 item 9: ``capped_mass_mean`` and ``capped_mass_max`` are the mean and maximum over scored
+        rows of the routing mass on capped entries, :math:`m_i = \sum_j \beta_{ij}\mathbb 1[\bar D_{ij} \ge \kappa]`,
+        which bounds the clamp's effect on the row, :math:`\mathrm{TV}(\beta_i, \beta_i^{\text{unclamped}}) \le m_i/(1 -
+        m_i)`; ``raw_row_min_median`` and ``raw_row_gap_median`` are the medians over scored rows of the pre-clamp
+        row minimum and row range (maximum minus minimum) of the admissible finite costs, read from ``cap``
+        (``score_raw_row_min_pre``, ``score_raw_row_max_pre``; NaN when the capture carries none).
         """
         rows = support.sum(dim=-1) >= 2                                       # (B, H, N)
         entries = support & rows.unsqueeze(-1)                                # (B, H, N, N)
         capped = entries & (score >= cap_level)                               # (B, H, N, N)
         clamped = rows & (capped.sum(dim=-1) == entries.sum(dim=-1))          # (B, H, N)
+        n_rows = rows.sum(dim=(0, 2)).double()                                # (H,)
+        mass = (beta.double() * capped).sum(dim=-1)                           # (B, H, N) m_i
+        raw_min, raw_gap = VFEModel._raw_row_extremes(cap, rows)              # (B, H, N) each, NaN off rows
         self_rows = rows & support.diagonal(dim1=-2, dim2=-1)                 # (B, H, N)
         beta_ii = beta.diagonal(dim1=-2, dim2=-1).double()                    # (B, H, N)
         row_max = beta.masked_fill(~support, float("-inf")).amax(dim=-1).double()   # (B, H, N)
@@ -1822,7 +1835,75 @@ class VFEModel(nn.Module):
             "self_argmax_frac": torch.where(
                 n_self > 0, ((beta_ii >= row_max) & self_rows).sum(dim=(0, 2)).double() / n_self.clamp(min=1),
                 nan),
+            "capped_mass_mean": torch.where(n_rows > 0, (mass * rows).sum(dim=(0, 2)) / n_rows.clamp(min=1), nan),
+            "capped_mass_max": torch.where(n_rows > 0, mass.masked_fill(~rows, float("-inf")).amax(dim=(0, 2)), nan),
+            "raw_row_min_median": raw_min.movedim(1, 0).reshape(len(n_rows), -1).nanmedian(dim=-1).values,
+            "raw_row_gap_median": raw_gap.movedim(1, 0).reshape(len(n_rows), -1).nanmedian(dim=-1).values,
         }
+
+    @staticmethod
+    def _raw_row_extremes(
+        cap:  Optional[dict],                  # the layer's capture
+        rows: torch.Tensor,                    # (B, H, N) bool scored rows
+    ) -> Tuple[torch.Tensor, torch.Tensor]:    # (B, H, N) float64 raw row minimum and row range, NaN off rows
+        r"""The pre-clamp row minimum and row range of the kernel router's cost (audit 2026-10-17 item 9).
+
+        Read from ``score_raw_row_min_pre`` and ``score_raw_row_max_pre`` of
+        :func:`vfe3.gradients.relational.relational_predictive_readout`; all NaN when the capture carries none (the
+        minimal agent, the full-link route). Under ``row_min`` and ``query_shifted`` they describe the cost before the
+        reference: under ``query_shifted`` the scorer has already dropped the query-only row constant.
+        """
+        nan = torch.full(rows.shape, float("nan"), dtype=torch.float64, device=rows.device)
+        low = None if cap is None else cap.get("score_raw_row_min_pre")
+        high = None if cap is None else cap.get("score_raw_row_max_pre")
+        if low is None or high is None:
+            return nan, nan
+        low, high = low.double().to(rows.device), high.double().to(rows.device)
+        if low.dim() == rows.dim() - 1:
+            low, high = low.unsqueeze(1), high.unsqueeze(1)                   # (B, 1, N) single head
+        return torch.where(rows, low, nan), torch.where(rows, high - low, nan)
+
+    @staticmethod
+    def _raw_router_cost_statistics(
+        cap:       dict,                       # the layer's capture
+        score:     torch.Tensor,               # (B, H, N, N) clamped routing cost as captured
+        beta:      torch.Tensor,               # (B, H, N, N) router
+        support:   torch.Tensor,               # (B, H, N, N) bool causal support
+        cap_level: float,
+    ) -> Dict[str, float]:
+        r"""Per-layer pre-clamp router-cost and capped-mass columns (audit 2026-10-17 item 9), pooled over heads.
+
+        ``relational_raw_row_{min,gap}_q{10,50,90}``: quantiles over the scored rows of every head of the raw row
+        minimum and row range (:meth:`_raw_row_extremes`), which tell a 129-nat row from a :math:`10^6`-nat one where
+        the clamped cost reads ``kl_max`` for both. ``relational_capped_mass_{mean,max}``: mean and maximum over scored
+        rows of the routing mass on capped entries (:meth:`_router_head_statistics`). The four
+        ``relational_score_term_*_median`` columns are the pooled medians of the diagonal-route cost terms (query
+        constant, key log-determinant, trace, Mahalanobis; ``score_term_medians_pre`` of
+        :func:`vfe3.gradients.relational.relational_score`), NaN on the dense route, which does not form them. A
+        query constant near the cap with a small trace and Mahalanobis median is the saturation of the absolute
+        reference on a quantity the softmax ignores (item 2).
+        """
+        rows = support.sum(dim=-1) >= 2                                       # (B, H, N)
+        raw_min, raw_gap = VFEModel._raw_row_extremes(cap, rows)              # (B, H, N) each
+        levels = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64, device=raw_min.device)
+        out: Dict[str, float] = {}
+        for name, values in (("min", raw_min), ("gap", raw_gap)):
+            finite = values[torch.isfinite(values)]
+            if finite.numel() > 2 ** 24:                                      # torch.quantile's input limit
+                finite = finite[torch.randperm(finite.numel(), device=finite.device)[:2 ** 24]]
+            quantiles = (torch.quantile(finite, levels).tolist() if finite.numel()
+                         else [float("nan")] * 3)
+            for level, value in zip(("q10", "q50", "q90"), quantiles):
+                out[f"relational_raw_row_{name}_{level}"] = float(value)
+        capped = support & rows.unsqueeze(-1) & (score >= cap_level)         # (B, H, N, N)
+        mass = (beta.double() * capped).sum(dim=-1)[rows]                     # (n_rows,) m_i
+        out["relational_capped_mass_mean"] = float(mass.mean()) if mass.numel() else float("nan")
+        out["relational_capped_mass_max"] = float(mass.max()) if mass.numel() else float("nan")
+        medians = cap.get("score_term_medians_pre")                           # (4, H + 1) or absent
+        for index, term in enumerate(_SCORE_TERM_NAMES):
+            out[f"relational_score_term_{term}_median"] = (float(medians[index, -1]) if medians is not None
+                                                            else float("nan"))
+        return out
 
     def _belief_spectrum(self, snapshot: DiagnosticSnapshot, layer_index: int) -> dict:
         r"""Spectrum statistics of layer ``layer_index``'s converged belief covariance."""
@@ -2089,6 +2170,11 @@ class VFEModel(nn.Module):
         maximum of :meth:`_nonfinite_frac`, the share of the causal support whose raw cost was non-finite before
         the clamp mapped it to ``kl_max``. Beside ``relational_score_klmax_frac_layer_max`` it tells a layer
         saturated by finite costs (zero here) from one whose costs failed.
+
+        Pre-clamp router cost (audit 2026-10-17 item 9; :meth:`_router_head_statistics` per (layer, head)):
+        ``relational_raw_row_min_median_head_max`` is the largest per-head median of the raw row minimum, at
+        ``relational_raw_row_min_median_argmax_{layer,head}``, and ``relational_capped_mass_mean_head_max`` the largest
+        per-head mean routing mass on capped entries.
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
@@ -2105,7 +2191,7 @@ class VFEModel(nn.Module):
                 beta, score = beta.unsqueeze(1), score.unsqueeze(1)
             support = causal_support(beta, snapshot.log_prior)                 # (B, H, N, N) bool
             cap_level = math.inf if minimal_agent else self.cfg.kl_max
-            for key, value in self._router_head_statistics(score, beta, support, cap_level).items():
+            for key, value in self._router_head_statistics(score, beta, support, cap_level, cap).items():
                 heads.setdefault(key, []).append(value)                        # per layer (H,)
             unit_distance.append(self._self_map_unit_distance(self.relational_operators_by_layer[layer_index]))
             if layer_index == n_layers - 1:
@@ -2154,6 +2240,7 @@ class VFEModel(nn.Module):
             return float(table.reshape(-1)[flat]), float(flat // table.shape[1]), float(flat % table.shape[1])
 
         clamped, clamped_layer, clamped_head = head_max("clamped_row_frac")
+        raw_min, raw_min_layer, raw_min_head = head_max("raw_row_min_median")
         self_weight, self_layer, self_head = head_max("self_weight")
         capped, capped_layer, capped_head = head_max("klmax_frac")
         locked = (unit_distance[int(self_layer)] if math.isfinite(self_layer) else None)   # (H,) or None
@@ -2173,6 +2260,11 @@ class VFEModel(nn.Module):
                 "relational_self_lock_argmax_head": self_head,
                 "relational_self_lock_unit_distance": (float(locked[int(self_head)]) if locked is not None
                                                        else float("nan")),
+                # pre-clamp router cost and capped routing mass per (layer, head) (audit 2026-10-17 item 9)
+                "relational_raw_row_min_median_head_max": raw_min,
+                "relational_raw_row_min_median_argmax_layer": raw_min_layer,
+                "relational_raw_row_min_median_argmax_head": raw_min_head,
+                "relational_capped_mass_mean_head_max": head_max("capped_mass_mean")[0],
                 **extremes_out}
 
     def _canonical_free_energy_diagnostics(
@@ -2410,6 +2502,7 @@ class VFEModel(nn.Module):
             relational_routing_free_energy=(float("nan") if minimal_agent
                                             else self._routing_free_energy(snapshot, layer_index, score, support)),
         )
+        d.update(self._raw_router_cost_statistics(cap, score, beta, support, cap_level))
         if self.cfg.diagnose_canonical_free_energy:
             d.update(self._canonical_free_energy_diagnostics(snapshot, layer_index, beta, support))
         from vfe3 import metrics

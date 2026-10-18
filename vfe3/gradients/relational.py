@@ -10,7 +10,9 @@ from vfe3.geometry.rope import (
 )
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import _compute_dtype, projected_condition_recovery, projected_moments, routing_cost
+from vfe3.relational_scoring import (
+    _compute_dtype, diagonal_kl_term_medians, projected_condition_recovery, projected_moments, routing_cost,
+)
 from vfe3.runtime import ieee_fp32_matmul
 
 
@@ -20,9 +22,10 @@ def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: 
     :math:`P(G)` is structurally diagonal when at most one coordinate of the block stays unrotated
     (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal`). The diagonal route
     (``diagonal_covariance`` of :func:`vfe3.relational_scoring.projected_gaussian_kl`) also requires the Gaussian-KL
-    cost, no GEMM error fallback (``pair_kl_gemm_tol`` None, since the diagonal route has none) and
-    conditioning-triggered recovery off (``projected_factorization='gram'``); every other case keeps the dense route
-    with its certificate, recovery and fallback (audit 2026-10-10 round 2, item 30).
+    cost and conditioning-triggered recovery off (``projected_factorization='gram'``); every other case keeps the
+    dense route with its certificate and recovery (audit 2026-10-10 round 2, item 30). ``pair_kl_gemm_tol`` no longer
+    moves a diagonal :math:`P(G)` onto the dense route: the diagonal route has its own error estimate and
+    direct-difference fallback (audit 2026-10-17 item 11).
 
     The recovery clause keeps what the certified toggles add on the dense route, not a float64 rescoring: a commutant
     projection has no source-root factor route, so ``cholesky_qr2_certified`` runs here as ``gram_certified``. An
@@ -33,7 +36,7 @@ def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: 
     at most about 2e-5 nats against the diagonal route on the audit probe (audit 2026-10-16 F9).
     """
     return (rope_commutant_is_diagonal(r, n_pairs) and operators.routing == "gaussian_kl"
-            and operators.pair_kl_gemm_tol is None and not projected_condition_recovery())
+            and not projected_condition_recovery())
 
 
 def relational_score(
@@ -47,6 +50,7 @@ def relational_score(
 
     *,
     row_invariant: bool = False,
+    term_support:  Optional[torch.Tensor] = None,      # (..., N, N) or (..., H, N, N) bool pairs of the term medians
 ) -> torch.Tensor:                                     # (..., H, N, N) projected routing costs
     r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j) or the noisy-query cost, retaining full reduced covariance.
 
@@ -65,6 +69,17 @@ def relational_score(
     to a per-query-row constant (the kernel router under ``routing_kl_max_reference='row_min'``). The
     Gaussian KL then computes its query log-determinant without autograd (``query_row_constant_grad``
     of :func:`vfe3.relational_scoring.projected_gaussian_kl`); the returned values are unchanged.
+
+    Under ``operators.kl_max_reference == 'query_shifted'`` every cost is returned without its query-only row
+    constant (``drop_query_constant`` of the scorers; :math:`-\tfrac12(r + \log\det G_i)` for the Gaussian KL), so the
+    clamp of :func:`clamped_routing_cost` tests only the part of :math:`D_{ij}` the softmax reads (audit 2026-10-17
+    item 2). The softmax over :math:`j` is unchanged; the values can be negative.
+
+    With ``capture`` on the diagonal route, ``score_term_medians_pre`` records the per-head medians of the four cost
+    terms (:func:`vfe3.relational_scoring.diagonal_kl_term_medians`, a (4, H + 1) float64 tensor, rows query constant,
+    key log-determinant, trace, Mahalanobis, columns the heads and then all heads pooled) over the pairs of
+    ``term_support`` (every pair when None); the dense
+    route does not form the terms and records nothing (audit 2026-10-17 item 9).
 
     Under ``rope_mode='comparison_invariant'`` (``operators.rope_comparison_covariance == 'rotation_invariant'``) each
     comparison covariance is replaced by its projection :math:`P(G)` onto the commutant of the RoPE torus
@@ -110,12 +125,16 @@ def relational_score(
     score = routing_cost(operators.routing)                                  # ROUTING_COSTS registry
     # noisy_key is the Gaussian KL of a broadened key law, so it takes the Gaussian-KL options.
     gaussian_kl = operators.routing in ("gaussian_kl", "noisy_key")
-    cost_options = ({"query_row_constant_grad": False}
-                    if row_invariant and gaussian_kl else {})
+    # query_shifted: the scorers drop the query-only row constant, so its gradient is exactly zero as under row_min.
+    query_shifted = getattr(operators, "kl_max_reference", "absolute") == "query_shifted"
+    cost_options: Dict[str, Any] = ({"query_row_constant_grad": False}
+                                    if (row_invariant or query_shifted) and gaussian_kl else {})
+    if query_shifted:
+        cost_options["drop_query_constant"] = True
     if gaussian_kl and operators.pair_kl_gemm_tol is not None:
         cost_options["gemm_expansion_tol"] = operators.pair_kl_gemm_tol
     key_log_noise = getattr(operators, "routing_key_log_noise", None)             # (H,) noisy_key only
-    scores, captured_q, captured_k = [], [], []
+    scores, captured_q, captured_k, term_medians = [], [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads), unless its
     # verdicts can only raise (the diagonal route), which deferred_host_checks then queues.
@@ -210,6 +229,11 @@ def relational_score(
         first_head += H
         if diagonal:
             run_options["diagonal_covariance"] = True                           # G_q, G_k are (..., N, H, r)
+            if capture is not None:
+                run_support = (term_support[..., first_head - H:first_head, :, :]   # this run's heads
+                               if term_support is not None and term_support.dim() >= 3
+                               and term_support.shape[-3] > 1 else term_support)
+                term_medians.append(diagonal_kl_term_medians(a_q, G_q, a_k, G_k, run_support))   # (4, H_run + 1)
         elif invariant:
             run_options["commutant_pairs"] = n_pairs
         # G_q, G_k are bitwise symmetric here (projected_moments and the RoPE branch both end in a
@@ -224,6 +248,11 @@ def relational_score(
         # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
         capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q
         capture["projected_key_covariance_pre"] = captured_k[0] if len(captured_k) == 1 else captured_k
+        if term_medians:
+            # (4, H + 1): the heads, then the median pooled over every head (NaN across several runs).
+            pooled = (term_medians[0][:, -1:] if len(term_medians) == 1
+                      else torch.full_like(term_medians[0][:, -1:], float("nan")))
+            capture["score_term_medians_pre"] = torch.cat([*(t[:, :-1] for t in term_medians), pooled], dim=-1)
     return scores[0] if len(scores) == 1 else torch.cat(scores, dim=-3)      # (..., H, N, N)
 
 
@@ -236,7 +265,12 @@ def clamped_routing_cost(
 ) -> torch.Tensor:
     r"""Clamp the kernel-router cost at ``kl_max`` relative to ``operators.kl_max_reference``.
 
-    ``absolute`` clamps :math:`D_{ij}`. ``row_min`` clamps the gap
+    ``absolute`` clamps :math:`D_{ij}` to :math:`[0, \kappa]`. ``query_shifted`` receives the cost without its
+    query-only row constant (:func:`relational_score` drops it under this reference, audit 2026-10-17 item 2) and
+    clamps it from above only, :math:`\min(D_{ij} - c_i, \kappa)` with NaN and :math:`+\infty` mapped to :math:`\kappa`:
+    the shifted cost can be negative, so a floor at zero would change beta, while below the cap beta is the absolute
+    route's exactly (a row shift). The test no longer saturates on :math:`c_i = -\tfrac12(r + \log\det G_i)`, which
+    the softmax ignores and which grows without bound as the query variances shrink. ``row_min`` clamps the gap
     :math:`D_{ij}-\min_{j' \in \mathcal{A}_i}D_{ij'}` over the admissible sources :math:`\mathcal{A}_i`
     (audit 2026-10-08 P1-4): the softmax is
     row-shift invariant, so beta is unchanged wherever a row keeps an entry below the cap, and a row
@@ -252,6 +286,8 @@ def clamped_routing_cost(
     roundoff.
     """
     from vfe3.families.base import safe_kl_clamp
+    if operators.kl_max_reference == "query_shifted":
+        return score.clamp(max=kl_max).nan_to_num(nan=kl_max, posinf=kl_max)
     if operators.kl_max_reference == "row_min":
         admissible = torch.isfinite(score)
         if log_prior is not None:
@@ -295,7 +331,10 @@ def relational_predictive_readout(
     returned covariance (:meth:`RelationalOperators.floor_term`); it is required with ``return_covariance``.
     ``capture`` receives the router ``beta_pre``, the clamped cost ``score_energy_pre`` and the boolean map
     ``score_nonfinite_pre`` of raw costs that were NaN or infinite before the clamp mapped them to ``kl_max``
-    (audit 2026-10-16 F10).
+    (audit 2026-10-16 F10), and, from the raw cost before the reference and the clamp (audit 2026-10-17 item 9),
+    ``score_raw_row_min_pre`` and ``score_raw_row_max_pre``, (..., H, N) float64 minimum and maximum over each row's
+    admissible finite costs (NaN for a row with none), and on the diagonal route ``score_term_medians_pre``
+    (:func:`relational_score`). Under ``query_shifted`` the raw cost is the shifted one.
 
     Under ``predictive_readout='minimal_agent'`` the routing, the content and the residual are replaced by the
     exact Gaussian conditioning of :meth:`RelationalOperators.minimal_agent_update`, which reads the ROUTING frame
@@ -326,11 +365,23 @@ def relational_predictive_readout(
         # Under the row_min reference the clamp and softmax read only row gaps, so the query
         # log-determinant (a row constant of the Gaussian KL) needs no autograd.
         row_invariant = operators.kl_max_reference == "row_min"
+        support = (None if capture is None or log_prior is None
+                   else torch.isfinite(log_prior.detach()))                  # (..., N, N) or (..., H, N, N)
         raw_score = relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
-                                     **({"row_invariant": True} if row_invariant else {}))   # (..., H, N, N)
+                                     **({"row_invariant": True} if row_invariant else {}),
+                                     **({"term_support": support} if support is not None else {}))   # (..., H, N, N)
         # The clamp maps NaN and +inf to kl_max, so a capped captured cost cannot tell a failed cost from a
         # finite one at the cap; the capture keeps which raw costs were non-finite (audit 2026-10-16 F10).
         score_nonfinite = None if capture is None else ~torch.isfinite(raw_score.detach())   # (..., H, N, N)
+        if capture is not None:
+            with torch.no_grad():
+                # Pre-clamp row extremes over admissible finite costs (audit 2026-10-17 item 9).
+                raw = raw_score.detach().double()                               # (..., H, N, N)
+                admissible = ~score_nonfinite if support is None else ~score_nonfinite & support
+                capture["score_raw_row_min_pre"] = raw.masked_fill(~admissible, float("inf")).amin(dim=-1).where(
+                    admissible.any(dim=-1), torch.tensor(float("nan"), dtype=raw.dtype, device=raw.device))
+                capture["score_raw_row_max_pre"] = raw.masked_fill(~admissible, float("-inf")).amax(dim=-1).where(
+                    admissible.any(dim=-1), torch.tensor(float("nan"), dtype=raw.dtype, device=raw.device))
         score = clamped_routing_cost(
             raw_score, operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
         beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype),
