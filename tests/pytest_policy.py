@@ -28,6 +28,10 @@ CUDA_TESTS: frozenset[str] = frozenset({
     # The tiny live launcher route on CUDA (fused KL-decode CE, fixed-schedule frame exponential) against a
     # float64 CPU copy (audit 2026-10-17 item 26).
     'test_cuda_live_route_20261018.py::test_cuda_live_route_matches_a_float64_cpu_copy',
+    # Fused Triton diagonal comparison moments (relational_diag_moments_kernel) against the float64 CPU torch route on
+    # a live-shaped layer and on the tiny live profile moved onto the diagonal comparison route (audit 2026-10-17 item 20).
+    'test_diag_moments_triton_20261018.py::test_cuda_fused_moments_match_float64_like_the_torch_route',
+    'test_diag_moments_triton_20261018.py::test_cuda_live_route_with_fused_moments_matches_a_float64_cpu_copy',
 })
 
 CUDA_MIRROR_TESTS: frozenset[str] = frozenset({

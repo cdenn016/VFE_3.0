@@ -172,6 +172,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'routing_kl_max_reference': 'absolute',
     'pair_kl_gemm_tol': None,
     'relational_tile_mib': 32,
+    'relational_diag_moments_kernel': 'torch',
     'sigma_max': 100.0,
     'e_mu_q_trust': 2,
     'e_sigma_q_trust': 5.0,

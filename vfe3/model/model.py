@@ -70,6 +70,7 @@ from vfe3.relational_scoring import (
     set_projected_condition_recovery,
     set_projected_factor_route,
     set_projection_tile_bytes,
+    set_diagonal_moments_kernel,
 )
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
@@ -276,6 +277,9 @@ class VFEModel(nn.Module):
         # (audit 2026-10-16 F26).
         set_projection_tile_bytes(cfg.relational_tile_mib * 1024 ** 2)
         set_spread_tile_bytes(cfg.relational_tile_mib * 1024 ** 2)
+        # The diagonal comparison moments kernel (relational_diag_moments_kernel; audit 2026-10-17 item 20), process-global
+        # like the tile budgets; CPU tensors run the torch route whatever it is.
+        set_diagonal_moments_kernel(cfg.relational_diag_moments_kernel)
         set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
         set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None
                                      else DEFAULT_FRAME_PAIR_CONDITION_TOL)
