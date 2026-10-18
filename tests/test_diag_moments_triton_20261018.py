@@ -82,8 +82,8 @@ def _moments(mu: torch.Tensor, sigma: torch.Tensor, inverse: torch.Tensor, S: to
     finally:
         rs.set_diagonal_moments_kernel(previous)
     gen = torch.Generator().manual_seed(11)
-    wa = torch.randn(a.shape, generator=gen, dtype=torch.float64).to(a.dtype)
-    wg = torch.randn(g.shape, generator=gen, dtype=torch.float64).to(g.dtype)
+    wa = torch.randn(a.shape, generator=gen, dtype=torch.float64).to(a)
+    wg = torch.randn(g.shape, generator=gen, dtype=torch.float64).to(g)
     loss = (a * wa).sum() + (g * wg).sum()
     grads = torch.autograd.grad(loss, leaves)
     return torch.cat([a.detach().flatten(), g.detach().flatten()]), dict(zip(("mu", "sigma", "inverse", "S"), grads))
