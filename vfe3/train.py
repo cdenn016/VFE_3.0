@@ -1555,6 +1555,8 @@ _VAL_GEOMETRY_KEYS: Tuple[str, ...] = (
     "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
     "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
     "nonfinite_frac",
+    # the argmin token position of belief_lam_min and the minimum over positions >= 1 (audit 2026-10-17 item 13)
+    "belief_lam_min_argmin_position", "belief_lam_min_from_position_1",
 )
 
 
@@ -1633,7 +1635,14 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "comparison_map_norm_spread_layer_max",
     # self-lock and capped-entry locations (round 2, items 4 and 7)
     "link_unit_distance_min", "self_lock_unit_distance",
-    "score_klmax_frac_head_argmax_layer", "score_klmax_frac_head_argmax_head")
+    "score_klmax_frac_head_argmax_layer", "score_klmax_frac_head_argmax_head",
+    # audit 2026-10-17: the projected-covariance minimum's argmin position and minimum over positions >= 1
+    # (item 13), and the diagonal projection loss and reference-trace ratio with their layer maxima (items 3, 18)
+    "projected_cov_min_eigenvalue_argmin_position", "projected_cov_min_eigenvalue_from_position_1",
+    "diagonal_projection_kl", "diagonal_projection_kl_max", "diagonal_projection_trace_ratio",
+    "diagonal_projection_trace_ratio_max", "diagonal_projection_kl_layer_max",
+    "diagonal_projection_kl_argmax_layer", "diagonal_projection_trace_ratio_layer_max",
+    "diagonal_projection_trace_ratio_argmax_layer")
 ) + tuple(f"val_{key}" for key in LINK_SPECTRUM_KEYS)
 
 # Edge-link probes (content_link_edges != 'off' only; edge_links.edge_diagnostic_capture), appended to the
@@ -5529,6 +5538,7 @@ def train(
                         "phi_norm_mean", "phi_norm_std",
                         "belief_cond_median", "belief_cond_p95", "belief_cond_max",
                         "belief_lam_min", "belief_lam_max", "belief_cond_valid_frac",
+                        "belief_lam_min_argmin_position", "belief_lam_min_from_position_1",
                         "belief_cond_median_layer_max",
                         "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
                         "fisher_trace_mean", "fisher_trace_median",

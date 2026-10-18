@@ -163,7 +163,7 @@ config = dict(
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     relational_key_noise             = 1.0,         # relational_routing="noisy_key" only: initial per-head key noise n_h > 0 (learned; routes at temperature 1)
     predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
-    predictive_covariance_floor_mode = "prior",     # "prior" (f Sigma_p, reference-invariant) | "relative" (f tr(C)/K U U^T, the pre-2026-10-12 floor)
+    predictive_covariance_floor_mode = "prior",     # "prior" (f Sigma_p, reference-invariant) | "relative" (f tr(C)/K U U^T, the pre-2026-10-12 floor) | "max" (the larger of the two: relative scaling with the absolute bound f Sigma_p)
     predictive_covariance_ceiling    = None,        # None (off) | c > floor, e.g. 100: Loewner ceiling Sigma^+ <= c * Sigma_p (a clamp; counted in metrics.csv)
     diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
@@ -203,6 +203,7 @@ config = dict(
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
     block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal) | "pushforward_moment" (the same at the effective scale s^2 + tr(Pi Sigma Pi)/K with a span floor; a moment estimate at every Sigma/s^2)
     block_norm_trace_cap             = True,               # True | False: cap the LayerNorm covariance pushforward at the sphere bound K max(gamma^2) (False: uncapped delta method)
+    block_norm_cap_moment_fallback   = False,              # True | False: capped 'pushforward' only: where the cap binds, return the 'pushforward_moment' estimate instead of the capped delta method
 
     #################################
     #        Initialization
@@ -256,6 +257,7 @@ config = dict(
     
     lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
     mstep_self_coupling_weight       = 0.0,      # float >= 0: alpha_hat of the M-step term alpha_hat * mean_i alpha_i D(q_i*||p_i), gradient through q*; 0.0 = off
+    self_kl_max                      = None,     # None | float > 0 (float("inf") allowed): divergence clamp of the M-step self term; None = kl_max
   
     ########################################
     #     Attention Belief/Model Settings
@@ -351,6 +353,8 @@ config = dict(
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
     predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
     predictive_covariance_precision  = "fp32",     # "fp32" | "fp64": moment_matched kernel readout: run the whole covariance update in float64 from fp32 beliefs (removes kappa(U)^2 rounding; costly)
+    predictive_covariance_spread_squares = False,  # True | False: moment_matched kernel readout: routed spread as a nonnegative sum of squares after the sandwich (no edge links)
+    predictive_covariance_symmetric_pairs = False, # True | False: moment_matched kernel readout, blockwise body: head pairs h <= g only, off-diagonal pairs doubled (no edge links)
         
    
     

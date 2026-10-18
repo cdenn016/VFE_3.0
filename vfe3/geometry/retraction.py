@@ -9,6 +9,7 @@ import math
 from typing import Dict, Optional, Tuple
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from vfe3.numerics import safe_eigh
 
@@ -204,11 +205,14 @@ class _SymmetricSpectralMap(torch.autograd.Function):
         kind:   str,
         lower:  float,
         upper:  Optional[float],
+        spectrum: Optional[Dict[str, torch.Tensor]] = None,   # receives the detached eigenvalues, or None
     ) -> torch.Tensor:
         symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
         # safe_eigh: value-identical to torch.linalg.eigh, but chunks the flattened batch below the
         # cuSOLVER batched-eigensolver ceiling (audit 2026-09-23 low; see numerics._EIG_MAX_BATCH).
         eigenvalues, eigenvectors = safe_eigh(symmetric)
+        if spectrum is not None:
+            spectrum["eigenvalues"] = eigenvalues.detach()
         values, _ = _spectral_values_and_derivatives(eigenvalues, kind, lower, upper)
         ctx.save_for_backward(eigenvalues, eigenvectors)
         ctx.kind = kind
@@ -217,6 +221,7 @@ class _SymmetricSpectralMap(torch.autograd.Function):
         return eigenvectors * values.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
 
     @staticmethod
+    @once_differentiable      # the adjoint reads eigenpairs formed without a graph (audit 2026-10-17 item 41)
     def backward(ctx, grad_output: torch.Tensor):
         eigenvalues, eigenvectors = ctx.saved_tensors
         grad_matrix = _loewner_adjoint(
@@ -227,7 +232,7 @@ class _SymmetricSpectralMap(torch.autograd.Function):
             ctx.upper,
             grad_output,
         )
-        return grad_matrix, None, None, None
+        return grad_matrix, None, None, None, None
 
 
 class _SymmetricSpectralMapPair(torch.autograd.Function):
@@ -252,6 +257,7 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
         kind_b: str,
         lower:  float,
         upper:  Optional[float],
+        spectrum: Optional[Dict[str, torch.Tensor]] = None,   # receives the detached eigenvalues, or None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Without this, autograd MATERIALIZES an undefined output gradient as a zero tensor, so the
         # backward's `if grad_output is None: continue` never fires and a full Loewner adjoint runs
@@ -262,6 +268,8 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
         eigenvalues, eigenvectors = safe_eigh(symmetric)
+        if spectrum is not None:
+            spectrum["eigenvalues"] = eigenvalues.detach()
         values_a, _ = _spectral_values_and_derivatives(eigenvalues, kind_a, lower, upper)
         values_b, _ = _spectral_values_and_derivatives(eigenvalues, kind_b, lower, upper)
         ctx.save_for_backward(eigenvalues, eigenvectors)
@@ -275,6 +283,7 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
         )
 
     @staticmethod
+    @once_differentiable      # the adjoint reads eigenpairs formed without a graph (audit 2026-10-17 item 41)
     def backward(ctx, grad_a: Optional[torch.Tensor], grad_b: Optional[torch.Tensor]):
         eigenvalues, eigenvectors = ctx.saved_tensors
         grad_matrix = None
@@ -290,7 +299,7 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
                 grad_output,
             )
             grad_matrix = contribution if grad_matrix is None else grad_matrix + contribution
-        return grad_matrix, None, None, None, None
+        return grad_matrix, None, None, None, None, None
 
 
 def _symmetric_spectral_map(
@@ -300,8 +309,9 @@ def _symmetric_spectral_map(
     *,
     lower:  float,
     upper:  Optional[float] = None,
+    spectrum: Optional[Dict[str, torch.Tensor]] = None,   # receives the detached eigenvalues of the symmetrized input
 ) -> torch.Tensor:
-    return _SymmetricSpectralMap.apply(matrix, kind, lower, upper)
+    return _SymmetricSpectralMap.apply(matrix, kind, lower, upper, spectrum)
 
 
 def _symmetric_spectral_map_pair(
@@ -312,12 +322,13 @@ def _symmetric_spectral_map_pair(
     *,
     lower:  float,
     upper:  Optional[float] = None,
+    spectrum: Optional[Dict[str, torch.Tensor]] = None,   # receives the detached eigenvalues of the symmetrized input
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Both matrix functions of ONE matrix from a single shared eigendecomposition.
 
     Bit-identical to calling :func:`_symmetric_spectral_map` twice on the same input; see
     :class:`_SymmetricSpectralMapPair`."""
-    return _SymmetricSpectralMapPair.apply(matrix, kind_a, kind_b, lower, upper)
+    return _SymmetricSpectralMapPair.apply(matrix, kind_a, kind_b, lower, upper, spectrum)
 
 
 class _ClippedSpectralRebuild(torch.autograd.Function):
@@ -354,6 +365,7 @@ class _ClippedSpectralRebuild(torch.autograd.Function):
         return eigenvectors * clipped.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
 
     @staticmethod
+    @once_differentiable      # the adjoint reads eigenpairs formed without a graph (audit 2026-10-17 item 41)
     def backward(ctx, grad_output: torch.Tensor):
         eigenvalues, eigenvectors, clipped, lower, upper = ctx.saved_tensors
         has_upper = ctx.has_upper
@@ -679,7 +691,32 @@ def retract_spd_full(
     spectrum -- at the isotropic ``Sigma = I`` default gaussian_full init the stock eigh backward is
     100% NaN.
     When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
+
+    The final projection onto :math:`[\epsilon, \sigma_{\max}]` needs a third eigendecomposition only on rows whose
+    spectrum may leave the band (audit 2026-10-17 item 63). By Ostrowski's theorem (Horn and Johnson, *Matrix
+    Analysis*, 2nd ed., 2013, Theorem 4.5.9) the eigenvalues of :math:`S^{1/2}e^RS^{1/2}` lie in
+    :math:`[\lambda_{\min}(S)e^{\lambda_{\min}(R)}, \lambda_{\max}(S)e^{\lambda_{\max}(R)}]`, with
+    :math:`\lambda(S) = \max(\lambda(\Sigma), \epsilon)` and :math:`\lambda(R)` clipped to :math:`[-50, 50]` as the
+    spectral maps apply them, both from the first two decompositions. A row whose enclosure lies inside the band with
+    a relative margin of :math:`64K` units of roundoff keeps its rebuilt matrix: the projection there is the identity
+    in exact arithmetic, so values change only by rounding, and its Loewner adjoint is the symmetrization the rebuilt
+    matrix already carries.
     """
+    return _retract_spd_full(sigma, delta_sigma, step_size=step_size, trust_region=trust_region, eps=eps,
+                             sigma_max=sigma_max, skip_inside=True)
+
+
+def _retract_spd_full(
+    sigma:        torch.Tensor,             # (..., K, K) SPD covariances
+    delta_sigma:  torch.Tensor,             # (..., K, K) symmetric tangent
+    *,
+    step_size:    float,
+    trust_region: float,
+    eps:          float,
+    sigma_max:    Optional[float],
+    skip_inside:  bool,                     # skip the projection on rows the Ostrowski enclosure places in the band
+) -> torch.Tensor:
+    r"""Body of :func:`retract_spd_full`; ``skip_inside=False`` projects every row (the reference path)."""
     _check_sigma_max(sigma_max, eps)
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
@@ -699,11 +736,13 @@ def retract_spd_full(
         # ONE damped eigendecomposition serves both halves: sqrt and inv-sqrt of the SAME sigma
         # share a spectrum (audit 2026-08-05 -- the two separate calls ran eigh twice over the
         # live (B*N, K, K) stack on every E-step). Bit-identical, forward and backward.
+        sigma_spectrum: Dict[str, torch.Tensor] = {}
         sigma_sqrt, sigma_inv_sqrt = _symmetric_spectral_map_pair(
             sigma,
             "sqrt_floor",
             "inv_sqrt_floor",
             lower=eps,
+            spectrum=sigma_spectrum,
         )
 
         R = sigma_inv_sqrt @ (step_size * delta_sigma) @ sigma_inv_sqrt
@@ -716,22 +755,28 @@ def retract_spd_full(
             R_norm = torch.linalg.norm(R, ord='fro', dim=(-2, -1), keepdim=True)
             R = R * torch.clamp(trust_region / (R_norm + eps), max=1.0)
 
+        R_spectrum: Dict[str, torch.Tensor] = {}
         exp_R = _symmetric_spectral_map(
             R,
             "exp_bounded",
             lower=-50.0,
             upper=50.0,
+            spectrum=R_spectrum,
         )
 
         sigma_new = sigma_sqrt @ exp_R @ sigma_sqrt
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        sigma_new = _symmetric_spectral_map(
-            sigma_new,
-            "project",
-            lower=eps,
-            upper=sigma_max,
-        )
+        if skip_inside and sigma_new.dim() == 3:
+            sigma_new = _project_outside_rows(sigma_new, sigma_spectrum["eigenvalues"], R_spectrum["eigenvalues"],
+                                              eps, sigma_max)
+        else:
+            sigma_new = _symmetric_spectral_map(
+                sigma_new,
+                "project",
+                lower=eps,
+                upper=sigma_max,
+            )
 
     sigma_new = _certify_public_spd(
         sigma_new.to(orig_dtype),
@@ -741,6 +786,32 @@ def retract_spd_full(
     if len(orig_shape) == 4:
         sigma_new = sigma_new.reshape(orig_shape)
     return sigma_new
+
+
+def _project_outside_rows(
+    sigma_new:   torch.Tensor,              # (R, K, K) rebuilt S^{1/2} e^R S^{1/2}, symmetrized
+    sigma_eigs:  torch.Tensor,              # (R, K) eigenvalues of Sigma (ascending, detached)
+    R_eigs:      torch.Tensor,              # (R, K) eigenvalues of R (ascending, detached)
+    eps:         float,
+    sigma_max:   Optional[float],
+) -> torch.Tensor:                          # (R, K, K) projected onto [eps, sigma_max] where needed
+    r"""The spectral projection of :func:`retract_spd_full` on the rows its Ostrowski enclosure does not certify."""
+    with torch.no_grad():
+        K = sigma_new.shape[-1]
+        margin = 64.0 * K * torch.finfo(sigma_new.dtype).eps
+        s_eigs = sigma_eigs.clamp(min=eps)                                       # lambda(S), S = sqrt_floor^2
+        r_eigs = R_eigs.clamp(min=-50.0, max=50.0)                               # exp_bounded's clip
+        low = s_eigs[..., 0] * torch.exp(r_eigs[..., 0])                         # (R,)
+        high = s_eigs[..., -1] * torch.exp(r_eigs[..., -1])                      # (R,)
+        inside = low >= eps * (1.0 + margin)
+        if sigma_max is not None:
+            inside = inside & (high <= sigma_max * (1.0 - margin))
+        inside = inside & torch.isfinite(low) & torch.isfinite(high)
+        rows = (~inside).nonzero().flatten()                                     # one host read
+    if rows.numel() == 0:
+        return sigma_new
+    projected = _symmetric_spectral_map(sigma_new.index_select(0, rows), "project", lower=eps, upper=sigma_max)
+    return sigma_new.index_copy(0, rows, projected)
 
 
 def retract_spd_affine(

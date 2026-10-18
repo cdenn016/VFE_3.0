@@ -33,7 +33,7 @@ def _norm() -> AffineLayerNorm:
     return norm
 
 
-def test_cap_off_returns_the_uncapped_pushforward_and_counts_nothing() -> None:
+def test_cap_off_returns_the_uncapped_pushforward_and_counts_the_tokens_above_the_bound() -> None:
     norm = _norm()
     g = torch.Generator().manual_seed(0)
     mu = 0.1 * torch.randn(3, K, generator=g, dtype=torch.float64)          # small s: Sigma >> s^2, the cap binds
@@ -46,9 +46,16 @@ def test_cap_off_returns_the_uncapped_pushforward_and_counts_nothing() -> None:
     torch.testing.assert_close(capped.sum(-1), torch.full((3,), bound, dtype=torch.float64))
     bm.reset_layernorm_trace_cap_elements()
     off = bm.block_norm_covariance_pushforward(norm, mu, sigma, 1e-3, trace_cap=False)
-    assert bm.layernorm_trace_cap_elements() == 0
     torch.testing.assert_close(off, uncapped)
     assert bool((off.sum(-1) > bound).all())
+    # Uncapped tokens above the sphere bound are still counted, and the largest ratio is kept (audit 2026-10-17
+    # item 7); the counter read warns once per run when it exceeds UNCAPPED_TRACE_RATIO_WARN.
+    ratio = float((off.sum(-1) / bound).max())
+    assert bm.layernorm_uncapped_trace_ratio_max() == pytest.approx(ratio, rel=1e-12)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert bm.layernorm_trace_cap_elements() == 3
+    bm.reset_layernorm_trace_cap_elements()
 
 
 def _cfg(**over: object):

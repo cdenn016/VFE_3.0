@@ -545,6 +545,25 @@ def belief_spectrum(
     return result
 
 
+def positional_minimum(
+    values: torch.Tensor,                # (..., N) a per-token statistic, the token position last
+) -> Tuple[float, float]:                # (argmin position, minimum over positions >= 1)
+    r"""Token position of the smallest value and the minimum over positions :math:`\ge 1` (audit 2026-10-17 item 13).
+
+    Position 0 routes only to itself and receives no routed spread, so a minimum over every :math:`(b, i)`, such as
+    ``belief_lam_min`` (:func:`belief_spectrum`'s ``lam_min``) or the projected-covariance minimum, can be set there
+    alone. Non-finite values are skipped; NaN when none is finite (and for the second value at ``N = 1``).
+    """
+    flat = values.detach().double().reshape(-1, values.shape[-1])                       # (rows, N)
+    finite = torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float("inf")))
+    per_position = finite.amin(dim=0)                                                    # (N,)
+    if not bool(torch.isfinite(per_position).any()):
+        return float("nan"), float("nan")
+    tail = per_position[1:]
+    tail_min = float(tail.min()) if tail.numel() and bool(torch.isfinite(tail).any()) else float("nan")
+    return float(per_position.argmin()), tail_min
+
+
 def half_fisher_trace(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 

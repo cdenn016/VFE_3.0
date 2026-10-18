@@ -31,6 +31,7 @@ which stays finite on the degenerate eigenvalues the clamp creates, where the ``
 from typing import Dict, List, Optional, Sequence
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from vfe3.contracts import host_check
 from vfe3.numerics import safe_eigh
@@ -69,6 +70,7 @@ class _SpectralCeiling(torch.autograd.Function):
         return (V * g.unsqueeze(-2)) @ V.mT
 
     @staticmethod
+    @once_differentiable      # the adjoint reads eigenpairs formed without a graph (audit 2026-10-17 item 41)
     def backward(ctx, grad: torch.Tensor):
         lam, g, V = ctx.saved_tensors
         diff = lam.unsqueeze(-1) - lam.unsqueeze(-2)                    # (n, r, r) lambda_a - lambda_b

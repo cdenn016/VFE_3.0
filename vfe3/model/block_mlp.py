@@ -1,4 +1,5 @@
 import math
+import warnings
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
@@ -363,18 +364,33 @@ def layernorm_diagonal_pushforward(
     :math:`\Sigma/s^2`; it is the diagonal of the full layout's (:func:`layernorm_full_pushforward`) at
     :math:`\operatorname{diag}(\sigma)`.
     """
+    return _layernorm_diagonal_pushforward_pair(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight,
+                                                effective_scale=effective_scale)[0]
+
+
+def _layernorm_diagonal_pushforward_pair(
+    mu:               torch.Tensor,                   # (..., K) pre-norm means
+    sigma:            torch.Tensor,                   # (..., K) diagonal covariance at mu
+    *,
+    eps:              float,
+    covariance_floor: float,
+    weight:           Optional[torch.Tensor] = None,
+    effective_scale:  bool                   = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:     # (working result, its float64 evaluation without graph or None)
+    r""":func:`layernorm_diagonal_pushforward` and, below float64, the float64 evaluation it selects from (no graph),
+    which the trace cap reads on tokens whose working-precision result overflowed (audit 2026-10-17 item 32)."""
     dtype = _pushforward_dtype(mu, sigma)
     with torch.autocast(device_type=mu.device.type, enabled=False):
         pushed = _layernorm_diagonal_pushforward_at(
             mu.to(dtype), sigma.to(dtype), eps, covariance_floor, None if weight is None else weight.to(dtype),
             effective_scale)
         if dtype == torch.float64:
-            return pushed
+            return pushed, None
         with torch.no_grad():                    # no float64 graph: the select below routes no gradient here
             high = _layernorm_diagonal_pushforward_at(
                 mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double(),
                 effective_scale)
-        return _SelectWorkingGradient.apply(pushed, high.to(dtype), pushed <= 0)
+        return _SelectWorkingGradient.apply(pushed, high.to(dtype), pushed <= 0), high
 
 
 class _SelectWorkingGradient(torch.autograd.Function):
@@ -569,6 +585,7 @@ def block_norm_covariance_pushforward(
     *,
     mode:             str                     = "pushforward",   # a BLOCK_NORM_PUSHFORWARD_MODES value
     trace_cap:        bool                    = True,            # block_norm_trace_cap; False returns it uncapped
+    cap_moment_fallback: bool                 = False,           # block_norm_cap_moment_fallback (pushforward only)
 ) -> torch.Tensor:                                    # sigma's layout, at promote_types(dtype, float32)
     r"""The covariance through a LayerNorm seam at the pre-norm mean (``block_norm_covariance`` = ``mode``).
 
@@ -585,19 +602,103 @@ def block_norm_covariance_pushforward(
     floor that keeps its conditioning from compounding across seams; it tracks the Monte Carlo moments at every
     :math:`\Sigma/s^2`, and net of its floor terms it is within the sphere bound in every tested regime, so there the
     cap, read net of the floor, is a guard whose counter reads zero.
+
+    ``trace_cap=False`` (audit 2026-10-17 item 7) returns the uncapped delta method; the tokens whose trace exceeds
+    the sphere bound are still counted (:func:`layernorm_trace_cap_elements`) and the largest ratio
+    :math:`\operatorname{tr}P/B` is kept on the device, so the counter read warns once per run when it exceeds
+    :data:`UNCAPPED_TRACE_RATIO_WARN` (at the launcher initialization the uncapped route overflows within a few seams
+    and decodes uniformly).
+
+    ``cap_moment_fallback`` (``block_norm_cap_moment_fallback``, ``mode='pushforward'`` with the cap only; audit
+    2026-10-17 item 8) returns the moment estimate of ``'pushforward_moment'`` on the tokens where the cap binds,
+    where the capped delta method keeps the radial shape :math:`\gamma_k^2z_k^2` and is off by up to about
+    :math:`10^3` per coordinate on anisotropic input, and the capped delta method elsewhere. The tokens are counted
+    as capped.
+
+    Below float64 the scale :math:`\lambda` is computed in float64 from a max-scaled trace (audit 2026-10-17 item
+    32), so a trace that overflows the working precision no longer gives :math:`\lambda = 0` (all-zero output) or
+    :math:`0\cdot\infty` (NaN); on the diagonal layout a token whose working-precision pushforward overflowed takes
+    its float64 evaluation, capped in float64 and cast back, with no gradient there.
     """
     if mode not in BLOCK_NORM_PUSHFORWARD_MODES:
         raise ValueError(f"block norm covariance pushforward mode must be one of {BLOCK_NORM_PUSHFORWARD_MODES}, "
                          f"got {mode!r}")
     moment = mode == "pushforward_moment"
-    pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor, head_dims, effective_scale=moment)
-    if not trace_cap:
-        return pushed
     diagonal = _is_diagonal_layout(mu, sigma)
     eps, weight = _layernorm_arguments(norm)
+    high = None
+    if diagonal:
+        pushed, high = _layernorm_diagonal_pushforward_pair(mu, sigma, eps=eps, covariance_floor=covariance_floor,
+                                                            weight=weight, effective_scale=moment)
+    else:
+        pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor, head_dims, effective_scale=moment)
+    if not trace_cap:
+        _record_uncapped_excess(pushed, weight, diagonal)
+        return pushed
     allowance = (_layernorm_moment_floor_trace(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)
                  if moment else None)                                        # (..., 1) the floor's trace, or None
-    return _apply_trace_cap(pushed, layernorm_trace_cap(pushed, weight, diagonal, allowance), diagonal)
+    overflow = None
+    if high is not None:                                                     # tokens whose working value overflowed
+        overflow = ~torch.isfinite(pushed).all(dim=-1, keepdim=True)         # (..., 1)
+        pushed = torch.where(overflow, torch.zeros_like(pushed), pushed)     # no inf * 0 in the graph
+    lam = layernorm_trace_cap(pushed, weight, diagonal, allowance)           # (..., 1) float64
+    capped = _apply_trace_cap(pushed, lam, diagonal)
+    if overflow is not None:
+        with torch.no_grad():
+            bound = _sphere_bound(weight, high.dtype, allowance, K=high.shape[-1])
+            lam_high = torch.clamp(bound / high.sum(dim=-1, keepdim=True), max=1.0)
+            _count_capped(overflow & (lam_high < 1.0))
+            capped = torch.where(overflow, (high * lam_high).to(capped.dtype), capped)
+            lam = torch.where(overflow, lam_high, lam)
+    if cap_moment_fallback and not moment:
+        fallback = block_norm_covariance_pushforward(norm, mu, sigma, covariance_floor, head_dims,
+                                                     mode="pushforward_moment", trace_cap=True)
+        binds = lam < 1.0 if diagonal else (lam < 1.0).unsqueeze(-1)         # (..., 1) or (..., 1, 1)
+        capped = torch.where(binds, fallback.to(capped.dtype), capped)
+    return capped
+
+
+# Ratio tr P / B above which the uncapped pushforward (block_norm_trace_cap=False) warns once per run.
+UNCAPPED_TRACE_RATIO_WARN = 1e2
+
+
+def _sphere_bound(
+    weight:    Optional[torch.Tensor],                # (K,) affine gamma, or None
+    dtype:     torch.dtype,
+    allowance: Optional[torch.Tensor] = None,         # (..., 1)
+    K:         Optional[int] = None,
+) -> 'torch.Tensor | float':                          # B = K max gamma^2 (+ allowance)
+    K = weight.shape[-1] if (weight is not None and K is None) else K
+    bound = float(K) if weight is None else K * weight.to(dtype).square().amax()
+    return bound if allowance is None else bound + allowance.to(dtype)
+
+
+def _count_capped(capped: torch.Tensor) -> None:      # bool, any shape
+    with torch.no_grad():
+        key = str(capped.device)
+        count = capped.sum()
+        _LAYERNORM_TRACE_CAPS[key] = (count if key not in _LAYERNORM_TRACE_CAPS
+                                      else _LAYERNORM_TRACE_CAPS[key] + count)
+
+
+def _record_uncapped_excess(
+    pushed:   torch.Tensor,                           # (..., K) or (..., K, K) uncapped LayerNorm pushforward
+    weight:   Optional[torch.Tensor],
+    diagonal: bool,
+) -> None:
+    r"""Count the uncapped tokens above the sphere bound and keep the largest ratio :math:`\operatorname{tr}P/B`
+    on the device (no host synchronization; ``block_norm_trace_cap=False``, audit 2026-10-17 item 7)."""
+    with torch.no_grad():
+        K = pushed.shape[-1]
+        work = pushed.detach().double()
+        trace = work.sum(dim=-1) if diagonal else torch.diagonal(work, dim1=-2, dim2=-1).sum(dim=-1)   # (...,)
+        ratio = trace / _sphere_bound(None if weight is None else weight.detach(), torch.float64, K=K)
+        ratio = torch.where(torch.isnan(ratio), torch.full_like(ratio, float("inf")), ratio)
+        _count_capped(ratio > 1.0)
+        key = str(pushed.device)
+        top = ratio.amax() if ratio.numel() else torch.zeros((), dtype=torch.float64, device=pushed.device)
+        _LAYERNORM_UNCAPPED_RATIO[key] = (top if key not in _LAYERNORM_UNCAPPED_RATIO
+                                          else torch.maximum(_LAYERNORM_UNCAPPED_RATIO[key], top))
 
 
 def _uncapped_block_norm_pushforward(
@@ -616,9 +717,13 @@ def _uncapped_block_norm_pushforward(
                                       head_dims=head_dims, effective_scale=effective_scale)
 
 
-# Tokens whose LayerNorm covariance pushforward was capped at the sphere bound, per device, counted on the device
-# (no host synchronization); read by the training loop through layernorm_trace_cap_elements().
+# Tokens whose LayerNorm covariance pushforward trace exceeded the sphere bound, per device, counted on the device
+# (no host synchronization); read by the training loop through layernorm_trace_cap_elements(). With the cap on these
+# are the capped tokens; under block_norm_trace_cap=False the uncapped tokens above the bound (audit 2026-10-17 item 7).
 _LAYERNORM_TRACE_CAPS: Dict[str, torch.Tensor] = {}
+# Largest tr P / B of an uncapped pushforward since the last reset, per device, and whether this run has warned.
+_LAYERNORM_UNCAPPED_RATIO: Dict[str, torch.Tensor] = {}
+_UNCAPPED_WARNED = [False]
 
 
 def layernorm_trace_cap(
@@ -657,17 +762,13 @@ def layernorm_trace_cap(
     for the regularizing floor added to it, so there the cap is a guard on the estimate net of its floor.
     """
     K = pushed.shape[-1]
-    bound = float(K) if weight is None else K * weight.to(pushed.dtype).square().amax()   # carries d/d gamma
-    if allowance is not None:
-        bound = bound + allowance.to(pushed.dtype)                                            # (..., 1) B + a
-    trace = (pushed.sum(dim=-1, keepdim=True) if diagonal
-             else torch.diagonal(pushed, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True))       # (..., 1)
-    lam = torch.clamp(bound / trace, max=1.0)                                                 # (..., 1)
-    with torch.no_grad():
-        key = str(pushed.device)
-        capped = (lam < 1.0).sum()
-        _LAYERNORM_TRACE_CAPS[key] = (capped if key not in _LAYERNORM_TRACE_CAPS
-                                      else _LAYERNORM_TRACE_CAPS[key] + capped)
+    wide = torch.promote_types(pushed.dtype, torch.float64)
+    bound = _sphere_bound(weight, wide, allowance, K=K)                                       # carries d/d gamma
+    entries = pushed.to(wide) if diagonal else torch.diagonal(pushed, dim1=-2, dim2=-1).to(wide)   # (..., K)
+    # Max-scaled float64 trace (audit 2026-10-17 item 32): lambda = (B / m) / sum_k(P_kk / m), m = max_k |P_kk|.
+    m = entries.detach().abs().amax(dim=-1, keepdim=True).clamp_min(torch.finfo(wide).tiny)   # (..., 1)
+    lam = torch.clamp((bound / m) / (entries / m).sum(dim=-1, keepdim=True), max=1.0)       # (..., 1) float64
+    _count_capped(lam < 1.0)
     return lam
 
 
@@ -678,8 +779,9 @@ def _apply_trace_cap(
 ) -> torch.Tensor:
     if lam is None:
         return covariance
-    lam = lam.to(covariance.dtype)
-    return covariance * lam if diagonal else covariance * lam.unsqueeze(-1)
+    wide = torch.promote_types(covariance.dtype, lam.dtype)                 # the product at lambda's float64
+    scaled = covariance.to(wide) * (lam if diagonal else lam.unsqueeze(-1))
+    return scaled.to(covariance.dtype)
 
 
 def block_norm_trace_cap(
@@ -697,13 +799,34 @@ def block_norm_trace_cap(
 
 
 def layernorm_trace_cap_elements() -> int:
-    r"""Capped LayerNorm-pushforward tokens since the last reset, over all devices. Host-syncs."""
+    r"""LayerNorm-pushforward tokens above the sphere bound since the last reset, over all devices: capped with the
+    cap on, passed through uncapped under ``block_norm_trace_cap=False``. Host-syncs.
+
+    Under ``block_norm_trace_cap=False`` the first read after the largest uncapped ratio :math:`\operatorname{tr}P/B`
+    exceeds :data:`UNCAPPED_TRACE_RATIO_WARN` warns once per run (audit 2026-10-17 item 7)."""
+    if _LAYERNORM_UNCAPPED_RATIO and not _UNCAPPED_WARNED[0]:
+        top = layernorm_uncapped_trace_ratio_max()
+        if not top <= UNCAPPED_TRACE_RATIO_WARN:
+            _UNCAPPED_WARNED[0] = True
+            warnings.warn(
+                f"block_norm_trace_cap=False: an uncapped LayerNorm covariance pushforward reached {top:.3g} times "
+                f"the sphere bound K max(gamma^2) (warning above {UNCAPPED_TRACE_RATIO_WARN:g}); the delta method is "
+                "outside its regime (Sigma >> s^2) and the covariance can overflow within a few layers. Use the cap "
+                "or block_norm_covariance='pushforward_moment'.", RuntimeWarning, stacklevel=2)
     return int(sum(int(count) for count in _LAYERNORM_TRACE_CAPS.values()))
 
 
+def layernorm_uncapped_trace_ratio_max() -> float:
+    r"""Largest :math:`\operatorname{tr}P/B` of an uncapped pushforward since the last reset (0 when none ran;
+    inf for a non-finite trace). Host-syncs."""
+    return max((float(value) for value in _LAYERNORM_UNCAPPED_RATIO.values()), default=0.0)
+
+
 def reset_layernorm_trace_cap_elements() -> None:
-    r"""Zero the per-device LayerNorm trace-cap counters."""
+    r"""Zero the per-device LayerNorm trace-cap counters, the uncapped ratio and the once-per-run warning."""
     _LAYERNORM_TRACE_CAPS.clear()
+    _LAYERNORM_UNCAPPED_RATIO.clear()
+    _UNCAPPED_WARNED[0] = False
 
 
 def layernorm_full_pushforward(
