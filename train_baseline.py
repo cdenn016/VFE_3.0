@@ -64,7 +64,7 @@ from vfe3.data.datasets import (
     make_dataloader,
     tokens_per_char as _tokens_per_char,
 )
-from vfe3.experiment import rename_run_by_test_ppl, reserve_directory
+from vfe3.experiment import rename_run_by_test_ppl, reserve_directory, write_failure_record
 from vfe3.runtime import seed_everything
 from vfe3.train import evaluate, train
 
@@ -245,7 +245,9 @@ def run_baseline(
     :func:`vfe3.train.train` on the ``train_vfe3`` loaders (data order from ``data_seed``, the model
     seed when None), validated, and finalized by :func:`vfe3.run_artifacts.finalize_run` (test at the
     final and at the validation-selected weights, training-sample CE, provenance, summary,
-    resources). The global RNG is reseeded after the build, as in ``train_vfe3._run_once``.
+    resources). The global RNG is reseeded after the build, as in ``train_vfe3._run_once``. An
+    exception during training or finalization writes ``failure.json`` into the run directory
+    (:func:`vfe3.experiment.write_failure_record`) and is re-raised.
     """
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
@@ -273,32 +275,37 @@ def run_baseline(
                 run_label, f"{n_params:,}", f"{model.context_processing_parameter_count():,}",
                 cfg.embed_dim, cfg.n_heads, cfg.n_layers, cfg.mlp_expansion, cfg.per_type_table,
                 run_dir)
-    seed_everything(cfg.seed, deterministic=cfg.deterministic)
-    started = time.perf_counter()
-    final_validation: Dict[str, Optional[float]] = {}
-    losses = train(model, train_loader, cfg, n_steps=cfg.max_steps, grad_clip=cfg.grad_clip,
-                   log_interval=cfg.log_interval, eval_interval=cfg.eval_interval,
-                   val_loader=val_loader, tokens_per_char=val_tpc, device=device, logger=logger,
-                   artifacts=artifacts, _final_validation_out=final_validation,
-                   generate_samples=generate_samples, sample_dataset=dataset)
-    wall = time.perf_counter() - started
-    if final_validation:
-        iter(val_loader)                     # the omitted pass's CPU base-seed draw, as train_vfe3
-        metrics = final_validation
-    else:
-        metrics = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
-    logger.info("Final (val) | CE: %.4f | PPL: %.2f", metrics["ce"], metrics["ppl"])
-    results = finalize_run(
-        model, artifacts, cfg, final_validation=metrics, tokens_per_char=test_tpc,
-        train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, losses=losses,
-        data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=_tokenizer_tag(dataset),
-        device=device, wall_time=wall, logger=logger)
-    if score_test:
-        final_dir = rename_run_by_test_ppl(run_dir, run_label, results.get("test_ppl"), logger)
-    else:
-        final_dir = rename_run_by_test_ppl(run_dir, run_label, results.get("best_val_ppl"), logger, prefix="val")
-    logger.info("Artifacts written to %s", final_dir)
-    return final_dir
+    try:
+        seed_everything(cfg.seed, deterministic=cfg.deterministic)
+        started = time.perf_counter()
+        final_validation: Dict[str, Optional[float]] = {}
+        losses = train(model, train_loader, cfg, n_steps=cfg.max_steps, grad_clip=cfg.grad_clip,
+                       log_interval=cfg.log_interval, eval_interval=cfg.eval_interval,
+                       val_loader=val_loader, tokens_per_char=val_tpc, device=device, logger=logger,
+                       artifacts=artifacts, _final_validation_out=final_validation,
+                       generate_samples=generate_samples, sample_dataset=dataset)
+        wall = time.perf_counter() - started
+        if final_validation:
+            iter(val_loader)                     # the omitted pass's CPU base-seed draw, as train_vfe3
+            metrics = final_validation
+        else:
+            metrics = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
+        logger.info("Final (val) | CE: %.4f | PPL: %.2f", metrics["ce"], metrics["ppl"])
+        results = finalize_run(
+            model, artifacts, cfg, final_validation=metrics, tokens_per_char=test_tpc,
+            train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, losses=losses,
+            data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=_tokenizer_tag(dataset),
+            device=device, wall_time=wall, logger=logger)
+        if score_test:
+            final_dir = rename_run_by_test_ppl(run_dir, run_label, results.get("test_ppl"), logger)
+        else:
+            final_dir = rename_run_by_test_ppl(run_dir, run_label, results.get("best_val_ppl"), logger, prefix="val")
+        logger.info("Artifacts written to %s", final_dir)
+        return final_dir
+    except Exception as exc:
+        # A crash is a recorded failure of the seed pair, not an unfinished run (audit 2026-10-17 item 28).
+        write_failure_record(run_dir, exc, stage="train_or_finalize")
+        raise
 
 
 def lr_sweep(

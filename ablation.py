@@ -279,6 +279,10 @@ CONFIG: Dict[str, Any] = {
     # invalidate a finished cell. Set that flag True for a reproducibility-strict cohort instead.
     "resume":      True,
 
+    # Under resume, a cell whose earlier attempt failed (crash, non-finite PPL) is reported, not retrained,
+    # so results are not conditioned on eventual success; True retrains it (every attempt is archived).
+    "retry_failed": False,   # False | True
+
     "output_dir":  "vfe3_ablation_results",   # "vfe3_ablation_results_attention_20260913"
 }
 
@@ -3778,6 +3782,161 @@ def _start_owned_cell_generation(
             child.unlink()
 
 
+# Per-cell attempt ledger and archive (audit 2026-10-17 item 28). Under resume a cell whose marker records a
+# run failure (a training crash, a non-finite terminal validation PPL, or incomplete requested outputs) is
+# terminal: it is reported, not retrained, unless ``retry_failed`` is set. Every earlier generation of a cell
+# is archived under ``<sweep>/.attempts/<cell>/attempt_<n>/`` before it is cleared, and the ledger
+# ``cell_attempts.json`` lists each attempt's status, so results conditioned on eventual success are visible.
+_CELL_ATTEMPTS_FILENAME = "cell_attempts.json"
+_CELL_ATTEMPT_ARCHIVE = ".attempts"
+_CELL_ATTEMPT_ARCHIVE_MAX_BYTES = 4 * 1024 * 1024        # larger files (weights, checkpoints) are listed, not copied
+
+
+def _read_cell_attempts(sweep_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
+    r"""The sweep's attempt ledger ``{label: [attempt records]}`` (empty when absent or unreadable)."""
+    try:
+        ledger = json.loads((sweep_dir / _CELL_ATTEMPTS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(ledger, dict):
+        return {}
+    return {str(label): [dict(a) for a in attempts if isinstance(a, Mapping)]
+            for label, attempts in ledger.items() if isinstance(attempts, list)}
+
+
+def _cell_failure_class(marker: Mapping[str, object]) -> Optional[str]:
+    r"""``"run"`` for a failure the run itself produced, ``"contract"`` for any other failure, None otherwise.
+
+    A run failure is a training crash (``error_kind = "train"``), a non-finite terminal validation PPL or
+    incomplete requested outputs; setup, configuration, parameter-count, corpus, code or contract failures
+    are ``"contract"``. Markers written before the field existed are classified from ``error_kind`` and
+    ``final_val_ppl``.
+    """
+    if marker.get("status") != "failed":
+        return None
+    recorded = marker.get("failure_class")
+    if recorded in ("run", "contract"):
+        return str(recorded)
+    error_kind = marker.get("error_kind")
+    if error_kind == "train":
+        return "run"
+    if error_kind is None:
+        try:
+            ppl = float(marker.get("final_val_ppl"))           # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            ppl = float("inf")
+        if not math.isfinite(ppl):
+            return "run"
+    return "contract"
+
+
+def _is_terminal_cell_failure(
+    marker:    object,
+    label:     str,
+    seed:      int,
+    overrides: Mapping[str, Any],
+) -> bool:
+    r"""Whether ``marker`` records a run failure of exactly this cell (label, seed and overrides)."""
+    return (isinstance(marker, Mapping)
+            and _cell_failure_class(marker) == "run"
+            and marker.get("label") == label
+            and marker.get("seed") == int(seed)
+            and marker.get("overrides") == _jsonable(dict(overrides)))
+
+
+def _attempt_record(result: Mapping[str, Any], attempt: int) -> Dict[str, Any]:
+    r"""One ledger entry for a finished (or recovered) attempt of a cell."""
+    return {
+        "attempt":         int(attempt),
+        "status":          result.get("status"),
+        "failure_class":   _cell_failure_class(result),
+        "error_kind":      result.get("error_kind"),
+        "error":           result.get("error"),
+        "final_val_ppl":   result.get("final_val_ppl"),
+        "skipped_steps":   result.get("skipped_steps"),
+        "timestamp":       time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _archive_cell_attempt(
+    sweep_dir: Path,
+    run_dir:   Path,
+    label:     str,
+    ledger:    Dict[str, List[Dict[str, Any]]],
+) -> Optional[Path]:
+    r"""Copy the current generation of ``run_dir`` into the attempt archive before it is cleared.
+
+    Regular files up to :data:`_CELL_ATTEMPT_ARCHIVE_MAX_BYTES` are copied; larger files and directories
+    are listed in ``archive_manifest.json``. An attempt the ledger does not yet hold (a crash that left a
+    ``running`` marker, or a marker older than the ledger) is added from its marker. Returns the archive
+    directory, or None when there is no marker to archive.
+    """
+    marker_path = run_dir / "ablation_result.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, Mapping):
+        return None
+    attempts = ledger.setdefault(label, [])
+    if marker.get("status") == "running":
+        attempts.append({**_attempt_record({"status": "interrupted"}, len(attempts) + 1),
+                         "error": "the process ended before the cell published a result"})
+    elif not attempts or attempts[-1].get("archive") is not None:
+        attempts.append(_attempt_record(marker, len(attempts) + 1))
+    root = sweep_dir / _CELL_ATTEMPT_ARCHIVE
+    root.mkdir(exist_ok=True)
+    target = root / run_dir.name / f"attempt_{int(attempts[-1]['attempt']):04d}"
+    target.mkdir(parents=True, exist_ok=True)
+    skipped: List[Dict[str, Any]] = []
+    for child in sorted(run_dir.iterdir()):
+        if child.is_symlink() or _path_is_junction(child):
+            continue
+        if child.is_file():
+            size = child.stat().st_size
+            if size <= _CELL_ATTEMPT_ARCHIVE_MAX_BYTES:
+                shutil.copy2(child, target / child.name)
+            else:
+                skipped.append({"name": child.name, "size_bytes": size})
+        elif child.is_dir():
+            skipped.append({"name": child.name + "/", "size_bytes": None})
+    _write_json_atomic(target / "archive_manifest.json", {"label": label, "not_copied": skipped})
+    attempts[-1]["archive"] = target.relative_to(sweep_dir).as_posix()
+    _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, ledger)
+    return target
+
+
+def _cell_attempt_summary(
+    ledger: Mapping[str, Sequence[Mapping[str, Any]]],
+    labels: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    r"""Per requested label with a ledger: attempts, failed attempts and the last attempt's status."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for label in labels:
+        attempts = list(ledger.get(label) or [])
+        if not attempts:
+            continue
+        failed = [a for a in attempts if a.get("status") in ("failed", "interrupted")]
+        out[label] = {"n_attempts": len(attempts), "n_failed": len(failed),
+                      "last_status": attempts[-1].get("status"),
+                      "failures": [{key: a.get(key) for key in ("attempt", "status", "failure_class",
+                                                                  "error_kind", "error")} for a in failed]}
+    return out
+
+
+def _print_cell_attempts(summary: Mapping[str, Mapping[str, Any]]) -> None:
+    r"""Print every cell that failed or needed more than one attempt."""
+    flagged = {label: row for label, row in summary.items() if row["n_failed"] or row["n_attempts"] > 1}
+    if not flagged:
+        return
+    print("\n  Cells with failed or repeated attempts (results are not conditioned on eventual success):")
+    for label, row in flagged.items():
+        kinds = ", ".join(f"#{f['attempt']} {f['status']} ({f.get('error_kind') or f.get('failure_class')})"
+                          for f in row["failures"])
+        print(f"    {label}: {row['n_attempts']} attempt(s), {row['n_failed']} failed, last {row['last_status']}"
+              + (f"; {kinds}" if kinds else ""))
+
+
 def _invalidate_code_drifted_cells(
     sweep_dir: Path,
     cells:     List[Tuple[str, Dict[str, Any], int]],
@@ -3842,6 +4001,7 @@ def run_sweep(
     device:      torch.device,
     seed:        int,
     resume:      bool,
+    retry_failed: bool                  = False,
     save_model_artifacts: bool          = True,
     max_tokens:  Optional[int] = None,
     max_steps:   Optional[int] = None,
@@ -3852,6 +4012,11 @@ def run_sweep(
 
     Returns the collected cohort only for a complete sweep and ``[]`` otherwise. ``collected_out``
     receives the collected cohort in either case, for callers that rank partial results.
+
+    Under ``resume`` a cell whose marker records a run failure (:func:`_cell_failure_class`) is terminal
+    and is reported rather than retrained, unless ``retry_failed`` is True. Every generation of a cell is
+    archived before it is cleared and recorded in ``cell_attempts.json``; ``sweep_meta.json`` carries the
+    per-cell attempts and failures under ``cell_attempts`` and they are printed (audit 2026-10-17 item 28).
     """
     stop_after_steps = _validated_stop_after_steps(stop_after_steps)
     sweep_name = _validated_sweep_name(sweep_name)
@@ -4046,6 +4211,7 @@ def run_sweep(
     running_meta["aggregation_contract"] = aggregation_contract
     
     _write_json_atomic(sweep_dir / "sweep_meta.json", running_meta)
+    attempt_ledger = _read_cell_attempts(sweep_dir)
     results: List[Dict[str, Any]] = []
     for i, (label, overrides, cell_seed) in enumerate(cells):
         run_dir = sweep_dir / _sanitize(label)
@@ -4087,6 +4253,16 @@ def run_sweep(
                 cached_result = json.loads(marker.read_text(encoding="utf-8"))
             except Exception:
                 cached_result = None
+            if (not retry_failed and _cell_dir_is_owned(sweep_dir, run_dir)
+                    and _is_terminal_cell_failure(cached_result, label, cell_seed, overrides)):
+                n_tried = len(attempt_ledger.get(label) or []) or 1
+                print(f"\n--- {i + 1}/{len(cells)}: {label}  [FAILED earlier, not retried; "
+                      f"{n_tried} attempt(s); set retry_failed=True to retrain] ---")
+                if not attempt_ledger.get(label):
+                    attempt_ledger[label] = [_attempt_record(cached_result, 1)]
+                    _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger)
+                results.append(dict(cached_result))
+                continue
             parameter_record = parameter_record_by_label.get(label)
             parameter_budget_current = (
                 parameter_record is None
@@ -4128,6 +4304,14 @@ def run_sweep(
             print(f"\n--- {i + 1}/{len(cells)}: {label} ---")
         t0 = time.perf_counter()
         generation_started = False
+        if marker.exists() and _cell_dir_is_owned(sweep_dir, run_dir):
+            try:
+                archived_attempt = _archive_cell_attempt(sweep_dir, run_dir, label, attempt_ledger)
+            except OSError as exc:
+                logger.warning("  [%s] earlier attempt could not be archived: %s", label, exc)
+            else:
+                if archived_attempt is not None:
+                    print(f"  [ARCHIVED] earlier attempt of {label} -> {archived_attempt}")
         try:
             _start_owned_cell_generation(
                 sweep_dir,
@@ -4213,6 +4397,8 @@ def run_sweep(
             terminal_ppl = float("inf")
         result["final_val_ppl"] = terminal_ppl
         successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
+        run_failure = result["error_kind"] == "train" or (result["error_kind"] is None
+                                                           and not math.isfinite(terminal_ppl))
 
         # Requested collections are terminal artifacts. Every declared diagnostic must be finite,
         # and extrapolation must contain the contracted number of distinct finite sequence lengths.
@@ -4224,6 +4410,7 @@ def run_sweep(
                 mandatory_extrapolation_lengths=mandatory_extrapolation_lengths):
             logger.warning("  [%s] requested outputs incomplete -> cell marked failed", label)
             successful = False
+            run_failure = True
 
         # A retained terminal checkpoint's path, size, and SHA-256 are recorded; reuse revalidates its
         # location. Lightweight optimizer cells instead bind the explicit absence of both best weights
@@ -4278,6 +4465,7 @@ def run_sweep(
             successful = False
             contract = None
         result["status"] = "success" if successful else "failed"
+        result["failure_class"] = None if successful else ("run" if run_failure else "contract")
         result["cell_contract_fingerprint"] = (
             semantic_config_fingerprint(contract)
             if successful and contract is not None else None
@@ -4292,6 +4480,9 @@ def run_sweep(
             _write_json_atomic(contract_path, contract)
         if generation_started:
             _write_json_atomic(marker, result)
+        cell_attempts = attempt_ledger.setdefault(label, [])
+        cell_attempts.append(_attempt_record(result, len(cell_attempts) + 1))
+        _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger)
         results.append(result)
 
         ppl = result["primary_val_ppl"]
@@ -4350,6 +4541,7 @@ def run_sweep(
         sweep_error = None
     sweep_status = "complete" if sweep_error is None else "incomplete"
     gauge_purity = _gauge_purity_summary(union)
+    cell_attempts_summary = _cell_attempt_summary(attempt_ledger, [label for label, _o, _s in cells])
 
     # Publish the complete accumulated frame before the terminal metadata. A reader that observes
     # status="complete" therefore cannot see a truncated or previous-generation CSV.
@@ -4368,6 +4560,8 @@ def run_sweep(
         "error":       sweep_error,
         "aggregation_contract": aggregation_contract,
         "gauge_purity": gauge_purity,
+        "retry_failed": bool(retry_failed),
+        "cell_attempts": cell_attempts_summary,
         # PB-07 report metadata (null for ordinary sweeps): lets the ablation-forest / joint-LR-grid
         # adapters operate after a process restart, when only the persisted sweep view survives.
         **report_metadata,
@@ -4375,6 +4569,7 @@ def run_sweep(
 
     if collected_out is not None:
         collected_out[:] = union
+    _print_cell_attempts(cell_attempts_summary)
     if sweep_error is not None:
         print(f"\nSWEEP INCOMPLETE: {sweep_name}  ->  {sweep_error}")
         return []
@@ -5532,6 +5727,7 @@ def main() -> int:
             continue
         run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
                   seed=CONFIG["seed"], resume=CONFIG["resume"],
+                  retry_failed=bool(CONFIG.get("retry_failed", False)),
                   max_tokens=CONFIG["max_tokens"],
                   max_steps=(LR_WIDTH_TRANSFER["max_steps"] if name == _LR_WIDTH_TRANSFER_SWEEP
                              else CONFIG["max_steps"]),

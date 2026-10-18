@@ -819,6 +819,35 @@ def _requested_design(
     }
 
 
+def _design_path(input_dir: Path) -> Path:
+    r"""``scaling_design.json`` of ``input_dir``, or of its parent when ``input_dir`` is one route."""
+    path = input_dir / "scaling_design.json"
+    return path if path.is_file() else input_dir.parent / "scaling_design.json"
+
+
+def print_design_attempts(design: Mapping[str, Any]) -> None:
+    r"""Print every design cell that failed or needed more than one attempt.
+
+    ``scaling.py`` records ``n_attempts``, ``n_failed_attempts`` and ``attempts`` per cell in
+    ``scaling_design.json``; archived attempts are never harvested, so this is where a cell that failed
+    before it succeeded, or failed and was not retried, stays visible (audit 2026-10-17 item 28).
+    """
+    cells = design.get("cells") if isinstance(design, Mapping) else None
+    flagged = [cell for cell in (cells if isinstance(cells, list) else [])
+               if isinstance(cell, Mapping) and ((cell.get("n_failed_attempts") or 0) > 0
+                                                 or (cell.get("n_attempts") or 0) > 1)]
+    if not flagged:
+        return
+    print("\n  Cells with failed or repeated attempts (the fit is not conditioned on eventual success):")
+    for cell in flagged:
+        kinds = ", ".join(f"#{a.get('attempt')} {a.get('status')} ({a.get('error_kind')})"
+                          for a in cell.get("attempts", []) if isinstance(a, Mapping)
+                          and a.get("status") != "complete")
+        print(f"    {cell.get('route')}/{cell.get('label')}/s{cell.get('seed')}: {cell.get('n_attempts')} "
+              f"attempt(s), {cell.get('n_failed_attempts')} failed, now {cell.get('status')}"
+              + (f"; {kinds}" if kinds else ""))
+
+
 def write_csv(rows: List[Dict[str, Any]], out_path: Path) -> None:
     r"""Tidy ``scaling_points.csv`` (fixed columns; missing keys blank). Python file I/O, never
     PowerShell ``>`` redirection (which writes UTF-16LE+BOM that numpy/csv misread)."""
@@ -1507,6 +1536,7 @@ def analyze() -> None:
     write_csv(rows, input_dir / "scaling_points.csv")
     print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
+    print_design_attempts(_read_json(_design_path(input_dir)))   # audit 2026-10-17 item 28
     if design.get("forced_code_identity_acceptance") is True:
         print(
             "\nWARNING: FORCED CODE-IDENTITY ACCEPTANCE is active for "

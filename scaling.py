@@ -105,6 +105,10 @@ CONFIG: Dict[str, Any] = {
     # are skipped with explicit provenance labeling; partial cells are restarted.
     "resume":     True,
 
+    # Under resume, a cell whose earlier attempt crashed or ended non-finite is reported, not retrained, so
+    # the fit is not conditioned on eventual success; True retrains it (every attempt is archived).
+    "retry_failed": False,       # False | True
+
     "output_dir": "vfe3_scaling_results/standard",
 }
 
@@ -1179,6 +1183,79 @@ def _archive_scaling_attempt(
     raise RuntimeError("scaling attempt archive exhausted its numeric namespace")
 
 
+# Failure kinds a run produces itself; under resume they are terminal unless CONFIG["retry_failed"] is set
+# (audit 2026-10-17 item 28). Config and path failures are recomputed on every invocation.
+_SCALING_TERMINAL_FAILURE_KINDS = frozenset({"train", "nonfinite"})
+
+
+def _terminal_scaling_failure(
+    run_dir: Path,
+    cfg:     VFE3Config,
+
+    *,
+    route:   str,
+    label:   str,
+    seed:    int,
+) -> Optional[Dict[str, Any]]:
+    r"""The recorded run failure of this exact cell, or None.
+
+    The cell's ``scaling_failure.json`` must name the route, label and seed and carry a run-produced
+    ``error_kind`` (:data:`_SCALING_TERMINAL_FAILURE_KINDS`); when the attempt wrote ``scaling_cell.json``,
+    its ``config_sha256`` must equal ``cfg``'s, so a changed cell is retrained rather than reported.
+    """
+    try:
+        failure = json.loads((run_dir / "scaling_failure.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(failure, dict)
+            or failure.get("error_kind") not in _SCALING_TERMINAL_FAILURE_KINDS
+            or failure.get("route") != route or failure.get("label") != label
+            or failure.get("seed") != int(seed)):
+        return None
+    try:
+        cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cellmeta = None
+    if isinstance(cellmeta, Mapping):
+        current = _canonical_json_sha256(json.loads(json.dumps(serialize_config(cfg), default=str)))
+        if cellmeta.get("config_sha256") != current:
+            return None
+    return failure
+
+
+def _scaling_attempt_history(run_dir: Path, seed: int) -> Dict[str, Any]:
+    r"""Every attempt of one cell: the archived ones under ``.attempts`` and the current directory.
+
+    Each attempt reports ``status``, ``error_kind`` and ``error`` from its ``scaling_result.json`` (or
+    ``scaling_failure.json``); an archived attempt with neither was interrupted.
+    """
+    def read(directory: Path) -> Optional[Dict[str, Any]]:
+        for name in ("scaling_result.json", "scaling_failure.json"):
+            try:
+                record = json.loads((directory / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(record, dict):
+                return record
+        return None
+
+    archive_root = run_dir.parent / ".attempts"
+    directories = (sorted(archive_root.glob(f"s{int(seed)}__attempt_*")) if archive_root.is_dir() else [])
+    attempts: List[Dict[str, Any]] = []
+    for directory in [*directories, run_dir]:
+        record = read(directory)
+        if record is None:
+            if directory is run_dir:
+                continue
+            record = {"status": "interrupted", "error_kind": None,
+                      "error": "the attempt published no scaling_result.json"}
+        attempts.append({"attempt": len(attempts) + 1, "status": record.get("status"),
+                         "error_kind": record.get("error_kind"), "error": record.get("error"),
+                         "archive": None if directory is run_dir else directory.name})
+    failed = [a for a in attempts if a["status"] not in ("complete", None)]
+    return {"n_attempts": len(attempts), "n_failed": len(failed), "attempts": attempts}
+
+
 def _scaling_cell_has_payload(run_dir: Path) -> bool:
     """Return whether a cell contains anything beyond its ownership sentinel."""
     return run_dir.is_dir() and any(
@@ -1255,6 +1332,16 @@ def run_cell(
                 "error_kind": None, "seed": seed, "cached": True,
                 "cache_status": resume_status,
                 **metrics}
+    terminal = (None if not CONFIG["resume"] or CONFIG.get("retry_failed", False) else
+                _terminal_scaling_failure(run_dir, cfg, route=cell["route"], label=label, seed=seed))
+    if terminal is not None:
+        print(f"    [FAILED earlier, not retried] {label} s{seed}  {terminal.get('error_kind')}: "
+              f"{terminal.get('error')}  (set retry_failed=True to retrain)")
+        return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
+                "error_kind": terminal.get("error_kind"), "error": terminal.get("error"), "seed": seed,
+                "preserve_existing": True, "terminal_failure": True,
+                "test_ce": None, "test_ppl": None, "test_bits_per_token": None,
+                "test_bpc": None, "n_params": None}
 
     if _scaling_cell_has_payload(run_dir):
         archived = _archive_scaling_attempt(
@@ -1654,11 +1741,20 @@ def main() -> int:
                 elif status != "complete":
                     incomplete = True
                 manifest_cell = design_cells[(name, cell["label"], int(seed))]
+                try:
+                    history = _scaling_attempt_history(
+                        _trusted_scaling_run_dir(output_dir, name, cell["label"], int(seed)), int(seed))
+                except (OSError, ValueError):
+                    history = {"n_attempts": None, "n_failed": None, "attempts": []}
                 manifest_cell.update({
                     "status": status,
                     "error_kind": published.get("error_kind"),
                     "error": published.get("error"),
                     "cache_status": published.get("cache_status"),
+                    "terminal_failure": bool(published.get("terminal_failure")),
+                    "n_attempts": history["n_attempts"],
+                    "n_failed_attempts": history["n_failed"],
+                    "attempts": history["attempts"],
                 })
                 design["status"] = "incomplete" if incomplete else "running"
                 _trusted_scaling_output_dir(output_dir)
@@ -1688,8 +1784,12 @@ def main() -> int:
         design["error"] = "; ".join(invocation_errors)
 
     design["status"] = "incomplete" if incomplete else "complete"
+    design["retry_failed"] = bool(CONFIG.get("retry_failed", False))
     _trusted_scaling_output_dir(output_dir)
     _write_json_atomic(design_path, design)
+    from scaling_analysis import print_design_attempts
+
+    print_design_attempts(design)              # failed and repeated attempts (audit 2026-10-17 item 28)
     if incomplete:
         print(f"\nROUTES INCOMPLETE. Inspect {design_path} and per-cell scaling_failure.json files.")
         return 1
