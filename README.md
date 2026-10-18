@@ -105,7 +105,8 @@ $$
 The full-Gaussian theory assumes $\Sigma_i\succ0$. The current launcher selects
 `gaussian_diagonal`; the projected route also admits `gaussian_full`. Saved configs
 naming `gaussian_diagonal_exact` load as `gaussian_diagonal` (the same function and
-parameters); `gaussian_frame_diagonal` is retired and refused on load. A diagonal stored
+parameters); `gaussian_frame_diagonal` was retired on 2026-10-01 and revived on 2026-10-18
+with the semantics described below, under which a saved config naming it loads. A diagonal stored
 state still yields dense projected covariances through the frames. Under the launcher's
 moment-matched predictive covariance, the diagonal family keeps the diagonal of the local
 moment-matched covariance (the moment projection onto diagonal Gaussians) while
@@ -128,6 +129,21 @@ variance table by per-type head blocks $C_{vh}=L_{vh}L_{vh}^\top$ (log-diagonal 
 `sigma_chol_embed`), so that `mu_embed` and the blocks hold $(\xi_v, C_v)$ and the model
 represents what the learned-frame reference arm represents without a frame table; it
 needs a full-layout family and an untied decode bank (or the linear decoder).
+
+`family="gaussian_frame_diagonal"` keeps the covariance diagonal in reference coordinates,
+$\Sigma_i=U_i\operatorname{diag}(c_i)U_i^\top$, and stores the reference variances $c_i$ in the
+$(\ldots, K)$ layout. The passive action leaves $c_i$ fixed, so the family is closed under every
+structure group, and the moment-matched update returns $c_i^+=\operatorname{diag}C_i^{\mathrm{att}}$
+plus the floor in reference coordinates ($f c_{p,i}$, $f\,\mathrm{mean}(c_i)$, or their elementwise
+maximum), a frame-independent projection whose reference trace does not grow with the frame
+condition number (audit 2026-10-17 item 3). The router and the update read $(U_i^{-1}\mu_i, c_i)$,
+which makes the comparison covariance $S\operatorname{diag}(c_i)S^\top$ with no frame product. It
+is defined on the kernel predictive readout with edge links off, no frame-space RoPE, no CG
+coupling, a `none` or `layernorm` block norm with a `coordinate` block MLP (local coordinates
+push $U_i\operatorname{diag}(c_i)U_i^\top$ and read back $\operatorname{diag}(U_i^{-1}SU_i^{-\top})$;
+reference coordinates push $\operatorname{diag}(c_i)$ and keep the diagonal), the `linear` or
+`diagonal_chunked` decoders (the latter reads $(\xi_i, c_i)$ in reference coordinates, or
+$\operatorname{diag}\Sigma_i$ in local ones), and the table Fisher step only with identity frames.
 
 ### Whom to listen to: query and key
 
@@ -732,8 +748,8 @@ layer. There are no configurable input/output scope fields or identity-content a
 
 `projected_gradient` takes `lambda_alpha_mode` `state_dependent` or
 `state_dependent_per_coord` (the last on `gaussian_diagonal` only), `n_e_steps>=1`, `relational_routing="gaussian_kl"`,
-`family` in {`gaussian_diagonal`, `gaussian_full`} (`gaussian_block` is refused: it is defined on the
-projected-predictive kernel readout only), at least two heads,
+`family` in {`gaussian_diagonal`, `gaussian_full`} (`gaussian_block` and `gaussian_frame_diagonal`
+are refused: they are defined on the projected-predictive kernel readout only), at least two heads,
 filtering, and unrolled updates. `predictive_covariance` and `attention_residual` are
 predictive-readout fields: under `projected_gradient` they are inert (listed by
 `inactive_fields()`), not refused. Under `euler` its inner mean and covariance learning
