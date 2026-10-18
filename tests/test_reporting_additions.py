@@ -169,26 +169,6 @@ def test_gauge_transport_figure_aggregates_seeds(monkeypatch, tmp_path):
     assert abs(by[("off", "L1")]["ppl"] - 21.0) < 1e-9     # (20 + 22) / 2
 
 
-def test_mu_precond_figure_aggregates_seeds(monkeypatch, tmp_path):
-    # M4(b): fisher_T2__s6 must parse (int('2__s6') would ValueError and skip); aggregate to one point
-    # per (precond, n_e_steps).
-    rows = [
-        {"label": "fisher_T2__s6", "primary_val_ppl": "30.0"},
-        {"label": "fisher_T2__s7", "primary_val_ppl": "32.0"},
-        {"label": "raw_T2__s6",    "primary_val_ppl": "40.0"},
-        {"label": "raw_T2__s7",    "primary_val_ppl": "42.0"},
-    ]
-    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d: rows)
-    cap = _capture_ablation_figure(monkeypatch, "plot_mu_precond")
-    ablation._plot_mu_precond(tmp_path, tmp_path)
-    assert "cells" in cap, "figure skipped: int('2__s6') ValueError on seeded labels"
-    assert len(cap["cells"]) == 2
-    by = {(c["precond"], c["n_e_steps"]): c for c in cap["cells"]}
-    assert set(by) == {("fisher", 2), ("raw", 2)}
-    assert abs(by[("fisher", 2)]["ppl"] - 31.0) < 1e-9
-    assert abs(by[("raw", 2)]["ppl"] - 41.0) < 1e-9
-
-
 def test_offset_power_law_honors_weights():
     # m29: the with_offset (Chinchilla) fit must honor the WLS weights callers pass, not silently
     # run unweighted OLS. Down-weighting a corrupted point must move the fitted exponent.

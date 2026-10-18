@@ -5790,32 +5790,3 @@ def plot_pos_extrapolation(
         ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
-
-
-@register_figure("mu_precond")
-def plot_mu_precond(
-    cells,                               # list of {precond in {fisher,raw}, n_e_steps, ppl}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""B3/EXP-14: validation PPL vs n_e_steps, Fisher natural-gradient vs raw-Euclidean mean step.
-
-    The mu-arm ablation: nat_mu = Sigma*grad_mu (Fisher) vs the raw grad_mu, sigma retraction held
-    fixed. One line per preconditioner; a gap that grows with n_e_steps means the mean-sector Fisher
-    metric is load-bearing for the converged belief."""
-    cells = list(cells)
-    fig, ax = plt.subplots(figsize=(6.2, 4.4))
-    for j, pre in enumerate(("fisher", "raw")):
-        pts = sorted([(float(c["n_e_steps"]), float(c["ppl"])) for c in cells
-                      if str(c["precond"]) == pre], key=lambda t: t[0])
-        if pts:
-            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
-                    color=_CB[j], lw=1.8, label=f"{pre} mean step")
-    ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="validation PPL")
-    ax.set_title("Fisher nat-grad vs raw Euclidean E-step mean")
-    ax.legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
