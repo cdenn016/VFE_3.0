@@ -328,7 +328,7 @@ def test_plot_free_energy_decomposition_saves(tmp_path):
     fig = plot_free_energy_decomposition(
         _fe_hist(), lambda_beta=1.0, path=str(p))
     labels = " ".join(text.get_text() for axis in fig.axes for text in axis.get_yticklabels())
-    assert "KL" not in labels
+    assert "KL(q,p)" in labels and "Renyi" not in labels        # the seam is KL-only (audit item 72)
     plt.close(fig)
     assert _saved_nonempty(p)
 
@@ -349,13 +349,6 @@ def test_fe_terms_total_sums_components_and_excludes_ce():
     h2 = dict(h); h2["val_ce"] = np.asarray(h["val_ce"], dtype=float) + 1000.0
     _, _, total2, _ = _fe_terms(h2, lambda_beta=1.0)
     assert np.allclose(total, total2)                             # total is independent of CE (no data term in F)
-
-
-def test_fe_terms_belief_only_and_entropy_gate():
-    _, comps, _, _ = _fe_terms(_fe_hist(10), lambda_beta=1.0)
-    assert [k for k, _ in comps] == ["self", "belief", "attention_entropy"]
-    _, comps_off, _, _ = _fe_terms(_fe_hist(10), lambda_beta=1.0, include_attention_entropy=False)
-    assert [k for k, _ in comps_off] == ["self", "belief"]        # entropy gated out of F, matching the column
 
 
 def test_plot_grad_norm_decomposition_saves(tmp_path):

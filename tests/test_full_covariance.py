@@ -107,8 +107,8 @@ def _full_reference_logits(pb, mu_q, sigma_q, tau_eff):
     q = family_cls(mu_q.unsqueeze(-2), sigma_q.unsqueeze(-3))
     p_sigma = torch.diag_embed(bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps))
     p = family_cls(pb._decode_mu_table(), p_sigma)
-    functional = get_functional(pb.divergence_family)
-    energy = functional(q, p, alpha=pb.renyi_order, kl_max=float("inf"), eps=pb.eps)
+    functional = get_functional("renyi")
+    energy = functional(q, p, alpha=1.0, kl_max=float("inf"), eps=pb.eps)
     return -energy / tau_eff
 
 
@@ -122,7 +122,7 @@ def test_family_decode_matches_direct_functional_full_gaussian(alpha):
     g = torch.Generator().manual_seed(0)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.2, family="gaussian_full",
-                   renyi_order=alpha, decode_mode="full_chunked",
+                   decode_mode="full_chunked",
                    diagonal_covariance=False)
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.6)

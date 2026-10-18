@@ -266,15 +266,14 @@ def test_self_divergence_for_alpha_routes_by_declared_reduction():
 
 def test_self_divergence_per_coord_requires_kl_for_full_and_a_registered_functional():
     # Full covariance is supported for KL only: ordered conditional KL contributions that sum to
-    # the full KL before clipping (docs/2026-09-22.md); a non-KL Renyi order raises. An
-    # unregistered functional still raises rather than silently summing the wrong thing.
+    # the full KL before clipping (docs/2026-09-22.md); a non-KL Renyi order raises.
     import pytest
-    from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
+    from vfe3.families.gaussian import FullGaussian
     from vfe3.free_energy import self_divergence_per_coord
 
     N, K = 2, 3
-    mu = torch.randn(N, K); sigma = torch.rand(N, K) + 0.5
-    mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
+    mu = torch.randn(N, K)
+    mu_p = torch.randn(N, K)
     cov = torch.eye(K).expand(N, K, K).contiguous()
     q_full, p_full = FullGaussian(mu, cov), FullGaussian(mu_p, cov.clone())
     per_coord = self_divergence_per_coord(q_full, p_full)
@@ -282,9 +281,6 @@ def test_self_divergence_per_coord_requires_kl_for_full_and_a_registered_functio
     assert torch.allclose(per_coord.sum(-1), q_full.renyi_closed_form(p_full), atol=1e-5)
     with pytest.raises(ValueError, match="KL"):
         self_divergence_per_coord(q_full, p_full, alpha=0.5)
-    with pytest.raises((ValueError, NotImplementedError, KeyError)):
-        self_divergence_per_coord(DiagonalGaussian(mu, sigma), DiagonalGaussian(mu_p, sigma_p),
-                                  divergence_family="not_a_functional")
 
 
 # --- value-gauge decoupling: free_energy coupling_energy --------------------

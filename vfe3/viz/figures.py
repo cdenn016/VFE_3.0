@@ -24,7 +24,6 @@ matplotlib.use("Agg")                                            # non-interacti
 import matplotlib.figure
 import matplotlib.pyplot as plt
 
-from vfe3.families.base import get_functional_display
 from vfe3.metric_contracts import scaling_min_testable_sizes
 from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
@@ -1481,7 +1480,7 @@ _FE_LABELS = {
 }
 
 
-def _fe_terms(history: Dict, lambda_beta, *, include_attention_entropy=True) -> tuple:
+def _fe_terms(history: Dict, lambda_beta) -> tuple:
     r"""Per-eval complexity free-energy components shared by the decomposition/co-descent figures.
 
     Returns ``(step, components, total, ce)`` where ``components`` is an ordered list of
@@ -1489,8 +1488,8 @@ def _fe_terms(history: Dict, lambda_beta, *, include_attention_entropy=True) -> 
     that the E-step descends. ``total`` does not include a data/likelihood term, so it is not the
     canonical full variational free energy. Cross-entropy is returned separately as ``ce`` for
     co-plotting and is never summed into this diagnostic. The belief blocks carry the (scalar or per-row)
-    ``lambda_beta`` weight; the attention-entropy block is included only when
-    ``include_attention_entropy`` (matching ``free_energy_terms``' gate on ``total``). The logged
+    ``lambda_beta`` weight, as does the attention-entropy block (the retired
+    ``include_attention_entropy`` field is pinned on, audit 2026-10-17 item 72). The logged
     diagnostics are already per token, so every component is commensurate and ``total`` matches the
     ``inner_alignment_energy_total`` column.
     """
@@ -1498,9 +1497,8 @@ def _fe_terms(history: Dict, lambda_beta, *, include_attention_entropy=True) -> 
     lb   = _np(lambda_beta).astype(float)
     zeros = np.zeros(step.shape, dtype=float)
     comps = [("self",   _np(history["self_coupling"]).astype(float)),
-             ("belief", lb * _np(history["belief_coupling"]).astype(float))]
-    if include_attention_entropy:
-        comps.append(("attention_entropy", lb * _np(history["attention_entropy"]).astype(float)))
+             ("belief", lb * _np(history["belief_coupling"]).astype(float)),
+             ("attention_entropy", lb * _np(history["attention_entropy"]).astype(float))]
     total = sum((c for _, c in comps), zeros.copy())
     ce = _np(history["val_ce"]).astype(float) if "val_ce" in history else np.full(step.shape, np.nan)
     return step, comps, total, ce
@@ -1513,8 +1511,6 @@ def plot_free_energy_relationship(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    include_attention_entropy: bool  = True,
-    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
     r"""Descriptive relationship between the target-blind objective and held-out loss.
@@ -1527,9 +1523,8 @@ def plot_free_energy_relationship(
     association of the two curves is in the title; it summarizes co-movement and does not establish
     that changing either quantity causes the other to change.
     """
-    step, _comps, total, ce = _fe_terms(history, lambda_beta,
-                                        include_attention_entropy=include_attention_entropy)
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    step, _comps, total, ce = _fe_terms(history, lambda_beta)
+    objective_label, objective_units = _KL_AXIS
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
     w = max(5, total.size // 80)
@@ -1563,13 +1558,9 @@ def plot_free_energy_relationship(
 plot_free_energy_codescent = plot_free_energy_relationship
 
 
-def _registered_divergence_axis(name: str) -> tuple[str, Optional[str]]:
-    """Return typed display metadata, or a unit-free generic divergence fallback."""
-    try:
-        display = get_functional_display(name)
-    except KeyError:
-        return "divergence", None
-    return display.label, display.units
+# Axis label and units of every objective axis: the divergence seam implements only the KL (audit
+# 2026-10-16 F93), so the axes read "KL (nats)" (audit 2026-10-17 item 72).
+_KL_AXIS: tuple[str, str] = ("KL", "nats")
 
 
 def _objective_axis_text(label: str, units: Optional[str], *, per_token: bool = False) -> str:
@@ -1583,8 +1574,6 @@ def plot_free_energy_decomposition(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    include_attention_entropy: bool  = True,
-    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
     r"""The per-token inner alignment-energy budget and how its terms move over training.
@@ -1599,9 +1588,8 @@ def plot_free_energy_decomposition(
     diagnostic must not be read as the canonical full variational free energy; see the co-descent
     figure for the separate CE.
     """
-    step, comps, _total, _ce = _fe_terms(history, lambda_beta,
-                                         include_attention_entropy=include_attention_entropy)
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    step, comps, _total, _ce = _fe_terms(history, lambda_beta)
+    objective_label, objective_units = _KL_AXIS
     dynamic_labels = dict(_FE_LABELS)
     dynamic_labels["self"] = ("self-coupling", f"self-coupling\n{objective_label}(q,p)")
     dynamic_labels["belief"] = (
@@ -4168,7 +4156,6 @@ def plot_estep_capacity(
     *,
     n_params:          Optional[int] = None,
     wall_time:         Optional[object] = None,
-    divergence_family: str = "renyi",
     evidence:          Optional[Mapping[str, object]] = None,
     path:              Optional[str] = None,
 ):
@@ -4179,7 +4166,7 @@ def plot_estep_capacity(
     shows the compute cost.
     """
     x = _np(n_e_steps)
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    objective_label, objective_units = _KL_AXIS
     evidence = dict(evidence or {})
     fig, ax = plt.subplots(figsize=(5.4, 4.0))
     ax.plot(x, _np(bpc), "o-", color=_CB[0], lw=2, label="val BPC")
@@ -5204,7 +5191,6 @@ def plot_f_ce_relationship(
     arms,                                # list of {n_e_steps, final_f, ce, [label]} (one per n_e_steps cell)
 
     *,
-    divergence_family: str = "renyi",
     path: Optional[str] = None,
 ):
     r"""Final-iterate target-blind objective per token versus held-out CE.
@@ -5212,7 +5198,7 @@ def plot_f_ce_relationship(
     Target blindness establishes structural separation from the prediction objective. It does not
     imply any correlation sign across a finite depth sweep; the displayed correlations are descriptive.
     Points are ordered and annotated by n_e_steps."""
-    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    objective_label, objective_units = _KL_AXIS
     pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
     ne = np.array([float(a["n_e_steps"]) for a in pts])
     ff = np.array([float(a["final_f"]) for a in pts])
@@ -5802,38 +5788,6 @@ def plot_pos_extrapolation(
     ax.set_title("Positional extrapolation: offset vs absolute (CE vs N)")
     if items:
         ax.legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-@register_figure("renyi_saturation")
-def plot_renyi_saturation(
-    cells,                               # list of {alpha, attn_entropy, energy_klmax_frac}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""B2/EXP-12: attention entropy H(beta) and the kl_max energy-saturation fraction vs Renyi order.
-
-    alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates the pairwise
-    energy E_ij to kl_max with zero gradient (rising saturation fraction, right panel), which can drive
-    a NON-MONOTONE H(beta)-vs-alpha tail (left panel) -- the saturation diagnostic explaining the
-    entropy curve. alpha=1 (KL) is marked."""
-    cells = sorted(cells, key=lambda c: float(c["alpha"]))
-    a = [float(c["alpha"]) for c in cells]
-    h = [float(c.get("attn_entropy", float("nan"))) for c in cells]
-    s = [float(c.get("energy_klmax_frac", float("nan"))) for c in cells]
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.2))
-    ax1.plot(a, h, "o-", color=_CB[0], lw=1.8)
-    ax1.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5, label=r"$\alpha=1$ (KL)")
-    ax1.set(xlabel=r"Rényi order $\alpha$", ylabel=r"attention entropy H($\beta$)")
-    ax1.set_title("Attention diffuseness vs α")
-    ax1.legend(fontsize=8, frameon=False)
-    ax2.plot(a, s, "s-", color=_CB[1], lw=1.8)
-    ax2.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5)
-    ax2.set(xlabel=r"Rényi order $\alpha$", ylabel="energy kl_max saturation fraction")
-    ax2.set_title("Non-PD saturation vs α (the α>1 tail)")
-    fig.suptitle("Rényi α-attention: entropy + saturation diagnostic (B2/EXP-12)")
     fig.tight_layout()
     return _save(fig, path)
 

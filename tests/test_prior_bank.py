@@ -157,8 +157,8 @@ def _family_reference_logits(pb, mu_q, sigma_q, tau_eff):
     p_sigma = (torch.diag_embed(p_sigma_diag) if family_cls.cov_kind == "full"
                else p_sigma_diag)
     p = family_cls(pb._decode_mu_table(), p_sigma)
-    functional = get_functional(pb.divergence_family)
-    energy = functional(q, p, alpha=pb.renyi_order, kl_max=float("inf"), eps=pb.eps)
+    functional = get_functional("renyi")
+    energy = functional(q, p, alpha=1.0, kl_max=float("inf"), eps=pb.eps)
     return -energy / tau_eff
 
 
@@ -169,7 +169,7 @@ def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
     torch.manual_seed(0)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.3, family="gaussian_diagonal",
-                   renyi_order=alpha, decode_mode="diagonal_chunked")
+                   decode_mode="diagonal_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.7)
         pb.sigma_log_embed.normal_(0.0, 0.4)
@@ -191,7 +191,7 @@ def test_reference_decode_dispatches_configured_divergence(alpha):
     torch.manual_seed(2)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.1, family="gaussian_diagonal",
-                   renyi_order=alpha, decode_mode="diagonal_chunked")
+                   decode_mode="diagonal_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.5)
     mu_q = torch.randn(2, 3, K); sigma_q = torch.rand(2, 3, K) + 0.3
@@ -213,17 +213,18 @@ def test_retired_family_decode_is_not_a_config_value():
 
 def test_prior_bank_family_metadata_defaults_and_state_dict_unchanged():
     torch.manual_seed(0)
-    pb = PriorBank(6, 3, 9)                                      # NO family/divergence/order args
+    pb = PriorBank(6, 3, 9)                                      # NO family args
     assert pb.family == "gaussian_diagonal"
-    assert pb.divergence_family == "renyi"
-    assert pb.renyi_order == 1.0
-    # the three new attributes are plain fields (not params/buffers): the state dict is unchanged.
+    # the retired divergence knobs are gone (audit 2026-10-17 item 72) and no parameter name changed.
+    assert not hasattr(pb, "divergence_family") and not hasattr(pb, "renyi_order")
     assert set(pb.state_dict().keys()) == {
         "mu_embed", "sigma_log_embed", "phi_embed", "decode_log_scale",
     }
     # every existing test-style constructor keeps working unchanged.
-    assert PriorBank(6, 3, 9, decode_mode="linear").divergence_family == "renyi"
-    assert PriorBank(6, 3, 9, decode_tau=1.7).renyi_order == 1.0
+    with pytest.raises(TypeError):
+        PriorBank(6, 3, 9, renyi_order=1.0)
+    with pytest.raises(TypeError):
+        PriorBank(6, 3, 9, divergence_family="renyi")
 
 
 # --- DecodeRegistration metadata resolution --------------------------------------------------
