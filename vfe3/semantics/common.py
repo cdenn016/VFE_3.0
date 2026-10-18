@@ -298,6 +298,26 @@ def panel_label(ax: Any, letter: str) -> None:
 # Tables and JSON
 # ----------------------------------------------------------------------------------------------
 
+def nested_get(obj: Any, *keys: Any) -> Any:
+    r"""Follow ``keys`` through mappings and in-range sequence indices; ``None`` on the first miss."""
+    for key in keys:
+        if isinstance(obj, Mapping) and key in obj:
+            obj = obj[key]
+        elif isinstance(obj, (list, tuple)) and isinstance(key, int) and -len(obj) <= key < len(obj):
+            obj = obj[key]
+        else:
+            return None
+    return obj
+
+
+def finite_float(value: Any) -> Optional[float]:
+    r"""``float(value)`` for finite real numbers (bools excluded), else ``None``."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
 def format_value(value: Any, digits: int = 3) -> str:
     r"""Compact cell text: floats to ``digits`` significant decimals, ``None``/NaN to an en dash."""
     if value is None:

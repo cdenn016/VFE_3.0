@@ -333,8 +333,6 @@ def _decode_workspace_requirements(
     r"""Return dense-matrix dimension, coordinate dimension, and coordinate vocabulary width."""
     width = int(cfg.embed_dim)
     vocab_size = int(cfg.vocab_size)
-    if not cfg.diagonal_covariance and active_decode_mode == "full":
-        return width, None, None
     if active_decode_mode == "expected_likelihood_chunked":
         return None, width, min(vocab_size, int(cfg.decode_chunk_size))
     return None, None, None

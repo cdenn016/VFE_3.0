@@ -25,11 +25,12 @@ back as float64 numpy arrays.
 
 from __future__ import annotations
 
-import contextlib
 import math
-from typing import Any, Dict, Hashable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from vfe3.runtime import ieee_fp32_matmul
 
 
 # ----------------------------------------------------------------------------------------------
@@ -60,26 +61,6 @@ def torch_device(device: Any) -> Optional[Any]:
     if not torch.cuda.is_available():
         raise RuntimeError(f"device {text!r} requested but torch.cuda.is_available() is False")
     return dev
-
-
-@contextlib.contextmanager
-def ieee_fp32_matmul() -> Iterator[None]:
-    r"""Run the enclosed torch float32 GEMMs in IEEE float32 (``"highest"``), then restore the policy.
-
-    A process that enabled TF32 (``"high"``) would otherwise round the GEMM inputs to a 10-bit
-    mantissa (relative error about ``1e-3``), enough to reorder near neighbors and analogy candidates.
-    """
-    import torch
-
-    previous = torch.get_float32_matmul_precision()
-    if previous == "highest":
-        yield
-        return
-    torch.set_float32_matmul_precision("highest")
-    try:
-        yield
-    finally:
-        torch.set_float32_matmul_precision(previous)
 
 
 # ----------------------------------------------------------------------------------------------

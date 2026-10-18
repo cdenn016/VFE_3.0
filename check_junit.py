@@ -15,7 +15,12 @@ def _local_name(tag: str) -> str:
 
 
 def read_junit_counts(path: Path) -> Dict[str, int]:
-    """Return aggregate pytest counts from either supported JUnit root form."""
+    """Return aggregate pytest counts from either supported JUnit root form.
+
+    Raises ``ValueError`` on a malformed report and on one that records zero executed tests, so an
+    empty run can never read as a pass. The one JUnit reader, shared by ``run_cpu_tests.py`` and
+    ``check_gpu_tests.py`` (audit 2026-10-17 item 85).
+    """
     root = ElementTree.parse(path).getroot()
     root_name = _local_name(root.tag)
     if root_name not in ("testsuite", "testsuites"):
@@ -41,6 +46,8 @@ def read_junit_counts(path: Path) -> Dict[str, int]:
     counts["passes"] = counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
     if counts["passes"] < 0:
         raise ValueError("JUnit failure/error/skip counts exceed the test count")
+    if counts["tests"] == 0:
+        raise ValueError("JUnit XML contains no executed tests")
     return counts
 
 

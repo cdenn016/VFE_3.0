@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import math
 import os
 import re
 import sys
@@ -66,7 +65,9 @@ from vfe3.semantics.common import (
     SectionResult,
     VectorView,
     diagonal_redundancy_status,
+    finite_float as _num,
     markdown_table,
+    nested_get as _get,
     write_json,
 )
 
@@ -128,25 +129,6 @@ def _log(message: str) -> None:
     r"""Progress line, made safe for the console encoding (cp1252 on Windows)."""
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     print(message.encode(encoding, errors="replace").decode(encoding, errors="replace"), flush=True)
-
-
-def _get(obj: Any, *keys: Any) -> Any:
-    for key in keys:
-        if isinstance(obj, Mapping) and key in obj:
-            obj = obj[key]
-        elif isinstance(obj, (list, tuple)) and isinstance(key, int) and -len(obj) <= key < len(obj):
-            obj = obj[key]
-        else:
-            return None
-    return obj
-
-
-def _num(value: Any) -> Optional[float]:
-    r"""``float(value)`` for finite real numbers, else ``None``."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
-        return None
-    value = float(value)
-    return value if math.isfinite(value) else None
 
 
 def _f(value: Any, digits: int = 3) -> str:
