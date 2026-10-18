@@ -36,3 +36,12 @@ def test_triton_preflight_refuses_without_triton_unless_opted_out() -> None:
     assert run_cpu_tests.triton_preflight(True, False) is None
     assert run_cpu_tests.triton_preflight(False, True) is None
     assert run_cpu_tests.ALLOW_MISSING_TRITON is False
+
+
+def test_triton_lane_runs_the_interpreter_tests_serially_under_triton_python(tmp_path: Path) -> None:
+    command = run_cpu_tests.build_triton_lane_command("C:/x/python.exe", tmp_path / "t.xml")
+    assert command[:3] == ["C:/x/python.exe", "-m", "pytest"]
+    assert "-n" not in command
+    for path in run_cpu_tests.TRITON_INTERPRETER_TESTS:
+        assert path in command
+    assert run_cpu_tests.interpreter_has_triton(str(tmp_path / "missing.exe")) is False

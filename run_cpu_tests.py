@@ -1,9 +1,10 @@
 """Run the ordinary CPU pytest lanes with bounded parallelism.
 
-Run this file under ``$CUDA_PYTHON`` (``C:/anaconda/python.exe``): ``CPU_ENVIRONMENT`` hides CUDA from
-the lanes, and that interpreter has triton, which the Triton interpreter tests of the live decode kernel
-need. Under an interpreter without triton those tests skip, so the runner refuses to start unless
-``ALLOW_MISSING_TRITON`` is set (audit 2026-10-17 item 40).
+The parallel lanes need pytest-xdist and run under the interpreter that launches this file. The Triton
+interpreter tests of the live decode kernel need triton; when the launching interpreter lacks it, a final
+serial ``triton`` lane runs ``TRITON_INTERPRETER_TESTS`` under ``TRITON_PYTHON`` (``$CUDA_PYTHON``, default
+``C:/anaconda/python.exe``) with ``CPU_ENVIRONMENT`` hiding CUDA. If no interpreter with triton is
+available the run fails unless ``ALLOW_MISSING_TRITON`` is set (audit 2026-10-17 item 40).
 """
 
 import importlib.util
@@ -42,6 +43,7 @@ CPU_ENVIRONMENT = {
 # Click-to-run opt-out: True runs the lanes under an interpreter without triton, accepting that the
 # Triton interpreter tests below skip and the live decode kernel's gradients go unchecked.
 ALLOW_MISSING_TRITON = False                    # False (default) | True
+TRITON_PYTHON = os.environ.get("CUDA_PYTHON", "C:/anaconda/python.exe")   # interpreter with triton for the triton lane
 TRITON_INTERPRETER_TESTS = (
     "tests/test_kl_decode_triton_20261012.py",
     "tests/test_expected_likelihood_kernel_20261010.py",
@@ -55,13 +57,29 @@ def triton_preflight(
     allow_missing: bool,
     triton_found:  bool,
 ) -> "str | None":
-    r"""The refusal message when triton is absent and not explicitly allowed, else ``None``."""
+    r"""The refusal message when no interpreter with triton is available and not explicitly allowed, else ``None``."""
     if triton_found or allow_missing:
         return None
     listed = "\n".join(f"  {path}" for path in TRITON_INTERPRETER_TESTS)
-    return (f"triton is not importable under {sys.executable}; the Triton interpreter tests would "
-            f"skip:\n{listed}\nRun under $CUDA_PYTHON (C:/anaconda/python.exe) or set "
-            "ALLOW_MISSING_TRITON = True to run without them.")
+    return (f"triton is importable neither under {sys.executable} nor under TRITON_PYTHON={TRITON_PYTHON}; the "
+            f"Triton interpreter tests would not run:\n{listed}\nPoint $CUDA_PYTHON at an interpreter with triton "
+            "or set ALLOW_MISSING_TRITON = True to run without them.")
+
+
+def interpreter_has_triton(python: str) -> bool:
+    r"""Whether ``python`` exists and can import triton (``sys.executable`` is checked in process)."""
+    if os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable)):
+        return importlib.util.find_spec("triton") is not None
+    if not Path(python).is_file():
+        return False
+    probe = subprocess.run([python, "-c", "import importlib.util,sys; sys.exit(importlib.util.find_spec('triton') is None)"],
+                           capture_output=True, timeout=120)
+    return probe.returncode == 0
+
+
+def build_triton_lane_command(python: str, junit_path: Path) -> list[str]:
+    r"""The serial triton lane: the Triton interpreter tests under ``python`` without xdist."""
+    return [python, "-m", "pytest", "-p", "no:cacheprovider", *TRITON_INTERPRETER_TESTS, f"--junitxml={junit_path}"]
 
 
 def resolve_cpu_workers(
@@ -162,16 +180,17 @@ def run_lane(
     junit_path.unlink(missing_ok=True)
 
     try:
-        command = build_cpu_lane_command(lane, junit_path, logical_cpu_count)
+        command = (build_triton_lane_command(TRITON_PYTHON, junit_path) if lane == "triton"
+                   else build_cpu_lane_command(lane, junit_path, logical_cpu_count))
         try:
             completed = run_process_tree(
                 command,
                 env=dict(environment),
-                timeout=LANE_TIMEOUT_SECONDS[lane],
+                timeout=LANE_TIMEOUT_SECONDS.get(lane, LANE_TIMEOUT_SECONDS["fast"]),
             )
         except subprocess.TimeoutExpired as exc:
             print(
-                f"{lane}: pytest subprocess exceeded {LANE_TIMEOUT_SECONDS[lane]} seconds: {exc}",
+                f"{lane}: pytest subprocess exceeded {LANE_TIMEOUT_SECONDS.get(lane)} seconds: {exc}",
                 file=sys.stderr,
             )
             return 1
@@ -210,13 +229,15 @@ def main() -> int:
     except (TypeError, ValueError) as exc:
         print(f"CPU lane preflight failed: {exc}", file=sys.stderr)
         return 1
-    refusal = triton_preflight(ALLOW_MISSING_TRITON, importlib.util.find_spec("triton") is not None)
+    local_triton = importlib.util.find_spec("triton") is not None
+    separate_triton = (not local_triton) and interpreter_has_triton(TRITON_PYTHON)
+    refusal = triton_preflight(ALLOW_MISSING_TRITON, local_triton or separate_triton)
     if refusal is not None:
         print(f"CPU lane preflight failed: {refusal}", file=sys.stderr)
         return 1
 
     child_environment = build_cpu_environment(os.environ)
-    for lane in RUN_LANES:
+    for lane in RUN_LANES + (("triton",) if separate_triton else ()):
         status = run_lane(lane, child_environment, logical_cpu_count)
         if status != 0:
             return status
