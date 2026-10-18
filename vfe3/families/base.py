@@ -119,6 +119,12 @@ class BeliefParams(ABC):
     # returns its head-block M-projection, and config validation scopes it to the routes that preserve it.
     head_block_covariance: ClassVar[bool] = False
 
+    # Whether the stored (..., K) dispersion is the diagonal of the covariance in REFERENCE coordinates,
+    # C_i = U_i^{-1} Sigma_i U_i^{-T} = diag(c_i), rather than in local coordinates (gaussian_frame_diagonal). Such a
+    # family's parameter objects hold the reference moments (xi, c), and every consumer of a local covariance converts
+    # through the realized frame; config validation scopes it to the routes that do.
+    frame_diagonal_covariance: ClassVar[bool] = False
+
     @abstractmethod
     def coordinate_dim(self) -> int:
         r"""K, the number of belief coordinates."""

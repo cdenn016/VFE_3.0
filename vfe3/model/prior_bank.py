@@ -787,6 +787,10 @@ class PriorBank(nn.Module):
         self.diagonal_covariance = diagonal_covariance
         # The vocabulary prior and decode variance tables stay diagonal in EVERY family (PB-11).
         self.family = family
+        # gaussian_frame_diagonal: the encoded table variances are the reference variances c_v of the token's prior
+        # (Sigma_p = U_i diag(c_v) U_i^T), and a KL decoder reads the query through the frame (_frame_diagonal_query).
+        from vfe3.families.base import get_family
+        self.frame_diagonal = bool(get_family(family).frame_diagonal_covariance)
         # The reference decode scores the KL (the divergence seam implements only alpha = 1, audit
         # 2026-10-16 F93); the retired divergence_family / renyi_order arguments were removed (audit
         # 2026-10-17 item 72).
@@ -1193,13 +1197,51 @@ class PriorBank(nn.Module):
         Local-coordinate decoders score the query as given and reject a frame context, so a stale or
         accidentally threaded frame cannot change their values. ``decode_coordinates='reference'``
         requires the realized relational frame and scores the reference moments
-        (``_reference_query``).
+        (``_reference_query``). A frame-diagonal family (``gaussian_frame_diagonal``) reads its stored reference
+        variances through the frame in both coordinate settings (:meth:`_frame_diagonal_query`).
         """
+        if self.frame_diagonal and self.decode_mode != "linear":
+            return self._frame_diagonal_query(mu_q, sigma_q, canonical_frame)
         if self.decode_coordinates == "reference":
             return self._reference_query(mu_q, sigma_q, canonical_frame)
         if canonical_frame is not None:
             raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
         return mu_q, self._diagonal_decoder_dispersion(mu_q, sigma_q)
+
+    def _frame_diagonal_query(
+        self,
+        mu_q:            torch.Tensor,                           # (..., N, K) local means
+        c_q:             torch.Tensor,                           # (..., N, K) reference variances c_i
+        canonical_frame: Optional[CanonicalFrameContext],        # realized U_i: (..., N, K, K) or (..., N, G, d, d)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""The query of a frame-diagonal belief, :math:`\Sigma_i = U_i\operatorname{diag}(c_i)U_i^\top`, for a KL decoder.
+
+        Under ``decode_coordinates='reference'`` it is :math:`(\xi_i, c_i)`, :math:`\xi_i = U_i^{-1}\mu_i`: the reference
+        covariance is :math:`\operatorname{diag}(c_i)` exactly, so the diagonal decoder scores
+        :math:`\mathrm{KL}(\mathcal N(\xi_i, \operatorname{diag}c_i)\|p_v)` with no per-position constant. Under ``'local'`` it
+        is :math:`(\mu_i, \operatorname{diag}\Sigma_i)`, :math:`(\Sigma_i)_{kk} = \sum_m(U_i)_{km}^2c_{i,m}`: against a diagonal
+        bank the vocabulary-dependent part of the KL reads only :math:`\operatorname{diag}\Sigma_i`, so the logits differ
+        from :math:`-\mathrm{KL}/\tau` by the per-position constant
+        :math:`\tfrac{1}{2\tau}(\log\det\Sigma_i - \sum_k\log\Sigma_{i,kk})` and the softmax is exact
+        (as :meth:`_diagonal_decoder_dispersion` for ``gaussian_block``). Both read the realized frame, which every decode
+        boundary of this family receives as ``canonical_frame``.
+        """
+        from vfe3.model.frame_actions import frame_diagonal_local_covariance
+        if canonical_frame is None:
+            raise ValueError(
+                "family='gaussian_frame_diagonal' decodes its reference variances through the realized relational "
+                "frame of the same forward (canonical_frame); none was supplied")
+        if self.decode_coordinates == "reference":
+            xi, _ = self._reference_query(mu_q, None, canonical_frame)                   # (..., N, K) U^{-1} mu
+            if get_decode_registration(self.decode_mode).supports_full:
+                return xi, torch.diag_embed(c_q)                                         # (..., N, K, K) diag c
+            return xi, c_q
+        inverse = canonical_frame.inverse
+        compact = canonical_frame.block_diagonal or inverse.dim() == mu_q.dim() + 2
+        frame = (canonical_frame if compact == canonical_frame.block_diagonal
+                 else CanonicalFrameContext(canonical_frame.forward, canonical_frame.inverse, compact))
+        full = get_decode_registration(self.decode_mode).supports_full
+        return mu_q, frame_diagonal_local_covariance(c_q, frame, diagonal=not full)     # (..., N, K[, K])
 
     def decode(
         self,
@@ -1553,7 +1595,11 @@ class PriorBank(nn.Module):
         factor), and a full decoder factors ``C = U^{-1} Sigma U^{-T}`` when the frame is supplied.
         Without the frame the local rows answer the same question, since ``Sigma`` is positive
         definite iff ``C`` is.
+
+        A frame-diagonal family scores a diagonal (no factorization) and returns ``None``.
         """
+        if self.frame_diagonal and not get_decode_registration(self.decode_mode).supports_full:
+            return None                                       # diag c_i or diag Sigma_i: no factorization
         if self.decode_coordinates == "reference":
             if not get_decode_registration(self.decode_mode).supports_full:
                 return None                                   # diag C: no factorization

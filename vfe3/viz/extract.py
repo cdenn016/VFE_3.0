@@ -832,6 +832,13 @@ def projected_gauge_equivariance(
     frame, value_frame = as64(frame32), as64(value_frame32)
     mu = beliefs.mu.double()                                                   # (1, N, K)
     sigma = beliefs.sigma.double()
+    # gaussian_frame_diagonal stores c_i = diag(U_i^-1 Sigma_i U_i^-T), which the action leaves fixed: the operators
+    # read c unchanged in every draw, and the self term reads the lifted local Sigma_i = U_i diag(c_i) U_i^T.
+    frame_diagonal = bool(getattr(model.prior_bank, "frame_diagonal", False))
+    reference_c = sigma if frame_diagonal else None                            # (1, N, K) or None
+    if frame_diagonal:
+        from vfe3.model.frame_actions import frame_diagonal_local_covariance
+        sigma = frame_diagonal_local_covariance(sigma, frame, diagonal=False)  # (1, N, K, K)
     sigma = torch.diag_embed(sigma) if sigma.dim() == mu.dim() else sigma      # (1, N, K, K)
     H, d = len(model.group.irrep_dims), model.group.irrep_dims[0]
 
@@ -874,7 +881,8 @@ def projected_gauge_equivariance(
                 floor_anchor=sigma,                     # the snapshot prior moves with the belief: Sigma_p = Sigma
                 **({"link_state": link_state} if link_state is not None else {}))
             out = {"readout_mean": (U_v_inv @ mean.unsqueeze(-1)).squeeze(-1),
-                   "readout_covariance": U_v_inv @ cov @ U_v_inv.transpose(-1, -2)}
+                   "readout_covariance": (torch.diag_embed(cov) if frame_diagonal       # c^+ is already reference
+                                          else U_v_inv @ cov @ U_v_inv.transpose(-1, -2))}
         else:
             # The scalar form with (b0, c0) = (1, c0/b0) gives alpha* = c0/b0 at D = 0 on every family; the
             # profile is dropped, so the witness reads the receiver energy frozen at that alpha.
@@ -907,7 +915,7 @@ def projected_gauge_equivariance(
     base_self_coupling = self_coupling(mu, sigma, mu_p, sigma_p) if self_coupling_live else None
     for layer_index, ops in enumerate(layers):
         base_links = links()
-        base = evaluate(ops, mu, sigma, frame, value_frame, base_links)
+        base = evaluate(ops, mu, reference_c if frame_diagonal else sigma, frame, value_frame, base_links)
         if self_coupling_live:
             base["self_coupling"] = base_self_coupling
         worst: Dict[str, float] = {}
@@ -933,7 +941,8 @@ def projected_gauge_equivariance(
                     float(scale) * torch.einsum("...a,akl->...kl", a, gens)).to(mu.device)   # (1, N, K, K)
             G = _dense_frame(g, True) if g.dim() == mu.dim() + 2 else g        # (1, N, K, K)
             moved = evaluate(
-                ops, (G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
+                ops, (G @ mu.unsqueeze(-1)).squeeze(-1),
+                reference_c if frame_diagonal else G @ sigma @ G.transpose(-1, -2),
                 _act_on_frame(g, frame), _act_on_frame(g, value_frame), links())
             if "receiver_energy" in base:
                 # -c_i/2 log det(g Sigma g^T) = -c_i/2 log det Sigma - c_i log|det g_i|.

@@ -92,7 +92,18 @@ def relational_score(
     ``projected_factorization='gram'``, ``pair_kl_gemm_tol`` None) only diag(G) is formed and the
     Gaussian KL takes its diagonal route, with no Gram, factorization or source tuple.
     Under ``tie_comparison_maps`` a belief scored against itself is projected once and both roles share it.
+
+    Under ``operators.frame_diagonal`` (``gaussian_frame_diagonal``) ``sigma`` and ``source_sigma`` hold the reference
+    variances :math:`c_i`, so :math:`S U_i^{-1}\Sigma_iU_i^{-\top}S^\top = S\operatorname{diag}(c_i)S^\top`: the means are
+    moved to :math:`\xi_i = U_i^{-1}\mu_i` and every role reads them through the identity frame, the diagonal source
+    root :math:`S\operatorname{diag}(c_i)^{1/2}` included, with no frame product in the covariance.
     """
+    if getattr(operators, "frame_diagonal", False):
+        from vfe3.model.frame_actions import frame_diagonal_reference, frame_matvec
+        same = source_mu is mu
+        mu, reference_frame = frame_diagonal_reference(mu, frame)                 # (..., N, K) xi, identity frame
+        source_mu = mu if same else frame_matvec(frame.inverse, source_mu, frame.block_diagonal)
+        frame = reference_frame
     dims = operators.irrep_dims
     inverse = frame.inverse
     if not frame.block_diagonal:

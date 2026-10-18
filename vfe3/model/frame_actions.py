@@ -232,3 +232,64 @@ def local_covariance(
         if not diagonal:
             out = 0.5 * (out + out.transpose(-1, -2))
     return out.to(C.dtype)
+
+
+def identity_frame(frame: Any) -> Any:             # CanonicalFrameContext -> CanonicalFrameContext
+    r"""The identity frame in ``frame``'s layout, dtype and device (an expanded view, no copy).
+
+    The frame-diagonal family (``gaussian_frame_diagonal``) stores its covariance in reference coordinates, so a
+    consumer written for local moments and a frame reads its reference moments :math:`(\xi_i, c_i)` exactly through
+    this frame: :math:`I^{-1}\xi_i = \xi_i` and :math:`I\operatorname{diag}(c_i)I^\top = \operatorname{diag}(c_i)`.
+    """
+    from vfe3.contracts import CanonicalFrameContext
+
+    eye = torch.eye(frame.forward.shape[-1], dtype=frame.forward.dtype, device=frame.forward.device)
+    eye = eye.expand(frame.forward.shape)                                              # (..., N, [G,] d|K, d|K)
+    return CanonicalFrameContext(forward=eye, inverse=eye, block_diagonal=frame.block_diagonal)
+
+
+def frame_diagonal_reference(
+    mu:    torch.Tensor,                           # (..., N, K) local means
+    frame: Any,                                    # CanonicalFrameContext of U_i
+) -> 'tuple[torch.Tensor, Any]':                   # (..., N, K) xi = U^{-1} mu, and the identity frame
+    r"""The reference means :math:`\xi_i = U_i^{-1}\mu_i` and the identity frame (:func:`identity_frame`).
+
+    With the stored reference variances :math:`c_i` of ``gaussian_frame_diagonal`` the pair
+    :math:`(\xi_i, \operatorname{diag}c_i)` and the identity frame are a belief in the layout every local-coordinate
+    consumer reads, with the same reference moments; idempotent on an identity frame.
+    """
+    return frame_matvec(frame.inverse, mu, frame.block_diagonal), identity_frame(frame)
+
+
+@ieee_fp32_matmul()
+def frame_diagonal_local_covariance(
+    c:        torch.Tensor,                        # (..., N, K) reference variances c_i
+    frame:    Any,                                 # CanonicalFrameContext of U_i
+    *,
+    diagonal: bool,                                # True: return diag Sigma_i, (..., N, K)
+) -> torch.Tensor:                                 # (..., N, K) or (..., N, K, K) in c's dtype
+    r"""The local covariance :math:`\Sigma_i = U_i\operatorname{diag}(c_i)U_i^\top` of a frame-diagonal belief.
+
+    With ``diagonal`` only :math:`(\Sigma_i)_{kk} = \sum_m(U_i)_{km}^2c_{i,m}` is formed (blockwise on a compact frame),
+    else the dense, symmetrized product. Autocast off, float64 for an escalated frame, returned in ``c``'s dtype.
+    """
+    dtype = _work_dtype(frame.forward, c)
+    K = c.shape[-1]
+    with torch.autocast(device_type=c.device.type, enabled=False):
+        U, s = frame.forward.to(dtype), c.to(dtype)
+        if frame.block_diagonal:
+            G, d = U.shape[-3], U.shape[-1]
+            s_b = s.reshape(*s.shape[:-1], G, d)                                       # (..., N, G, d)
+            if diagonal:
+                out = (U.square() @ s_b.unsqueeze(-1)).flatten(-3)                     # (..., N, K)
+            else:
+                blocks = (U * s_b.unsqueeze(-2)) @ U.transpose(-1, -2)                 # (..., N, G, d, d)
+                eye_g = torch.eye(G, dtype=dtype, device=c.device)
+                out = torch.einsum("...gij,gh->...gihj", blocks, eye_g).reshape(*s.shape[:-1], K, K)
+        elif diagonal:
+            out = (U.square() @ s.unsqueeze(-1)).squeeze(-1)                           # (..., N, K)
+        else:
+            out = (U * s.unsqueeze(-2)) @ U.transpose(-1, -2)                          # (..., N, K, K)
+        if not diagonal:
+            out = 0.5 * (out + out.transpose(-1, -2))
+    return out.to(c.dtype)
