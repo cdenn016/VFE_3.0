@@ -1,8 +1,7 @@
 r"""Numerical conditioning fallbacks + health probes for VFE_3.0.
 
 CONDITIONING FALLBACKS keep the SPD-manifold math finite under ill-conditioning
-(guarded Cholesky factorizations and solves, chunked eigensolvers, the mean trust region);
-``nan_inf_fraction`` reports numerical health as a plain scalar.
+(guarded Cholesky factorizations and solves, chunked eigensolvers, the mean trust region).
 
 A theoretically pure path is always available (the unregularized op); the fallbacks are
 guards that activate only when the pure path fails, and they are documented as such.
@@ -746,12 +745,3 @@ def triangular_condition_estimate(
         y = torch.linalg.solve_triangular(C, alternating, upper=False)
         estimate = torch.maximum(estimate, 2. * y.abs().sum(dim=(-2, -1)) / (3. * n))
         return norm * estimate
-
-
-def nan_inf_fraction(
-    tensor: torch.Tensor,
-) -> float:                              # fraction of non-finite entries in [0, 1]
-    r"""Fraction of NaN/Inf entries (0.0 = all finite)."""
-    if tensor.numel() == 0:
-        return 0.0
-    return float((~torch.isfinite(tensor)).float().mean())

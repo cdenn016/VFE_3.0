@@ -3,15 +3,8 @@ import torch
 
 from vfe3.numerics import (
     bounded_variance_from_log,
-    nan_inf_fraction,
     safe_cholesky,
 )
-
-
-def test_nan_inf_fraction_counts_nonfinite():
-    t = torch.tensor([1.0, float("nan"), float("inf"), 2.0])
-    assert abs(nan_inf_fraction(t) - 0.5) < 1e-6
-    assert nan_inf_fraction(torch.ones(10)) == 0.0
 
 
 def test_safe_cholesky_factors_spd_byte_identical():

@@ -50,9 +50,3 @@ def perplexity_matches_ce(
         return math.isinf(ppl_value) and ppl_value > 0.0
     return math.isfinite(ppl_value) and math.isclose(
         ppl_value, expected, rel_tol=rel_tol, abs_tol=abs_tol)
-
-
-def target_blind_objective_interpretation() -> str:
-    """State only what target blindness implies about held-out prediction."""
-    return ("The target-blind latent objective and held-out prediction are separate objectives; "
-            "target blindness alone implies no Pearson sign.")
