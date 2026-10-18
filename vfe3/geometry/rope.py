@@ -89,11 +89,17 @@ def build_rope_rotation(
     therefore POSITIONALLY INERT (it carries zero positional content) -- a future un-gating of rope
     onto an odd-dim block must not assume full positional coverage (audit 2026-06-13 L21). The result
     is orthogonal and block-diagonal, so it preserves the block-diagonal exp fast path.
+
+    Positions, angles, cosines and sines are formed in float64 and the rotation is cast once to ``dtype``, so a
+    float32 result has entrywise error near the float32 rounding of its entries at every position and
+    :math:`R_i^\top R_{i+t} = R_t` holds to that floor, instead of to :math:`|\theta| \varepsilon_{32}` from float32
+    angles, which grows with the position (audit 2026-10-17 item 44). Callers cache the result, so the float64
+    arithmetic is paid once per length.
     """
-    pos = positions.to(device=device, dtype=dtype)                 # (N,)
+    pos = positions.to(device=device, dtype=torch.float64)         # (N,) float64 positions
     K = int(sum(irrep_dims))
     N = pos.shape[0]
-    R = torch.eye(K, device=device, dtype=dtype).expand(N, K, K).clone()
+    R = torch.eye(K, device=device, dtype=torch.float64).expand(N, K, K).clone()   # (N, K, K) float64
     start = 0
     if not 0.0 < fraction <= 1.0:
         raise ValueError(f"rope fraction must be in (0, 1], got {fraction!r}")
@@ -109,7 +115,7 @@ def build_rope_rotation(
             R[:, a, a] = c;  R[:, a, b] = -s
             R[:, b, a] = s;  R[:, b, b] = c
         start += d
-    return R
+    return R.to(dtype)                                             # one cast of the float64 rotation
 
 
 def rope_rotated_pairs(d: int, fraction: float) -> int:
