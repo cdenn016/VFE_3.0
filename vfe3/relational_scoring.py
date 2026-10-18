@@ -62,6 +62,47 @@ def _tile_token_cap() -> int:
     shape (audit 2026-10-17 item 6); tiles are token independent, so the cap changes only the dispatch count."""
     return _TILE_TOKEN_CAP * max(1, _PROJECTION_TILE_BYTES // _CHECKPOINT_BYTES)
 
+
+# Kernel of the diagonal comparison moments (config relational_diag_moments_kernel, installed by VFEModel):
+# "torch", the checkpointed tile loop of projected_moments, or "triton", the fused kernels of
+# vfe3.kernels.diagonal_moments (audit 2026-10-17 item 20). "triton" applies to CUDA tensors only.
+_DIAG_MOMENTS_KERNELS = ("torch", "triton")
+_DIAG_MOMENTS_KERNEL: str = "torch"
+
+# Calls of projected_moments that ran the fused kernels since the last reset (a host integer, no sync).
+_DIAG_MOMENTS_TRITON_CALLS: int = 0
+
+
+def set_diagonal_moments_kernel(kernel: str) -> str:
+    r"""Set the kernel of the diagonal comparison moments, ``"torch"`` or ``"triton"``; returns the previous value."""
+    if kernel not in _DIAG_MOMENTS_KERNELS:
+        raise ValueError(f"diagonal moments kernel must be one of {_DIAG_MOMENTS_KERNELS}, got {kernel!r}")
+    global _DIAG_MOMENTS_KERNEL
+    previous = _DIAG_MOMENTS_KERNEL
+    _DIAG_MOMENTS_KERNEL = kernel
+    return previous
+
+
+def diagonal_moments_kernel() -> str:
+    r"""Return the selected kernel of the diagonal comparison moments."""
+    return _DIAG_MOMENTS_KERNEL
+
+
+def diagonal_moments_triton_calls() -> int:
+    r"""Calls of :func:`projected_moments` that ran the fused Triton kernels since the last reset."""
+    return _DIAG_MOMENTS_TRITON_CALLS
+
+
+def reset_diagonal_moments_triton_calls() -> None:
+    r"""Zero the fused diagonal moments call counter."""
+    global _DIAG_MOMENTS_TRITON_CALLS
+    _DIAG_MOMENTS_TRITON_CALLS = 0
+
+
+def _diagonal_moments_triton_active(*tensors: torch.Tensor) -> bool:
+    r"""Whether the fused kernels are selected and every operand is a CUDA tensor (CPU tensors run torch)."""
+    return _DIAG_MOMENTS_KERNEL == "triton" and all(tensor.is_cuda for tensor in tensors)
+
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float32 shifted CholeskyQR3, or float64 QR where the float32 retry fails, the input is
 # float64, or the route is cholesky_qr2_certified), per device. Updated asynchronously on the recovery
@@ -268,6 +309,10 @@ def projected_moments(
     tokens = mu_h.shape[-3]
     batch = torch.broadcast_shapes(mu_h.shape[:-3], inverse_blocks.shape[:-4])
     roles = S.shape[0] if S.ndim == 4 else 1
+    if diagonal_only and diagonal and _diagonal_moments_triton_active(mu_h, Sigma_h, inverse_blocks, S):
+        fused = _fused_diagonal_moments(mu_h, Sigma_h, inverse_blocks, S, dtype, batch)
+        if fused is not None:
+            return fused
     bytes_per_token = math.prod(batch) * roles * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.
@@ -290,6 +335,51 @@ def projected_moments(
             covariances.append(G)
         return torch.cat(means, dim=-3), torch.cat(covariances, dim=-3 if diagonal_only else -4)
     return _projected_moments_tile(mu_h, Sigma_h, inverse_blocks, S, head_dims, diagonal_only)
+
+
+def _fused_diagonal_moments(
+    mu_h:           torch.Tensor,  # (..., N, H, K)
+    Sigma_h:        torch.Tensor,  # (..., N, H, K) diagonal variances
+    inverse_blocks: torch.Tensor,  # (..., N, M, d, d) compact blocks, K = M d (M = 1: one dense block)
+    S:              torch.Tensor,  # (H, r, K) or (R, H, r, K)
+    dtype:          torch.dtype,
+    batch:          Tuple[int, ...],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    r"""``diagonal_only`` moments of a diagonal covariance through the fused Triton kernels, or None.
+
+    Returns what :func:`_projected_moments_tile` returns under ``diagonal_only`` for the whole token range: the
+    projected means :math:`a = S U^{-1} \mu` from the torch GEMMs of :func:`_projected_root_mean`, and
+    :math:`g = \operatorname{diag}(X X^\top) = \sum_k X_{\cdot k}^2` with :math:`X = S U^{-1}\operatorname{diag}(\rho)`
+    from :func:`vfe3.kernels.diagonal_moments.diagonal_root_square_sums`, where :math:`\rho` is the zero-safe root of
+    :func:`_diagonal_root_moments` formed here in torch, so a negative or NaN variance still reaches g as NaN and the
+    scorer's checks and failure detail see the same failures. Nothing token-sized is saved but the inputs, so no tile
+    loop or checkpoint is needed. Returns None, leaving the torch route, when the variance is per head (no
+    head-shared root), the frame is a per-head dense block, or a frame block is wider than the kernels take.
+    """
+    from vfe3.kernels.diagonal_moments import MAX_BLOCK_WIDTH, diagonal_root_square_sums
+    H, K = mu_h.shape[-2:]
+    M, d = inverse_blocks.shape[-3], inverse_blocks.shape[-1]
+    sigma = _head_shared(Sigma_h)
+    if sigma.shape[-2] != 1 or M * d != K or d > MAX_BLOCK_WIDTH:
+        return None
+    global _DIAG_MOMENTS_TRITON_CALLS
+    _DIAG_MOMENTS_TRITON_CALLS += 1
+    tokens = mu_h.shape[-3]
+    with torch.autocast(device_type=mu_h.device.type, enabled=False):
+        inverse = inverse_blocks.to(dtype)                                             # (..., N, M, d, d)
+        maps = (S if S.ndim == 4 else S.unsqueeze(0)).to(dtype)                        # (R, H, r, K)
+        R, r = maps.shape[0], maps.shape[-2]
+        a = _projected_root_mean(_head_shared(mu_h).to(dtype), inverse, maps)          # (..., N, R, H, r)
+        sigma = sigma.to(dtype)                                                        # (..., N, 1, K)
+        zero = sigma == 0
+        root = torch.where(zero, 0., torch.where(zero, 1., sigma).sqrt())              # as _diagonal_root_moments
+        U = inverse.expand(*batch, tokens, M, d, d).reshape(-1, M, d, d)               # (T, M, d, d)
+        rho = root.squeeze(-2).expand(*batch, tokens, K).reshape(-1, K)                # (T, K)
+        g = diagonal_root_square_sums(maps.reshape(-1, K), U, rho)                     # (T, R H r)
+        g = g.reshape(*batch, tokens, R, H, r)                                         # (..., N, R, H, r)
+    if S.ndim == 3:
+        return a.squeeze(-3), g.squeeze(-3)                                            # (..., N, H, r)
+    return a.movedim(-3, 0).contiguous(), g.movedim(-3, 0).contiguous()               # (R, ..., N, H, r)
 
 
 @ieee_fp32_matmul()
@@ -395,25 +485,38 @@ def _diagonal_root_moments(
     R, H, r, K = S.shape
     zero = sigma == 0
     root = torch.where(zero, 0., torch.where(zero, 1., sigma).sqrt())              # (..., N, h, K)
+    a = _projected_root_mean(mu, inverse, S)                                       # (..., N, R, H, r)
     if inverse.shape[-2:] == (K, K):
         # Dense blocks (..., N, H', K, K): W = U^{-1} diag(sigma)^{1/2} column-scales each block.
-        xi = (inverse @ mu.unsqueeze(-1)).squeeze(-1)                              # (..., N, h, K)
         W = inverse * root.unsqueeze(-2)                                           # (..., N, h, K, K)
         X = (_projected_linear_map(S.flatten(0, 1), W).unflatten(-3, (R, H)) if W.shape[-3] == 1
              else _projected_linear_map(S, W.unsqueeze(-4)))                       # (..., N, R, H, r, K)
     else:
         M, d = inverse.shape[-3], inverse.shape[-1]
         blocks = inverse.unsqueeze(-4)                                             # (..., N, 1, M, d, d)
-        xi = (blocks @ mu.unflatten(-1, (M, d)).unsqueeze(-1)).flatten(-3)         # (..., N, h, K)
         W = blocks * root.unflatten(-1, (M, d)).unsqueeze(-2)                      # (..., N, h, M, d, d)
         X = (_projected_linear_map(S.flatten(0, 1), W.squeeze(-4)).unflatten(-3, (R, H)) if W.shape[-4] == 1
              else torch.einsum("Rhrmd,...hmde->...Rhrme", S.unflatten(-1, (M, d)), W).flatten(-2))
+    return a, X
+
+
+def _projected_root_mean(
+    mu:      torch.Tensor,             # (..., N, h, K), h = 1 for a head-shared mean or H
+    inverse: torch.Tensor,             # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1} blocks
+    S:       torch.Tensor,             # (R, H, r, K) comparison maps, one per role
+) -> torch.Tensor:                     # a (..., N, R, H, r)
+    r"""Projected means :math:`a_i = S \xi_i`, :math:`\xi_i = U_i^{-1}\mu_i`, of :func:`_diagonal_root_moments`."""
+    R, H, r, K = S.shape
+    if inverse.shape[-2:] == (K, K):
+        xi = (inverse @ mu.unsqueeze(-1)).squeeze(-1)                              # (..., N, h, K)
+    else:
+        M, d = inverse.shape[-3], inverse.shape[-1]
+        blocks = inverse.unsqueeze(-4)                                             # (..., N, 1, M, d, d)
+        xi = (blocks @ mu.unflatten(-1, (M, d)).unsqueeze(-1)).flatten(-3)         # (..., N, h, K)
     if xi.shape[-2] == 1:
         # One (tokens, K) x (K, R H r) GEMM, not a broadcast batched matvec per (token, role, head).
-        a = (xi.squeeze(-2) @ S.flatten(0, 2).transpose(0, 1)).unflatten(-1, (R, H, r))
-    else:
-        a = torch.einsum("Rhrk,...hk->...Rhr", S, xi)                              # (..., N, R, H, r)
-    return a, X
+        return (xi.squeeze(-2) @ S.flatten(0, 2).transpose(0, 1)).unflatten(-1, (R, H, r))
+    return torch.einsum("Rhrk,...hk->...Rhr", S, xi)                               # (..., N, R, H, r)
 
 
 def _head_block_covariance(

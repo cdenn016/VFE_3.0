@@ -114,6 +114,20 @@ CASES: Dict[str, dict] = {
     "decode_constant_kl": {"decode_mode": "diagonal_chunked", "decode_covariance": "constant"},
     "decode_constant_gaussian_block": {"family": "gaussian_block", "decode_mode": "full_chunked",
                                        "decode_covariance": "constant"},
+    # the frame-diagonal family (revived 2026-10-18): the switch keeps it and its diagonal KL decoder
+    "frame_diagonal":     {"family": "gaussian_frame_diagonal", "decode_mode": "diagonal_chunked"},
+    "frame_diagonal_block_so": {"family": "gaussian_frame_diagonal", "decode_mode": "diagonal_chunked",
+                                "gauge_group": "block_so"},
+    "frame_diagonal_so_n": {**_SO3, "family": "gaussian_frame_diagonal", "decode_mode": "diagonal_chunked"},
+    "frame_diagonal_pushforward_relative": {"family": "gaussian_frame_diagonal", "decode_mode": "diagonal_chunked",
+                                            "block_norm_covariance": "pushforward_moment",
+                                            "block_mlp_covariance": "delta_full",
+                                            "predictive_covariance_floor_mode": "relative"},
+    "frame_diagonal_max_floor_self_term": {"family": "gaussian_frame_diagonal", "decode_mode": "diagonal_chunked",
+                                           "predictive_covariance_floor_mode": "max",
+                                           "block_norm_covariance": "pushforward",
+                                           "mstep_self_coupling_weight": 0.5,
+                                           "decode_covariance": "constant"},
 }
 
 
@@ -159,7 +173,10 @@ def _frame_change(model: VFEModel, g: torch.Tensor, *, frames: bool) -> Callable
     def changed(token_ids: torch.Tensor) -> BeliefState:
         prior = encode(token_ids)
         mu = (g @ prior.mu.unsqueeze(-1)).squeeze(-1)                  # (B, N, K)
-        sigma = g @ prior.sigma @ g.transpose(-1, -2)                  # (B, N, K, K)
+        # gaussian_frame_diagonal stores c_i = diag(U_i^-1 Sigma_i U_i^-T), which the action leaves fixed:
+        # Sigma_i = U_i diag(c_i) U_i^T -> g_i Sigma_i g_i^T is carried by the frame alone.
+        sigma = (prior.sigma if model.prior_bank.frame_diagonal
+                 else g @ prior.sigma @ g.transpose(-1, -2))           # (B, N, K) or (B, N, K, K)
         if not frames:
             return prior._replace(mu=mu, sigma=sigma)
         log_gU, failed, _ = logm_principal(g @ torch.linalg.matrix_exp(embed_phi(prior.phi, G)))   # (B, N, K, K)

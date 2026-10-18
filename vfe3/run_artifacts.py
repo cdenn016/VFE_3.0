@@ -5085,7 +5085,11 @@ def _pure_path_report(
     from vfe3.attention_prior import get_prior_registration
 
     invariant_families = declared_invariant_families(cfg.gauge_group)
-    family_group_invariant = cfg.family in invariant_families
+    # gaussian_frame_diagonal stores c_i = diag(U_i^{-1} Sigma_i U_i^{-T}), invariant under the passive action of every
+    # group (the frame carries the action), so the family is covariant whatever the group declares.
+    from vfe3.families import get_family as _family_of
+    family_group_invariant = (cfg.family in invariant_families
+                              or bool(getattr(_family_of(cfg.family), "frame_diagonal_covariance", False)))
     transport_registration = get_transport_registration("flat")       # the only projected transport
     if executable_build is not None:
         block_mlp_build = executable_build.block_mlp

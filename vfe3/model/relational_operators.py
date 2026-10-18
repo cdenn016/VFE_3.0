@@ -13,7 +13,7 @@ from vfe3.contracts import CanonicalFrameContext, host_read
 from vfe3.model import edge_links, minimal_agent
 from vfe3.model.covariance_ceiling import covariance_ceiling
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
-from vfe3.model.frame_actions import frame_matvec
+from vfe3.model.frame_actions import frame_diagonal_reference, frame_matvec
 from vfe3.relational_scoring import (
     ROUTING_COSTS, _compute_dtype, _count_source_recovery, projected_condition_recovery, source_recovery_counter,
 )
@@ -571,6 +571,12 @@ class RelationalOperators(nn.Module):
     ``block_covariance`` (family ``gaussian_block``; equal heads, the kernel predictive readout, edges off) makes
     the moment-matched update return the head-block M-projection of :math:`\Sigma_i^+` in the dense layout,
     one SPD :math:`d\times d` block per head (:meth:`_predictive_covariance_update_blockwise`).
+    ``frame_diagonal`` (family ``gaussian_frame_diagonal``; the kernel predictive readout, edges off) declares that
+    ``sigma`` holds the reference variances :math:`c_i`, :math:`\Sigma_i = U_i\operatorname{diag}(c_i)U_i^\top`: the
+    router (:func:`vfe3.gradients.relational.relational_score`) and the moment-matched update read the reference
+    moments :math:`(U_i^{-1}\mu_i, c_i)` through the identity frame, so the update returns
+    :math:`c_i^+ = \operatorname{diag}C_i^{\mathrm{att}}` plus the floor in reference coordinates, the family's
+    frame-independent M-projection (:meth:`predictive_covariance_update`).
     ``content_link_edges`` ("lowrank" or "pure_gauge", exponential chart, equal heads, predictive
     content only) gives every edge the link :math:`G_{ij} = g_ie^{L}E_{ij}` of :mod:`vfe3.model.edge_links`,
     with rank-``content_link_edge_rank`` factor maps stored as ``edge_receiver_map`` (lowrank) or
@@ -646,6 +652,7 @@ class RelationalOperators(nn.Module):
         learn_attention_temperature: bool = False,
         tie_comparison_maps:   bool  = False,
         block_covariance:      bool  = False,
+        frame_diagonal:        bool  = False,
         pair_kl_gemm_tol:      Optional[float] = None,
         routing_key_noise:     float = 1.0,
         elbo_diagnostic:       bool  = False,
@@ -841,6 +848,21 @@ class RelationalOperators(nn.Module):
                                  + ", ".join(block_problems))
         # gaussian_block: the moment-matched update returns the head-block M-projection (one SPD block per head).
         self.block_covariance = block_covariance
+        if not isinstance(frame_diagonal, bool):
+            raise ValueError(f"frame_diagonal must be bool, got {frame_diagonal!r}")
+        if frame_diagonal:
+            frame_problems = []
+            if block_covariance:
+                frame_problems.append("block_covariance=False (one covariance family per operator)")
+            if readout_mode != "predictive_content" or minimal:
+                frame_problems.append("the kernel predictive readout (predictive_content, predictive_readout='kernel')")
+            if content_link_edges != "off":
+                frame_problems.append("content_link_edges='off'")
+            if frame_problems:
+                raise ValueError("frame_diagonal (the gaussian_frame_diagonal reference-coordinate covariance) "
+                                 "requires " + ", ".join(frame_problems))
+        # gaussian_frame_diagonal: sigma holds the reference variances c_i (router and update read (U^-1 mu, c)).
+        self.frame_diagonal = frame_diagonal
         if not isinstance(learn_attention_temperature, bool) or not isinstance(tie_comparison_maps, bool):
             raise ValueError("learn_attention_temperature and tie_comparison_maps must be bool")
         if minimal and (learn_attention_temperature or tie_comparison_maps):
@@ -1526,6 +1548,11 @@ class RelationalOperators(nn.Module):
         computed outside the checkpointed region and enters it as an input.
         """
         self._require_kernel_readout("predictive_covariance_update")
+        if self.frame_diagonal:
+            # gaussian_frame_diagonal: sigma holds c_i, C_i = diag(c_i). The body reads (xi, diag c) through the identity
+            # frame, so it returns diag(C^att) and adds the floor in reference coordinates (f c_p, f mean(c_i), or their
+            # elementwise max), the family's M-projection; idempotent when the frame is already the identity.
+            mu, frame = frame_diagonal_reference(mu, frame)                           # (..., N, K) xi, identity frame
         if self.predictive_covariance_precision == "fp64" and sigma.dtype != torch.float64:
             # The float64 update of the float32 inputs; a float64 call takes the plain path below, so this equals
             # the float64-belief update cast back, bit for bit (with a given edge context: of that context cast to

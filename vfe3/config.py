@@ -268,8 +268,14 @@ class VFE3Config:
     #   4. Belief family and table initialization
     ##################################################
 
-    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block"
+    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" | "gaussian_frame_diagonal"
     # The belief covariance structure (read diagonal_covariance, never a second flag).
+    #   gaussian_frame_diagonal  Sigma_i = U_i diag(c_i) U_i^T, diagonal in REFERENCE coordinates; stores c_i (..., K),
+    #                   invariant under the passive action. only: projected_predictive, predictive_readout="kernel",
+    #                   content_link_edges "off", no frame-space RoPE, no CG coupling, norm_type_block "none" |
+    #                   "layernorm", a "coordinate" block MLP, decode_mode "linear" | "diagonal_chunked", no
+    #                   decode_second_order, m_table_update_mode "fisher" only with pos_phi="none" (its metric
+    #                   U_v^-T diag(1/s_v) U_v^-1 reads the type frame; positional frames make it per occurrence)
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, any
     #                   block_* group or an equal-block so_n / su_n tower; any tying), content_link_edges
@@ -947,6 +953,13 @@ class VFE3Config:
     # 32 * (relational_tile_mib // 32) tokens (audit 2026-10-17 item 6). Keep 32 until a CUDA A/B confirms a gain
     # (audit 2026-10-16 F26).
     relational_tile_mib:              int             = 32
+    # "torch" | "triton". Kernel of the diagonal comparison route's projected moments (rope_mode="comparison_invariant"
+    # with a diagonal P(G), gaussian_diagonal family, Gaussian-KL kernel router): "triton" computes diag(G) = sum_k X^2,
+    # X = S U^{-1} Sigma^{1/2}, in fused Triton kernels that keep X in registers and recompute it in backward
+    # (vfe3/kernels/diagonal_moments.py; audit 2026-10-17 item 20), instead of the checkpointed torch tile loop. Same
+    # source-root formula, rounding-level differences. CPU tensors, and shapes the kernels do not take (per-head
+    # variances or frames, frame blocks wider than 64), always run the torch route.
+    relational_diag_moments_kernel:   str             = "torch"
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
 
@@ -1112,9 +1125,13 @@ class VFE3Config:
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
-        if self.family not in ("gaussian_diagonal", "gaussian_full", "gaussian_block"):
-            incompatible.append(f"family={self.family!r} (requires gaussian_diagonal, gaussian_full or "
-                                "gaussian_block)")
+        # gaussian_frame_diagonal runs on the predictive route only (its own validation below lists the rest).
+        if self.family == "gaussian_frame_diagonal" and full_link:
+            incompatible.append("family='gaussian_frame_diagonal' (requires attention_mode='projected_predictive': the "
+                                "gradient receiver's Fisher steps and closed forms act on a local covariance)")
+        elif self.family not in ("gaussian_diagonal", "gaussian_full", "gaussian_block", "gaussian_frame_diagonal"):
+            incompatible.append(f"family={self.family!r} (requires gaussian_diagonal, gaussian_full, "
+                                "gaussian_block or, on projected_predictive, gaussian_frame_diagonal)")
         if self.n_heads < 2:
             incompatible.append(f"n_heads={self.n_heads!r} (requires at least 2)")
         if incompatible:
@@ -1453,6 +1470,52 @@ class VFE3Config:
             if block_problems:
                 raise ValueError(f"family={self.family!r} keeps one SPD covariance block per head and is defined "
                                  "only where every covariance producer preserves that; got " + "; ".join(block_problems))
+        # Frame-diagonal family (gaussian_frame_diagonal): the stored (..., K) dispersion is c_i = diag C_i in reference
+        # coordinates, Sigma_i = U_i diag(c_i) U_i^T. Defined only where every consumer of the covariance reads it through
+        # the realized relational frame U_i: the kernel readout (router and moment-matched update on (U^-1 mu, c)), the
+        # LayerNorm and coordinate MLP in local coordinates (pushforwards on U diag(c) U^T, read back as diag U^-1 S U^-T)
+        # or reference coordinates (on diag c, read back as the diagonal), and the KL decoders.
+        if _family_cls.frame_diagonal_covariance:
+            frame_problems = []
+            if self.attention_mode != "projected_predictive":
+                frame_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive': the "
+                                      "gradient receiver's Fisher steps and retraction act on a local covariance)")
+            if self.predictive_readout != "kernel":
+                frame_problems.append(f"predictive_readout={self.predictive_readout!r} (requires 'kernel': the minimal "
+                                      "agent's conditioning reads a local diagonal covariance)")
+            if self.content_link_edges != "off":
+                frame_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off': the edge "
+                                      "links' latent receivers read the local covariance)")
+            if self.rope_mode in _FRAME_ROPE_MODES:
+                frame_problems.append(f"rope_mode={self.rope_mode!r} (folds a rotation into the routing frame, so the "
+                                      "covariance's reference coordinates would differ between routing and content; "
+                                      "use 'none' or a comparison mode)")
+            if self.use_cg_coupling:
+                frame_problems.append("use_cg_coupling=True (the CG coupling acts on a local covariance)")
+            if self.norm_type_block not in ("none", "layernorm"):
+                frame_problems.append(f"norm_type_block={self.norm_type_block!r} (requires 'none' or 'layernorm': the "
+                                      "Mahalanobis norm inverts the local covariance blocks)")
+            if self.use_block_mlp and self.block_mlp_mode != "coordinate":
+                frame_problems.append(f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate': the other block "
+                                      "MLPs read a local or template covariance this family does not store)")
+            if self.decode_mode not in ("linear", "diagonal_chunked"):
+                frame_problems.append(f"decode_mode={self.decode_mode!r} (requires 'linear' or 'diagonal_chunked': the "
+                                      "diagonal KL decoder reads diag Sigma_i in local or c_i in reference coordinates)")
+            if self.decode_second_order:
+                frame_problems.append("decode_second_order=True (its trace term reads a local diagonal covariance)")
+            # The table Fisher step preconditions mu_v by the metric U_v^-T diag(1/s_v) U_v^-1 of the type's layer-0
+            # frame U_v (vfe3.table_optim). A positional frame makes U_i depend on the position, so the exact metric
+            # would be the occurrence average of U_i^-T diag(1/s_v) U_i^-1, which the step does not implement.
+            if self.m_table_update_mode == "fisher" and self.gauge_transport != "off" and self.pos_phi != "none":
+                frame_problems.append(
+                    f"m_table_update_mode='fisher' with pos_phi={self.pos_phi!r} (the Fisher metric of p_v in mu_v is "
+                    "U_i^-T diag(1/s_v) U_i^-1 with a position-dependent layer-0 frame U_i, whose occurrence average "
+                    "the table step does not form; the step supports frames that depend on the token only, "
+                    "pos_phi='none')")
+            if frame_problems:
+                raise ValueError(f"family={self.family!r} stores the covariance diagonal in reference coordinates and "
+                                 "is defined only where every covariance consumer reads it through the realized frame; "
+                                 "got " + "; ".join(frame_problems))
         _require(self.prior_covariance_table, ("diagonal", "block_cholesky"), "prior_covariance_table")
         # Frame-free (xi, C) prior table: with identity frames (gauge_transport='off') it represents exactly what
         # the learned-frame reference arm reads, C_v = U_v^-1 diag(sigma_v) U_v^-T as one SPD block per head.
@@ -1591,6 +1654,10 @@ class VFE3Config:
                 fisher_problems.append(f"pos_phi in ('none', 'learned', 'frozen'); got {self.pos_phi!r}")
             if self.pos_phi_project_slk:
                 fisher_problems.append("pos_phi_project_slk=False (the metric uses the full chart)")
+            if _family_cls.frame_diagonal_covariance:
+                fisher_problems.append(
+                    f"a family whose layer-0 local covariance is diag(s_v); family={self.family!r} encodes "
+                    "Sigma = U diag(s_v) U^T, whose reference covariance diag(s_v) does not move with the frame")
             chart_problem = self._chart_ordering_problem()
             if chart_problem is not None:
                 fisher_problems.append(chart_problem)
@@ -1879,6 +1946,7 @@ class VFE3Config:
             raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
         if type(self.relational_tile_mib) is not int or self.relational_tile_mib < 1:
             raise ValueError(f"relational_tile_mib must be an int >= 1 (MiB), got {self.relational_tile_mib!r}")
+        _require(self.relational_diag_moments_kernel, ("torch", "triton"), "relational_diag_moments_kernel")
 
         if self.block_mlp_expansion < 1:
             raise ValueError(
@@ -1905,11 +1973,12 @@ class VFE3Config:
         # item 9), as the attention update already projects its dense covariance; gauge_gate's delta_full
         # Jacobian needs the full layout.
         if (self.use_block_mlp and self.block_mlp_covariance == "delta_full"
-                and self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal")):
+                and self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal",
+                                        "gaussian_frame_diagonal")):
             raise ValueError(
                 "block_mlp_covariance='delta_full' needs a Gaussian family (family='gaussian_full', "
-                "'gaussian_block' through its head-block projection, or 'gaussian_diagonal' through its "
-                f"diagonal projection); got family={self.family!r}."
+                "'gaussian_block' through its head-block projection, or 'gaussian_diagonal' or "
+                f"'gaussian_frame_diagonal' through its diagonal projection); got family={self.family!r}."
             )
         if (self.use_block_mlp and self.block_mlp_covariance == "delta_full"
                 and self.family == "gaussian_diagonal" and self.block_mlp_mode == "gauge_gate"):
@@ -1927,11 +1996,14 @@ class VFE3Config:
             # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
             # Only a LayerNorm block norm reads the field: under 'none' or 'mahalanobis' it is inert (inactive_fields)
             # and either value is accepted (audit 2026-10-16 F5).
+            # gaussian_frame_diagonal pushes diag(c) in reference coordinates and keeps the diagonal of the result.
             problems = []
-            if self.block_coordinates != "local" and self.family not in ("gaussian_full", "gaussian_block"):
-                problems.append(f"block_coordinates='local', or 'reference' with family 'gaussian_full' or "
-                                f"'gaussian_block' (got {self.block_coordinates!r} with {self.family!r})")
-            if self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal"):
+            if self.block_coordinates != "local" and self.family not in ("gaussian_full", "gaussian_block",
+                                                                         "gaussian_frame_diagonal"):
+                problems.append(f"block_coordinates='local', or 'reference' with family 'gaussian_full', "
+                                f"'gaussian_block' or 'gaussian_frame_diagonal' (got {self.block_coordinates!r} "
+                                f"with {self.family!r})")
+            if self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal", "gaussian_frame_diagonal"):
                 problems.append(f"a Gaussian family (got {self.family!r})")
             if problems:
                 raise ValueError(f"block_norm_covariance={self.block_norm_covariance!r} needs " + "; ".join(problems))
@@ -2020,12 +2092,12 @@ class VFE3Config:
             # coordinate MLP pushes the dense C and maps it back the same way, kept by the full and head-block
             # families (audit 2026-10-10 round 2, item 51).
             covariant_delta_full = (self.block_mlp_covariance == "delta_full"
-                                    and self.family in ("gaussian_full", "gaussian_block"))
+                                    and self.family in ("gaussian_full", "gaussian_block", "gaussian_frame_diagonal"))
             if (self.use_block_mlp and self.block_mlp_covariance not in ("passthrough", "posterior")
                     and not covariant_delta_full):
                 incompatible.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires "
                                     "'passthrough', 'posterior' with prototype_agents, or 'delta_full' with "
-                                    "family 'gaussian_full' or 'gaussian_block')")
+                                    "family 'gaussian_full', 'gaussian_block' or 'gaussian_frame_diagonal')")
             if incompatible:
                 raise ValueError(
                     "block_coordinates='reference' conjugates the block by the realized relational frame "
@@ -2501,6 +2573,12 @@ class VFE3Config:
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing in ("gaussian_kl", "noisy_key")):
             mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
+        if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
+                and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"
+                and self.family == "gaussian_diagonal" and self.projected_factorization == "gram"):
+            mark(("relational_diag_moments_kernel",),
+                 "only read by the diagonal comparison route (comparison_invariant Gaussian-KL kernel router on "
+                 "gaussian_diagonal under projected_factorization='gram')")
         if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "noisy_key"):
             mark(("kappa_beta",), "relational_routing='noisy_key' routes at temperature exactly 1: the learned key "
@@ -2898,7 +2976,9 @@ RETIRED_CONFIG_KEYS = frozenset(
     | {"relational_receiver_law", "lambda_alpha"}
     | set(_ROUND2_REMOVED_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
-_RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
+# gaussian_frame_diagonal (retired 2026-10-01) was revived 2026-10-18 as the reference-coordinate diagonal family
+# (vfe3.families.frame_gaussian), so a serialized config naming it loads under the revived semantics.
+_RETIRED_FAMILIES = frozenset({"laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
 _RETIRED_ENCODE_MODES = frozenset({"canonical_content_gauge", "canonical_content_projected"})
 

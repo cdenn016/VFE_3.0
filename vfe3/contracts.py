@@ -372,6 +372,9 @@ class MStepCapture(TypedDict, total=False):
     prior:              BeliefState
     out:                BeliefState
     canonical_frame:    CanonicalFrameContext
+    # gaussian_frame_diagonal only: the realized relational frame U_i, through which the M-step self term reads the
+    # reference moments of q* and its prior.
+    relational_frame:   CanonicalFrameContext
     relational_capture: dict
     # CG moment-energy participation (PB-13). Present ONLY when cfg.cg_energy_weight>0. Each block
     # appends its D(q_post||q_pre) rows to ``cg_moment_energy_rows``. A capture allocated only for

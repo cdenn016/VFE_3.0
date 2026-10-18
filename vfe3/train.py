@@ -420,7 +420,14 @@ def build_optimizer(
 
     table_kwargs = {}
     if table_fisher:
-        table_kwargs = dict(statistics=TableFisherStatistics(pb), table_fisher_lr=cfg.m_table_fisher_lr,
+        # gaussian_frame_diagonal: the metric of p_v in mu_v is U_v^-T diag(1/s_v) U_v^-1, so the step reads the layer-0
+        # frames of the step's types; on identity frames it is the diagonal metric and the diagonal step is exact.
+        from vfe3.model.frame_actions import frames_identity_reason
+        frame_builder = (model.token_type_frames
+                         if pb.frame_diagonal and frames_identity_reason(cfg, pb.phi_embed.shape[-1]) is None
+                         else None)
+        table_kwargs = dict(statistics=TableFisherStatistics(pb, frame_builder=frame_builder),
+                            table_fisher_lr=cfg.m_table_fisher_lr,
                             table_fisher_trust_radius=cfg.m_table_fisher_trust_radius)
     if phi_update_policy.requires_manifold_optimizer:
         # Stored phi factors use one mixed optimizer; every other group remains standard AdamW.

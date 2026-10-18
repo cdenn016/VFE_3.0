@@ -19,6 +19,7 @@ from vfe3.families.base import (
     safe_kl_clamp,
 )
 from vfe3.families import gaussian as _gaussian  # noqa: F401  (registers the Gaussian families)
+from vfe3.families import frame_gaussian as _frame_gaussian  # noqa: F401  (registers gaussian_frame_diagonal)
 
 __all__ = [
     "BeliefParams",
