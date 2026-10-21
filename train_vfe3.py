@@ -155,7 +155,7 @@ config = dict(
     
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1        
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-    predictive_covariance            = 'moment_matched',        # "passthrough" 
+    predictive_covariance            = 'moment_matched',        # "passthrough"  #TODO passthrough 
                                                                 # "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) 
                                                                  # "spread_corrected" (minimal_agent mean_field: plus the label spread)
             
@@ -322,7 +322,7 @@ config = dict(
 
     m_p_mu_lr                        = 0.005,     #0.025
     m_p_sigma_lr                     = 0.001,       
-    m_phi_lr                         = 0.001,     #0.003
+    m_phi_lr                         = 0.00075,     #0.003
     
     
     #################################
@@ -375,7 +375,7 @@ config = dict(
     
     pair_kl_gemm_tol                 = None,         # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128) 
     relational_tile_mib              = 512,          # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
-    phi_frame_condition_max          = None,         # None (off) | kappa_max > 1, e.g. 20 or 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
+    phi_frame_condition_max          = 20,         # None (off) | kappa_max > 1, e.g. 20 or 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
     
     frame_pair_escalation_tol        = None,         # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     decode_ranking_fp64_escalation   = False, 
