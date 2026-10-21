@@ -464,7 +464,7 @@ def _baseline_total(K: int, *, L: int, e: int, V: int) -> int:
     return L * (4 * K * K + 2 * e * K * K + e * K + 5 * K) + 2 * K + 2 * V * K + V
 
 
-def test_total_matched_arm_is_a_baseline_row_in_table_order_and_in_no_tier() -> None:
+def test_total_matched_arm_is_a_baseline_row_in_table_order_and_in_tier_a() -> None:
     from tests.test_paper_arms_20260928 import _paper_artifacts_rows
 
     spec = pa.ARMS[TOTAL_MATCHED]
@@ -473,7 +473,7 @@ def test_total_matched_arm_is_a_baseline_row_in_table_order_and_in_no_tier() -> 
     assert _paper_artifacts_rows()[TOTAL_MATCHED] == "_BASELINES"
     labels = list(pa.ARMS)
     assert labels.index("Matched measured compute") + 1 == labels.index(TOTAL_MATCHED)
-    assert TOTAL_MATCHED not in (*pa.TIER_A, *pa.TIER_B)
+    assert TOTAL_MATCHED in pa.TIER_A and TOTAL_MATCHED not in pa.TIER_B
 
 
 def test_total_parameter_width_picks_the_nearest_whole_head_width() -> None:

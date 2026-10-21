@@ -961,13 +961,10 @@ def aggregate_per_layer(
 # CLICK-TO-RUN  -- edit, then `python multiseed_analysis.py`.
 # =============================================================================
 CONFIG: Dict[str, Any] = {
-    "run_root": "K=60_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
-    "key":      "best_val_ppl",  # exploratory selection/noise metric; test remains final endpoint
-    "curve_x":  "step",          # x axis of the per-step curves: "step" or "tokens_seen" (CURVE_X_OPTIONS)
-    # Opt-in: accept seeds whose code identity (git_sha / dirty-tree fingerprint) differs. Data,
-    # tokenizer and data-order identity must still match. The across-seed SD then also contains any
-    # effect of the code differences; every output records the per-seed code identity.
-    "allow_mixed_code_identity": False,
+    "run_root": "multiseed_20261005-112404",
+    "key":      "best_val_ppl",
+    "curve_x":  "step",
+    "allow_mixed_code_identity": True,
 }
 
 # metrics.csv columns accepted as the curve x axis, with their axis labels. ``tokens_seen`` (training

@@ -134,7 +134,7 @@ def test_total_matched_arm_scales_the_hidden_lr_and_records_it_untuned(tmp_path:
     assert any(d.startswith("lr not tuned at this width") for d in plan.deviations)
     manifest = pa.build_manifest(tmp_path / "exp", [plan], base=base, budget="base_protocol", seeds=[(1, 1)])
     assert manifest["paper_arms"]["rows"][TOTAL_MATCHED]["declared_deviations"] == plan.deviations
-    assert TOTAL_MATCHED not in (*pa.TIER_A, *pa.TIER_B)
+    assert TOTAL_MATCHED in pa.TIER_A and TOTAL_MATCHED not in pa.TIER_B
 
     model = BaselineTransformer(plan.cfg)
     groups = build_optimizer(model, plan.cfg).param_groups

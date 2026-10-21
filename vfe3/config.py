@@ -185,7 +185,9 @@ class VFE3Config:
     min_lr_frac:                      float           = 0.01         # LR floor as a fraction of each group's base LR (0 = decay to 0)
     
     grad_accum_steps:                 int             = 1            # microbatches per optimizer step (1 = no accumulation)
+    
     grad_clip:                        Optional[float] = 1.0          # L2 clip per grad_clip_scope set after accumulation; None or 0 = off
+    
     # "role" | "group"
     # The parameter sets grad_clip bounds, each by its own L2 norm (groups marked table_fisher are never clipped).
     #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
@@ -233,6 +235,7 @@ class VFE3Config:
     checkpoint_at_end:                bool            = False        # also write a resumable checkpoint after the last step
     block_variance_at_log:            bool            = False        # also write diagnostics/block_variance.csv at log steps
     val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
+    
     # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
     # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
     # with D^h_ij the head-marginal KL of q_i and Omega_ij q_j and the canonical router beta* = softmax(log pi - D/tau).
@@ -243,6 +246,7 @@ class VFE3Config:
     # (mean beta*_ii) and, at each layer's converged output, canonical_total_output and canonical_total_delta
     # (F_out - F_in). O(B N K^3 + B N^2 sum_h d_h^2) per diagnostic window (O(B N H d^3) on head-block groups)
     diagnose_canonical_free_energy:   bool            = False
+    
     # Eval-cadence diagnostic (audit 2026-10-12 T1): per layer, the evidence lower bound of the minimal agent's
     # posterior (predictive_readout='minimal_agent') and of each prototype_agents block, the evidence of the declared
     # record model (ADF over heads for the minimal agent, exact for the prototypes) and their gap, in nats per token.
@@ -366,7 +370,7 @@ class VFE3Config:
 
     # decode_mode="linear" with amp_dtype set only: run the logits matmul x W^T under amp_dtype
     # autocast (bf16/fp16 operands, fp32 accumulate); bias, logsumexp and the cross-entropy stay fp32.
-    decode_logits_amp:                bool            = False
+    decode_logits_amp:                bool            = True
 
     # "fp64" | "fp32"
     # Prior-bank Gaussian decoders only: precision of the a_v reduction (sum of 1/sigma_v terms). fp32 loses digits once
@@ -382,7 +386,7 @@ class VFE3Config:
     # (bias, clamp, temperature, unigram bias), online log-sum-exp, target gather and their backward in fused Triton
     # kernels (vfe3/kernels/kl_decode.py); the cross-term GEMMs stay cuBLAS. Same formula and logits, rounding-level
     # differences in the log-sum-exp and the backward sums. CPU tensors always run the torch loop.
-    decode_ce_triton:                 bool            = False
+    decode_ce_triton:                 bool            = True
 
     ##################################################
     #   6. Gauge group
@@ -459,6 +463,7 @@ class VFE3Config:
     #   frozen   parameter-free i * pos_phi_scale on one generator axis; on the projected routes it is folded into
     #            the frame before the learned maps, so routing is not relative (relative: a comparison rope_mode)
     pos_phi:                          str             = "learned"
+    
     # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
     # Gauge-RoPE: the block-diagonal positional rotation R(theta_i).
     #   none                  no rotation
@@ -480,9 +485,10 @@ class VFE3Config:
     #                         (vfe3.gradients.relational._diagonal_comparison_route). only: the kernel readout (not
     #                         minimal_agent)
     rope_mode:                        str             = "none"
-    pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
+    pos_phi_project_slk:              bool            = False    # pos_phi only: per-block trace projection (det = 1)
     
     rope_base:                        float           = 100.0        # rope_mode != "none" only: frequency base
+    
     # rope_mode != "none" only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
     # pairs of each block rotate, at their full-RoPE frequencies; the slower pairs stay position-free. 1.0 = RoPE.
     rope_fraction:                    float           = 1.0
@@ -499,6 +505,7 @@ class VFE3Config:
     # Temperature scale: tau_h = kappa_beta * sqrt(d_h); a list (one per head) gives per-head temperatures.
     # Not read by predictive_readout="minimal_agent".
     kappa_beta:                 'float | List[float]' = 1.0
+    
     # Learn the routing temperature per layer and head: tau_{l,h} = kappa_h sqrt(d_h) exp(3 tanh(delta_{l,h} / 3))
     # with delta = 0 at init (routing_log_temperature, (H,) per layer; no weight decay, score learning rate).
     # The KL cost is invariant under (S_Q, S_K) -> (A S_Q, A S_K), so no map can set the sharpness. Cools only
@@ -525,11 +532,13 @@ class VFE3Config:
     #   noisy_query    the query mean treated as a noisy measurement (GL(K) v2, Remark 9)
     #   mean_distance  ||a_i - b_j||^2 / 2 of the projected means: the covariance-blind control
     relational_routing:               str             = "gaussian_kl"
+    
     # projected_predictive kernel only: tie the key comparison map to the query map, S_K := S_Q (no raw_score_k),
     # so D_ii = 0 and each head scores D^h_ij = KL((S_h)_* r_i || (S_h)_* r_j) between the reference beliefs pushed
     # forward by the one rank-d map S_h, which is at most KL(q_i || (Omega_ij)_* q_j) and equals it only when S_h
     # is sufficient for the pair (GL(K) v2, flat alignment).
     tie_comparison_maps:              bool            = False
+    
     # relational_routing="noisy_key" only (audit 2026-10-12, T6): the initial per-head key noise n_h > 0 (learned as
     # routing_key_log_noise, (H,) per layer). The router scores D_ij = KL(N(a_i, V_Q,i) || N(b_j, V_K,j + n_h I)) at
     # temperature exactly 1 (kappa_beta is not read; learn_attention_temperature is refused), so the routing
@@ -567,6 +576,7 @@ class VFE3Config:
     predictive_covariance:            str             = "moment_matched"
     
     predictive_covariance_floor:      float           = 1e-4         # moment_matched only (kernel and minimal_agent readouts): floor * Sigma_p, the token's local prior covariance
+    
     # "prior" | "relative"
     # The moment-matched covariance floor (scaled by predictive_covariance_floor = f).
     #   prior     f Sigma_p, the token's local prior covariance: frame-free and exactly reference-invariant (since 2026-10-12)
@@ -584,6 +594,7 @@ class VFE3Config:
     #             f Sigma_p^{1/2} max(W, I) Sigma_p^{1/2} (W the relative floor whitened by f Sigma_p) on full layouts;
     #             keeps the relative floor's scaling with the absolute bound f Sigma_p (audit 2026-10-17 item 1)
     predictive_covariance_floor_mode: str             = "prior"
+    
     # moment_matched / spread_corrected only: Loewner ceiling Sigma^+ <= c * Sigma_p (vfe3.model.covariance_ceiling),
     # the counterpart of the floor; a clamp where it binds, counted in metrics.csv covariance_ceiling_elements. None = off.
     predictive_covariance_ceiling:    Optional[float] = None
@@ -592,6 +603,7 @@ class VFE3Config:
     # moment_matched only: recompute the covariance update in backward instead of storing its
     # intermediates (identical values and gradients; saves memory at large K).
     predictive_covariance_checkpoint: bool            = False
+    
     # moment_matched, kernel readout only: recompute the failing sequences of a float32 update in float64 when its
     # output is not positive definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in covariance_escalation_elements;
     # one host read per layer call. A float64 failure raises.
@@ -612,7 +624,7 @@ class VFE3Config:
     # rounding, about H(H-1)/2 fewer pair contractions. Blockwise route (block frames, equal heads), not with
     # content_link_edges.
     predictive_covariance_symmetric_pairs: bool       = False
-    attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
+    attention_residual:               bool            = False      # kernel only: new mean = mu_i + content (False: content only)
 
     ##################################################
     #   10. Content links (O, T)
@@ -679,9 +691,9 @@ class VFE3Config:
 
     # "state_dependent" | "state_dependent_per_coord"
     # Self-coupling alpha_i on KL(q_i || p_i).
-    #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i)), frame-invariant
+    #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i)), gauge/frame-invariant
     #   state_dependent_per_coord  the same per coordinate (b0, c0 may be K-lists)
-    lambda_alpha_mode:                str                   = "state_dependent_per_coord"
+    lambda_alpha_mode:                str                   = "state_dependent"
     b0:                               'float | List[float]' = 1.0
     c0:                               'float | List[float]' = 1.0
 
@@ -703,7 +715,7 @@ class VFE3Config:
     #   mahalanobis  gauge-invariant rescale
     # norm_type_block runs inside every block; no norm runs between the stack and the decoder.
     norm_type_block:                  str             = "layernorm"
-    layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
+    layernorm_affine:                 bool            = True        # layernorm only: learned gamma/beta (init 1/0)
 
     # "passthrough" | "pushforward" | "pushforward_moment"
     # Covariance through the LayerNorm block norm (norm_type_block="layernorm").
@@ -716,7 +728,7 @@ class VFE3Config:
     #                expected LayerNorm variance) plus a span floor f (T/K) D W W^T D on span{1, z}: a moment estimate
     #                of the LayerNorm output at every Sigma/s^2, where 'pushforward' (the delta method at s, capped at
     #                the sphere bound) keeps the delta method's radial shape (audit 2026-10-16 F3, F2)
-    block_norm_covariance:            str             = "passthrough"
+    block_norm_covariance:            str             = "pushforward"
     # Scale the LayerNorm covariance pushforward (both pushforward modes, and the delta_full composite's norm stage)
     # by min(1, K max(gamma^2) / tr) at the sphere bound (audit 2026-10-12 item 1). False skips the cap: the
     # uncapped delta method, which can exceed the bound by orders of magnitude once Sigma is large against s^2.
@@ -779,6 +791,7 @@ class VFE3Config:
     block_mlp_dropout:                float           = 0.0
     block_mlp_covariance_floor:       float           = 1e-4         # delta_full and a block_norm_covariance pushforward
     block_mlp_template_init_variance: float           = 10.0         # prototype_agents only: initial template variance > 0
+    
     # "absolute" | "working_variance"
     # prototype_agents only: template initialization.
     #   absolute          nu ~ U(+-K^-1/2), lambda = block_mlp_template_init_variance (the absolute variance)
@@ -970,6 +983,7 @@ class VFE3Config:
     # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
     # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
     kl_max:                           Optional[float] = None
+
     # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1": what kl_max clamps in the kernel router,
     # projected_predictive and projected_gradient (audit 2026-10-08 P1-4)
     #   absolute          D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi
@@ -986,6 +1000,7 @@ class VFE3Config:
     #                     log-determinant and moves by r ln c under that rescaling, so heads can cross the cap by
     #                     scale alone; retained so configs saved before 2026-10-21 reload as they ran
     routing_kl_max_reference:         str             = "absolute"
+    
     # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
     # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
     # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base on the dense route; the
@@ -3474,9 +3489,9 @@ def _migrate_projected_factorization(
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
 #   block_norm_covariance             "passthrough" at 89eedfb (2026-10-10): a record without it ran the mean-only norm
 #   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
-#   decode_logits_amp                 False at 46a3a6c (2026-10-07)
-#   decode_ce_triton                  False at 5e5a118 (2026-10-12)
-#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08); a saved "query_shifted" from before
+#   decode_logits_amp                 False at 46a3a6c (2026-10-07), now True
+#   decode_ce_triton                  False at 5e5a118 (2026-10-12), now True
+#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08), now "row_min"; a saved "query_shifted" from before
 #                                     2026-10-21 reloads as "query_shifted_v1" (era rule in historical_default_pins)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",

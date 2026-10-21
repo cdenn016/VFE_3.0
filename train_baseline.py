@@ -89,7 +89,8 @@ SEEDS: Sequence[int] = (6,)
 DATA_SEED: Optional[int] = 3        # the data-order seed of the base run (3 for k128_exp); None -> model seed
 MAX_TOKENS: Optional[int] = None    # cap the training stream (smoke runs only)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-PER_TYPE_TABLE = "none"             # "none" | "block_read" (Table M2, per-type table of the frame table's size)
+PER_TYPE_TABLE = "block_read"             # "none" | "block_read" (Table M2, per-type table of the frame table's size)
+
 # Everything in MATCHED_FIELDS is copied from the base run (K, H, L, context, batch, stride, 150,000 steps,
 # warmup, LR floor, clip, bf16, "highest" matmul precision, cadence, unigram decode prior), and a base with
 # pos_rotation="rope" also gives the baseline rotary query/key positions at the base's rope_base (the
@@ -107,7 +108,7 @@ LABEL: Optional[str] = None         # stable run-folder label; None -> <dataset>
 # select it on validation. Each launch sweeps its own arm (with PER_TYPE_TABLE="block_read" the read-map
 # lr follows the swept lr) and trains the winner. A short schedule favors larger lr, so a winner at the
 # top of the grid (3e-3) means the grid should be extended, not trusted. Set () to skip the sweep.
-LR_SWEEP: Sequence[float] = (3e-4, 6e-4, 1e-3, 2e-3, 3e-3)    # validation-only selection
+LR_SWEEP: Sequence[float] = (7e-4, 1e-3, 3e-3, 5e-3, 6e-3)    # validation-only selection
 LR_SWEEP_STEPS = 6000
 
 CALIBRATE_WIDTHS: Sequence[int] = ()   # e.g. (128, 256, 384, 512, 768); training-only throughput runs

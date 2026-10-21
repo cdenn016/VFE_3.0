@@ -113,7 +113,7 @@ linear decoder under ``decode_logits_amp``). Rules:
   widened in whole heads by :func:`vfe3.baseline.total_parameter_width`; its declared changes are
   :data:`TOTAL_MATCHED_FIELDS` and the hidden-matrix learning-rate scale K_0/K (muP-style transfer,
   Yang et al. 2022), recorded in the plan and in the manifest row's ``declared_deviations`` as "lr not
-  tuned at this width" (peak lr, initialization and warmup are the base width's). It is in neither tier.
+  tuned at this width" (peak lr, initialization and warmup are the base width's). It is in :data:`TIER_A`.
 
 An arm whose code is not in this build (a missing config field or ``vfe3.baseline`` /
 ``train_baseline``) is reported as unavailable with the reason; an arm that does not apply to the
@@ -161,13 +161,14 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parent
 
 CONFIG: Dict[str, Any] = {
-    "bases":             ["k128_diag_chunked"],   # keys of BASES
-    "arms":              "TIER_A",         # None: every row of ARMS in table order; a list of labels;
-                                           # or "TIER_A" / "TIER_B" (the confound controls)
+    "bases":             ["k128_alibi"],   # keys of BASES
+    "arms":              "TIER_A",        # None: every row of ARMS in table order; a list of labels;
+                                           # "TIER_A" / "TIER_B" (the confound controls), "TIER_AB" (both),
+                                           # or "REST" (every row in neither tier, e.g. at one seed)
     "budget":            "base_protocol",  # key of BUDGETS
-    "seeds":             [(6, 3), (23, 23), (54, 54)],   # (seed, data_seed); (6, 3) is the 32.65 and 34.48 runs'
+    "seeds":             [(6, 3), (23, 23), (54, 54)],   # (seed, data_seed); (6, 3) is the 36.41, 32.65 and 34.48 runs'
     "out_root":          "vfe3_runs/paper_arms",
-    "dry_run":           True,             # True: resolve, validate and print the plan; train nothing
+    "dry_run":           False,             # True: resolve, validate and print the plan; train nothing
     "device":            None,             # None -> cuda when available
     "calibration_steps": 200,              # matched-compute baseline: steps of each width's calibration run
     "width_ladder":      (1, 1.5, 2, 3, 4, 6, 8),   # matched-compute ladder, multiples of the matched width
@@ -178,6 +179,9 @@ CONFIG: Dict[str, Any] = {
 # Archived runs live under D:/DATA_KEEP/<date>_experiments/ (paths checked 2026-10-17); a base whose
 # directory is gone is reported unavailable by main(), which plans the other selected bases.
 BASES: Dict[str, str] = {
+    # K=128 exponential chart, 4 layers, ALiBi prior without RoPE, chunked diagonal decoder, no attention
+    # residual, row_min clamp, per-epoch window offsets (36.41 test PPL).
+    "k128_alibi": "vfe3_runs/36.41_wikitext-103_K128_alibi-exp-chunk",
     # K=128 exponential chart, 6 layers, RoPE, chunked diagonal decoder, no attention residual,
     # 120,000 steps (32.65 test PPL).
     "k128_diag_chunked": "D:/DATA_KEEP/10-10-2026_experiments/32.65_wikitext-103_K128_diag-chunked_exp",
@@ -526,8 +530,8 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
 }
 # Confound controls for the 34.48 against 55.10 comparison (October 7, 2026), with the plain
 # matched-parameter baseline and the frozen-frame clause of the registered decision rule (audit
-# 2026-10-09). TIER_A: conventional baselines (about 1.5 GPU-hours each at the base protocol, the
-# compute-matched arm about as long as the evaluated run). TIER_B: VFE retraining arms (about 16
+# 2026-10-09). TIER_A: conventional baselines (about 1.5 GPU-hours each at the base protocol; the
+# compute-matched arm is left out and runs only by label). TIER_B: VFE retraining arms (about 16
 # GPU-hours each).
 TIER_A: Tuple[str, ...] = (
     "Per-type read table, ALiBi (as run)",
@@ -536,7 +540,7 @@ TIER_A: Tuple[str, ...] = (
     "Per-type read-and-write table, ALiBi",
     "Per-type read table, ALiBi, shared post-norm",
     "Matched context-processing parameters",
-    "Matched measured compute",
+    "Matched total parameters",
 )
 TIER_B: Tuple[str, ...] = (
     EVALUATED,
@@ -1956,7 +1960,8 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
     seeds = seed_pairs(config["seeds"])
     labels = config.get("arms")
     if isinstance(labels, str):
-        tiers = {"TIER_A": TIER_A, "TIER_B": TIER_B}
+        tiers = {"TIER_A": TIER_A, "TIER_B": TIER_B, "TIER_AB": (*TIER_A, *TIER_B),
+                 "REST": tuple(label for label in ARMS if label not in (*TIER_A, *TIER_B))}
         if labels not in tiers:
             raise SystemExit(f"arms {labels!r} is not None, a list of labels, or one of {sorted(tiers)}")
         labels = list(tiers[labels])

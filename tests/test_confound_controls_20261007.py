@@ -152,7 +152,7 @@ def test_post_shared_norm_has_the_vfe_context_count_and_one_shared_layernorm() -
 
 def test_tiers_name_existing_arms_and_base_protocol_keeps_the_base_budget() -> None:
     assert set(pa.TIER_A) <= set(pa.ARMS) and set(pa.TIER_B) <= set(pa.ARMS)
-    assert pa.CONFIG["bases"] == ["k128_diag_chunked"] and pa.CONFIG["budget"] == "base_protocol"
+    assert pa.CONFIG["bases"] == ["k128_alibi"] and pa.CONFIG["budget"] == "base_protocol"
     cfg = _tiny_cfg(max_steps=9, eval_interval=3)
     assert pa.base_protocol(cfg, "unused") == {"max_steps": 9, "eval_interval": 3, "checkpoint_interval": 9}
 
@@ -161,7 +161,7 @@ def test_confound_arms_resolve_with_declared_changes_only(tmp_path: Path) -> Non
     import train_baseline  # noqa: F401
     base = pa.load_base("tiny", _write_base(tmp_path, _tiny_cfg(beta_attention_prior="causal")))
     plans = {p.label: p for p in pa.build_plan(
-        base, budget="base_protocol", seeds=[(6, 3)], labels=[*pa.TIER_A, *pa.TIER_B],
+        base, budget="base_protocol", seeds=[(6, 3)], labels=[*pa.TIER_A, *pa.TIER_B, "Matched measured compute"],
         baseline_overrides={"lr": 3e-3})}
     as_run = plans["Per-type read table, ALiBi (as run)"]
     assert as_run.status == "ready" and as_run.cfg.per_type_table == "block_read"

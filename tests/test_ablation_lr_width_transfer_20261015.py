@@ -84,3 +84,39 @@ def test_the_toggle_runs_only_the_transfer_sweep(monkeypatch: pytest.MonkeyPatch
 def test_the_sweep_is_registered_and_validates() -> None:
     assert ablation.LR_WIDTH_TRANSFER["enabled"] in (True, False)
     ablation.validate_sweeps(["lr_width_transfer"], require_construction=False)
+
+
+def test_a_requested_cell_without_a_row_counts_as_diverged() -> None:
+    widths = [(20, 2), (40, 4), (80, 8)]
+    multipliers = [0.5, 1.0, 2.0, 4.0]
+    rows = _rows(widths, "m_phi_lr", 0.004, 0.0, multipliers)
+    missing = ablation._lr_width_transfer_label(80, 8, "m_phi_lr", 4.0)
+    rows = [row for row in rows if row["label"] != missing]
+    requested = [ablation._lr_width_transfer_label(k, h, "m_phi_lr", m) for k, h in widths for m in multipliers]
+    fit = ablation.fit_lr_width_transfer(rows, {"m_phi_lr": 0.004}, requested)["fields"]["m_phi_lr"]
+    k80 = fit["widths"][2]
+    assert k80["diverged_multipliers"] == [4.0] and k80["ppl_by_multiplier"]["4"] is None
+    assert k80["best_multiplier"] == 1.0 and not k80["at_grid_edge"]     # the grid edge is x4, not the last row
+
+
+def test_an_incomplete_transfer_sweep_is_still_fitted(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    calls: List[Any] = []
+
+    def fake_run_sweep(name, output_dir, **_: Any) -> list:
+        directory = output_dir / ablation._sweep_output_scope(name)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "sweep_meta.json").write_text(json.dumps({"status": "incomplete"}), encoding="utf-8")
+        (directory / "sweep_results.csv").write_text("label,primary_val_ppl\n", encoding="utf-8")
+        return []
+
+    monkeypatch.setitem(ablation.LR_WIDTH_TRANSFER, "enabled", True)
+    monkeypatch.setitem(ablation.CONFIG, "list_only", False)
+    monkeypatch.setitem(ablation.CONFIG, "output_dir", str(tmp_path))
+    monkeypatch.setitem(ablation.CONFIG, "device", "cpu")
+    monkeypatch.setattr(ablation, "validate_sweeps", lambda *a, **k: None)
+    monkeypatch.setattr(ablation, "_run_ablation_figures_isolated", lambda *a, **k: True)
+    monkeypatch.setattr(ablation, "run_sweep", fake_run_sweep)
+    monkeypatch.setattr(ablation, "analyze_lr_width_transfer", lambda d: calls.append(d))
+    assert ablation.main() == 1                                          # still reported incomplete
+    assert [d.name for d in calls] == [ablation._sweep_output_scope("lr_width_transfer")]
