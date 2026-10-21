@@ -2319,6 +2319,9 @@ def _decode_full(
     ``kl_max=inf`` so the full KL ranking over the vocabulary is preserved (decode must not
     saturate distant priors to a single logit). General but O(B*N*V*K^3) (per-pair Cholesky):
     the theoretically pure full-covariance path, not the fast diagonal kernel.
+
+    Test oracle: no production code calls it. The registered full-covariance decode is
+    ``_decode_full_chunked``, which tests pin against this dense value.
     """
     sigma_q, factor_q, spd_ok = pb._prepare_full_covariance_for_decode(sigma_q)
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)

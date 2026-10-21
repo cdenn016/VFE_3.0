@@ -99,6 +99,9 @@ def frame_diagonal_kl(
 ) -> torch.Tensor:                     # (...,) KL(q || p)
     r"""Exact KL between two frame-diagonal Gaussians in possibly different frames.
 
+    Test oracle: no production code calls it; the live routes compare beliefs that share a frame and use the
+    diagonal KL of their reference moments.
+
     With :math:`W = U_p^{-1}U_q` and :math:`\delta = U_p^{-1}(\mu_q - \mu_p)` (both in :math:`p`'s reference
     coordinates, where :math:`\Sigma_p` is :math:`\operatorname{diag}(c_p)` and :math:`\Sigma_q` is
     :math:`W\operatorname{diag}(c_q)W^\top`),

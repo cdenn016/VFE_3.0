@@ -124,10 +124,11 @@ def vfe_stack(
             diagnostic_capture["layer_priors"].append((mu_p, sigma_p))
         tau_b = tau
         if capture is not None and layer_index == cfg.n_layers - 1:
+            # The live prior entering the final block, which the M-step self term reads as its prior. At
+            # n_layers > 1 and prior_handoff_rho > 0 its mean is (1 - rho) mu_p + rho mu_belief (and its variance
+            # mixes likewise at prior_handoff_sigma > 0), so it carries the previous block's output and is not the
+            # type prior p_{x_i} (audit 2026-10-20 item 70).
             capture["final_block_prior"] = (mu_p.clone(), sigma_p.clone())
-            # Capture the exact base temperature used by the final block so reflection
-            # scoring reuses the forward value. The scorer reads it under no_grad.
-            capture["final_block_tau"] = tau_b
         hidden_bias = (block_mlp_hidden_biases[layer_index]
                        if block_mlp_hidden_biases is not None else None)
         block_extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}

@@ -10,7 +10,9 @@ backpropagation. No nn.Linear module is built only with ``use_block_mlp=False`` 
 ``prototype_agents`` / ``gaussian_template`` block MLP together with a prior-bank decoder, and the
 attention maps remain learned linear maps there. The M-step minimizes the decode cross-entropy;
 ``projected_predictive`` takes one differentiable readout step per layer, and ``projected_gradient``
-unrolls its ``n_e_steps`` receiver updates into the graph. Click-to-run: edit a ``VFE3Config`` and call ``run_training`` (no CLI).
+unrolls its ``n_e_steps`` receiver updates into the graph. The training entry point is the click-to-run launcher
+``train_vfe3.py`` (edit its config dictionary; no CLI), which seeds the run and calls ``train``; ``run_training``
+below is a minimal helper that only tests call.
 """
 
 import collections
@@ -7014,7 +7016,7 @@ def _banner(
     n_steps:     int,
     train_loader: object = None,
 ) -> str:
-    r"""Compact init banner (no FLOPs counter)."""
+    r"""Compact init banner (no FLOPs counter) of the test-only ``run_training``; the launcher prints its own."""
     rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []
@@ -7055,7 +7057,7 @@ def run_training(
     n_steps:    int           = 1000,
     max_tokens: Optional[int] = None,
 ) -> Tuple[VFEModel, List[float]]:
-    r"""Click-to-run entry: build a model + a cached dataloader by name and train (no CLI).
+    r"""Test-only helper: build a model + a cached dataloader by name and train (no CLI).
 
     Constructs a ``VFEModel`` from ``cfg``, a causal-LM dataloader from the tokenized
     cache for ``dataset``/``split`` (capped at ``max_tokens`` for fast runs), prints the
@@ -7063,7 +7065,7 @@ def run_training(
     logging (``cfg.log_interval``, ``cfg.eval_interval``). Returns the trained model and
     its loss history.
 
-    DEPRECATED / minimal: superseded by ``train_vfe3.main()``, which is the canonical entry
+    Not the training entry point: only tests call it. ``train_vfe3.py`` (``_run_once``) is the canonical entry
     point. This helper passes no ``artifacts`` (so ``checkpoint_interval``/best-model/CSV are
     never written), reuses ``loader`` as the validation loader (train == val), and never runs
     the end-of-run test eval. Kept only for the lightweight in-process smoke use it already had.
