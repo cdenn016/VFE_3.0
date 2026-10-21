@@ -462,7 +462,8 @@ class VFE3Config:
     #                         per rotating plane, the full non-rotating block, no cross-covariance), so
     #                         R_i P(G) R_i^T = P(G) and only the mean term carries i - j; scored on the Gram route (no
     #                         source-root factor route), or in closed form with no factorization when P(G) is diagonal
-    #                         (rope_fraction = 1) and projected_factorization="gram"
+    #                         (rope_fraction = 1), the routing cost is gaussian_kl, noisy_query or noisy_key, and
+    #                         projected_factorization="gram"
     #                         (vfe3.gradients.relational._diagonal_comparison_route). only: the kernel readout (not
     #                         minimal_agent)
     rope_mode:                        str             = "none"
@@ -986,11 +987,13 @@ class VFE3Config:
     # (audit 2026-10-16 F26).
     relational_tile_mib:              int             = 32
     # "torch" | "triton". Kernel of the diagonal comparison route's projected moments (rope_mode="comparison_invariant"
-    # with a diagonal P(G), gaussian_diagonal family, Gaussian-KL kernel router): "triton" computes diag(G) = sum_k X^2,
+    # with a diagonal P(G), gaussian_diagonal family, gaussian_kl, noisy_query or noisy_key kernel router): "triton"
+    # computes diag(G) = sum_k X^2,
     # X = S U^{-1} Sigma^{1/2}, in fused Triton kernels that keep X in registers and recompute it in backward
     # (vfe3/kernels/diagonal_moments.py; audit 2026-10-17 item 20), instead of the checkpointed torch tile loop. Same
     # source-root formula, rounding-level differences. CPU tensors, and shapes the kernels do not take (per-head
-    # variances or frames, frame blocks wider than 64), always run the torch route.
+    # variances or frames, frame blocks wider than 64), always run the torch route. gaussian_frame_diagonal reads its
+    # reference variances through the identity frame, diag(G) = (S o S) c, one torch GEMM (audit 2026-10-20 item 46).
     relational_diag_moments_kernel:   str             = "torch"
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
@@ -2304,7 +2307,8 @@ class VFE3Config:
         # (vfe3.gradients.relational._diagonal_comparison_route); a notice, since gram and certified still differ here
         # (audit 2026-10-16 F9).
         if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
-                and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"):
+                and self.relational_routing in ("gaussian_kl", "noisy_query", "noisy_key")
+                and self.rope_mode == "comparison_invariant"):
             route_notes = []
             if self.projected_factorization == "cholesky_qr2_certified":
                 route_notes.append("projected_factorization='cholesky_qr2_certified' acts as 'gram_certified' on this "
@@ -2641,14 +2645,16 @@ class VFE3Config:
                 and self.relational_routing in ("gaussian_kl", "noisy_key")):
             mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
-                and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"
-                and self.family in ("gaussian_diagonal", "gaussian_frame_diagonal")
-                and self.projected_factorization == "gram"):
-            # gaussian_frame_diagonal reaches the fused route too: its reference variances c_i are read through the
-            # identity frame (audit 2026-10-20 item 45).
+                and self.relational_routing in ("gaussian_kl", "noisy_query", "noisy_key")
+                and self.rope_mode == "comparison_invariant"
+                and self.family == "gaussian_diagonal" and self.projected_factorization == "gram"):
+            # gaussian_frame_diagonal reads its reference variances through the identity frame, whose diagonal moments
+            # are one torch GEMM, (S o S) c_i, on every device (audit 2026-10-20 item 46); the noisy costs share the
+            # diagonal route (item 50).
             mark(("relational_diag_moments_kernel",),
-                 "only read by the diagonal comparison route (comparison_invariant Gaussian-KL kernel router on "
-                 "gaussian_diagonal or gaussian_frame_diagonal under projected_factorization='gram')")
+                 "only read by the diagonal comparison route (comparison_invariant kernel router with gaussian_kl, "
+                 "noisy_query or noisy_key on gaussian_diagonal under projected_factorization='gram'; "
+                 "gaussian_frame_diagonal runs its identity-frame GEMM)")
         if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "noisy_key"):
             mark(("kappa_beta",), "relational_routing='noisy_key' routes at temperature exactly 1: the learned key "

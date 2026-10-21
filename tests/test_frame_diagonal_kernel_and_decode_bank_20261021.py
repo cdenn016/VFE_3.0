@@ -1,7 +1,7 @@
 r"""``gaussian_frame_diagonal`` on the diagonal comparison route and its decode bank (audit 2026-10-20 items 45, 59).
 
-Item 45: the family reaches the fused diagonal-moments route, so ``relational_diag_moments_kernel`` is active there,
-and ``summary.json`` records which kernel ran. Item 59: a tied decode bank pairs the encoder's local-frame mean with
+Item 45: ``summary.json`` records which diagonal-moments kernel ran; the family reaches the diagonal route, now through
+the identity-frame GEMM of item 46, so ``relational_diag_moments_kernel`` is inactive under it. Item 59: a tied decode bank pairs the encoder's local-frame mean with
 the reference variance, so the validator refuses it for the non-linear decoder and the gauge switch unties it.
 Tiny CPU models only.
 """
@@ -34,8 +34,11 @@ def _route(**over: Any) -> VFE3Config:
 
 # ------------------------------------------------------------------------------------- item 45
 
-def test_kernel_field_is_active_under_the_frame_diagonal_family_on_the_diagonal_route() -> None:
-    assert "relational_diag_moments_kernel" not in _route().inactive_fields()
+def test_kernel_field_is_inactive_under_the_frame_diagonal_family() -> None:
+    # Audit 2026-10-20 item 46 supersedes item 45 here: the frame-diagonal family's moments read the identity frame
+    # through one torch GEMM, (S o S) c, on every device, so the fused kernels never run under it.
+    assert "relational_diag_moments_kernel" in _route().inactive_fields()
+    assert "relational_diag_moments_kernel" not in _route(family="gaussian_diagonal").inactive_fields()
     assert "relational_diag_moments_kernel" in _route(projected_factorization="gram_certified").inactive_fields()
 
 
