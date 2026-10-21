@@ -249,6 +249,7 @@ def test_log_metrics_rejects_text_in_a_numeric_column(tmp_path: Path) -> None:
 def _reader_tuples() -> Dict[str, tuple]:
     r"""Every metrics.csv column tuple a reader reads, by reader."""
     from vfe3.run_resources import _TELEMETRY_COLUMNS, _THROUGHPUT_COLUMNS
+    from vfe3.weight_ema import WEIGHT_EMA_METRIC_COLUMNS
     return {
         "viz grad_norm_decomposition": figs.GRAD_NORM_DECOMPOSITION_COLUMNS,
         "viz optimizer_geometry": figs.OPTIMIZER_GEOMETRY_COLUMNS,
@@ -268,6 +269,7 @@ def _reader_tuples() -> Dict[str, tuple]:
         "paper S1 panel D": tuple(key for pair in paper_figures.COUNTER_PAIRS for key in pair[:2]),
         "paper S1 panel D totals": tuple(key for key, _ in paper_figures.COUNTER_TOTALS),
         "row kinds": ("step", "divergence_spike", schema.ROW_KIND_COLUMN),
+        "weight_ema best validation": WEIGHT_EMA_METRIC_COLUMNS,
     }
 
 

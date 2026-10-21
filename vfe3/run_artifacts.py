@@ -2517,6 +2517,9 @@ class RunArtifacts:
                 # Divergence-monitor EMAs, warmups, cooldown and open interval with the skip counters
                 # (vfe3.train._divergence_checkpoint_record, or None); a diagnostic like the counters above.
                 "divergence_monitor": _checkpoint_divergence_state(getattr(self, "divergence_state", None)),
+                # Opt-in weight EMA (vfe3.weight_ema.WeightEMA.state_dict, or None when off); a new key, so the
+                # retired "ema_state" refusal of load_checkpoint is unaffected (audit 2026-10-20 item 8).
+                "weight_ema":      getattr(self, "weight_ema_state", None),
             }, tmp)
             _atomic_replace(path, tmp)
         return path
@@ -2675,6 +2678,7 @@ def load_checkpoint(
     expected_data_identity: Optional[Mapping[str, object]]   = None,
     expected_selection_data_identity: Optional[Mapping[str, object]] = None,
     expected_steps_per_epoch: Optional[int]                  = None,
+    weight_ema:           Optional[Any]                      = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -2702,6 +2706,10 @@ def load_checkpoint(
     mutable ``data_state`` mapping is supplied, it is filled from the bundled iterator cursor.
     Supplying ``expected_data_identity`` requests exact data resume: a legacy bundle without
     ``data_state`` or a bundle whose identity differs is rejected before any mutable state is restored.
+    ``weight_ema`` (a :class:`vfe3.weight_ema.WeightEMA`): the bundle's ``"weight_ema"`` record is validated against
+    it before any mutable state is restored and then loaded, so a resumed run continues the shadow; a bundle without
+    the key (older, or written with the EMA off) leaves it unstarted, and a record with no ``weight_ema`` to receive
+    it is dropped with a warning. The retired ``"ema_state"`` key is still refused.
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -2833,6 +2841,9 @@ def load_checkpoint(
             "checkpoint carries retired non-null ema_state; exact resume requires the removed EMA "
             "runtime. Import model weights explicitly to start a new non-EMA run"
         )
+    saved_weight_ema = ckpt.get("weight_ema")
+    if weight_ema is not None and saved_weight_ema is not None:
+        weight_ema.validate_state(saved_weight_ema)          # before any mutable state is restored
     expected_code_identity = (
         artifacts.code_identity_sha256
         if artifacts is not None
@@ -2900,6 +2911,13 @@ def load_checkpoint(
             raise
         del optimizer_snapshot
     model.load_state_dict(saved_model_state)
+    if saved_weight_ema is not None:
+        if weight_ema is not None:
+            weight_ema.load_state_dict(saved_weight_ema)
+        else:
+            import warnings
+            warnings.warn(f"{checkpoint_path.name} carries a weight EMA, but this run has weight_ema_decay=None; "
+                          "the EMA is not continued", UserWarning, stacklevel=2)
     # A bounded run's checkpoint is a fixed point of the frame condition bound, so this is a bitwise no-op
     # there; it bounds the frames of any other state before step 0 or evaluation (audit round 2, M4).
     bound_frame_condition_if_configured_(model)
@@ -4088,6 +4106,57 @@ def _resolved_alibi_slopes(cfg: VFE3Config) -> Optional[List[float]]:
     return [float(value) for value in slopes.tolist()]
 
 
+def _weight_ema_evaluation(
+    model:           torch.nn.Module,
+    artifacts:       RunArtifacts,
+    logger:          logging.Logger,
+
+    *,
+    val_loader:      Optional[Iterable],
+    test_loader:     Optional[Iterable],
+    tokens_per_char: Optional[float],
+    device:          torch.device,
+) -> Dict[str, object]:
+    r"""Validation and test at the weight-EMA weights (``weight_ema_decay``; audit 2026-10-20 item 8), or ``{}`` when off.
+
+    The shadow is swapped into the trainable parameters by :meth:`vfe3.weight_ema.WeightEMA.applied`, which restores the
+    raw final weights bit for bit; CPU and CUDA RNG are forked. The headline ``test_ce`` / ``test_ppl`` stay the final
+    raw weights and ``best_model.pt`` stays the raw validation-selected weights; these fields sit beside them.
+    """
+    from vfe3.train import evaluate
+
+    weight_ema = getattr(artifacts, "weight_ema", None)
+    if weight_ema is None:
+        return {}
+    from vfe3.weight_ema import best_ema_validation
+
+    out: Dict[str, object] = {**weight_ema.summary(), "val_ema_ce": None, "val_ema_ppl": None,
+                              "test_ema_ce": None, "test_ema_ppl": None, "test_ema_bits_per_token": None,
+                              "weight_ema_status": None,
+                              **best_ema_validation(getattr(artifacts, "history", None))}
+    if not weight_ema.active:
+        out["weight_ema_status"] = f"not started (start step {weight_ema.start_step})"
+        return out
+    rng_devices = [device] if device.type == "cuda" else []
+    try:
+        with torch.random.fork_rng(devices=rng_devices), weight_ema.applied():
+            if val_loader is not None:
+                val = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
+                out.update(val_ema_ce=float(val["ce"]), val_ema_ppl=float(val["ppl"]))
+            if test_loader is not None:
+                test = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
+                out.update(test_ema_ce=float(test["ce"]), test_ema_ppl=float(test["ppl"]),
+                           test_ema_bits_per_token=float(test["bits_per_token"]))
+                logger.info("Test at the EMA weights (decay %g, %d updates since step %s) | CE: %.4f | PPL: %.2f",
+                            weight_ema.decay, weight_ema.updates, weight_ema.initialized_step,
+                            test["ce"], test["ppl"])
+        out["weight_ema_status"] = "evaluated"
+    except Exception as exc:
+        out["weight_ema_status"] = f"failed: {exc!r}"
+        logger.warning("evaluation at the EMA weights failed (%s); headline unaffected", exc)
+    return out
+
+
 def _best_weight_and_train_sample_evaluation(
     model:        torch.nn.Module,
     artifacts:    RunArtifacts,
@@ -4395,6 +4464,11 @@ def finalize_run(
                               "test_best_step": artifacts.best_step,
                               "test_best_status": f"failed: {exc!r}",
                               "train_sample_ce_final": None, "train_sample_ce_best": None}
+    # Validation and test at the opt-in weight-EMA weights, beside the raw numbers in both JSON files (item 8).
+    ema_fields = _weight_ema_evaluation(model, artifacts, logger, val_loader=val_loader, test_loader=test_loader,
+                                        tokens_per_char=tokens_per_char, device=device)
+    best_weight_fields = {**best_weight_fields, **ema_fields}
+    results.update(ema_fields)
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
     decode_tau_eff = _decode_tau_eff(model, cfg)
     # Test at the validation-selected weights beside the final-weights headline in test_results.json, as in
