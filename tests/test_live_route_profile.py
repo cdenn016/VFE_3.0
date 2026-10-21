@@ -2,10 +2,11 @@
 
 The default test profile is the legacy projected_gradient route; these checks run the route
 ``train_vfe3.py`` trains. The profile takes every key of the launcher's ``config`` dictionary, shrinks the
-shape and run fields to a CPU unit test, and pins the fields the launcher omits at their defaults, so a
-route switch in the launcher reaches these checks without an edit here.
+shape and run fields to a CPU unit test, and pins the fields the launcher omits at test-owned values (their frozen
+introduction values, ``vfe3.config_history``), so a route switch in the launcher reaches these checks without an
+edit here. Every check here must hold for any valid launcher setting: where a check needs a toggle the launcher may
+hold otherwise (the frame transport of the frame-exponential check), it sets it.
 """
-import dataclasses
 import math
 from dataclasses import asdict, fields
 from typing import Any, Callable, Dict, Tuple
@@ -15,13 +16,14 @@ import torch
 
 from tests.profiles import _LIVE_TINY, config_values, launcher_values, live_config, live_kl_max, live_values
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
+from vfe3.config_history import FIELD_INTRODUCTION_VALUES
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
 
 
-def _model(seed: int = 0) -> VFEModel:
+def _model(seed: int = 0, **overrides: Any) -> VFEModel:
     torch.manual_seed(seed)
-    return VFEModel(live_config())
+    return VFEModel(live_config(**overrides))
 
 
 def _batch(cfg: VFE3Config, seed: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
@@ -41,10 +43,11 @@ def test_live_profile_is_the_launcher_route() -> None:
                        "log_interval", "eval_interval", "checkpoint_interval", "generate_embedding_figures"}
     followed = {name: (values[name], launcher[name]) for name in launcher if name not in resized}
     assert {name: pair for name, pair in followed.items() if pair[0] != pair[1]} == {}
-    defaults = {field.name: field.default for field in fields(VFE3Config)
-                if field.default is not dataclasses.MISSING}
+    # A field the launcher omits holds a test-owned value: its frozen introduction value (which a changed default
+    # leaves alone); a field newer than that table holds the baseline value of tests.profiles.
     omitted = {name for name in values if name not in launcher and name not in resized}
-    assert {name: (values[name], defaults[name]) for name in omitted if values[name] != defaults[name]} == {}
+    assert {name: (values[name], FIELD_INTRODUCTION_VALUES[name]) for name in omitted
+            if name in FIELD_INTRODUCTION_VALUES and values[name] != FIELD_INTRODUCTION_VALUES[name]} == {}
     # kl_max keeps the launcher's nats per comparison coordinate: it scales by the head width d = K / H, d_tiny /
     # d_launcher, and a launcher None (8 K) is resolved at the launcher's K first (audit 2026-10-20 item 5).
     cfg = live_config()
@@ -58,22 +61,49 @@ def test_live_profile_is_the_launcher_route() -> None:
     assert live_kl_max({"kl_max": None, "embed_dim": 128, "n_heads": 4}) == 8.0 * 128 * d_tiny / 32
 
 
+def _dead_router_maps(model: VFEModel) -> list:
+    r"""The comparison maps whose gradient is absent or exactly zero after a backward."""
+    grads = {name: p.grad for name, p in model.named_parameters() if "raw_score" in name and p.requires_grad}
+    assert grads, "the live route has no comparison maps"
+    return [name for name, grad in grads.items() if grad is None or not bool((grad != 0).any())]
+
+
+def _with_a_live_router(build: Callable[..., VFEModel], **overrides: Any) -> Tuple[VFEModel, Callable[[], torch.Tensor]]:
+    r"""``build(**overrides)`` and its loss closure on one fixed batch, backward taken, with a router that is not
+    clamped dead.
+
+    The tiny cap keeps the launcher's nats per comparison coordinate (:func:`tests.profiles.live_kl_max`). On a
+    launcher route where that cap still binds on every pair of a layer (for instance the absolute reference on the
+    capped pushforward of a full family), the router gradient is zero by the clamp's definition and a gradient
+    check of the router would compare zero with zero (audit 2026-10-20 item 5); there the ceiling is lifted
+    (``kl_max=inf``) so that the router's backward is still checked, on the same route otherwise.
+    """
+    for lifted in ({}, {"kl_max": math.inf}):
+        model = build(**{**overrides, **lifted})
+        tokens, targets = _batch(model.cfg)
+
+        def loss(model: VFEModel = model, tokens: torch.Tensor = tokens, targets: torch.Tensor = targets
+                 ) -> torch.Tensor:
+            return model(tokens, targets)[1]
+
+        loss().backward()
+        if not _dead_router_maps(model):
+            break
+    _assert_router_gradient_nonzero(model)
+    return model, loss
+
+
 def _assert_router_gradient_nonzero(model: VFEModel) -> None:
     r"""Every comparison map (``raw_score_q``, ``raw_score_k``) receives a nonzero gradient after a backward: the
     tiny live cap does not clamp the router dead (audit 2026-10-20 item 5, where every live-route gradient check
     compared a router gradient of exactly zero)."""
-    grads = {name: p.grad for name, p in model.named_parameters() if "raw_score" in name and p.requires_grad}
-    assert grads, "the live route has no comparison maps"
-    dead = [name for name, grad in grads.items() if grad is None or not bool((grad != 0).any())]
+    dead = _dead_router_maps(model)
     assert dead == [], f"router gradient is exactly zero on {dead}"
 
 
 def test_live_forward_backward_is_finite() -> None:
-    model = _model()
-    tokens, targets = _batch(model.cfg)
-    _, loss, _ = model(tokens, targets)
-    assert torch.isfinite(loss)
-    loss.backward()
+    model, loss = _with_a_live_router(_model)
+    assert torch.isfinite(loss())
     trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
     # Every trainable parameter is reached by backward (audit 2026-10-16 F111): a dead table or a severed
     # detach leaves its gradient None.
@@ -81,7 +111,6 @@ def test_live_forward_backward_is_finite() -> None:
     grads = [p.grad for p in trainable.values()]
     assert all(bool(torch.isfinite(g).all()) for g in grads)
     assert any(bool((g != 0).any()) for g in grads)
-    _assert_router_gradient_nonzero(model)
 
 
 def _float64_live_model(**overrides: Any) -> VFEModel:
@@ -121,6 +150,11 @@ def _richardson_mismatches(
     tolerance is :math:`|R - a| \le 10^{-6}\max(|R|, |a|) + \max(10^{-8}, 10^3\varepsilon|L|/h)`, the second
     term bounding the float64 cancellation in :math:`L(p + h d) - L(p - h d)`. Every ``p.grad`` must already
     hold :math:`\nabla_p L`.
+
+    The remainder of :math:`R` is :math:`O(h^4)`, and its constant depends on the route (a launcher route with a large
+    fourth derivative leaves a few :math:`10^{-6}` at :math:`h = 10^{-4}`). A parameter that misses at :math:`h` is
+    therefore measured again at :math:`h/4`, where that remainder is 256 times smaller, and counts as mismatched
+    unless it meets the tolerance there with a smaller error: a defect in the backward does not shrink with the step.
     """
     eps = torch.finfo(torch.float64).eps
     with torch.no_grad():
@@ -140,11 +174,17 @@ def _richardson_mismatches(
                 p.copy_(original)
             return (plus - minus) / (2.0 * step)
 
-        richardson = (4.0 * central(h / 2.0) - central(h)) / 3.0
+        def miss(step: float) -> Tuple[float, float, float]:
+            richardson = (4.0 * central(step / 2.0) - central(step)) / 3.0
+            tolerance = 1e-6 * max(abs(richardson), abs(analytic)) + max(1e-8, 1e3 * eps * base / step)
+            return richardson, abs(richardson - analytic), tolerance
+
         analytic = float((p.grad * d).sum())
-        tolerance = 1e-6 * max(abs(richardson), abs(analytic)) + max(1e-8, 1e3 * eps * base / h)
-        if abs(richardson - analytic) > tolerance:
-            mismatched[name] = (richardson, analytic, tolerance)
+        richardson, error, tolerance = miss(h)
+        if error > tolerance:
+            _, finer_error, finer_tolerance = miss(h / 4.0)
+            if finer_error > finer_tolerance or finer_error >= error:
+                mismatched[name] = (richardson, analytic, tolerance)
     return mismatched
 
 
@@ -157,17 +197,10 @@ def test_live_backward_matches_float64_richardson_differences(block_norm_covaria
     side away from the extrapolated difference, while the :math:`O(h^2)` truncation the pushforward's large third
     derivative produces at a single step does not.
     """
-    model = _float64_live_model(block_norm_covariance=block_norm_covariance)
+    model, loss = _with_a_live_router(_float64_live_model, block_norm_covariance=block_norm_covariance)
     assert model.cfg.block_norm_covariance == block_norm_covariance
-    tokens, targets = _batch(model.cfg)
-
-    def loss() -> torch.Tensor:
-        return model(tokens, targets)[1]
-
-    loss().backward()
     trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
     assert trainable and [name for name, p in trainable.items() if p.grad is None] == []
-    _assert_router_gradient_nonzero(model)
     assert _richardson_mismatches(loss, trainable) == {}
 
 
@@ -190,7 +223,7 @@ def test_live_phi_embed_gradient_under_the_fixed_schedule_exponential(monkeypatc
         return transport._FixedScheduleMatrixExp.apply(blocks, math.sqrt(blocks.shape[-1]) * norm_bound)
 
     monkeypatch.setattr(transport, "_frame_matrix_exp", fixed_schedule)
-    model = _float64_live_model()
+    model = _float64_live_model(gauge_transport="on")        # the frame exponential runs only with transport on
     phi = model.prior_bank.phi_embed
     with torch.no_grad():
         phi.mul_(10.0)

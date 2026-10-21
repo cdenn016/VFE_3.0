@@ -17,6 +17,8 @@ from dataclasses import MISSING, asdict, dataclass, fields
 from numbers import Real
 from typing import Any, Callable, List, Literal, Mapping, Optional, Tuple
 
+from vfe3.config_history import FIELD_INTRODUCTION_VALUES
+
 
 class ConfigNotice(UserWarning):
     r"""An advisory that a setting is INERT -- read by no active path under this config.
@@ -3477,9 +3479,12 @@ def _migrate_projected_factorization(
         else "gram_certified" if recovery else "gram")
 
 
-# Introduction-time values of fields whose default was later flipped, applied by config_from_serialized
-# only when a serialized config lacks the field (it predates it). Add a row whenever a default flips.
-#   content_link_chart                "affine" at 6e54aee (2026-10-03), now "exponential"
+# Introduction-time values of fields whose default had changed by the caa0114 snapshot, applied by
+# config_from_serialized only when a serialized config lacks the field (it predates it); a row overrides the
+# snapshot value in vfe3.config_history. A default changed after the snapshot needs no row: a record lacking the
+# field reloads from the frozen introduction values of vfe3.config_history (2026-10-21), whatever the current
+# default. The "now" notes record the default when each row was written.
+#   content_link_chart               "affine" at 6e54aee (2026-10-03), now "exponential"
 #   predictive_covariance             "passthrough" at 8b398f3 (2026-09-27), now "moment_matched"
 #   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
 #   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04); merged into projected_factorization
@@ -3541,6 +3546,21 @@ def historical_default_pins(
     if "block_norm_trace_cap" not in payload and "phi_frame_condition_max" not in payload:
         pins["block_norm_trace_cap"] = False
     return pins
+
+
+def introduction_values_for_missing_fields(
+    payload: Mapping[str, Any],    # a serialized config after the pins and the retired-field migrations
+) -> dict[str, Any]:               # field -> its frozen introduction value, for the fields payload lacks
+    r"""The frozen introduction values of the ``VFE3Config`` fields ``payload`` lacks.
+
+    :func:`serialize_config` writes every field, so a record lacks a field only when it predates it, and it ran the
+    field's value at introduction (:data:`vfe3.config_history.FIELD_INTRODUCTION_VALUES`). A field newer than that
+    table is left out and takes the current default, its introduction value until the default first changes. The
+    pins and era rules of :func:`historical_default_pins` are applied first and take precedence. A table row whose
+    field has since been removed is ignored.
+    """
+    return {field.name: FIELD_INTRODUCTION_VALUES[field.name] for field in fields(VFE3Config)
+            if field.name not in payload and field.name in FIELD_INTRODUCTION_VALUES}
 
 
 def _migrate_receiver_law_and_alpha(
@@ -3649,6 +3669,8 @@ def config_from_serialized(
     payload.update(historical_default_pins(payload))
     _migrate_retired_fields(payload, source=source)
     config_fields = {field.name: field for field in fields(VFE3Config)}
+    # Every other field the record lacks predates it and ran its introduction value, not today's default.
+    payload.update(introduction_values_for_missing_fields(payload))
     unknown = sorted(str(key) for key in payload if key not in config_fields)
     if unknown:
         raise ValueError(

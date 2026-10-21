@@ -161,8 +161,11 @@ def test_default_measurement_matches_the_config_and_a_missing_attribute_is_the_a
     required = dict(attention_residual=False, predictive_covariance="passthrough", receiver_update="euler",
                     content_link_chart="affine", minimal_agent_inference="exact", kl_max_reference="absolute",
                     rope_comparison_covariance="full")
+    # The operator default is the dual measurement; the VFE3Config default is the user's to choose (2026-10-21) and
+    # reaches every layer operator through the model (test_tiny_model_trains_one_step_under_the_inverse_measurement).
     config_default = VFE3Config.__dataclass_fields__["relational_receiver_measurement"].default
-    assert RelationalOperators([2, 2], 5, **required).receiver_measurement == config_default == "inverse"
+    assert RelationalOperators([2, 2], 5, **required).receiver_measurement == "inverse"
+    assert config_default in ("inverse", "adjoint")
     with pytest.raises(ValueError, match="receiver_measurement"):
         make_relational_operators([2, 2], 5, receiver_measurement="other")
     mu, sigma, mu_p, sigma_p = _state(5, seed=21)

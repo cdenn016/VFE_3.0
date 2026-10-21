@@ -19,9 +19,12 @@ _MLP_SETTINGS = {
 
 @pytest.fixture(autouse=True)
 def _local_launcher_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise launcher construction with an explicit, small MLP experiment."""
+    """Exercise launcher construction with an explicit, small MLP experiment (the drivers' covariance switches off,
+    whatever the user set)."""
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(**_MLP_SETTINGS))
     monkeypatch.setattr(train_vfe3, "config", config_values(**_MLP_SETTINGS))
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)
+    monkeypatch.setattr(train_vfe3, "fully_gauge_covariant", False)
 
 
 def _label_config(**overrides: object) -> VFE3Config:

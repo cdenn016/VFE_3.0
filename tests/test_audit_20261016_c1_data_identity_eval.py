@@ -17,7 +17,7 @@ F125: evaluation forwards ran outside ``deferred_host_checks`` and paid one host
 certificate. Each attempt of the evaluation forward on the replay ladder now runs inside the deferral scope; the
 metrics are unchanged and a deferred verdict still reaches the ladder.
 
-Tiny CPU models only (K=4, two heads, N=4, vocab 7; the deferral test runs ``tests.profiles.live_config``).
+Tiny CPU models only (K=4, two heads, N=4, vocab 7; the deferral test runs ``tests.profiles.reference_config``).
 """
 import ast
 import contextlib
@@ -190,9 +190,9 @@ def _counted_host_checks(monkeypatch: pytest.MonkeyPatch) -> Dict[str, int]:
     original = contracts.host_check
     counts = {"immediate": 0, "queued": 0}
 
-    def counting(flags: torch.Tensor, verdict: Any) -> None:
+    def counting(flags: torch.Tensor, verdict: Any, *args: Any, **kwargs: Any) -> None:
         counts["immediate" if contracts._DEFERRED_CHECKS is None else "queued"] += 1
-        original(flags, verdict)
+        original(flags, verdict, *args, **kwargs)
 
     for name, module in list(sys.modules.items()):
         if name.startswith("vfe3") and getattr(module, "host_check", None) is original:
@@ -201,8 +201,10 @@ def _counted_host_checks(monkeypatch: pytest.MonkeyPatch) -> Dict[str, int]:
 
 
 def _live_evaluation() -> Tuple[VFEModel, List[Tuple[torch.Tensor, torch.Tensor]]]:
-    from tests.profiles import live_config
-    cfg = live_config()
+    r"""The frozen reference route (``tests.profiles.reference_config``), whose ``comparison_invariant`` RoPE takes the
+    diagonal comparison route and its ``host_check(..., detail=...)`` certificates, on three evaluation batches."""
+    from tests.profiles import reference_config
+    cfg = reference_config(rope_mode="comparison_invariant", relational_diag_moments_kernel="torch")
     torch.manual_seed(11)
     model = VFEModel(cfg)
     generator = torch.Generator().manual_seed(12)

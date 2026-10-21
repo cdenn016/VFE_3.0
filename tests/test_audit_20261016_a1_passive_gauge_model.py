@@ -262,24 +262,54 @@ def test_local_decode_coordinates_leave_the_constant_decode_covariance_frame_dep
     assert _invariance(_model(reverted))[0] > 1e-3
 
 
-@pytest.mark.parametrize("variant", [
-    {},
-    # a prior-bank decoder under each non-belief decode covariance, and the relative floor (audit 2026-10-17,
-    # items 25 and 43); the switch moves diagonal_chunked to full_chunked on the full family
-    {"decode_mode": "diagonal_chunked", "decode_covariance": "constant"},
-    {"decode_mode": "diagonal_chunked", "decode_covariance": "encoded"},
-    {"predictive_covariance_floor_mode": "relative"},
-], ids=["as_written", "kl_decode_constant", "kl_decode_encoded", "relative_floor"])
-def test_the_launcher_route_under_the_switch_is_invariant(variant: dict) -> None:
-    r"""The route ``train_vfe3.py`` trains, at tiny scale, with the switch applied as the launcher applies it."""
+_KL_DECODE_MODES = ("diagonal_chunked", "full_chunked")
+
+
+def _launcher_switched_values(variant: dict) -> dict:
+    r"""The launcher route at tiny scale with ``variant`` and the switch's overrides applied.
+
+    The switch refusing the route is its contract and skips the case.
+    """
     launcher = {**launcher_values(), **variant}
     try:
         overrides = fully_gauge_covariant_overrides(launcher)
     except ValueError as exc:                                          # a refusal is the switch's contract
         pytest.skip(f"the launcher route has no covariant reading: {exc}")
-    values = {**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher, **live_tiny(launcher), **overrides,
-              "max_seq_len": N, "batch_size": B}
-    cfg = _switched(values)
+    return {**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher, **live_tiny(launcher), **overrides,
+            "max_seq_len": N, "batch_size": B}
+
+
+def _launcher_variant_config(variant: dict) -> VFE3Config:
+    r"""The switched launcher route under ``variant``.
+
+    ``decode_mode="kl"`` selects the prior-bank KL decoder whose covariance rank matches the switched family
+    (``diagonal_chunked`` or ``full_chunked``, the coupling the validator enforces), so the case is defined whatever
+    family the launcher holds.
+    """
+    if variant.get("decode_mode") != "kl":
+        return _switched(_launcher_switched_values(variant))
+    refusals = []
+    for mode in _KL_DECODE_MODES:
+        try:
+            return _switched(_launcher_switched_values({**variant, "decode_mode": mode}))
+        except ValueError as exc:
+            refusals.append(f"{mode}: {exc}")
+    raise AssertionError("no KL decoder matches the switched launcher route:\n" + "\n".join(refusals))
+
+
+@pytest.mark.parametrize("variant", [
+    {},
+    # a prior-bank decoder under each non-belief decode covariance, and the relative floor (audit 2026-10-17,
+    # items 25 and 43); the KL decoder is the one whose rank matches the switched family
+    {"decode_mode": "kl", "decode_covariance": "constant"},
+    {"decode_mode": "kl", "decode_covariance": "encoded"},
+    {"predictive_covariance_floor_mode": "relative"},
+], ids=["as_written", "kl_decode_constant", "kl_decode_encoded", "relative_floor"])
+def test_the_launcher_route_under_the_switch_is_invariant(variant: dict) -> None:
+    r"""The route ``train_vfe3.py`` trains, at tiny scale, with the switch applied as the launcher applies it."""
+    cfg = _launcher_variant_config(variant)
+    for key, value in variant.items():
+        assert getattr(cfg, key) in (_KL_DECODE_MODES if value == "kl" else (value,)), key
     assert _pure_path_report(cfg, [])["on_gauge_pure_path"] is True
     logits_change, loss_change, beliefs_only_change = _invariance(_model(cfg))
     assert logits_change < _REL and loss_change < _REL

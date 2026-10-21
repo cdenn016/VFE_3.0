@@ -240,10 +240,10 @@ def _set_rows(table: torch.Tensor, rows: slice, value: float) -> None:
 
 
 def test_decode_variance_columns_read_the_table_the_decoder_scores_against() -> None:
-    from tests.profiles import live_config
+    from tests.profiles import reference_config
     from vfe3.model.model import VFEModel
-    # The launcher's untied prior-bank decode (its committed readout may be linear; the decode route is pinned here).
-    cfg = live_config(decode_mode="diagonal_chunked", untie_decode_bank=True)
+    # The reference route's untied prior-bank decode on the diagonal family, pinned here.
+    cfg = reference_config(family="gaussian_diagonal", decode_mode="diagonal_chunked", untie_decode_bank=True)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     bank = model.prior_bank

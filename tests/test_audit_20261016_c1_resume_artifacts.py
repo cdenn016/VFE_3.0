@@ -15,12 +15,12 @@ summary's best_step is run-wide. The summary now names the source run (``resume_
 history lives.
 
 F128: every resume-equivalence test ran on the legacy test baseline (AdamW tables, per-role clip, passthrough
-covariance). A parametrized test now resumes the launcher route of ``tests.profiles.live_config`` with the live
-optimizer routing pinned (Fisher table step, per-group clip, untied diagonal decode, moment-matched predictive
+covariance). A parametrized test now resumes the frozen reference route of ``tests.profiles.reference_config`` with
+the live optimizer routing pinned (Fisher table step, per-group clip, untied diagonal decode, moment-matched predictive
 covariance, frame condition bound; phi under AdamW or ``fisher_group``; kernel and minimal-agent readouts) from an
 epoch boundary and from mid-epoch of a shuffled loader, and compares the final checkpoints leg by leg.
 
-Tiny CPU models only (K=4, two heads, N=4, vocab 7; the live-route test runs ``tests.profiles.live_config``).
+Tiny CPU models only (K=4, two heads, N=4, vocab 7; the live-route test runs ``tests.profiles.reference_config``).
 """
 import csv
 import json
@@ -263,16 +263,23 @@ def _assert_same(actual: Any, expected: Any, path: str) -> None:
         assert actual == expected, path
 
 
+# The RoPE each readout takes on the reference route: the kernel router's rotation-invariant comparison, and the
+# record-channel rotation minimal_agent reads ('comparison_invariant' is the kernel router's projection of it).
+_ROPE_FOR_READOUT = {"kernel": "comparison_invariant", "minimal_agent": "comparison"}
+
+
 def _live_route(readout: str, phi_mode: str) -> VFE3Config:
-    r"""The launcher route at tiny scale with the live optimizer routing pinned: Fisher table step, one clip per
-    optimizer group, untied diagonal prior-bank decode, moment-matched predictive covariance, and the frame
-    condition bound (which the manifold phi optimizer does not take)."""
-    from tests.profiles import live_config
-    return live_config(m_table_update_mode="fisher", grad_clip_scope="group", decode_mode="diagonal_chunked",
-                       untie_decode_bank=True, predictive_covariance="moment_matched",
-                       attention_mode="projected_predictive", predictive_readout=readout, m_phi_update_mode=phi_mode,
-                       phi_frame_condition_max=1e4 if phi_mode == "adamw" else None, checkpoint_interval=1,
-                       max_steps=8)
+    r"""The frozen reference route at tiny scale with the live optimizer routing pinned: Fisher table step, one clip
+    per optimizer group, untied diagonal prior-bank decode, moment-matched predictive covariance, and the frame
+    condition bound (which the manifold phi optimizer does not take). The checkpoint policy is set here: one
+    resumable checkpoint per step, every one kept, none extra at the end."""
+    from tests.profiles import reference_config
+    return reference_config(m_table_update_mode="fisher", grad_clip_scope="group", decode_mode="diagonal_chunked",
+                            untie_decode_bank=True, predictive_covariance="moment_matched",
+                            attention_mode="projected_predictive", predictive_readout=readout,
+                            rope_mode=_ROPE_FOR_READOUT[readout], m_phi_update_mode=phi_mode,
+                            phi_frame_condition_max=1e4 if phi_mode == "adamw" else None, checkpoint_interval=1,
+                            checkpoint_keep_last=None, checkpoint_at_end=False, max_steps=8)
 
 
 def _shuffled_loader(cfg: VFE3Config) -> DataLoader:

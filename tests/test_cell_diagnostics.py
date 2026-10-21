@@ -26,6 +26,7 @@ def test_experiment_arms_validate_and_build(
 ) -> None:
     r"""Registered MLP sweep arms build on a local tiny enabling profile."""
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(use_block_mlp=True))
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     ablation.validate_sweeps([sweep_name])                          # guard #1: real VFE3Config fields
     runs = ablation.make_run_overrides(sweep_name)
     assert len(runs) >= 2

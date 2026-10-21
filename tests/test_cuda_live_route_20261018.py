@@ -35,7 +35,10 @@ def test_cuda_live_route_matches_a_float64_cpu_copy(record_property: Any) -> Non
     pytest.importorskip("triton")
     overrides: Dict[str, Any] = {"decode_ce_triton": True}
     if live_config().decode_mode == "linear":
-        overrides["decode_mode"] = "diagonal_chunked"
+        # The fused chunk kernels need a KL decoder: the one whose covariance rank matches the launcher's family
+        # (the coupling the validator enforces), so the case is defined whatever family the launcher holds.
+        overrides["decode_mode"] = ("full_chunked" if live_config().family in ("gaussian_full", "gaussian_block")
+                                    else "diagonal_chunked")
     cfg = live_config(**overrides)
     device = torch.device("cuda")
     torch.manual_seed(0)

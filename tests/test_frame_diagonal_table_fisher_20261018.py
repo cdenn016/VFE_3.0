@@ -21,7 +21,7 @@ from typing import Any, Dict, Tuple
 import pytest
 import torch
 
-from tests.profiles import live_config
+from tests.profiles import reference_k8_config
 from vfe3.config import VFE3Config
 from vfe3.families.frame_gaussian import frame_diagonal_kl
 from vfe3.geometry.lie_ops import embed_phi, extract_phi
@@ -45,13 +45,14 @@ def _quiet_two_threads():
 
 
 def _cfg(**over: Any) -> VFE3Config:
-    r"""The tiny live route with the frame-diagonal family inside its envelope, block_glk per-head frames of width 4."""
+    r"""The frozen reference route at K = 8 with the frame-diagonal family inside its envelope, block_glk per-head
+    frames of width 4 (no launcher read)."""
     values = dict(family=FAMILY, predictive_readout="kernel", block_mlp_mode="coordinate",
                   block_mlp_covariance="passthrough", decode_mode="diagonal_chunked", norm_type_block="layernorm",
                   untie_decode_bank=True, m_table_update_mode="fisher", gauge_group="block_glk",
                   gauge_tying="per_head", pos_phi="none", rope_mode="none", vocab_size=9, embed_dim=8, n_heads=2,
                   weight_decay=0.0, mu_weight_decay=0.0, sigma_weight_decay=0.0)
-    return live_config(**{**values, **over})
+    return reference_k8_config(**{**values, **over})
 
 
 def _model(cfg: VFE3Config, phi_std: float = 0.5) -> VFEModel:
@@ -232,9 +233,19 @@ _TINY_SHAPES = dict(vocab_size=11, embed_dim=8, n_heads=2, max_seq_len=4, batch_
 def test_the_launcher_dictionary_with_this_family_trains() -> None:
     r"""The launcher at ``VFE3_LAUNCHER_PATH`` (default: this checkout's ``train_vfe3.py``) with ``family`` set to this
     family and only the shape fields shrunk constructs and takes finite training steps; a launcher route outside the
-    family's envelope for another reason is skipped with that reason."""
+    family's envelope for another reason is skipped with that reason.
+
+    The toggles the family's envelope couples to it are set with it, whatever the launcher holds: the kernel readout,
+    the coordinate block MLP, a linear or diagonal KL decoder, and token-only frames (``pos_phi='none'``) under the
+    Fisher table step."""
     path = Path(os.environ.get("VFE3_LAUNCHER_PATH", Path(__file__).resolve().parents[1] / "train_vfe3.py"))
-    values = {**_launcher(path), "family": FAMILY, **_TINY_SHAPES}
+    launcher = _launcher(path)
+    envelope: Dict[str, Any] = {"family": FAMILY, "predictive_readout": "kernel", "block_mlp_mode": "coordinate"}
+    if launcher.get("decode_mode") not in ("linear", "diagonal_chunked"):
+        envelope["decode_mode"] = "diagonal_chunked"
+    if launcher.get("m_table_update_mode") == "fisher":
+        envelope["pos_phi"] = "none"
+    values = {**launcher, **envelope, **_TINY_SHAPES}
     if values.get("kl_max") is not None:
         values["kl_max"] = float(values["kl_max"]) * 8 / _launcher(path)["embed_dim"]
     try:

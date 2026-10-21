@@ -222,8 +222,10 @@ def test_tiny_model_train_step_under_the_stabilizer_completion(retraction: str) 
 
 
 def test_config_field_default_validation_and_inactive_marks() -> None:
-    assert VFE3Config.m_phi_fisher_completion == "rotation"
+    # The test baseline pins the rotation completion; the VFE3Config default only has to be admitted.
     assert config_values()["m_phi_fisher_completion"] == "rotation"
+    default = VFE3Config.__dataclass_fields__["m_phi_fisher_completion"].default
+    assert _fisher_cfg(m_phi_fisher_completion=default).m_phi_fisher_completion == default
     assert _fisher_cfg(m_phi_fisher_completion="stabilizer").m_phi_fisher_completion == "stabilizer"
     assert _fisher_cfg(m_phi_fisher_completion="stabilizer", pos_phi="frozen").pos_phi == "frozen"
     with pytest.raises(ValueError, match="m_phi_fisher_completion"):

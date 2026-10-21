@@ -81,6 +81,16 @@ def test_load_base_lists_selectors_merged_from_recorded_keys_as_migrated(tmp_pat
 
 # ---- F1: a conditional migration of an absent field is reported, a coercion is not ------------------
 
+def _assert_absent_field_listed(base: Any, name: str) -> None:
+    r"""``name``, absent from the record, is listed as defaulted when its loaded value is the current
+    ``VFE3Config`` default and as pinned (with that value) otherwise."""
+    value = getattr(base.cfg, name)
+    if value == VFE3Config.__dataclass_fields__[name].default:
+        assert name in base.defaulted and name not in base.pinned, name
+    else:
+        assert base.pinned.get(name, object()) == value and name not in base.defaulted, name
+
+
 def test_load_base_reports_a_conditional_migration_of_an_absent_field_as_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -100,11 +110,14 @@ def test_load_base_reports_a_conditional_migration_of_an_absent_field_as_pinned(
     assert old.cfg.predictive_covariance_floor_mode == "relative"
     assert old.pinned.get("predictive_covariance_floor_mode") == "relative"
     assert "predictive_covariance_floor_mode" not in old.defaulted
-    assert "phi_frame_condition_max" in old.defaulted                  # absent and at its default
-    # The newer era (the marker field recorded) keeps the current default and lists it as defaulted.
+    # An absent field the loader fills with its introduction value is listed as defaulted while that value is the
+    # current default, and as pinned once the default has changed (whatever vfe3/config.py holds now).
+    _assert_absent_field_listed(old, "phi_frame_condition_max")
+    # The newer era (the marker field recorded) loads the floor's introduction value, "prior".
     new = pa.load_base("new", _write_base(tmp_path / "new", cfg, drop=("predictive_covariance_floor_mode",)))
     assert new.cfg.predictive_covariance_floor_mode == "prior"
-    assert "predictive_covariance_floor_mode" in new.defaulted and new.pinned == {}
+    _assert_absent_field_listed(new, "predictive_covariance_floor_mode")
+    assert set(new.pinned) <= {"predictive_covariance_floor_mode"}
 
 
 def test_load_base_keeps_a_post_init_coercion_of_an_absent_field_as_defaulted(tmp_path: Path) -> None:
@@ -149,8 +162,13 @@ def test_the_two_arms_keep_the_base_block_norm_covariance_where_it_stays_read(tm
 def test_parameter_optimization_config_does_not_inherit_the_block_norm_covariance_default() -> None:
     import parameter_optimization as po
 
-    # The driver's own keys are written last, so this builds the driver config under a pushforward default.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cfg = VFE3Config(**{"block_norm_covariance": "pushforward", **po.config})
-    assert (cfg.norm_type_block, cfg.block_norm_covariance) == ("none", "passthrough")
+    # The driver's own keys are written last, so this builds the driver config under each block_norm_covariance
+    # default. The driver's values are the user's (2026-10-21): a driver that spells the field keeps its value under
+    # every default; one that leaves it to the default must be valid under the default it runs with.
+    spelled = "block_norm_covariance" in po.config
+    current = VFE3Config.__dataclass_fields__["block_norm_covariance"].default
+    for default in (("passthrough", "pushforward", "pushforward_moment") if spelled else (current,)):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cfg = VFE3Config(**{"block_norm_covariance": default, **po.config})
+        assert cfg.block_norm_covariance == po.config.get("block_norm_covariance", current), default

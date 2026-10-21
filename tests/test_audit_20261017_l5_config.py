@@ -2,7 +2,9 @@ r"""Audit 2026-10-17, lane L5: configuration, gauge certification and the tests 
 
 * item 23: ``prior_handoff_sigma`` is live only where the prior covariance is read (the prior floor, or a ceiling);
 * item 24: a snapshot of every ``VFE3Config`` field default, and an oracle check that ``inactive_fields`` agrees with
-  two executed optimizer steps on the tiny live route;
+  two executed optimizer steps on the tiny live route. Since 2026-10-21 the snapshot is frozen into
+  ``vfe3.config_history``, from which ``config_from_serialized`` fills the fields a record predates, so a changed
+  default never fails a test and needs no pin row; the tests here check the frozen table and the loader instead;
 * item 25 and 43: the ``fully_gauge_covariant`` switch keeps the decode covariance and the floor mode (both are
   covariant under the declared local action; the passive-gauge harness measures it);
 * item 51: the era pin of ``block_norm_trace_cap``;
@@ -10,9 +12,6 @@ r"""Audit 2026-10-17, lane L5: configuration, gauge certification and the tests 
 * item 54: ``train()`` resolves its run keywords from ``cfg``;
 * item 55: ``PriorBank``'s config-mirroring keywords are keyword-only and required;
 * item 57: the switch's pushforward warning names the trace-cap state.
-
-Run as a script (``python -m tests.test_audit_20261017_l5_config``) to rewrite the default snapshot after a default
-change has been handled as the snapshot test's failure message asks.
 """
 from __future__ import annotations
 
@@ -28,13 +27,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pytest
 import torch
 
-from tests.profiles import config_values, live_values, test_config
+import vfe3.config as config_module
+from tests.profiles import config_values, live_values, reference_config, reference_values, test_config, tiny_config
 from vfe3.config import (_HISTORICAL_DEFAULT_PINS, VFE3Config, config_from_serialized, historical_default_pins,
                          serialize_config)
+from vfe3.config_history import FIELD_INTRODUCTION_VALUES, INTRODUCED_AFTER_CAA0114, SNAPSHOT_CAA0114
 from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
 
 _SNAPSHOT = Path(__file__).parent / "data" / "vfe3config_defaults_caa0114.json"
-_LAUNCHERS = ("train_vfe3.config", "ablation.BASELINE_CONFIG", "scaling.config", "parameter_optimization.config")
 
 
 @pytest.fixture(autouse=True)
@@ -44,74 +44,122 @@ def _quiet():
         yield
 
 
-# ------------------------------------------------------------------------------------- item 24: default snapshot
+# ----------------------------------------------------------- item 24: frozen introduction values and the loader
 
-def _jsonable(value: Any) -> Any:
-    r"""A JSON-comparable form of a default: tuples become lists, non-finite floats strings."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return repr(value)
+def _current_default(name: str) -> Any:
+    f = VFE3Config.__dataclass_fields__[name]
+    return f.default if f.default is not dataclasses.MISSING else f.default_factory()   # type: ignore[misc]
 
 
-def field_defaults() -> Dict[str, Any]:
-    r"""Every ``VFE3Config`` field default (a ``default_factory`` is called), in JSON-comparable form."""
-    out: Dict[str, Any] = {}
-    for f in dataclasses.fields(VFE3Config):
-        if f.default is not dataclasses.MISSING:
-            out[f.name] = _jsonable(f.default)
-        elif f.default_factory is not dataclasses.MISSING:          # type: ignore[misc]
-            out[f.name] = _jsonable(f.default_factory())            # type: ignore[misc]
-    return out
+def _flip_defaults(monkeypatch: pytest.MonkeyPatch, flips: Dict[str, Any]) -> None:
+    r"""Change the ``VFE3Config`` defaults of ``flips`` for one test, as an edit of ``vfe3/config.py`` would."""
+    constructor = VFE3Config.__init__
+    names = list(inspect.signature(constructor).parameters)[1:]
+    defaults = list(constructor.__defaults__)
+    for name, value in flips.items():
+        defaults[names.index(name)] = value
+        monkeypatch.setattr(VFE3Config, name, value)
+        monkeypatch.setattr(VFE3Config.__dataclass_fields__[name], "default", value)
+    monkeypatch.setattr(constructor, "__defaults__", tuple(defaults))
 
 
-def _launcher_dicts() -> Dict[str, Dict[str, Any]]:
-    import ablation
-    import parameter_optimization
-    import scaling
-    import train_vfe3
-    return dict(zip(_LAUNCHERS, (train_vfe3.config, ablation.BASELINE_CONFIG, scaling.config,
-                                 parameter_optimization.config)))
+# Fields whose absence a migration of config_from_serialized interprets (the receiver law era of
+# relational_receiver_update; a record without attention_mode is refused), checked by their own tests.
+_ABSENCE_MIGRATED = frozenset({"attention_mode", "relational_receiver_update"})
 
 
-def test_no_field_default_changes_without_a_pin_row() -> None:
-    r"""A changed default reaches every record saved without the field and every launcher that omits it.
+def _outcome(build: Callable[[], VFE3Config]) -> Any:
+    r"""The config ``build`` returns, or the type of the ``ValueError`` it raises."""
+    try:
+        return build()
+    except ValueError:
+        return ValueError
 
-    ``_HISTORICAL_DEFAULT_PINS`` says to add a row whenever a default flips; this test enforces it against a
-    snapshot of the defaults at caa0114. Fields added after the snapshot are not checked.
-    """
+
+def _expected_reload(base: VFE3Config, name: str) -> Any:
+    r"""What a serialized ``base`` without ``name`` must reload as: the pins and era rules where they apply, otherwise
+    the field's frozen introduction value, or the current default for a field newer than the table."""
+    stripped = {k: v for k, v in serialize_config(base).items() if k != name}
+    values = {**dataclasses.asdict(base), **historical_default_pins(stripped)}
+    if name not in historical_default_pins(stripped):
+        values[name] = config_module.FIELD_INTRODUCTION_VALUES.get(name, _current_default(name))
+    return _outcome(lambda: VFE3Config(**values))
+
+
+def _reload_without(base: VFE3Config, name: str) -> Any:
+    stripped = {k: v for k, v in serialize_config(base).items() if k != name}
+    return _outcome(lambda: config_from_serialized(stripped, source=f"record without {name}"))
+
+
+def test_the_frozen_snapshot_is_the_committed_one() -> None:
+    r"""``SNAPSHOT_CAA0114`` is the snapshot committed at 395a430 (taken at caa0114, before any later default
+    change), and the later rows are fields absent from it."""
     snapshot: Dict[str, Any] = json.loads(_SNAPSHOT.read_text(encoding="utf-8"))
-    current = field_defaults()
-    removed = sorted(name for name in snapshot if name not in current)
-    changed = {name: (snapshot[name], current[name]) for name in snapshot
-               if name in current and snapshot[name] != current[name]}
-    if not (removed or changed):
-        return
-    launchers = _launcher_dicts()
-    lines = []
-    for name, (old, new) in sorted(changed.items()):
-        omitting = [label for label, values in launchers.items() if name not in values]
-        pinned = (f"pinned to {_HISTORICAL_DEFAULT_PINS[name]!r}" if name in _HISTORICAL_DEFAULT_PINS
-                  else "NO pin row")
-        lines.append(f"  {name}: default {old!r} -> {new!r} ({pinned}; omitted by {omitting or 'no launcher'})")
-    for name in removed:
-        lines.append(f"  {name}: removed (config_from_serialized needs a migration that drops or refuses it)")
-    pytest.fail(
-        "VFE3Config field defaults changed since the snapshot:\n" + "\n".join(lines) + "\n"
-        "For each changed default: add a _HISTORICAL_DEFAULT_PINS row in vfe3/config.py pinning the OLD value (or an "
-        "era rule in historical_default_pins) so that records saved without the field reload as they ran, or show "
-        "that every loadable record carries the field; spell the intended value in every launcher listed as "
-        "omitting it; then rewrite the snapshot with `python -m tests.test_audit_20261017_l5_config`.")
+    assert dict(SNAPSHOT_CAA0114) == snapshot
+    assert not set(INTRODUCED_AFTER_CAA0114) & set(snapshot)
+    assert dict(FIELD_INTRODUCTION_VALUES) == {**snapshot, **INTRODUCED_AFTER_CAA0114}
+
+
+@pytest.mark.parametrize("profile", ["test_config", "reference_config"])
+def test_every_field_is_in_the_table_or_newer_and_a_record_without_it_reloads(profile: str) -> None:
+    r"""Each ``VFE3Config`` field is either in the frozen introduction table or newer than it, and a serialized
+    record lacking it reloads with its pin or era value, else its introduction value, else (newer than the table)
+    the current default; or both the loader and the constructor refuse the combination."""
+    base = {"test_config": test_config, "reference_config": reference_config}[profile]()
+    names = [f.name for f in dataclasses.fields(VFE3Config)]
+    newer = [name for name in names if name not in FIELD_INTRODUCTION_VALUES]
+    assert all(name not in SNAPSHOT_CAA0114 for name in newer)
+    for name in names:
+        if name in _ABSENCE_MIGRATED:
+            continue
+        assert _reload_without(base, name) == _expected_reload(base, name), name
+
+
+def test_a_field_newer_than_the_table_reloads_at_the_current_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""A field missing from the table (added after it) takes the current default when a record lacks it."""
+    table = dict(config_module.FIELD_INTRODUCTION_VALUES)
+    del table["weight_ema_start_frac"]
+    monkeypatch.setattr(config_module, "FIELD_INTRODUCTION_VALUES", table)
+    _flip_defaults(monkeypatch, {"weight_ema_start_frac": 0.25})
+    base = test_config(weight_ema_start_frac=0.75)
+    assert _reload_without(base, "weight_ema_start_frac").weight_ema_start_frac == 0.25
+
+
+# Alternative defaults, each valid on its own, for fields whose default has changed or may change: a record
+# lacking the field must reload with the frozen introduction value whatever the default reads.
+_FLIPPED_DEFAULTS: Dict[str, Any] = {
+    "attention_residual": False, "layernorm_affine": True, "lambda_alpha_mode": "state_dependent",
+    "block_norm_covariance": "pushforward", "decode_ce_triton": True, "decode_logits_amp": True,
+    "routing_kl_max_reference": "row_min", "relational_diag_moments_kernel": "triton", "checkpoint_at_end": True,
+    "m_phi_group_log_fallback": "eigenbasis", "predictive_covariance_precision": "fp64",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FLIPPED_DEFAULTS))
+def test_a_record_without_a_field_ignores_the_current_default(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""With the default changed (simulated as an edit of ``vfe3/config.py``), a record lacking the field reloads as
+    it did before the change: with its pin, or its frozen introduction value."""
+    profile = reference_values(norm_type_block="layernorm")
+    before = _reload_without(VFE3Config(**profile), name)
+    expected_value = _HISTORICAL_DEFAULT_PINS.get(name, FIELD_INTRODUCTION_VALUES[name])
+    assert _FLIPPED_DEFAULTS[name] != expected_value, name
+    _flip_defaults(monkeypatch, {name: _FLIPPED_DEFAULTS[name]})
+    after = _reload_without(VFE3Config(**profile), name)
+    assert after == before
+    if after is not ValueError:
+        assert getattr(after, name) == expected_value
+
+
+@pytest.mark.parametrize("factory", [test_config, tiny_config, reference_config])
+def test_serialize_config_carries_every_field_and_round_trips(factory: Callable[..., VFE3Config]) -> None:
+    for cfg in (factory(), factory(kl_max=math.inf)):
+        payload = serialize_config(cfg)
+        assert {f.name for f in dataclasses.fields(VFE3Config)} <= set(payload)
+        assert config_from_serialized(json.loads(json.dumps(payload)), source="round trip") == cfg
 
 
 def test_the_snapshot_covers_the_pinned_fields() -> None:
-    snapshot = json.loads(_SNAPSHOT.read_text(encoding="utf-8"))
-    assert set(_HISTORICAL_DEFAULT_PINS) <= set(snapshot) <= set(field_defaults()) | set(snapshot)
+    assert set(_HISTORICAL_DEFAULT_PINS) <= set(SNAPSHOT_CAA0114)
     assert {f.name for f in dataclasses.fields(VFE3Config)} >= set(_HISTORICAL_DEFAULT_PINS)
 
 
@@ -140,6 +188,16 @@ _RARE_TRIGGER = {"predictive_covariance_ceiling", "phi_frame_condition_max", "fr
                  "decode_ranking_fp64_escalation", "unigram_kappa", "block_norm_trace_cap",
                  "m_table_fisher_trust_radius", "m_phi_group_trust_radius", "attention_window"}
 _ALLOWLIST = _TRAIN_LOOP | _PRECISION | _RARE_TRIGGER
+
+
+def _route_rare_triggers(values: Dict[str, Any]) -> set:
+    r"""Knobs that act only through a threshold on this route. Under ``predictive_covariance_floor_mode='max'``
+    without a ceiling the layer prior covariance is read only by the prior term :math:`f\Sigma_p` of the floor's
+    maximum, which acts only where it exceeds the relative term, so the variance handoff can leave two steps
+    unchanged (it is marked live, and changes them, under the ``'prior'`` floor: item 23)."""
+    if values.get("predictive_covariance_floor_mode") == "max" and values.get("predictive_covariance_ceiling") is None:
+        return {"prior_handoff_sigma"}
+    return set()
 # Shape and run fields the tiny profile sets; perturbing them changes the problem, not a knob.
 _SHAPE = {"vocab_size", "embed_dim", "n_heads", "max_seq_len", "batch_size", "n_layers", "block_mlp_expansion"}
 
@@ -225,7 +283,7 @@ def test_inactive_fields_agree_with_two_executed_steps(profile: str) -> None:
             same = _identical(reference, run)
             if inert and not same:
                 disagreements.append(f"{key}={candidate!r}: marked inert ({base_inert[key]}) but the run changed")
-            elif not inert and same and key not in _ALLOWLIST:
+            elif not inert and same and key not in _ALLOWLIST | _route_rare_triggers(values):
                 disagreements.append(f"{key}={candidate!r}: unmarked but the run is bitwise identical "
                                      "(mark it in inactive_fields, or allowlist a train-loop, precision or "
                                      "rare-trigger knob here)")
@@ -236,11 +294,21 @@ def test_inactive_fields_agree_with_two_executed_steps(profile: str) -> None:
 
 # --------------------------------------------------------------------------------- item 23: prior_handoff_sigma
 
+# The RoPE each readout takes on the reference route: the kernel router's rotation-invariant comparison, and the
+# record-channel rotation minimal_agent reads ('comparison_invariant' is the kernel router's projection of it).
+_ROPE_FOR_READOUT = {"kernel": "comparison_invariant", "minimal_agent": "comparison"}
+
+
 def _handoff_values(readout: str, **overrides: Any) -> Dict[str, Any]:
-    return live_values(attention_mode="projected_predictive", predictive_readout=readout,
-                       predictive_covariance="moment_matched", minimal_agent_inference="exact",
-                       mstep_self_coupling_weight=0.0, cg_energy_weight=0.0, diagnose_canonical_free_energy=False,
-                       n_layers=2, prior_handoff_sigma=0.0, **overrides)
+    r"""The frozen reference route with every toggle the handoff's liveness depends on set here: the predictive
+    readout and its RoPE, the moment-matched covariance, no M-step prior consumer (self-coupling, CG energy, canonical
+    diagnostic), two layers (a next layer consumes the handoff), the decode covariance read from the beliefs, and the
+    mean handoff on."""
+    return reference_values(attention_mode="projected_predictive", predictive_readout=readout,
+                            rope_mode=_ROPE_FOR_READOUT[readout], predictive_covariance="moment_matched",
+                            minimal_agent_inference="exact", mstep_self_coupling_weight=0.0, cg_energy_weight=0.0,
+                            diagnose_canonical_free_energy=False, n_layers=2, prior_handoff_rho=1.0,
+                            prior_handoff_sigma=0.0, decode_covariance="belief", **overrides)
 
 
 @pytest.mark.parametrize("readout", ["kernel", "minimal_agent"])
@@ -381,8 +449,3 @@ def test_prior_bank_config_keywords_are_keyword_only_and_required() -> None:
         assert parameters[name].default is inspect.Parameter.empty
     with pytest.raises(TypeError):
         PriorBank(7, 4, 3)                                         # type: ignore[call-arg]
-
-
-if __name__ == "__main__":
-    _SNAPSHOT.write_text(json.dumps(field_defaults(), indent=1, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"wrote {_SNAPSHOT}")

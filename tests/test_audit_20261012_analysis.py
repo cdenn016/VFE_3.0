@@ -4,13 +4,14 @@ Item 7 / punch-list #29 (completed by round 2, item 13): every scalar key that t
 ``metrics.csv`` and ``summary.json`` -- the run figures (``GEOMETRY_HEALTH_COLUMNS``,
 ``VALIDATION_SANITY_COLUMNS``), the multi-seed aggregates (``CURVE_SPECS``, ``GRID_COLS``, the ``summary.json``
 members of ``SCALAR_KEYS``), the paper tables and S1 panel D counters, and ``vfe3.posthoc.report`` -- must be
-written by a real :func:`vfe3.train.train` run on the live route profile with nonzero log and evaluation intervals,
+written by a real :func:`vfe3.train.train` run on the frozen reference route profile (with a learned positional
+frame) with nonzero log and evaluation intervals,
 finalized by the launcher's :func:`finalize_run` or the ablation cell's :func:`finalize_validation_run`. Only the
 figure subprocess is stubbed; the metrics rows and diagnostics are real.
 Item 8: the multi-seed noise floor is :math:`t_{n-1, 0.975} \sqrt{2} s`.
 Item 16: figure titles use the headline :func:`vfe3.metrics.spearman_rho`.
 """
-from tests.profiles import live_config
+from tests.profiles import reference_config
 import csv
 import json
 import math
@@ -51,9 +52,12 @@ _RESEARCH_SCALARS = {"ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
 
 
 def _cfg() -> Any:
-    return live_config(vocab_size=6, max_seq_len=8, max_steps=2, warmup_steps=1, log_interval=1,
-                       eval_interval=1, checkpoint_interval=0, generate_embedding_figures=False,
-                       phi_frame_condition_max=1.5)
+    r"""The frozen reference route with a learned positional frame, so the ``pos_phi`` geometry-health columns the
+    readers take are written; every route toggle is test-owned, not read from ``train_vfe3.py``."""
+    return reference_config(vocab_size=6, max_seq_len=8, max_steps=2, warmup_steps=1, log_interval=1,
+                            eval_interval=1, checkpoint_interval=0, generate_embedding_figures=False,
+                            phi_frame_condition_max=1.5, pos_phi="learned", gauge_group="block_glk",
+                            phi_mstep_max_matrix_norm=None)
 
 
 def _loader(n: int, *, shuffle: bool) -> DataLoader:

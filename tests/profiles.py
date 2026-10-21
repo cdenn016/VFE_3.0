@@ -399,6 +399,28 @@ def reference_config(**overrides: Any) -> VFE3Config:
 reference_config.__test__ = False
 
 
+# The reference route at the live profile's shape: K = 8 in two heads of width 4, so kl_max keeps its 16 nats (4 per
+# comparison coordinate) and every other shape and run field is _REFERENCE_TINY's. For tests that exercised a
+# particular path through live_config at that shape: the route is now frozen here instead of read from train_vfe3.py.
+_REFERENCE_K8: dict[str, Any] = {
+    'embed_dim': 8,
+    'n_heads': 2,
+}
+
+
+def reference_k8_values(**overrides: Any) -> dict[str, Any]:
+    """Return a fresh complete reference-route configuration dictionary at K = 8, two heads (no launcher read)."""
+    return reference_values(**{**_REFERENCE_K8, **overrides})
+
+
+def reference_k8_config(**overrides: Any) -> VFE3Config:
+    """Construct the validated frozen reference route at K = 8, two heads."""
+    return VFE3Config(**reference_k8_values(**overrides))
+
+
+reference_k8_config.__test__ = False
+
+
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:
     """RelationalOperators whose config-mirroring keywords come from the test baseline.
 

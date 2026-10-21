@@ -312,6 +312,7 @@ def test_run_once_prints_inactive_launcher_settings(
         raise Stop
 
     monkeypatch.setattr(train_vfe3, "config", _launcher())
+    monkeypatch.setattr(train_vfe3, "fully_gauge_covariant", False)  # the launcher switch is the user's; off here
     monkeypatch.setattr(train_vfe3, "DEVICE", "cpu")
     monkeypatch.setattr(train_vfe3, "DATASET", "wikitext-103")
     monkeypatch.setattr(train_vfe3, "seed_everything", stop)       # halt right after the report
@@ -326,6 +327,7 @@ def test_run_once_prints_inactive_launcher_settings(
 def test_inert_sweep_is_rejected_when_selected(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline = serialize_config(_cfg(_launcher()))
     monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     # The registered sigma_max sweep requires its sigma E-step; without it the ceiling is inert on this baseline.
     monkeypatch.setitem(ablation.SWEEPS, "sigma_max_unrouted", {"param": "sigma_max", "values": [1, 100]})
     # The registered lambda_beta sweep requires projected_gradient; without it the weight is inert on this baseline.

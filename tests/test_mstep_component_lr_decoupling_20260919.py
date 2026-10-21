@@ -171,6 +171,7 @@ def fixed_component_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline = serialize_config(_cfg(m_phi_lr=0.0015, m_p_mu_lr=0.009,
                                      m_pos_phi_lr=None, m_layernorm_lr=None))
     monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     for name, values in (("m_pos_phi_lr", [0.0005, 0.0015, 0.003, 0.006]),
                          ("m_layernorm_lr", [0.001, 0.003, 0.009, 0.02])):
         monkeypatch.setitem(ablation.SWEEPS, name, dict(ablation.SWEEPS[name], values=values))
