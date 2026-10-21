@@ -1,5 +1,6 @@
 """Shared machine-readable pytest accounting for click-to-run verification scripts."""
 
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -92,8 +93,13 @@ def run_pytest_junit(
     *,
     prefix: str,
     required_node_keys: Optional[AbstractSet[str]] = None,
+    keep_report: Optional[Path] = None,
 ) -> tuple[int, Dict[str, int]]:
-    """Run pytest with a temporary JUnit report, return its exit code and derived counts."""
+    """Run pytest with a temporary JUnit report, return its exit code and derived counts.
+
+    ``keep_report`` copies the report there before the temporary file is removed, so recorded properties (parity
+    errors, timings) persist (audit 2026-10-20 item 15).
+    """
     cli_args = [str(arg) for arg in args]
     if any(arg.startswith(("--junitxml", "--junit-xml")) for arg in cli_args):
         raise ValueError("run_pytest_junit owns the temporary --junitxml argument")
@@ -118,6 +124,9 @@ def run_pytest_junit(
         cohort = SelectedCohort()
         plugins = [cohort] if required_node_keys is not None else []
         code = int(pytest.main([*cli_args, f"--junitxml={junit_path}"], plugins=plugins))
+        if keep_report is not None and junit_path.is_file():
+            keep_report.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(junit_path, keep_report)
         counts = read_junit_counts(junit_path)
         if required_node_keys is not None:
             counts["collected"] = cohort.count

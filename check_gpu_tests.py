@@ -16,6 +16,8 @@ os.environ["VFE3_TEST_DEVICE"] = "cuda"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import sys
+import time
+from pathlib import Path
 
 import torch
 
@@ -24,6 +26,9 @@ from tests.pytest_policy import required_cuda_node_keys
 
 
 REQUIRED_CUDA_TEST_KEYS = required_cuda_node_keys()
+# Each run's JUnit report (record_property parity errors and kernel timings) is kept here (gitignored; audit
+# 2026-10-20 item 15).
+REPORT_DIR = Path(__file__).resolve().parent / ".verification" / "gpu_tests"
 
 
 def main() -> int:
@@ -34,11 +39,14 @@ def main() -> int:
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  torch {torch.__version__}\n")
 
     print("CUDA marker lane -- canonical CUDA-only and mirrored tests:")
+    report = REPORT_DIR / f"junit_cuda_{time.strftime('%Y%m%d_%H%M%S')}.xml"
     cuda_code, cuda_counts = run_pytest_junit(
-        ["-m", "cuda", "-v", "-p", "no:cacheprovider"],
+        ["-m", "cuda", "-v", "-s", "-p", "no:cacheprovider"],
         prefix="vfe3-gpu-cuda-",
         required_node_keys=REQUIRED_CUDA_TEST_KEYS,
+        keep_report=report,
     )
+    print(f"JUnit report with the recorded parity errors and timings kept at {report}")
     cuda_ok = cuda_code == 0 and junit_is_exact_all_pass(
         cuda_counts,
         expected_tests=cuda_counts["collected"],

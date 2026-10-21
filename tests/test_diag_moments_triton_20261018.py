@@ -16,7 +16,8 @@ On the diagonal comparison route :func:`vfe3.relational_scoring.projected_moment
   comparison route has the torch route's loss and parameter gradients;
 * the kernels compile offline for the RTX 5090 target (sm_120) with zero register-spill bytes at d = 4 to 64;
 * on CUDA (``CUDA_TESTS``) the fused route matches a float64 CPU torch route on a live-shaped layer and on the tiny
-  live profile moved onto the diagonal comparison route, and is bitwise reproducible.
+  live profile moved onto the diagonal comparison route, and is bitwise reproducible; at the reference layer shape
+  (K = 160, H = 5, 32 x 128 tokens) it matches as well and the forward plus backward time of both kernels is recorded.
 
 The interpreter and compile checks run in subprocesses, so the test process never imports triton.
 """
@@ -428,3 +429,70 @@ def test_cuda_live_route_with_fused_moments_matches_a_float64_cpu_copy(record_pr
     abs_err = {name: float((g32[name].double() - g64[name].double()).norm()) for name in g64}
     assert {name: (value, floor[name], abs_err[name]) for name, value in grad_rel.items()
             if value > floor[name] and float(g64[name].norm()) > 0.0 and abs_err[name] > 1e-5 * total} == {}
+
+
+def _timed_fused_step(leaves: Tuple[torch.Tensor, ...], H: int, kernel: str, wa: torch.Tensor, wg: torch.Tensor,
+                      repeats: int) -> float:
+    r"""Mean CUDA milliseconds of one forward and backward of :func:`projected_moments` under ``kernel``."""
+    mu, sigma, inverse, S = leaves
+    K = mu.shape[-1]
+
+    def step() -> None:
+        mu_h = mu.unsqueeze(-2).expand(*mu.shape[:-1], H, K)
+        sigma_h = sigma.unsqueeze(-2).expand(*sigma.shape[:-1], H, K)
+        a, g = rs.projected_moments(mu_h, sigma_h, inverse, S, diagonal_only=True)
+        torch.autograd.grad((a * wa).sum() + (g * wg).sum(), leaves)
+
+    previous = rs.set_diagonal_moments_kernel(kernel)
+    try:
+        for _ in range(3):
+            step()
+        torch.cuda.synchronize()
+        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(repeats):
+            step()
+        stop.record()
+        torch.cuda.synchronize()
+    finally:
+        rs.set_diagonal_moments_kernel(previous)
+    return start.elapsed_time(stop) / repeats
+
+
+@requires_cuda
+def test_cuda_fused_moments_parity_and_timing_at_the_reference_shape(record_property: Any) -> None:
+    r"""The reference layer shape (K = 160 as M = H = 5 blocks of d = r = 32, both roles, 32 x 128 tokens; audit
+    2026-10-20 item 15): the fused float32 moments and the hand-written backward's gradients with respect to the mean,
+    the variance, the inverse frame and the comparison maps are as close to the float64 CPU torch route as the
+    float32 CUDA torch route is, and the forward plus backward time of each kernel is printed and recorded in the
+    JUnit report that ``check_gpu_tests.py`` keeps. No speed is asserted."""
+    pytest.importorskip("triton")
+    B, N, H, M, d, r = 32, 128, 5, 5, 32, 32
+    ops64 = _operands(B, N, H, M, d, r, 2, seed=3)
+    ref_v, ref_g = _moments(*ops64, H=H, kernel="torch")
+    ops32 = tuple(x.float().cuda() for x in ops64)
+    rs.reset_diagonal_moments_triton_calls()
+    v_t, g_t = _moments(*ops32, H=H, kernel="torch")
+    v_k, g_k = _moments(*ops32, H=H, kernel="triton")
+    assert rs.diagonal_moments_triton_calls() == 1
+    errs = {"moments": (_rel(v_t, ref_v), _rel(v_k, ref_v)),
+            **{n: (_rel(g_t[n], ref_g[n]), _rel(g_k[n], ref_g[n])) for n in ref_g}}
+    record_property("cuda_reference_shape_rel_vs_fp64_torch_triton", json.dumps(errs))
+    for name, (torch_err, triton_err) in errs.items():
+        assert triton_err <= 4.0 * torch_err + 1e-6, (name, errs)
+
+    leaves = tuple(x.detach().clone().requires_grad_() for x in ops32)
+    K = M * d
+    with torch.no_grad():
+        a, g = rs.projected_moments(leaves[0].unsqueeze(-2).expand(B, N, H, K),
+                                    leaves[1].unsqueeze(-2).expand(B, N, H, K), leaves[2], leaves[3],
+                                    diagonal_only=True)
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    wa = torch.randn(a.shape, generator=gen, device="cuda")
+    wg = torch.randn(g.shape, generator=gen, device="cuda")
+    timing = {kernel: _timed_fused_step(leaves, H, kernel, wa, wg, repeats=20) for kernel in ("torch", "triton")}
+    timing["speedup"] = timing["torch"] / timing["triton"]
+    record_property("cuda_reference_shape_fwd_bwd_ms", json.dumps(timing))
+    print(f"\ndiagonal moments forward+backward at B={B} N={N} H={H} K={K} r={r}: torch {timing['torch']:.3f} ms, "
+          f"triton {timing['triton']:.3f} ms, speedup {timing['speedup']:.2f}x")
+    assert all(value > 0.0 for value in timing.values())

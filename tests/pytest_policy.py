@@ -32,6 +32,9 @@ CUDA_TESTS: frozenset[str] = frozenset({
     # a live-shaped layer and on the tiny live profile moved onto the diagonal comparison route (audit 2026-10-17 item 20).
     'test_diag_moments_triton_20261018.py::test_cuda_fused_moments_match_float64_like_the_torch_route',
     'test_diag_moments_triton_20261018.py::test_cuda_live_route_with_fused_moments_matches_a_float64_cpu_copy',
+    # The same at the reference layer shape (K = 160, H = 5, 32 x 128 tokens) with a forward plus backward timing of
+    # both kernels (audit 2026-10-20 item 15).
+    'test_diag_moments_triton_20261018.py::test_cuda_fused_moments_parity_and_timing_at_the_reference_shape',
     # Selected by no runner before audit 2026-10-20 item 22: the frame exponential's host-sync count and the fused
     # decode bias gradient under 'high' precision.
     'test_sync_free_matrix_exp_20261012.py::test_cuda_frame_exponential_has_no_host_sync',
