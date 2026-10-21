@@ -305,6 +305,7 @@ config = dict(
     
     m_phi_sparse_rows                = False,          # False (dense AdamW) | True (row-lazy AdamW on phi_embed: rows absent from the step take no moment update, step or decay; per-row bias correction; adamw only)
     phi_mstep_max_matrix_norm        = None,           # None (off) | float in (0, transport_chart_max_norm): interior radius for phi after each M-step (adamw projects rows back; pullback_group rejects the step)
+    
     m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
     m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight lambda (under "rotation" it also damps Fisher-visible rotations)
     m_phi_fisher_completion          = "rotation",  # fisher_group only: "rotation" (lambda on every rotation) | "stabilizer" (lambda on the belief's stabilizer only: the belief-Fisher natural gradient on the visible subspace; not with pos_phi="learned")
@@ -319,9 +320,9 @@ config = dict(
     #        Learning Rates
     #################################
 
-    m_p_mu_lr                        = 0.025,     #0.025
+    m_p_mu_lr                        = 0.005,     #0.025
     m_p_sigma_lr                     = 0.001,       
-    m_phi_lr                         = 0.003,     #0.003
+    m_phi_lr                         = 0.001,     #0.003
     
     
     #################################
@@ -349,46 +350,46 @@ config = dict(
     sigma_weight_decay               = 0,      
     mu_weight_decay                  = 0,       
 
-    decode_mu_weight_decay           = 0,   # decode-side means only (untied decode bank / linear readout); None = mu_weight_decay; try ~1e-3 to bound rare-type rows
+    decode_mu_weight_decay           = 0,      # decode-side means only (untied decode bank / linear readout); None = mu_weight_decay; try ~1e-3 to bound rare-type rows
     relational_score_weight_decay    = 0.0,    # float >= 0: decoupled AdamW decay of the query/key comparison maps only (raw_score_q, raw_score_k); 0 = undecayed, as before
 
     #################################
     #   Numerics/Speed
     #################################
-    weight_ema_decay                 = None,        # None (off) | float in (0, 1): EMA of the trainable weights, scored at every eval and at the end
-    weight_ema_start_frac            = 0.5,         # float in [0, 1]: the EMA starts at this fraction of max_steps
-    weight_ema_update_interval       = 1,           # int >= 1: accepted updates between EMA updates (decay d^k per update)
-    weight_ema_device                = "same",      # "same" (shadow on the parameters' device) | "cpu" (host memory; pair with interval > 1)
+    weight_ema_decay                 = None,         # None (off) | float in (0, 1): EMA of the trainable weights, scored at every eval and at the end
+    weight_ema_start_frac            = 0.5,          # float in [0, 1]: the EMA starts at this fraction of max_steps
+    weight_ema_update_interval       = 1,            # int >= 1: accepted updates between EMA updates (decay d^k per update)
+    weight_ema_device                = "same",       # "same" (shadow on the parameters' device) | "cpu" (host memory; pair with interval > 1)
     
-    amp_dtype                        = None,     # None (fp32) | "bf16" | "fp16". 
+    amp_dtype                        = None,         # None (fp32) | "bf16" | "fp16". 
     
     grad_clip_scope                  = "group",      # "role" | "group" (one L2 clip per optimizer role, or per optimizer group)
-    fp32_matmul_precision            = "high",  # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
-    relational_diag_moments_kernel   = "triton",    # "torch" | "triton": diagonal comparison route (comparison_invariant) on CUDA: fused Triton diag(G) kernels, no materialized source root    
-    decode_ce_checkpoint             = "auto",    # "auto" | "auto_aggregate" (saves memory with recompute)        
+    fp32_matmul_precision            = "high",       # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
+    relational_diag_moments_kernel   = "triton",     # "torch" | "triton": diagonal comparison route (comparison_invariant) on CUDA: fused Triton diag(G) kernels, no materialized source root    
+    decode_ce_checkpoint             = "auto",       # "auto" | "auto_aggregate" (saves memory with recompute)        
     decode_av_precision              = "fp32",   
-    projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" 
+    projected_factorization          = "gram",       # "gram" | "gram_certified" | "cholesky_qr2_certified" 
     
     routing_kl_max_reference         = "query_shifted",  # "absolute" | "row_min" | "query_shifted" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, or D_ij less its query-only row constant)
-    predictive_covariance_floor_mode = "max",     # "prior" | "relative" | "max" (the larger of the two)
+    predictive_covariance_floor_mode = "max",            # "prior" | "relative" | "max" (the larger of the two)
     
-    pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128) 
-    relational_tile_mib              = 512,         # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
-    phi_frame_condition_max          = None,      # None (off) | kappa_max > 1, e.g. 20 or 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
+    pair_kl_gemm_tol                 = None,         # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128) 
+    relational_tile_mib              = 512,          # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
+    phi_frame_condition_max          = None,         # None (off) | kappa_max > 1, e.g. 20 or 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
     
-    frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
+    frame_pair_escalation_tol        = None,         # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     decode_ranking_fp64_escalation   = False, 
-    decode_logits_amp                = True,      # True | False: linear decode with amp_dtype set only: logits matmul under amp_dtype (CE stays fp32)
-    decode_ce_triton                 = True,      # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)
+    decode_logits_amp                = True,         # True | False: linear decode with amp_dtype set only: logits matmul under amp_dtype (CE stays fp32)
+    decode_ce_triton                 = True,         # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)
     
-    predictive_covariance_spread_squares  = False,  # True | False: moment_matched kernel readout: routed spread as a nonnegative sum of squares after the sandwich (no edge links)
-    predictive_covariance_symmetric_pairs = False, # True | False: moment_matched kernel readout, blockwise body: head pairs h <= g only, off-diagonal pairs doubled (no edge links)
+    predictive_covariance_spread_squares  = False,   # True | False: moment_matched kernel readout: routed spread as a nonnegative sum of squares after the sandwich (no edge links)
+    predictive_covariance_symmetric_pairs = False,   # True | False: moment_matched kernel readout, blockwise body: head pairs h <= g only, off-diagonal pairs doubled (no edge links)
    
-    diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
-    diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
+    diagnose_canonical_free_energy        = False,   # log the canonical free energy (gauge-KL routing) at the captured beliefs
+    diagnose_agent_elbo                   = False,   # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
    
-    deterministic                    = False,
-    generate_embedding_figures       = False,
+    deterministic                         = False,
+    generate_embedding_figures            = False,
     
     predictive_covariance_checkpoint      = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
     predictive_covariance_fp64_escalation = False,       # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
