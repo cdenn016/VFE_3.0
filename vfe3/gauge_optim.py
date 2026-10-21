@@ -14,6 +14,7 @@ The ``fisher_group`` policy uses the same staging with the belief-Fisher natural
 import functools
 import math
 import warnings
+import weakref
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
@@ -46,6 +47,7 @@ from vfe3.geometry.phi_preconditioner import (
     uspace_chart_velocity,
     uspace_pullback_body_direction,
 )
+from vfe3.runtime import ieee_fp32_matmul
 
 
 _PHI_PROJECTION_TEMPORARY_BYTES = 64 * 1024 * 1024
@@ -1240,7 +1242,14 @@ def project_phi_parameter_rows_(
 # not closed under the symmetric projection, so the bound refuses them.
 FRAME_CONDITION_GROUPS:       Tuple[str, ...] = ("block_glk", "block_glmc", "block_sl")
 FRAME_CONDITION_INERT_GROUPS: Tuple[str, ...] = ("block_so", "block_co", "so_n", "su_n")
-_SPREAD_BISECTION_STEPS = 64
+# The frame bound's transient budget: about six (H, d, d) stacks at the working dtype per screened row and sixteen per
+# certified or decomposed row, so at four heads of d = 32 in float32 a chunk is 2730 screened or 1024 decomposed rows.
+_FRAME_BOUND_TEMPORARY_BYTES = 256 * 1024 * 1024
+# Per model and table ("token", "positional"): the (rows, H) spectrum midpoints from each row's last eigendecomposition,
+# the centers of the Cholesky window certificate. A hint only: the certificate is sound for any center, so a missing,
+# stale or reset entry costs eigendecompositions and never changes a result.
+_FRAME_WINDOW_CENTERS: 'weakref.WeakKeyDictionary[torch.nn.Module, Dict[str, torch.Tensor]]' = \
+    weakref.WeakKeyDictionary()
 
 
 def _bounded_traceless_spectrum(
@@ -1252,33 +1261,39 @@ def _bounded_traceless_spectrum(
     Returns :math:`x_i = \operatorname{clamp}(\lambda_i, t - c, t + c) - \bar{x}`, where :math:`t` solves
     :math:`g(t) = \sum_i \operatorname{clamp}(\lambda_i, t - c, t + c) = 0`. The function :math:`g` is continuous
     and nondecreasing, :math:`g(\lambda_{\min} + c) \le \sum_i\lambda_i = 0 \le g(\lambda_{\max} - c)`, so a root
-    lies in that bracket whenever the spread exceeds :math:`2c`; it is found by bisection. The final centering only
-    removes the bisection residual and leaves the spread unchanged. The result is the Euclidean projection of
-    :math:`\lambda` onto :math:`\{x : \max_i x_i - \min_i x_i \le 2c\}`: for a fixed window
+    lies in that bracket whenever the spread exceeds :math:`2c`. It is also piecewise linear with breakpoints
+    :math:`\lambda_j \pm c`, so :math:`g` is evaluated at all :math:`2d` of them; no breakpoint lies strictly between
+    the largest one with :math:`g \le 0` and the smallest one with :math:`g \ge 0`, and linear interpolation between
+    the two is the exact root, in a fixed number of operations (it replaced a 64-step bisection, 2026-10-21). The
+    final centering only removes the rounding residual and leaves the spread unchanged. The result is the Euclidean
+    projection of :math:`\lambda` onto :math:`\{x : \max_i x_i - \min_i x_i \le 2c\}`: for a fixed window
     :math:`[a, a + 2c]` the nearest point is the clamp, and stationarity in :math:`a` is
     :math:`\sum_i (\operatorname{clamp}_i - \lambda_i) = 0`, which is :math:`g(t) = 0` for a zero-sum input.
     A spectrum whose spread is already at most :math:`2c` is not meaningful input here: the caller masks
     those blocks out.
     """
-    lo = lam[..., :1] + c                                                  # (..., 1)
-    hi = lam[..., -1:] - c                                                 # (..., 1)
-    for _ in range(_SPREAD_BISECTION_STEPS):
-        t = 0.5 * (lo + hi)
-        below = torch.clamp(lam, t - c, t + c).sum(-1, keepdim=True) < 0.0
-        lo = torch.where(below, t, lo)
-        hi = torch.where(below, hi, t)
-    t = 0.5 * (lo + hi)
+    c = torch.as_tensor(c, dtype=lam.dtype, device=lam.device)
+    b = torch.cat((lam - c, lam + c), dim=-1)                                  # (..., 2d) breakpoints of g
+    g = torch.clamp(lam[..., None, :], (b - c)[..., None], (b + c)[..., None]).sum(-1)   # (..., 2d) g(b_k)
+    below, above = g <= 0.0, g >= 0.0
+    b_lo = torch.where(below, b, -math.inf).amax(-1, keepdim=True)            # (..., 1)
+    g_lo = torch.where(below, g, -math.inf).amax(-1, keepdim=True)
+    b_hi = torch.where(above, b, math.inf).amin(-1, keepdim=True)             # (..., 1)
+    g_hi = torch.where(above, g, math.inf).amin(-1, keepdim=True)
+    rise = g_hi - g_lo
+    t = torch.where(rise > 0.0, b_lo - g_lo * (b_hi - b_lo) / rise, b_lo)
     x = torch.clamp(lam, t - c, t + c)
     return x - x.mean(-1, keepdim=True)
 
 
 @torch.no_grad()
+@ieee_fp32_matmul()
 def bound_phi_frame_condition_(
     model:     torch.nn.Module,
     kappa_max: float,
 
     *,
-    temporary_bytes: int                    = _PHI_PROJECTION_TEMPORARY_BYTES,
+    temporary_bytes: int                    = _FRAME_BOUND_TEMPORARY_BYTES,
     count_out:       Optional[torch.Tensor] = None,   # (2,) int64 on the generator device, or None
     check_budget:    bool                   = False,
 ) -> torch.Tensor:                 # () int64 on the generator device: rows changed (no host read)
@@ -1337,13 +1352,21 @@ def bound_phi_frame_condition_(
     ``count_out`` (S1 panel D counters): when given, the rows this call changed are added to ``count_out[0]``
     and the rows it checked (token and learned positional rows) to ``count_out[1]``, on the device.
 
-    Cost: a row is decomposed only if a head block fails the exact screen
-    :math:`\sqrt2\lVert S_0\rVert_F \le 2c` (:math:`\lambda_{\max} - \lambda_{\min} \le \sqrt2\lVert S_0\rVert_F` for a
-    traceless spectrum), which runs in float32 with no eigensolver; rows passing it are within the bound and are
-    not touched. The flagged rows are gathered (one host read per table) and decomposed in float32 with a
-    residual and orthogonality certificate, and rows with an uncertified block are recomputed in float64
-    (:func:`_frame_bound_rows`); a float64 table is decomposed in float64. Results are cast back to the table dtype.
-    The positional spread is computed on the device with no host read.
+    Cost (reworked 2026-10-21): a row is decomposed only if a head block fails two certificates of the bound. The first
+    is the exact screen :math:`\sqrt2\lVert S_0\rVert_F \le 2c` (:math:`\lambda_{\max} - \lambda_{\min} \le
+    \sqrt2\lVert S_0\rVert_F` for a traceless spectrum), run over every row in float32 with no factorization. It is
+    loose by up to :math:`\sqrt{d/2}` (a spectrum split between :math:`\pm c` has spread :math:`2c` and
+    :math:`\lVert S_0\rVert_F = c\sqrt d`), so the rows it flags are gathered and given :func:`_window_certified`,
+    two Cholesky factorizations that prove every eigenvalue lies in :math:`[t - c, t + c]`, with :math:`t` the spectrum
+    midpoint cached from the row's last eigendecomposition (zero before it has one). That certificate holds for any
+    :math:`t`, so the cache decides only how often it passes, never a result: a row inside the bound reaches the
+    eigensolver once, and again only after it drifts out of its window. The remaining rows are decomposed in float32
+    with a residual and orthogonality certificate under IEEE fp32 matmuls, whatever the process policy (TF32 rounding
+    fails that certificate almost always), and rows with an uncertified block are recomputed in float64
+    (:func:`_frame_bound_rows`) after all chunks; a float64 table is decomposed in float64. Results are cast back to the
+    table dtype. A table costs at most three host reads (the screened rows, the uncertified rows, the uncertified
+    float32 blocks) whatever its chunk count, plus the convergence check inside each ``torch.linalg.eigh`` call. The
+    positional spread is computed on the device with no host read.
     """
     if isinstance(kappa_max, bool) or not math.isfinite(kappa_max) or kappa_max <= 1.0:
         raise ValueError(f"kappa_max must be a finite real > 1, got {kappa_max!r}")
@@ -1380,41 +1403,69 @@ def bound_phi_frame_condition_(
                 "diagonal Frobenius Gram")
         basis = basis.detach().to(torch.float64)
         gram = basis.square().sum(dim=(1, 2, 3))                               # (n_gen,)
-    # Roughly six float64 (H, d, d) temporaries per row (X, S_0, Q, the update and two products).
-    rows_per_chunk = max(1, temporary_bytes // (6 * 8 * H * d * d))
+    centers_by_table = _FRAME_WINDOW_CENTERS.setdefault(model, {})
     checked = 0
 
-    def bound_table_(table: torch.Tensor, c: torch.Tensor) -> None:            # c: (H,) half-widths
+    def bound_table_(table: torch.Tensor, c: torch.Tensor, key: str) -> None:   # c: (H,) float64 half-widths
         nonlocal checked
         rows = table.reshape(-1, table.shape[-1])
         if rows.shape[-1] != group.generator_shape[0]:
             raise ValueError(
                 "the frame condition bound requires full generator coordinates; got table width "
                 f"{rows.shape[-1]} and {group.generator_shape[0]} generators")
+        checked += rows.shape[0]
+        work = torch.float64 if rows.dtype == torch.float64 else torch.float32
+        block_bytes = H * d * d * torch.finfo(work).bits // 8                 # one (H, d, d) stack at the work dtype
+        screen_rows = max(1, temporary_bytes // (6 * block_bytes))
+        solve_rows = max(1, temporary_bytes // (16 * block_bytes))
         # A traceless spectrum has lambda_max - lambda_min <= sqrt(2) ||S_0||_F, so a row whose every head block
         # has 2 ||S_0||_F^2 <= (2c)^2 is within the bound and needs no eigensolver. The margin flags a row on the
         # boundary rather than letting float32 rounding pass it.
         screen = (0.5 * (2.0 * c) ** 2 * (1.0 - 1e-4)).to(torch.float32)      # (H,)
         flagged = []
-        for start in range(0, rows.shape[0], rows_per_chunk):
-            S0 = _traceless_symmetric_blocks(rows[start : start + rows_per_chunk], basis, H, d, torch.float32)
+        for start in range(0, rows.shape[0], screen_rows):
+            S0 = _traceless_symmetric_blocks(rows[start : start + screen_rows], basis, H, d, torch.float32)
             flagged.append((S0.square().sum(dim=(-2, -1)) > screen).any(-1))     # (r,)
-        index = torch.cat(flagged).nonzero().squeeze(-1)                      # the one host read per table
-        work = torch.float64 if rows.dtype == torch.float64 else torch.float32
-        for start in range(0, index.numel(), rows_per_chunk):
-            idx = index[start : start + rows_per_chunk]
+        index = torch.cat(flagged).nonzero().squeeze(-1)                      # host read 1: the flagged rows
+        if index.numel() == 0:
+            return
+        centers = centers_by_table.get(key)
+        if (centers is None or tuple(centers.shape) != (rows.shape[0], H) or centers.dtype != work
+                or centers.device != rows.device):
+            centers = centers_by_table[key] = torch.zeros(rows.shape[0], H, dtype=work, device=rows.device)
+        c_work = c.to(work)
+        uncertified = []
+        for start in range(0, index.numel(), solve_rows):
+            idx = index[start : start + solve_rows]
+            S0 = _traceless_symmetric_blocks(rows.index_select(0, idx), basis, H, d, work)
+            uncertified.append(~_window_certified(S0, centers.index_select(0, idx), c_work).all(-1))   # (r,)
+        index = index[torch.cat(uncertified).nonzero().squeeze(-1)]           # host read 2: rows to decompose
+        failed = []
+        for start in range(0, index.numel(), solve_rows):
+            idx = index[start : start + solve_rows]
             phi = rows.index_select(0, idx)                                    # (r, n_gen)
-            new, over, failed = _frame_bound_rows(phi, basis, gram, H, d, c, work, store_dtype=rows.dtype)
-            if bool(failed.any()):                                            # uncertified float32 eigh: redo in float64
-                new64, over64, _ = _frame_bound_rows(phi[failed], basis, gram, H, d, c, torch.float64,
-                                                     store_dtype=rows.dtype)
-                new[failed], over[failed] = new64.to(new.dtype), over64
+            new, over, fail, mid = _frame_bound_rows(phi, basis, gram, H, d, c, work, store_dtype=rows.dtype,
+                                                     return_centers=True)
+            take = over & ~fail                                                # an uncertified row waits for float64
+            rows.index_copy_(0, idx, torch.where(take[:, None], new.to(rows.dtype), phi))
+            centers.index_copy_(0, idx, torch.where(fail[:, None], centers.index_select(0, idx), mid))
+            changed.add_(take.sum())
+            failed.append(fail)
+        if not failed or work == torch.float64:
+            return
+        retry = index[torch.cat(failed).nonzero().squeeze(-1)]                # host read 3: uncertified float32 rows
+        retry_rows = max(1, solve_rows // 2)
+        for start in range(0, retry.numel(), retry_rows):
+            idx = retry[start : start + retry_rows]
+            phi = rows.index_select(0, idx)
+            new, over, _, mid = _frame_bound_rows(phi, basis, gram, H, d, c, torch.float64, store_dtype=rows.dtype,
+                                                  return_centers=True)
             rows.index_copy_(0, idx, torch.where(over[:, None], new.to(rows.dtype), phi))
+            centers.index_copy_(0, idx, mid.to(work))
             changed.add_(over.sum())
-        checked += rows.shape[0]
 
     if pos_table is not None:                   # the learned positional rows to their even share
-        bound_table_(pos_table, torch.full((H,), L / 4.0, dtype=torch.float64, device=device))
+        bound_table_(pos_table, torch.full((H,), L / 4.0, dtype=torch.float64, device=device), "positional")
     positional_spread = _positional_spread(model, basis, H, d)                 # (H,) float64, or None
     if positional_spread is not None and check_budget and bool((positional_spread >= L).any()):
         raise ValueError(
@@ -1425,7 +1476,7 @@ def bound_phi_frame_condition_(
     if token_table is not None:                 # the token factor receives the remainder
         c_token = (torch.full((H,), L / 2.0, dtype=torch.float64, device=device) if positional_spread is None
                    else (0.5 * (L - positional_spread)).clamp_min(0.0))
-        bound_table_(token_table, c_token)
+        bound_table_(token_table, c_token, "token")
     if count_out is not None:
         count_out[0].add_(changed)
         count_out[1].add_(checked)
@@ -1493,6 +1544,45 @@ def _symmetric_part(X: torch.Tensor) -> torch.Tensor:
     return 0.5 * (X + X.transpose(-1, -2))
 
 
+def _window_certified(
+    S0: torch.Tensor,                       # (r, H, d, d) symmetric head blocks
+    t:  torch.Tensor,                       # (r, H) window centers
+    c:  torch.Tensor,                       # (H,) or (r, H) half-widths
+) -> torch.Tensor:                          # (r, H) bool: every eigenvalue proven to lie in [t - c, t + c]
+    r"""Certify :math:`(t - c)I \preceq S_0 \preceq (t + c)I` with two Cholesky factorizations and no eigensolver.
+
+    The factorizations are of :math:`A_+ = (t + c - \delta)I - S_0` and :math:`A_- = S_0 - (t - c + \delta)I`. When the
+    floating-point Cholesky factorization of a symmetric :math:`\hat A` runs to completion, the computed factor satisfies
+    :math:`\hat R^\top\hat R = \hat A + \Delta A` with :math:`|\Delta A| \le \gamma_{d+1}|\hat R^\top||\hat R|`
+    (Higham 2002, Theorem 10.3), so :math:`\lVert\Delta A\rVert_2 \le \gamma_{d+1}\lVert\hat R\rVert_F^2 \le
+    \tfrac{\gamma_{d+1}}{1 - \gamma_{d+1}}\operatorname{tr}\hat A` and :math:`\lambda_{\min}(\hat A) \ge
+    -\tfrac{\gamma_{d+1}}{1 - \gamma_{d+1}}\operatorname{tr}\hat A` (Rump 2006). The shift
+    :math:`\delta = 4\gamma_{d+1}\big(d(|t| + c) + \sum_i |s_{ii}|\big) + 6u\big(|t| + c + \max_i |s_{ii}|\big)`
+    covers that term with a factor four, the roundings in forming the diagonal of :math:`\hat A` and in storing
+    :math:`c` at the working precision (:math:`u` the unit roundoff, :math:`\gamma_k = ku/(1 - ku)`), and a term in
+    the smallest normal number for underflow; the off-diagonal entries are negated exactly. Two completed
+    factorizations therefore prove :math:`\lambda_{\max}(S_0) \le t + c` and :math:`\lambda_{\min}(S_0) \ge t - c`,
+    hence spread at most :math:`2c`, for any :math:`t`: the center decides only how often the test passes. The
+    input is the computed :math:`S_0`, the matrix the eigensolver route decides on too, and the factorization is
+    assumed to run in IEEE arithmetic (LAPACK on the CPU, cuSOLVER on CUDA).
+    """
+    d = S0.shape[-1]
+    finfo = torch.finfo(S0.dtype)
+    u = finfo.eps / 2.0
+    gamma = (d + 1) * u / (1.0 - (d + 1) * u)
+    diag = S0.diagonal(dim1=-2, dim2=-1).abs()                                 # (r, H, d)
+    reach = t.abs() + c                                                        # (r, H)
+    delta = (4.0 * gamma * (d * reach + diag.sum(-1)) + 6.0 * u * (reach + diag.amax(-1))
+             + 8.0 * d * (d + 2) * finfo.tiny)                                 # (r, H)
+    eye = torch.eye(d, dtype=S0.dtype, device=S0.device)
+    upper = (t + c - delta)[..., None, None] * eye - S0                        # (r, H, d, d) A_+
+    lower = S0 - (t - c + delta)[..., None, None] * eye                        # (r, H, d, d) A_-
+    factor, info = torch.linalg.cholesky_ex(torch.stack((upper, lower)))       # (2, r, H, d, d), (2, r, H)
+    pivots = factor.diagonal(dim1=-2, dim2=-1)                                 # (2, r, H, d)
+    return ((info == 0) & (pivots > 0.0).all(-1)).all(0)
+
+
+@ieee_fp32_matmul()
 def _frame_bound_rows(
     phi:   torch.Tensor,                    # (r, n_gen) flagged rows
     basis: Optional[torch.Tensor],          # (n_gen, H, d, d) float64, or None for row-major blocks
@@ -1503,16 +1593,20 @@ def _frame_bound_rows(
     dtype: torch.dtype,                     # float32 (certified) or float64
 
     *,
-    store_dtype: Optional[torch.dtype] = None,   # the table dtype the result is stored in (default: dtype)
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # projected rows (r, n_gen), over (r,), failed (r,)
+    store_dtype:    Optional[torch.dtype] = None,   # the table dtype the result is stored in (default: dtype)
+    return_centers: bool                  = False,  # also return the (r, H) midpoints of the bounded spectra
+) -> Tuple[torch.Tensor, ...]:              # projected rows (r, n_gen), over (r,), failed (r,)[, centers (r, H)]
     r"""The spread projection of :func:`bound_phi_frame_condition_` on ``rows`` at ``dtype``.
 
     In float32 the eigendecomposition :math:`S_0 = Q\Lambda Q^\top` of each head block is certified by
     :math:`\lVert S_0Q - Q\Lambda\rVert_F \le \tau\lVert S_0\rVert_F`, :math:`\lVert Q^\top Q - I\rVert_F \le \tau` and
     finiteness, :math:`\tau = 64\,d\,\varepsilon_{32}`; ``failed`` marks the rows with an uncertified block, which the
-    caller recomputes in float64. A block over the budget :math:`2c` is projected to spread :math:`2c - m`, with the
-    storage margin :math:`m = 8\,d\,\varepsilon\,(\lVert X\rVert_F + 2c)` of ``store_dtype``. The update
-    :math:`S_0' - S_0` is symmetrized, so the skew part of :math:`X` is unchanged exactly and its trace to rounding.
+    caller recomputes in float64. The certificate products run under IEEE fp32 whatever the process matmul policy:
+    TF32 inputs round to :math:`2^{-11}`, above :math:`\tau` at :math:`d = 32`. A block over the budget :math:`2c` is
+    projected to spread :math:`2c - m`, with the storage margin :math:`m = 8\,d\,\varepsilon\,(\lVert X\rVert_F + 2c)`
+    of ``store_dtype``. The update :math:`S_0' - S_0` is symmetrized, so the skew part of :math:`X` is unchanged exactly
+    and its trace to rounding. ``return_centers`` adds the midpoint of each bounded spectrum, the next center of
+    :func:`_window_certified`.
     """
     X = _head_blocks(phi, basis, H, d, dtype)                                 # (r, H, d, d)
     S = _symmetric_part(X)
@@ -1536,7 +1630,10 @@ def _frame_bound_rows(
     delta = 0.5 * (delta + delta.transpose(-1, -2))
     dphi = (delta.reshape(phi.shape[0], -1) if basis is None
             else torch.einsum("rhij,ahij->ra", delta, basis.to(dtype)) / gram.to(dtype))
-    return phi.to(dtype) + dphi, over.any(-1), failed
+    if not return_centers:
+        return phi.to(dtype) + dphi, over.any(-1), failed
+    bounded = lam + shift                                                     # (r, H, d) ascending
+    return phi.to(dtype) + dphi, over.any(-1), failed, 0.5 * (bounded[..., 0] + bounded[..., -1])
 
 
 def _fisher_diagnostics(accumulated: Dict[str, List[torch.Tensor]]) -> Dict[str, float]:
