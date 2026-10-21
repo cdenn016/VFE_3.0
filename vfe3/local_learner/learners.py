@@ -17,6 +17,9 @@ residual covariance. Averages follow :math:`s\leftarrow(1-\gamma_k)s+\gamma_k\ha
 :math:`\gamma_k=(k+1)^{-0.6}` (Cappe and Moulines 2009). No derivative of the filter is taken.
 
 Backprop arm. Adam on the forecast NLL of the same filter, autograd through it, truncated at ``chunk``.
+
+All statistics and parameters carry the leading run axis R of :class:`~vfe3.local_learner.core.Params`;
+runs never exchange information (Adam is elementwise and gradient clipping is per run).
 """
 
 from __future__ import annotations
@@ -33,21 +36,25 @@ from vfe3.local_learner.core import Params, Tensor, TreeSensor, assimilate, fore
 Logger = Callable[[dict], None]
 
 
+def _outer(x: Tensor, y: Tensor) -> Tensor:
+    return x.unsqueeze(-1) * y.unsqueeze(-2)
+
+
 @dataclass
 class Stats:
-    r"""Per-token averaged sufficient statistics."""
-    node_zz: Tensor    # (V-1, d+1, d+1) E[z~ z~^T] per node visit
-    node_uz: Tensor    # (V-1, d+1)      E[u z~]
-    zz: Tensor         # (d, d)  E[z_t z_t^T]
-    zp: Tensor         # (d, d)  E[z_t z_{t-1}^T]
-    pp: Tensor         # (d, d)  E[z_{t-1} z_{t-1}^T]
-    yp: Tensor         # (V, d)  sum over y_{t-1} = v of E[z_{t-1}]
-    yz: Tensor         # (V, d)  sum over y_{t-1} = v of E[z_t]
-    cnt: Tensor        # (V,)    frequency of y_{t-1} = v
+    r"""Per-token averaged sufficient statistics of R runs."""
+    node_zz: Tensor    # (R, V-1, d+1, d+1) E[z~ z~^T] per node visit
+    node_uz: Tensor    # (R, V-1, d+1)      E[u z~]
+    zz: Tensor         # (R, d, d)  E[z_t z_t^T]
+    zp: Tensor         # (R, d, d)  E[z_t z_{t-1}^T]
+    pp: Tensor         # (R, d, d)  E[z_{t-1} z_{t-1}^T]
+    yp: Tensor         # (R, V, d)  sum over y_{t-1} = v of E[z_{t-1}]
+    yz: Tensor         # (R, V, d)  sum over y_{t-1} = v of E[z_t]
+    cnt: Tensor        # (R, V)     frequency of y_{t-1} = v
 
     @staticmethod
-    def zeros(d: int, V: int, device: torch.device | str = "cpu") -> "Stats":
-        z = lambda *s: torch.zeros(*s, dtype=torch.float64, device=device)   # noqa: E731
+    def zeros(R: int, d: int, V: int, device: torch.device | str = "cpu") -> "Stats":
+        z = lambda *s: torch.zeros(R, *s, dtype=torch.float64, device=device)   # noqa: E731
         return Stats(z(V - 1, d + 1, d + 1), z(V - 1, d + 1), z(d, d), z(d, d), z(d, d), z(V, d), z(V, d), z(V))
 
     def scaled(self, c: float) -> "Stats":
@@ -60,15 +67,14 @@ class Stats:
 
 def node_moments(s: Tensor, m: Tensor, P: Tensor, Pa: Tensor, s2: Tensor, sig: Tensor, mu_u: Tensor,
                  kappa: Tensor, lam: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Truncated-utility moments (E[z], E[zz^T], E[u], E[uz]) at one node; batch (B,)."""
-    Eu = mu_u + s * sig * lam                                          # (B,)
+    r"""Truncated-utility moments (E[z], E[zz^T], E[u], E[uz]) at one node; any leading batch shape."""
+    Eu = mu_u + s * sig * lam
     Eu2 = s2 * (1.0 - lam * (lam + kappa)) + Eu ** 2
-    w = Pa / s2.unsqueeze(-1)                                          # (B, d)
+    w = Pa / s2.unsqueeze(-1)                                          # (..., d)
     c = m - w * mu_u.unsqueeze(-1)
-    outer = lambda x, y: x.unsqueeze(-1) * y.unsqueeze(-2)             # noqa: E731
     Ez = c + w * Eu.unsqueeze(-1)
-    Ezz = (P - s2[:, None, None] * outer(w, w) + outer(c, c)
-           + (outer(c, w) + outer(w, c)) * Eu[:, None, None] + outer(w, w) * Eu2[:, None, None])
+    Ezz = (P - s2[..., None, None] * _outer(w, w) + _outer(c, c)
+           + (_outer(c, w) + _outer(w, c)) * Eu[..., None, None] + _outer(w, w) * Eu2[..., None, None])
     Euz = c * Eu.unsqueeze(-1) + w * Eu2.unsqueeze(-1)
     return Ez, Ezz, Eu, Euz
 
@@ -79,17 +85,20 @@ class SensorCollector:
     def __init__(self, stats: Stats) -> None:
         self.st = stats
 
-    def __call__(self, n: Tensor, s: Tensor, m: Tensor, P: Tensor, Pa: Tensor, s2: Tensor, sig: Tensor,
-                 mu_u: Tensor, kappa: Tensor, lam: Tensor) -> None:
+    def __call__(self, rows: Tensor, n: Tensor, s: Tensor, m: Tensor, P: Tensor, Pa: Tensor, s2: Tensor,
+                 sig: Tensor, mu_u: Tensor, kappa: Tensor, lam: Tensor) -> None:
         Ez, Ezz, Eu, Euz = node_moments(s, m, P, Pa, s2, sig, mu_u, kappa, lam)
-        B, d = Ez.shape
-        blk = torch.empty(B, d + 1, d + 1, dtype=torch.float64, device=Ez.device)
-        blk[:, :d, :d] = Ezz
-        blk[:, :d, d] = Ez
-        blk[:, d, :d] = Ez
-        blk[:, d, d] = 1.0
-        self.st.node_zz.index_add_(0, n, blk)
-        self.st.node_uz.index_add_(0, n, torch.cat([Euz, Eu.unsqueeze(-1)], -1))
+        R, B, d = Ez.shape
+        nodes = self.st.node_uz.shape[1]
+        blk = torch.empty(R, B, d + 1, d + 1, dtype=torch.float64, device=Ez.device)
+        blk[..., :d, :d] = Ezz
+        blk[..., :d, d] = Ez
+        blk[..., d, :d] = Ez
+        blk[..., d, d] = 1.0
+        idx = (rows * nodes + n).reshape(-1)                           # (R*B,) flat (run, node)
+        self.st.node_zz.view(R * nodes, d + 1, d + 1).index_add_(0, idx, blk.reshape(R * B, d + 1, d + 1))
+        uz = torch.cat([Euz, Eu.unsqueeze(-1)], -1).reshape(R * B, d + 1)
+        self.st.node_uz.view(R * nodes, d + 1).index_add_(0, idx, uz)
 
 
 def accumulate_transition(st: Stats, G: Tensor, m_prev: Tensor, P_prev: Tensor, mf: list[Tensor],
@@ -98,77 +107,85 @@ def accumulate_transition(st: Stats, G: Tensor, m_prev: Tensor, P_prev: Tensor, 
 
     For pair (s-1, s): :math:`J=P_{s-1}G^\top(P_s^-)^{-1}`,
     :math:`\hat m_{s-1}=m_{s-1}+J(\hat m_s-m_s^-)`, :math:`\hat P_{s-1}=P_{s-1}+J(\hat P_s-P_s^-)J^\top`,
-    :math:`\operatorname{Cov}(z_s,z_{s-1})=\hat P_sJ^\top`.
+    :math:`\operatorname{Cov}(z_s,z_{s-1})=\hat P_sJ^\top`. States are (R, B, ...); G is (R, d, d).
     """
-    outer = lambda x, y: x.unsqueeze(-1) * y.unsqueeze(-2)             # noqa: E731
+    R, V, d = st.yp.shape
+    rows = torch.arange(R, device=G.device)[:, None]
+    Gb = G.unsqueeze(1)                                                # (R, 1, d, d)
     ms, Ps = mf[-1], Pf[-1]
     for s in reversed(range(len(mf))):
         mp, Pp = (mf[s - 1], Pf[s - 1]) if s > 0 else (m_prev, P_prev)
         L, _ = torch.linalg.cholesky_ex(Pm[s])                         # no host sync; Pm >= Q is SPD
-        J = torch.cholesky_solve(G @ Pp, L).transpose(-1, -2)          # (B, d, d) P_{s-1} G^T (P_s^-)^{-1}
+        J = torch.cholesky_solve(Gb @ Pp, L).transpose(-1, -2)         # (R, B, d, d) P_{s-1} G^T (P_s^-)^{-1}
         ms_p = mp + (J @ (ms - mm[s]).unsqueeze(-1)).squeeze(-1)
         Ps_p = Pp + J @ (Ps - Pm[s]) @ J.transpose(-1, -2)
         C = Ps @ J.transpose(-1, -2)                                   # Cov(z_s, z_{s-1})
-        st.zz += (Ps + outer(ms, ms)).sum(0)
-        st.zp += (C + outer(ms, ms_p)).sum(0)
-        st.pp += (Ps_p + outer(ms_p, ms_p)).sum(0)
-        st.yp.index_add_(0, y_prev[s], ms_p)
-        st.yz.index_add_(0, y_prev[s], ms)
-        st.cnt.index_add_(0, y_prev[s], torch.ones_like(y_prev[s], dtype=torch.float64))
+        st.zz += (Ps + _outer(ms, ms)).sum(1)
+        st.zp += (C + _outer(ms, ms_p)).sum(1)
+        st.pp += (Ps_p + _outer(ms_p, ms_p)).sum(1)
+        idx = (rows * V + y_prev[s]).reshape(-1)                       # (R*B,) flat (run, token)
+        st.yp.view(R * V, d).index_add_(0, idx, ms_p.reshape(-1, d))
+        st.yz.view(R * V, d).index_add_(0, idx, ms.reshape(-1, d))
+        st.cnt.view(R * V).index_add_(0, idx, torch.ones(idx.shape[0], dtype=torch.float64, device=G.device))
         ms, Ps = ms_p, Ps_p
 
 
 def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transition: bool = True) -> Params:
     r"""Ridge least-squares solves for every node and for :math:`[G\ E^\top]`; Q from the residual moments."""
-    d, V = prm.d, prm.E.shape[0]
+    d, V, R = prm.d, prm.E.shape[1], prm.R
     dev = prm.G.device
     eye1 = torch.eye(d + 1, dtype=torch.float64, device=dev)
-    ab = torch.linalg.solve(st.node_zz + ridge * eye1, st.node_uz.unsqueeze(-1)).squeeze(-1)   # (V-1, d+1)
+    # Both systems are second-moment matrices plus a ridge, hence SPD: Cholesky on contiguous operands (a batched
+    # LU solve with a transposed right-hand side fails inside MKL's DLASWP on CPU at d+V = 264).
+    Ln = torch.linalg.cholesky(st.node_zz + ridge * eye1)
+    ab = torch.cholesky_solve(st.node_uz.unsqueeze(-1).contiguous(), Ln).squeeze(-1)   # (R, V-1, d+1)
     new = prm.clone()
-    new.A, new.b = ab[:, :d].contiguous(), ab[:, d].contiguous()
+    new.A, new.b = ab[..., :d].contiguous(), ab[..., d].contiguous()
     if not learn_transition:
         return new
-    Sxx = torch.zeros(d + V, d + V, dtype=torch.float64, device=dev)
-    Sxx[:d, :d], Sxx[:d, d:], Sxx[d:, :d] = st.pp, st.yp.T, st.yp
-    Sxx[d:, d:] = torch.diag(st.cnt)
-    Szx = torch.cat([st.zp, st.yz.T], 1)                               # (d, d+V)
-    W = torch.linalg.solve(Sxx + ridge * torch.eye(d + V, dtype=torch.float64, device=dev), Szx.T).T
-    new.G, new.E = W[:, :d].contiguous(), W[:, d:].T.contiguous()
-    Q = st.zz - W @ Szx.T
-    Q = 0.5 * (Q + Q.T)
+    Sxx = torch.zeros(R, d + V, d + V, dtype=torch.float64, device=dev)
+    Sxx[:, :d, :d], Sxx[:, :d, d:], Sxx[:, d:, :d] = st.pp, st.yp.transpose(-1, -2), st.yp
+    Sxx[:, d:, d:] = torch.diag_embed(st.cnt)
+    Szx = torch.cat([st.zp, st.yz.transpose(-1, -2)], -1)              # (R, d, d+V)
+    Lx = torch.linalg.cholesky(Sxx + ridge * torch.eye(d + V, dtype=torch.float64, device=dev))
+    W = torch.cholesky_solve(Szx.transpose(-1, -2).contiguous(), Lx).transpose(-1, -2)   # (R, d, d+V)
+    new.G, new.E = W[..., :d].contiguous(), W[..., d:].transpose(-1, -2).contiguous()
+    Q = st.zz - W @ Szx.transpose(-1, -2)
+    Q = 0.5 * (Q + Q.transpose(-1, -2))
     evals, evecs = torch.linalg.eigh(Q)
-    new.Q = (evecs * evals.clamp_min(q_floor)) @ evecs.T
+    new.Q = (evecs * evals.clamp_min(q_floor).unsqueeze(-2)) @ evecs.transpose(-1, -2)
     return new
 
 
 def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, window: int = 1,
                 blind: bool = False, ridge: float = 1e-6, q_floor: float = 1e-4,
                 log: Optional[Logger] = None) -> Params:
-    r"""Stepwise variational EM over token streams (B, L). ``blind`` uses the forecast in place of the
-    assimilated state in the transition statistics (the target-blind control; requires window = 1)."""
+    r"""Stepwise variational EM over token streams (B, L), for all runs of ``prm0`` at once. ``blind`` uses the
+    forecast in place of the assimilated state in the transition statistics (the target-blind control;
+    requires window = 1)."""
     if blind and window != 1:
         raise ValueError("the target-blind control is defined for window = 1")
     if chunk % window:
         raise ValueError("window must divide chunk")
     prm = prm0.clone()
-    d, V = prm.d, prm.E.shape[0]
+    d, V, R = prm.d, prm.E.shape[1], prm.R
     B, Ltot = streams.shape
     with torch.no_grad():
         m, P = start_state(streams[:, 0], prm, tree)
         running: Optional[Stats] = None
         dev = prm.G.device
         k, t0, ntok = 0, time.perf_counter(), 0
-        nll = torch.zeros((), dtype=torch.float64, device=dev)          # read on the host only when logging
+        nll = torch.zeros(R, dtype=torch.float64, device=dev)          # read on the host only when logging
         for c0 in range(1, Ltot, chunk):
             steps = range(c0, min(c0 + chunk, Ltot))
-            st = Stats.zeros(d, V, dev)
+            st = Stats.zeros(R, d, V, dev)
             hook = SensorCollector(st)
             mf, Pf, mm_l, Pm_l, yp_l = [], [], [], [], []
             m_block, P_block = m, P
             for i, t in enumerate(steps):
                 mm, Pm = forecast(m, P, streams[:, t - 1], prm)
                 m, P, logp = assimilate(mm, Pm, streams[:, t], prm, tree, collect=hook)
-                nll -= logp.sum()
+                nll -= logp.sum(-1)
                 ntok += B
                 post_m, post_P = (mm, Pm) if blind else (m, P)
                 mf.append(post_m); Pf.append(post_P); mm_l.append(mm); Pm_l.append(Pm); yp_l.append(streams[:, t - 1])
@@ -182,55 +199,60 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
             prm = m_step(running, prm, ridge, q_floor)
             k += 1
             if log is not None and (k % 20 == 0 or c0 + chunk >= Ltot):
-                log({"arm": "local", "chunk": k, "train_bits": float(nll) / ntok / math.log(2),
-                     "G_spectral": float(torch.linalg.matrix_norm(prm.G, 2)), "sec": time.perf_counter() - t0})
+                log({"arm": "local", "chunk": k, "train_bits": (nll / ntok / math.log(2)).tolist(),
+                     "G_spectral": torch.linalg.matrix_norm(prm.G, 2).tolist(), "sec": time.perf_counter() - t0})
                 nll, ntok = torch.zeros_like(nll), 0
     return prm
 
 
 def train_backprop(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, lr: float = 3e-3,
                    clip: float = 1.0, log: Optional[Logger] = None) -> Params:
-    r"""Adam on the filter's forecast NLL, backpropagated through the filter (truncated at ``chunk``)."""
-    d = prm0.d
+    r"""Adam on the filter's forecast NLL, backpropagated through the filter (truncated at ``chunk``), for all
+    runs at once: the loss is the sum of the runs' mean NLLs and each run's gradient is clipped separately."""
+    d, R = prm0.d, prm0.R
+    dev = prm0.G.device
+    eye = torch.eye(d, dtype=torch.float64, device=dev)
     G = prm0.G.clone().requires_grad_(True)
     E = prm0.E.clone().requires_grad_(True)
-    Lq = torch.linalg.cholesky(prm0.Q - 1e-4 * torch.eye(d, dtype=torch.float64, device=prm0.G.device)).requires_grad_(True)
+    Lq = torch.linalg.cholesky(prm0.Q - 1e-4 * eye).requires_grad_(True)
     A = prm0.A.clone().requires_grad_(True)
     b = prm0.b.clone().requires_grad_(True)
-    opt = torch.optim.Adam([G, E, Lq, A, b], lr=lr)
-    eye = torch.eye(d, dtype=torch.float64, device=prm0.G.device)
+    leaves = [G, E, Lq, A, b]
+    opt = torch.optim.Adam(leaves, lr=lr)
 
     def current() -> Params:
         Lt = torch.tril(Lq)
-        return Params(G=G, E=E, Q=Lt @ Lt.T + 1e-4 * eye, A=A, b=b)
+        return Params(G=G, E=E, Q=Lt @ Lt.transpose(-1, -2) + 1e-4 * eye, A=A, b=b)
 
     B, Ltot = streams.shape
     with torch.no_grad():
         m, P = start_state(streams[:, 0], current(), tree)
     k, t0, ntok = 0, time.perf_counter(), 0
-    nll = torch.zeros((), dtype=torch.float64, device=eye.device)
+    nll = torch.zeros(R, dtype=torch.float64, device=dev)
     for c0 in range(1, Ltot, chunk):
         prm = current()
         m, P = m.detach(), P.detach()
-        loss = torch.zeros((), dtype=torch.float64, device=eye.device)
+        loss = torch.zeros(R, dtype=torch.float64, device=dev)
         steps = range(c0, min(c0 + chunk, Ltot))
         for t in steps:
             mm, Pm = forecast(m, P, streams[:, t - 1], prm)
             m, P, logp = assimilate(mm, Pm, streams[:, t], prm, tree)
-            loss = loss - logp.sum()
+            loss = loss - logp.sum(-1)
         n = B * len(steps)
         opt.zero_grad()
-        (loss / n).backward()
-        torch.nn.utils.clip_grad_norm_([G, E, Lq, A, b], clip)
+        (loss.sum() / n).backward()
+        with torch.no_grad():                                          # per-run gradient-norm clipping
+            sq = sum(p.grad.reshape(R, -1).pow(2).sum(-1) for p in leaves)
+            scale = (clip / (sq.sqrt() + 1e-6)).clamp(max=1.0)
+            for p in leaves:
+                p.grad.mul_(scale.reshape(R, *([1] * (p.dim() - 1))))
         opt.step()
         nll += loss.detach()
         ntok += n
         k += 1
         if log is not None and (k % 20 == 0 or c0 + chunk >= Ltot):
-            log({"arm": "backprop", "chunk": k, "train_bits": float(nll) / ntok / math.log(2),
-                 "G_spectral": float(torch.linalg.matrix_norm(G.detach(), 2)), "sec": time.perf_counter() - t0})
+            log({"arm": "backprop", "chunk": k, "train_bits": (nll / ntok / math.log(2)).tolist(),
+                 "G_spectral": torch.linalg.matrix_norm(G.detach(), 2).tolist(), "sec": time.perf_counter() - t0})
             nll, ntok = torch.zeros_like(nll), 0
     with torch.no_grad():
-        out = current()
-        return Params(G=out.G.detach().clone(), E=out.E.detach().clone(), Q=out.Q.detach().clone(),
-                      A=out.A.detach().clone(), b=out.b.detach().clone())
+        return current().clone()

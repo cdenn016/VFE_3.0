@@ -2,7 +2,8 @@ r"""Click-to-run local-learner test (design: docs/research/2026-10-21-local-lear
 
 Edit CONFIG and run. Stage "timing" measures one chunk per arm; "A" is the synthetic identifiability check;
 "B" is WikiText-103 bytes. Results append to ``<out_dir>/results_<stage>.jsonl`` and completed runs are
-skipped on relaunch. With ``device = "cuda"`` run it under the CUDA interpreter (``$CUDA_PYTHON``,
+skipped on relaunch. The seeds of one (arm, d) train as one stacked batch, so each kernel launch serves all
+of them; stacked runs never exchange information. With ``device = "cuda"`` run it under the CUDA interpreter (``$CUDA_PYTHON``,
 ``C:/anaconda/python.exe``); the n-gram references and synthetic sampling stay on the CPU.
 """
 
@@ -15,9 +16,10 @@ import time
 from pathlib import Path
 
 CONFIG = {
+    
     "stage":            "A",                    # "timing" | "A" | "B"
     "device":           "cuda",                 # "cuda" | "cpu"
-    "threads":          4,                      # CPU intra-op threads (machine stays usable)
+    "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
     "chunk":            16,                     # M-step / truncated-BPTT length (smoothing windows must divide it)
     "streams":          512,                    # parallel training streams (512 * 16 = 8192 tokens per update)
@@ -25,6 +27,7 @@ CONFIG = {
     "backprop_lr":      1e-2,                   # chosen on stage A only
     "ridge":            1e-6,
     "q_floor":          1e-4,
+    
     # stage A (synthetic, known theta*)
     "A_d":              8,
     "A_train_len":      2000,                   # per stream: 512 * 2000 = 1.02M tokens
@@ -32,6 +35,7 @@ CONFIG = {
     "A_val_streams":    64,
     "A_val_len":        1000,
     "A_seeds":          [0],
+    
     # stage B (WikiText-103 bytes)
     "B_dims":           [8, 16, 32],
     "B_seeds":          [0, 1, 2],
@@ -39,6 +43,7 @@ CONFIG = {
     "B_val_bytes":      200_000,
     "B_val_streams":    64,
     "ngram_k_grid":     [1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0],
+    
     # particle-filter approximation gap
     "pf_streams":       8,
     "pf_len":           2500,                   # 8 * 2500 = 20k scored-region bytes
@@ -51,7 +56,7 @@ os.environ.setdefault("MKL_NUM_THREADS", str(CONFIG["threads"]))
 import numpy as np   # noqa: E402
 import torch         # noqa: E402
 
-from vfe3.local_learner import (TreeSensor, evaluate_filter, init_params, ngram_nll,   # noqa: E402
+from vfe3.local_learner import (TreeSensor, evaluate_filter, init_runs, ngram_nll,   # noqa: E402
                                 particle_filter_nll, sample_sequences, train_backprop, train_local)
 from vfe3.local_learner.core import Params   # noqa: E402
 
@@ -88,12 +93,13 @@ def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log
     raise ValueError(arm)
 
 
-def scores(prm: Params, val: torch.Tensor, pf: torch.Tensor, tree: TreeSensor, seed: int) -> dict:
+def scores(prm: Params, val: torch.Tensor, pf: torch.Tensor, tree: TreeSensor, seed: int) -> list[dict]:
+    r"""Validation bits per byte and the particle-filter gap, one dict per stacked run."""
     nll, n = evaluate_filter(prm, val, tree)
     a_nll, a_n = evaluate_filter(prm, pf, tree)
     p_nll, p_n = particle_filter_nll(prm, pf, tree, CONFIG["pf_particles"], seed)
-    return {"val_bits": nll / n / LN2, "pf_subset_filter_bits": a_nll / a_n / LN2,
-            "pf_subset_exact_bits": p_nll / p_n / LN2, "n_val": n, "n_pf": p_n}
+    return [{"val_bits": float(nll[r]) / n / LN2, "pf_subset_filter_bits": float(a_nll[r]) / a_n / LN2,
+             "pf_subset_exact_bits": float(p_nll[r]) / p_n / LN2, "n_val": n, "n_pf": p_n} for r in range(prm.R)]
 
 
 def done_keys(path: Path) -> set:
@@ -110,45 +116,44 @@ def append(path: Path, row: dict) -> None:
 
 def run_timing(tree: TreeSensor) -> None:
     chunks = 20
+    seeds = CONFIG["B_seeds"]
     x = load_bytes("train", CONFIG["streams"] * (chunks * CONFIG["chunk"] + 1))
     train = as_streams(x, CONFIG["streams"]).to(DEVICE)
     for d in CONFIG["B_dims"]:
         for arm in CONFIG["arms"]:
-            train_arm(arm, init_params(d, tree.V, 0, DEVICE), train[:, :CONFIG["chunk"] + 1], tree, None)   # warm-up
+            train_arm(arm, init_runs(d, tree.V, seeds, DEVICE), train[:, :CONFIG["chunk"] + 1], tree, None)   # warm-up
             sync()
             t0 = time.perf_counter()
-            train_arm(arm, init_params(d, tree.V, 0, DEVICE), train, tree, None)
+            train_arm(arm, init_runs(d, tree.V, seeds, DEVICE), train, tree, None)
             sync()
             sec = (time.perf_counter() - t0) / chunks
-            print(f"d={d:3d} {arm:11s} {sec:7.3f} s per chunk of {CONFIG['streams'] * CONFIG['chunk']} tokens", flush=True)
+            print(f"d={d:3d} {arm:11s} {sec:7.3f} s per chunk of {CONFIG['streams'] * CONFIG['chunk']} tokens "
+                  f"for {len(seeds)} stacked seeds", flush=True)
 
 
 def run_stage(stage: str, tree: TreeSensor) -> None:
     c = CONFIG
     out = Path(c["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
-    seeds = os.environ.get("LOCAL_LEARNER_SEEDS")              # optional override for parallel launches
-    if seeds is not None:
-        c["B_seeds"] = [int(x) for x in seeds.split(",")]
-    path = out / (f"results_{stage}.jsonl" if seeds is None else f"results_{stage}_seeds{seeds.replace(',', '-')}.jsonl")
+    path = out / f"results_{stage}.jsonl"
     done = done_keys(path)
     if stage == "A":
         g = torch.Generator().manual_seed(1234)
         d = c["A_d"]
         q, _ = torch.linalg.qr(torch.randn(d, d, generator=g, dtype=torch.float64))
-        truth = Params(G=0.9 * q, E=0.5 * torch.randn(tree.V, d, generator=g, dtype=torch.float64),
-                       Q=0.2 * torch.eye(d, dtype=torch.float64),
-                       A=torch.randn(tree.V - 1, d, generator=g, dtype=torch.float64),
-                       b=0.5 * torch.randn(tree.V - 1, generator=g, dtype=torch.float64))
+        truth = Params(G=0.9 * q[None], E=0.5 * torch.randn(1, tree.V, d, generator=g, dtype=torch.float64),
+                       Q=0.2 * torch.eye(d, dtype=torch.float64)[None],
+                       A=torch.randn(1, tree.V - 1, d, generator=g, dtype=torch.float64),
+                       b=0.5 * torch.randn(1, tree.V - 1, generator=g, dtype=torch.float64))
         train_cpu = sample_sequences(truth, tree, c["streams"], c["A_train_len"], seed=1)
         val_cpu = sample_sequences(truth, tree, c["A_val_streams"], c["A_val_len"], seed=2)
         train = train_cpu.repeat(1, c["A_epochs"]).to(DEVICE)
         val = val_cpu.to(DEVICE)
         pf = sample_sequences(truth, tree, c["pf_streams"], c["pf_len"], seed=3).to(DEVICE)
         truth = truth.to(DEVICE)
-        configs = [(d, s) for s in c["A_seeds"]]
+        dims, seeds = [d], c["A_seeds"]
         if ("truth", d, -1) not in done:
-            append(path, {"stage": "A", "arm": "truth", "d": d, "seed": -1, **scores(truth, val, pf, tree, 0)})
+            append(path, {"stage": "A", "arm": "truth", "d": d, "seed": -1, **scores(truth, val, pf, tree, 0)[0]})
         uni, n = ngram_nll(train_cpu.reshape(-1).numpy(), val_cpu.numpy(), tree.V, 1, 1.0)
         if ("unigram", 0, 0) not in done:
             append(path, {"stage": "A", "arm": "unigram", "d": 0, "seed": 0, "val_bits": uni / n / LN2})
@@ -159,29 +164,30 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
         train = as_streams(xtrain, c["streams"]).to(DEVICE)
         val = val_cpu.to(DEVICE)
         pf = as_streams(xval[:c["pf_streams"] * c["pf_len"]], c["pf_streams"]).to(DEVICE)
-        for order in ((1, 2, 3) if 0 in c["B_seeds"] else ()):
+        for order in (1, 2, 3):
             key = (f"{order}-gram", 0, 0)
             if key in done:
                 continue
             best = min((ngram_nll(xtrain, val_cpu.numpy(), tree.V, order, k), k) for k in c["ngram_k_grid"])
             (nll, n), k = best
             append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k})
-        configs = [(d, s) for s in c["B_seeds"] for d in c["B_dims"]]
-    for d, seed in configs:
+        dims, seeds = c["B_dims"], c["B_seeds"]
+    for d in dims:
         for arm in c["arms"]:
-            if (arm, d, seed) in done:
+            todo = [s for s in seeds if (arm, d, s) not in done]
+            if not todo:
                 continue
             t0 = time.perf_counter()
             history: list[dict] = []
-            prm = train_arm(arm, init_params(d, tree.V, seed, DEVICE), train, tree, history.append)
+            prm = train_arm(arm, init_runs(d, tree.V, todo, DEVICE), train, tree, history.append)   # seeds stacked
             sync()
             sec = time.perf_counter() - t0
-            row = {"stage": stage, "arm": arm, "d": d, "seed": seed, "train_sec": sec,
-                   "train_tokens": int(train.shape[0] * (train.shape[1] - 1)),
-                   "final_train_bits": history[-1]["train_bits"] if history else None,
-                   "G_spectral": float(torch.linalg.matrix_norm(prm.G, 2)),
-                   **scores(prm, val, pf, tree, seed)}
-            append(path, row)
+            spectral = torch.linalg.matrix_norm(prm.G, 2).tolist()
+            for r, (seed, sc) in enumerate(zip(todo, scores(prm, val, pf, tree, 1000 * d + todo[0]))):
+                append(path, {"stage": stage, "arm": arm, "d": d, "seed": seed, "train_sec": sec,
+                              "stacked_runs": len(todo), "train_tokens": int(train.shape[0] * (train.shape[1] - 1)),
+                              "final_train_bits": history[-1]["train_bits"][r] if history else None,
+                              "G_spectral": spectral[r], **sc})
 
 
 def sync() -> None:
