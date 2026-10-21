@@ -206,8 +206,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "learning_rates": {
             # Unbound, so a duck-typed config (tests pass namespaces) resolves through the same rule.
             role: VFE3Config.resolved_hyperparameter(cfg, f"m_relational_{role}_lr") for role in counts},
-        "score_covariance_contract": ("exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
-                                      if minimal_agent else "exact_full_reduced_covariance_from_local_gaussian"),
+        "score_covariance_contract": _score_covariance_contract(cfg, dims, minimal_agent),
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
         "receiver_measurement": cfg.relational_receiver_measurement if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
@@ -226,6 +225,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                          # per-head block group (audit 2026-10-09 round 2, #10).
                                          else "head_block_moment_projection_of_predictive_kernel_plus_covariant_floor"
                                          if cfg.family == "gaussian_block"
+                                         # The frame-diagonal family stores c_i^+ = diag C^att plus the floor in
+                                         # reference coordinates: frame-independent, closed under the passive action
+                                         # (audit 2026-10-17 item 3; 2026-10-20 item 25).
+                                         else "reference_diagonal_moment_projection_of_predictive_kernel_plus_covariant_floor"
+                                         if cfg.family == "gaussian_frame_diagonal"
                                          # The diagonal family stores diag of U_i(C^att + f I)U_i^T in local
                                          # coordinates: a moment projection, neither exact nor covariant.
                                          else "diagonal_local_moment_projection_of_predictive_kernel_plus_floor"
@@ -245,7 +249,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "factorization_fallback": (("fp32_failure_or_certificate_layer_fp64_recompute"
                                     + ("" if cfg.minimal_agent_inference == "exact"
                                        else "_kl_certificate_fp64_refactor")) if minimal_agent
-                                   else "failed_entries_source_square_root_qr_fp64"),
+                                   else _kernel_factorization_fallback(cfg, dims)),
         "temperature_convention": ((f"unit_temperature_{'exact' if cfg.minimal_agent_inference == 'exact' else 'mean_field'}"
                                     "_posterior_no_clamp") if minimal_agent
                                    else "unit_temperature_learned_key_noise" if noisy_key
@@ -262,8 +266,84 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "source_beliefs": "live_episode_initial" if full_link else "live_pre_update",
         "outer_operator_and_frame_graph": "live",
         "canonical_shared_objective": False,
-        "gradient_clipping": "shares_existing_mu_role_and_global_budgets",
+        "gradient_clipping": _relational_clip_policy(cfg),
     }}
+
+
+def _diagonal_comparison_covariance(cfg: VFE3Config, dims: List[int]) -> bool:
+    r"""Whether ``rope_mode='comparison_invariant'`` makes every head's commutant projection :math:`P(G)` diagonal
+    (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal` at the head's rotated-pair count)."""
+    if getattr(cfg, "rope_mode", "none") != "comparison_invariant":
+        return False
+    from vfe3.geometry.rope import rope_commutant_is_diagonal, rope_rotated_pairs
+    fraction = float(getattr(cfg, "rope_fraction", 1.0))
+    return all(rope_commutant_is_diagonal(d, rope_rotated_pairs(d, fraction)) for d in dims)
+
+
+def _score_covariance_contract(cfg: VFE3Config, dims: List[int], minimal_agent: bool) -> str:
+    r"""The comparison covariance the router scores, from the configured route (audit 2026-10-20 item 25).
+
+    The kernel router reads :math:`G = SU^{-1}\Sigma U^{-\top}S^\top`, rotated to :math:`R_iGR_i^\top` under
+    ``rope_mode='comparison'`` and replaced by its commutant projection :math:`P(G)` under
+    ``'comparison_invariant'`` (diagonal, one isotropic variance per rotating plane, when at most one coordinate of
+    each head stays unrotated); ``noisy_key`` broadens the key law by :math:`n_hI`, and ``mean_distance`` reads no
+    covariance.
+    """
+    if minimal_agent:
+        return "exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
+    routing = getattr(cfg, "relational_routing", "gaussian_kl")
+    if routing == "mean_distance":
+        return "none_mean_distance_reads_no_covariance"
+    rope_mode = getattr(cfg, "rope_mode", "none")
+    if rope_mode == "comparison_invariant":
+        contract = ("diagonal_rope_commutant_projection_of_reduced_covariance"
+                    if _diagonal_comparison_covariance(cfg, dims)
+                    else "rope_commutant_projection_of_full_reduced_covariance")
+    elif rope_mode == "comparison":
+        contract = "exact_full_reduced_covariance_from_local_gaussian_rotated_by_query_and_key_position"
+    else:
+        contract = "exact_full_reduced_covariance_from_local_gaussian"
+    return contract + ("_plus_learned_key_noise" if routing == "noisy_key" else "")
+
+
+def _kernel_factorization_fallback(cfg: VFE3Config, dims: List[int]) -> str:
+    r"""The kernel router's recovery of a failed or flagged comparison factorization (audit 2026-10-20 item 25).
+
+    ``mean_distance`` and the closed-form diagonal comparison route
+    (:func:`vfe3.gradients.relational._diagonal_comparison_route`) factor nothing. On the other routes
+    (:func:`vfe3.relational_scoring._strict_cholesky`) ``cholesky_qr2_certified`` with a source-root
+    factor route rebuilds every flagged or failed entry by the float64 QR of its source root; otherwise the rebuilt
+    entries (failures, plus certificate-flagged entries under a certified setting) are factored from the source root
+    by float32 shifted CholeskyQR3, from the commutant root under ``comparison_invariant``, with float64 QR on its
+    failure. ``noisy_query`` and ``comparison_invariant`` have no source-root factor route, so
+    ``cholesky_qr2_certified`` acts there as ``gram_certified``.
+    """
+    routing = getattr(cfg, "relational_routing", "gaussian_kl")
+    if routing == "mean_distance":
+        return "none_mean_distance_has_no_factorization"
+    factorization = getattr(cfg, "projected_factorization", "gram")
+    invariant = getattr(cfg, "rope_mode", "none") == "comparison_invariant"
+    if invariant and routing == "gaussian_kl" and factorization == "gram" and _diagonal_comparison_covariance(cfg, dims):
+        return "none_closed_form_diagonal_comparison_route"
+    if factorization == "cholesky_qr2_certified" and not invariant and routing != "noisy_query":
+        return "certificate_flagged_or_failed_entries_source_root_qr_fp64"
+    rebuilt = "failed_entries" if factorization == "gram" else "certificate_flagged_or_failed_entries"
+    root = "commutant_root" if invariant else "source_root"
+    return f"{rebuilt}_{root}_shifted_cholesky_qr3_fp32_then_qr_fp64"
+
+
+def _relational_clip_policy(cfg: VFE3Config) -> str:
+    r"""How ``grad_clip`` bounds the relational maps (audit 2026-10-20 item 25; ``vfe3.train.train_step``).
+
+    The relational optimizer groups carry role ``mu``: under ``grad_clip_scope='role'`` they share one L2 bound with
+    every other clipped ``mu``-role group, and under ``'group'`` each group has its own.
+    """
+    clip = getattr(cfg, "grad_clip", None)
+    if clip is None or not clip > 0:
+        return "off"
+    if getattr(cfg, "grad_clip_scope", "role") == "group":
+        return "own_l2_bound_per_optimizer_group"
+    return "shares_mu_role_l2_bound"
 
 
 def _conditional_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
