@@ -841,6 +841,14 @@ class VFE3Config:
     # su_n; refused for block_borel and block_unipotent. None: no bound.
     phi_frame_condition_max:          Optional[float] = None
 
+    # Row-lazy AdamW for the frame table phi_embed (audit 2026-10-20 items 2, 49; M2). Dense AdamW moves a row whose
+    # gradient is zero this step by its momentum tail and its decoupled decay, and a rarely visited row by about
+    # min(sqrt(T), 31.6) lr per coordinate per appearance whatever the gradient size. True: a row that is neither in
+    # the step's input tokens nor carries a nonzero gradient takes no moment update, no step and no decay, and the
+    # bias correction of a stepped row uses its own step count k_v (vfe3/sparse_row_optim.py; checkpointed).
+    # m_phi_update_mode="adamw" only. False: dense AdamW.
+    m_phi_sparse_rows:                bool            = False
+
     # pullback_group / fisher_group only: upper bound R on each row's right-factor step ||eta s xi||_F, the embedded
     # Frobenius norm of the body generator xi (under fisher_group xi = U^{-1} W U, so R bounds a Frobenius norm, not
     # the Fisher norm or per-step KL that m_table_fisher_trust_radius bounds). group_log realizes R exactly; so does
@@ -875,8 +883,20 @@ class VFE3Config:
     #           decoder that does not read these tables (decode_mode="linear" or untie_decode_bank=True) and
     #           prior_covariance_table="diagonal"
     m_table_update_mode:              str             = "adamw"
-    m_table_fisher_lr:                float           = 0.1          # fisher only: natural step size eta > 0
-    m_table_fisher_trust_radius:      float           = 0.1          # fisher only: per-row Fisher-norm bound r (KL <= r^2/2 per step to second order; decay outside the bound)
+    m_table_fisher_lr:                float           = 0.1          # fisher only (table or decode bank): natural step size eta > 0
+    m_table_fisher_trust_radius:      float           = 0.1          # fisher only (table or decode bank): per-row Fisher-norm bound r (KL <= r^2/2 per step to second order; decay outside the bound)
+
+    # "adamw" | "fisher"
+    # M-step update of the untied decode bank decode_mu_embed / decode_sigma_log_embed, p_v = N(m_v, diag t_v),
+    # t_v = e^{l_v} (audit 2026-10-20 M6).
+    #   adamw   AdamW at m_decode_mu_lr / m_decode_sigma_lr
+    #   fisher  natural-gradient step preconditioned by (c_v/N) diag(1/t_v, 1/2), the Fisher metric of p_v counted
+    #           once per scored target occurrence (c_v floored at 1, since every row takes a softmax gradient):
+    #           (m_v, l_v) -= eta (N/max(c_v, 1)) (t_v grad_m, 2 grad_l) at eta = m_table_fisher_lr, each row's step
+    #           bounded in Fisher norm by m_table_fisher_trust_radius and never gradient-clipped; the decode AdamW
+    #           rates schedule it (lr_t/lr_0) and set the decoupled decay (decode_mu_weight_decay, sigma_weight_decay).
+    #           only: a prior-bank decode (decode_mode != "linear") with untie_decode_bank=True
+    m_decode_update_mode:             str             = "adamw"
 
     ##################################################
     #   17. Learning rates (M-step)
@@ -2160,6 +2180,20 @@ class VFE3Config:
                 table_problems.append(f"prior_covariance_table='diagonal' (got {self.prior_covariance_table!r})")
             if table_problems:
                 raise ValueError("m_table_update_mode='fisher' needs " + "; ".join(table_problems))
+        if not isinstance(self.m_phi_sparse_rows, bool):
+            raise ValueError(f"m_phi_sparse_rows must be a bool, got {self.m_phi_sparse_rows!r}")
+        if self.m_phi_sparse_rows:
+            from vfe3.gauge_optim import get_phi_update_policy
+            if get_phi_update_policy(self.m_phi_update_mode).requires_manifold_optimizer:
+                raise ValueError("m_phi_sparse_rows=True is a row-lazy AdamW step of phi_embed and requires "
+                                 f"m_phi_update_mode='adamw'; got {self.m_phi_update_mode!r}")
+        _require(self.m_decode_update_mode, ("adamw", "fisher"), "m_decode_update_mode")
+        if self.m_decode_update_mode == "fisher" and (self.decode_mode == "linear" or not self.untie_decode_bank):
+            # The step preconditions the untied (V, K) decode tables by the Fisher metric of p_v = N(m_v, diag t_v);
+            # a linear readout has no such tables and a tied bank's rows are the encoder tables.
+            raise ValueError("m_decode_update_mode='fisher' needs a prior-bank decode with its own tables "
+                             f"(decode_mode != 'linear' and untie_decode_bank=True); got decode_mode="
+                             f"{self.decode_mode!r}, untie_decode_bank={self.untie_decode_bank!r}")
         if self.e_mu_q_trust is not None and not (
             math.isfinite(self.e_mu_q_trust) and self.e_mu_q_trust > 0.0
         ):
@@ -2351,9 +2385,21 @@ class VFE3Config:
         if not (phi_update_policy.requires_pullback_geometry and self.m_phi_group_retraction == "group_log"):
             mark(("m_phi_group_log_fallback",),
                  "only read by m_phi_update_mode='pullback_group' with m_phi_group_retraction='group_log'")
-        if self.m_table_update_mode != "fisher":
-            mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"), "only read by m_table_update_mode='fisher'")
-        else:
+        decode_fisher = self.m_decode_update_mode == "fisher"
+        if self.m_table_update_mode != "fisher" and not decode_fisher:
+            mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"),
+                 "only read by m_table_update_mode='fisher' or m_decode_update_mode='fisher'")
+        if decode_fisher:
+            # The decode Fisher step reads each decode rate only through lr_t/lr_0 (independent of the base rate; 0
+            # freezes the table) and the decoupled decay lr_t * lambda, as the encoder table step does (below).
+            if self.resolved_hyperparameter("decode_mu_weight_decay") == 0.0:
+                mark(("m_decode_mu_lr",), "m_decode_update_mode='fisher' steps decode_mu_embed at m_table_fisher_lr; "
+                     "its AdamW rate only shapes the schedule (0 freezes the table) and its decay is 0")
+            if self.resolved_hyperparameter("sigma_weight_decay") == 0.0:
+                mark(("m_decode_sigma_lr",), "m_decode_update_mode='fisher' steps decode_sigma_log_embed at "
+                     "m_table_fisher_lr; its AdamW rate only shapes the schedule (0 freezes the table) and its "
+                     "decay is 0")
+        if self.m_table_update_mode == "fisher":
             # The table step reads its group rate only through lr_t/lr_0 (independent of the base rate; 0 freezes
             # the table) and the decoupled decay lr_t * lambda, so a table rate is inert when that decay is 0 and no
             # other optimizer group falls back to it (vfe3/train.py build_optimizer; audit 2026-10-10 round 2,
@@ -2613,12 +2659,14 @@ class VFE3Config:
             mark(("decode_covariance",), "the linear readout reads no covariance")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
+            mark(("m_decode_update_mode",), "the linear readout has no decode bank to precondition")
         else:
             if not self.untie_decode_bank:
                 mark(("m_decode_mu_lr", "m_decode_sigma_lr"),
                      "shared encode/decode tables use the encoder rates")
                 mark(("decode_mu_weight_decay",),
                      "shared encode/decode tables: the decode means are mu_embed, decayed by mu_weight_decay")
+                mark(("m_decode_update_mode",), "shared encode/decode tables are stepped as encoder tables")
             mark(("decode_second_order",),
                  "linear decode only; the prior-bank KL decoders already read Sigma_q")
         # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
@@ -2636,6 +2684,9 @@ class VFE3Config:
                  "with its own optimizer-group value")
         if self.beta_attention_prior != "causal_windowed":
             mark(("attention_window",), "only the causal_windowed prior reads the band width")
+        if self.gauge_transport in ("off", "frozen"):
+            mark(("m_phi_sparse_rows",),
+                 f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on phi_embed, so no row steps")
         if self.gauge_transport in ("off", "frozen"):
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
