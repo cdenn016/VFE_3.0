@@ -228,7 +228,10 @@ def test_cost_model_linear_decode_does_not_count_prior_bank_readout():
 
     assert linear["active_params_per_token"] == token_row + V * K + V + 4 * 2 * K * K   # weight + bias
     assert prior_bank["active_params_per_token"] == token_row + 2 * V * K + 4 * 2 * K * K
-    assert linear["flops_per_token_decode"] == prior_bank["flops_per_token_decode"] == 2.0 * V * K
+    # The prior-bank decode is one (S, 2K) x (2K, V) product, 4VK forward FLOPs; the linear decode 2VK
+    # (audit 2026-10-20 item 48).
+    assert linear["flops_per_token_decode"] == 2.0 * V * K
+    assert prior_bank["flops_per_token_decode"] == 4.0 * V * K
 
 
 def test_cost_model_declares_projected_estep_flops_unavailable():

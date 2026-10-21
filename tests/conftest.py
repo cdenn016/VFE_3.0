@@ -221,3 +221,45 @@ def restore_projected_scorer_policy() -> Iterator[None]:
     finally:
         for name, value in saved.items():
             setattr(scoring, name, value)
+
+
+_FP32_PRECISION_BACKENDS = ("cuda.matmul", "cudnn")
+
+
+@pytest.fixture(autouse=True)
+def restore_model_process_globals() -> Iterator[None]:
+    r"""Restore the process-global state ``VFEModel.__init__`` installs after each test (audit 2026-10-20 item 24).
+
+    The fp32 matmul precision (the legacy getter and the per-backend ``fp32_precision`` the CUDA lane pins to IEEE
+    above), the scorer and routed-spread tile budgets, the diagonal-moments kernel and the frame-pair float64
+    escalation settings, so a model built in one test cannot change what a later test reads.
+    """
+    import vfe3.geometry.transport as transport
+    import vfe3.model.relational_operators as relational_operators
+    import vfe3.relational_scoring as scoring
+
+    precision = torch.get_float32_matmul_precision()
+    backend_precision = []
+    for path in _FP32_PRECISION_BACKENDS:
+        backend: Any = torch.backends
+        for part in path.split("."):
+            backend = getattr(backend, part)
+        if hasattr(backend, "fp32_precision"):
+            backend_precision.append((backend, backend.fp32_precision))
+    projection_tile = scoring.projection_tile_bytes()
+    spread_tile = relational_operators.spread_tile_bytes()
+    kernel = scoring.diagonal_moments_kernel()
+    escalation = transport.frame_pair_fp64_escalation()
+    condition_tol = transport._FRAME_PAIR_CONDITION_TOL
+    try:
+        yield
+    finally:
+        # The legacy setter first, since it rewrites cuda.matmul.fp32_precision; then the per-backend values.
+        torch.set_float32_matmul_precision(precision)
+        for backend, value in backend_precision:
+            backend.fp32_precision = value
+        scoring.set_projection_tile_bytes(projection_tile)
+        relational_operators.set_spread_tile_bytes(spread_tile)
+        scoring.set_diagonal_moments_kernel(kernel)
+        transport.set_frame_pair_fp64_escalation(escalation)
+        transport.set_frame_pair_condition_tol(condition_tol)

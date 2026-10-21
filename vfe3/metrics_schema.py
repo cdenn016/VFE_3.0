@@ -177,18 +177,6 @@ def row_kinds(
     return [row_kind_of(row, log_interval=log_interval, eval_interval=eval_interval) for row in rows]
 
 
-def regular_rows(
-    rows: Sequence[Mapping[str, object]],
-
-    *,
-    cfg:       object              = None,
-    intervals: Optional[Intervals] = None,
-) -> List[Mapping[str, object]]:
-    r"""The rows of ``rows`` that are not ``spike`` rows, in order."""
-    kinds = row_kinds(rows, cfg=cfg, intervals=intervals)
-    return [row for row, kind in zip(rows, kinds) if kind != ROW_KIND_SPIKE]
-
-
 def split_spike_rows(
     rows: Sequence[Mapping[str, object]],
 
@@ -291,6 +279,13 @@ _REGISTRY: List[MetricColumn] = [
     # Resources.
     *_declare("row", "float", ("tokens_per_s", "train_step_tokens_per_s", "pipeline_tokens_per_s",
                                "train_step_ms_mean", "peak_mem_mb")),
+    # Allocator and clock telemetry (vfe3.train.DEVICE_TELEMETRY_COLUMNS; audit 2026-10-20 item 20). NaN off CUDA
+    # and absent in runs written before it; vfe3.run_resources.throughput_summary reads them.
+    *_declare("row", "float", ("cuda_mem_allocated_mb", "cuda_mem_reserved_mb", "cuda_mem_reserved_peak_mb",
+                               "cuda_mem_inactive_split_mb", "gpu_sm_clock_mhz", "gpu_temperature_c",
+                               "gpu_power_w")),
+    *_declare("cumulative", "count", ("cuda_alloc_retries", "cuda_device_allocs", "cuda_device_frees",
+                                      "cuda_ooms")),
     # Validation (eval rows only).
     *_declare("eval", "float", ("val_ce", "val_ppl", "val_bits_per_token", "val_bpc",
                                 "generalization_gap", "generalization_gap_fixed", "train_sample_ce",
@@ -346,11 +341,6 @@ for _column in _REGISTRY:
         raise RuntimeError(f"metrics column {_column.name!r} has an undeclared cadence or dtype")
     METRIC_COLUMNS[_column.name] = _column
 del _column
-
-
-def columns_with_cadence(cadence: Cadence) -> Tuple[str, ...]:
-    r"""Registered column names of one cadence, in declaration order."""
-    return tuple(name for name, column in METRIC_COLUMNS.items() if column.cadence == cadence)
 
 
 def unregistered_columns(columns: Iterable[str]) -> List[str]:

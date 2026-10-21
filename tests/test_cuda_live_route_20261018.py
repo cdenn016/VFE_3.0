@@ -67,6 +67,10 @@ def test_cuda_live_route_matches_a_float64_cpu_copy(record_property: Any) -> Non
     loss_rel = abs(float(loss_cuda) - float(loss_cpu)) / abs(float(loss_cpu))
     g32, g64, g32_cpu = _grads(cuda_model), _grads(cpu_model), _grads(cpu32_model)
     assert set(g32) == set(g64) == set(g32_cpu) and g64
+    # the router is live at the tiny cap, so the comparison maps are compared, not filtered out as zero-norm
+    # (audit 2026-10-20 item 5)
+    router = [name for name in g64 if "raw_score" in name]
+    assert router and all(float(g64[name].norm()) > 0.0 for name in router)
 
     def rel(grads: Dict[str, torch.Tensor], name: str) -> float:
         return float((grads[name] - g64[name]).norm() / g64[name].norm().clamp_min(1e-300))

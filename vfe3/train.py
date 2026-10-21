@@ -10,11 +10,14 @@ backpropagation. No nn.Linear module is built only with ``use_block_mlp=False`` 
 ``prototype_agents`` / ``gaussian_template`` block MLP together with a prior-bank decoder, and the
 attention maps remain learned linear maps there. The M-step minimizes the decode cross-entropy;
 ``projected_predictive`` takes one differentiable readout step per layer, and ``projected_gradient``
-unrolls its ``n_e_steps`` receiver updates into the graph. Click-to-run: edit a ``VFE3Config`` and call ``run_training`` (no CLI).
+unrolls its ``n_e_steps`` receiver updates into the graph. The training entry point is the click-to-run launcher
+``train_vfe3.py`` (edit its config dictionary; no CLI), which seeds the run and calls ``train``; ``run_training``
+below is a minimal helper that only tests call.
 """
 
 import collections
 import contextlib
+import itertools
 import json
 import logging
 import math
@@ -37,7 +40,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _redirect_logging = contextlib.nullcontext
 
 from vfe3.attention_prior import get_prior_registration
-from vfe3.contracts import deferred_host_checks, is_vfe_model, model_family_of
+from vfe3.contracts import add_exception_note, deferred_host_checks, is_vfe_model, model_family_of
 from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
@@ -55,6 +58,7 @@ from vfe3.gauge_optim import (
 from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments
 from vfe3.table_optim import (TABLE_FISHER_DIAGNOSTIC_KEYS, TableFisherAdamW, TableFisherGaugeManifoldAdamW,
                               TableFisherStatistics)
+from vfe3.sparse_row_optim import RowLazyAdamW, RowLazyTableFisherAdamW
 from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
@@ -269,6 +273,8 @@ def build_optimizer(
             "role": "phi",
         }
         phi_group.update(phi_group_metadata)
+        if cfg.m_phi_sparse_rows:                               # row-lazy AdamW (vfe3.sparse_row_optim)
+            phi_group["sparse_rows"] = True
     # sigma_weight_decay (default None = inherit the global weight_decay, the long-standing
     # behavior): a dedicated AdamW decay for the log-variance tables. The global decay pulls
     # log sigma toward 0 (sigma toward 1) -- an unintended lognormal prior fighting the configured
@@ -293,6 +299,8 @@ def build_optimizer(
     # m_table_update_mode='fisher' marks the type-prior tables for the natural-gradient step of
     # vfe3.table_optim; their AdamW rates then only schedule that step and set its decoupled decay.
     table_fisher = cfg.m_table_update_mode == "fisher"
+    # m_decode_update_mode='fisher' marks the untied decode bank for the same module's decode step.
+    decode_fisher = cfg.m_decode_update_mode == "fisher"
     groups = []
     if pb.mu_embed is not None:
         groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd,
@@ -315,8 +323,10 @@ def build_optimizer(
         # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
         # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
         # the tables they were cloned from unless their decoder rate overrides the fallback.
-        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **decode_mu_wd})
-        groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd})
+        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **decode_mu_wd,
+                       **({"table_fisher": "decode_mu"} if decode_fisher else {})})
+        groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd,
+                       **({"table_fisher": "decode_sigma"} if decode_fisher else {})})
     if pb.output_proj_weight is not None:                       # decode_mode='linear'
         groups.append({"params": [pb.output_proj_weight], "lr": decode_mu_lr, "role": "mu", **decode_mu_wd})
     if pb.output_proj_bias is not None:                         # decode_mode='linear': learned log-unigram prior
@@ -351,8 +361,24 @@ def build_optimizer(
                 # content_link_edges: the edge factor maps are content-link parameters (absent when off).
                 parameters += [p for ops in layers for p in getattr(ops, "edge_parameters", list)()]
             parameters = [p for p in parameters if p.requires_grad]
-            if parameters:
-                groups.append({"params": parameters, "lr": cfg.resolved_hyperparameter(f"m_relational_{role}_lr"),
+            lr = cfg.resolved_hyperparameter(f"m_relational_{role}_lr")
+            map_decay = float(getattr(cfg, "relational_score_weight_decay", 0.0))
+            if role == "score" and map_decay > 0.0:
+                # relational_score_weight_decay (audit 2026-10-20 item 9): the comparison maps take the decay, the
+                # noise and temperature scalars stay undecayed in a second group of the same rate without the
+                # auxiliary role (one group per role), so grad_norm_relational_score then reads the maps alone.
+                # At 0 the single group below is kept, so optimizer state from earlier runs loads unchanged.
+                maps = {id(p) for ops in layers for name in ("raw_score_q", "raw_score_k")
+                        for p in (ops._stored_runs(name) if getattr(ops, name, None) is not None else [])}
+                decayed = [p for p in parameters if id(p) in maps]
+                scalars = [p for p in parameters if id(p) not in maps]
+                if decayed:
+                    groups.append({"params": decayed, "lr": lr, "weight_decay": map_decay, "role": "mu",
+                                   "lr_aux_role": "relational_score"})
+                if scalars:
+                    groups.append({"params": scalars, "lr": lr, "weight_decay": 0.0, "role": "mu"})
+            elif parameters:
+                groups.append({"params": parameters, "lr": lr,
                                "weight_decay": 0.0, "role": "mu", "lr_aux_role": f"relational_{role}"})
 
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
@@ -419,16 +445,19 @@ def build_optimizer(
         )
 
     table_kwargs = {}
-    if table_fisher:
+    if table_fisher or decode_fisher:
         # gaussian_frame_diagonal: the metric of p_v in mu_v is U_v^-T diag(1/s_v) U_v^-1, so the step reads the layer-0
         # frames of the step's types; on identity frames it is the diagonal metric and the diagonal step is exact.
+        # The decode bank's metric reads no frame.
         from vfe3.model.frame_actions import frames_identity_reason
         frame_builder = (model.token_type_frames
-                         if pb.frame_diagonal and frames_identity_reason(cfg, pb.phi_embed.shape[-1]) is None
+                         if table_fisher and pb.frame_diagonal
+                         and frames_identity_reason(cfg, pb.phi_embed.shape[-1]) is None
                          else None)
         table_kwargs = dict(statistics=TableFisherStatistics(pb, frame_builder=frame_builder),
                             table_fisher_lr=cfg.m_table_fisher_lr,
                             table_fisher_trust_radius=cfg.m_table_fisher_trust_radius)
+    table_fisher = table_fisher or decode_fisher                # either bank selects the table Fisher optimizer
     if phi_update_policy.requires_manifold_optimizer:
         # Stored phi factors use one mixed optimizer; every other group remains standard AdamW.
         #
@@ -471,6 +500,13 @@ def build_optimizer(
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
     use_fused = next(model.parameters()).is_cuda
+    if cfg.m_phi_sparse_rows:
+        # Row-lazy phi_embed (validated adamw-only): the occurrence mask reads the step's tokens from the statistics
+        # train_step fills; the base AdamW (fused on CUDA) never sees the frame table's gradient.
+        if table_fisher:
+            return RowLazyTableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
+        return RowLazyAdamW(groups, statistics=TableFisherStatistics(pb), weight_decay=cfg.weight_decay,
+                            fused=use_fused)
     if table_fisher:
         return TableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
     return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused)
@@ -1233,10 +1269,11 @@ def train_step(
         _fisher_provider = getattr(optimizer, "phi_statistics_provider", None)
         if _fisher_provider is not None:
             _fisher_provider.set_batch(tokens, _scored_det)
-        # m_table_update_mode='fisher': the table step's counts n_v and denominator N.
+        # m_table_update_mode='fisher': the table step's counts n_v and denominator N; m_decode_update_mode='fisher':
+        # the target counts c_v; m_phi_sparse_rows: the occurrence mask of the frame rows.
         _table_provider = getattr(optimizer, "table_statistics_provider", None)
         if _table_provider is not None:
-            _table_provider.set_batch(tokens, _scored_det)
+            _table_provider.set_batch(tokens, _scored_det, targets=targets)
         if status_out is not None:
             # References (no copy, no host sync) to the gradients that reach the step: the table Fisher step
             # and the manifold phi step set .grad = None inside step(), so a post-step reader of .grad (the spike
@@ -1649,6 +1686,11 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_self_weight_head_max", "val_relational_self_argmax_frac_head_max",
     "val_relational_self_lock_argmax_layer", "val_relational_self_lock_argmax_head",
     "val_belief_cond_median_layer_max",
+    # every layer beside the last-layer headline columns (VFEModel._layer_guard_maxima; audit 2026-10-20 item 14)
+    "val_relational_capped_mass_mean_layer_max", "val_relational_capped_mass_mean_argmax_layer",
+    "val_relational_score_term_query_constant_median_layer_max",
+    "val_belief_lam_min_layer_min", "val_belief_lam_min_argmin_layer", "val_belief_lam_max_layer_max",
+    "val_belief_cond_max_layer_max", "val_belief_eig_ratio_layer_min", "val_belief_eig_ratio_argmin_layer",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
     "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
@@ -1783,6 +1825,13 @@ ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
 # mean and RMS of log rho_ijk = log(beta_ij beta_jk / beta_ik) over strict triangles, for the learned
 # router and for its prior alone (zero for flat routing beta_ij = c_i / c_j); path_mass is the mean
 # two-step path weight per query row.
+# Per-(layer, head) medians of the four diagonal-route router cost terms (score_term_medians_pre of
+# vfe3.gradients.relational.relational_score: query constant c_i, key log-determinant ell_j, trace, Mahalanobis), the
+# per-head split of the pooled relational_score_term_*_median columns, so a fully clamped head can be attributed to
+# one term (audit 2026-10-20 item 38). Each value is the mean over the diagnostic chunks of the chunk's median (the
+# median itself when the fixed windows fit one chunk); no rows on the dense route, which does not form the terms.
+SCORE_TERM_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "head", "query_constant", "key_logdet", "trace", "mahalanobis", "n_chunks")
 ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "path_mass", "log_defect_mean", "log_defect_rms",
     "prior_log_defect_mean", "prior_log_defect_rms", "n_rows")
@@ -1840,10 +1889,13 @@ CAP_CLAMPED_ROW_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "clamped_row
 # var_min / var_max are taken before any subsampling; scale_* are quantiles of the centered LayerNorm scale
 # s_i = ||Pi mu_i|| / sqrt(K) (Pi = I - 1 1^T / K, no epsilon) and trace_ratio_* of r_i = tr(Pi Sigma_i Pi) / (K s_i^2),
 # the ratio that decides whether the delta-method pushforward of the norm is in its regime (r << 1).
+# Audit 2026-10-20 (spike report section 7): var_q99 and var_q999 give the upper tail between the median and the
+# maximum, so the share of entries with an exploded variance can be read off; they are appended last, and an older
+# file is migrated to the wider header on the next append (RunArtifacts.append_diagnostic_rows).
 BLOCK_VARIANCE_FIELDS: Tuple[str, ...] = (
     "step", "layer", "stage", "var_min", "var_q001", "var_q01", "var_median", "var_max", "mean_rms_median",
     "n_entries", "n_nonfinite", "scale_q01", "scale_median", "scale_q99",
-    "trace_ratio_median", "trace_ratio_q99", "trace_ratio_max")
+    "trace_ratio_median", "trace_ratio_q99", "trace_ratio_max", "var_q99", "var_q999")
 _BLOCK_VARIANCE_STAGES: Tuple[Tuple[str, str], ...] = (
     ("pre_norm", "layer_converged"), ("post_norm", "layer_block_mlp_inputs"), ("block_out", "layer_outputs"))
 _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
@@ -1945,7 +1997,8 @@ def _warn_dead_router(
 
     ``clamped``: ``relational_clamped_row_frac_head_max`` above :data:`DEAD_ROUTER_CLAMPED_ROW_FRAC`, at
     ``relational_clamped_row_frac_argmax_{layer,head}``: fully clamped rows route by the attention prior pi alone,
-    with zero router gradient. Only the absolute reference without the tie can clamp a whole row; the value is zero otherwise.
+    with zero router gradient. Under ``'row_min'`` and the tie no whole row is clamped; the absolute and the shifted
+    references can clamp one (under ``'query_shifted_v1'`` by the comparison-map scale alone, audit 2026-10-20 item 1).
 
     ``capped``: ``relational_score_klmax_frac_head_max`` above :data:`DEAD_ROUTER_CAPPED_FRAC`, at
     ``relational_score_klmax_frac_head_argmax_{layer,head}``: the capped entries carry a constant cost and get no
@@ -2056,14 +2109,16 @@ def _covariance_floor_reference(
 
     Under ``predictive_covariance='moment_matched'`` with ``predictive_covariance_floor_mode='prior'`` the readout
     adds :math:`f\Sigma_p` to the predictive covariance, so its smallest eigenvalue cannot fall below
-    :math:`f\lambda_{\min}(\Sigma_p) \ge f\min_{v,k}s_{vk}` for the diagonal prior table. The projected covariance the
+    :math:`f\lambda_{\min}(\Sigma_p) \ge f\min_{v,k}s_{vk}` for the diagonal prior table. Under ``'max'`` the floor
+    is the larger of the relative floor and :math:`f\Sigma_p` (``RelationalOperators.covariance_floor``), so the same
+    lower bound holds and the alarm is armed there too (audit 2026-10-20 item 14). The projected covariance the
     router reads is that covariance carried by the comparison maps, so the comparison against this value is an alarm
     in the reference coordinates, not an exact bound. None under the relative floor (no absolute value exists),
     another readout, another table, or another model family. One host read, at log cadence.
     """
     cfg = getattr(model, "cfg", None)
     if (cfg is None or getattr(cfg, "predictive_covariance", None) != "moment_matched"
-            or getattr(cfg, "predictive_covariance_floor_mode", None) != "prior"
+            or getattr(cfg, "predictive_covariance_floor_mode", None) not in ("prior", "max")
             or getattr(cfg, "prior_covariance_table", "diagonal") != "diagonal"):
         return None
     try:
@@ -2087,26 +2142,35 @@ def _warn_eigenvalue_collapse(
     belief_layer:    int,                         # the layer belief_lam_min / belief_lam_max are read at
     floor_reference: Optional[float] = None,      # _covariance_floor_reference(model)
     sink:            Optional[WarningSink] = None,
+    layer_extremes:  Optional[Mapping[str, Sequence[float]]] = None,   # VFEModel.last_belief_layer_extremes
 ) -> None:
     r"""Warn once per layer on an eigenvalue collapse that a trace ratio cannot see (audit 2026-10-17 item 14).
 
-    ``belief_eigenvalue_ratio``: :math:`\lambda_{\min}/\lambda_{\max}` of the converged belief covariances
-    (``belief_lam_min`` / ``belief_lam_max``) below :data:`EIGENVALUE_COLLAPSE_RATIO` :math:`= 10^3\epsilon_{32}`,
-    where float32 arithmetic on that covariance has lost all but about three digits of its smallest direction.
+    ``belief_eigenvalue_ratio``: :math:`\lambda_{\min}/\lambda_{\max}` of the converged belief covariances below
+    :data:`EIGENVALUE_COLLAPSE_RATIO` :math:`= 10^3\epsilon_{32}`, where float32 arithmetic on that covariance has lost
+    all but about three digits of its smallest direction. With ``layer_extremes`` (``{"lam_min": [...], "lam_max":
+    [...]}``, one entry per layer) every layer is tested (audit 2026-10-20 item 14: an early layer at 3.5e-5 was never
+    warned because only the last layer was read); without it the unsuffixed ``belief_lam_min`` / ``belief_lam_max``
+    are read as layer ``belief_layer``.
     ``projected_floor``: ``relational_projected_cov_min_eigenvalue_layer_min`` below ``floor_reference``
     (:func:`_covariance_floor_reference`), at its ``_argmin_layer``.
     """
-    lam_min = _finite_or_none(diagnostics.get("belief_lam_min"))
-    lam_max = _finite_or_none(diagnostics.get("belief_lam_max"))
-    if lam_min is not None and lam_max is not None and lam_max > 0.0:
+    if layer_extremes is not None:
+        pairs = list(enumerate(zip(layer_extremes.get("lam_min", ()), layer_extremes.get("lam_max", ()))))
+    else:
+        pairs = [(int(belief_layer), (diagnostics.get("belief_lam_min"), diagnostics.get("belief_lam_max")))]
+    for layer, (low, high) in pairs:
+        lam_min, lam_max = _finite_or_none(low), _finite_or_none(high)
+        if lam_min is None or lam_max is None or lam_max <= 0.0:
+            continue
         ratio = lam_min / lam_max
-        key = ("belief_eigenvalue_ratio", int(belief_layer), -1)
+        key = ("belief_eigenvalue_ratio", int(layer), -1)
         if ratio < EIGENVALUE_COLLAPSE_RATIO and key not in warned:
             warned.add(key)
             message = (" covariance layer %d: converged belief lambda_min / lambda_max = %.3g (lambda_min %.3g, "
                        "lambda_max %.3g) is below 1e3 eps32 = %.3g; the smallest covariance direction has collapsed"
-                       % (belief_layer, ratio, lam_min, lam_max, EIGENVALUE_COLLAPSE_RATIO))
-            _emit_warning(logger, sink, "belief_eigenvalue_ratio", message, layer=int(belief_layer), value=ratio,
+                       % (layer, ratio, lam_min, lam_max, EIGENVALUE_COLLAPSE_RATIO))
+            _emit_warning(logger, sink, "belief_eigenvalue_ratio", message, layer=int(layer), value=ratio,
                           threshold=EIGENVALUE_COLLAPSE_RATIO)
     projected = _finite_or_none(diagnostics.get("relational_projected_cov_min_eigenvalue_layer_min"))
     if projected is not None and floor_reference is not None and projected < floor_reference:
@@ -2964,8 +3028,13 @@ def _residual_and_attention_rows(
     holonomy_out: Optional[Dict[Any, Any]] = None,
     features_out: Optional[Dict[str, Any]] = None,
     variance_out: Optional[Dict[Tuple[int, str], List[Any]]] = None,
+    score_terms_out: Optional[Dict[Tuple[int, int], List[float]]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
     r"""Per-layer residual-ratio quantiles and per-head attention statistics on fixed windows.
+
+    ``score_terms_out``: when a dict is given, per (layer, head) the sums over chunks of the four router cost-term
+    medians of the capture (``score_term_medians_pre``, diagonal route only) and the chunk count are accumulated into
+    it (``[query constant, key log-determinant, trace, Mahalanobis, chunks]``), for :func:`_score_term_rows`.
 
     ``variance_out``: when a dict is given, per (layer, stage) of :data:`_BLOCK_VARIANCE_STAGES` the local variances
     :math:`\mathrm{diag}(\Sigma_i)` and per-token mean rms values of the same captures are collected into it, for
@@ -3056,6 +3125,17 @@ def _residual_and_attention_rows(
                     ln_changes.setdefault(layer, []).append(
                         change[torch.isfinite(change)].reshape(-1).cpu())
             log_prior = diagnostic.get("log_prior")
+            if score_terms_out is not None:
+                for layer, capture_l in enumerate(diagnostic["layer_conditional_captures"]):
+                    medians = capture_l.get("score_term_medians_pre")              # (4, H + 1) or absent
+                    if medians is None:
+                        continue
+                    values = medians.detach().double().cpu()[:, :-1]                # (4, H) per head
+                    for head in range(values.shape[1]):
+                        total = score_terms_out.setdefault((layer, head), [0.0] * 5)
+                        for index in range(4):
+                            total[index] += float(values[index, head])
+                        total[4] += 1.0
             betas = [capture_l["beta_pre"].float()
                      for capture_l in diagnostic["layer_conditional_captures"]]
             for layer, beta in enumerate(betas):
@@ -3196,7 +3276,7 @@ def _block_variance_rows(
         variances = torch.cat(slot[0]).double()
         rms = torch.cat(slot[1]).double()
         finite = variances[torch.isfinite(variances)]
-        quantiles = _quantiles_of_finite(finite, (0.001, 0.01, 0.5))
+        quantiles = _quantiles_of_finite(finite, (0.001, 0.01, 0.5, 0.99, 0.999))
         scale = torch.cat(slot[2]).double() if len(slot) > 2 and slot[2] else None
         ratio = torch.cat(slot[3]).double() if len(slot) > 3 and slot[3] else None
         scale_q = _quantiles_of_finite(scale, (0.01, 0.5, 0.99)) if scale is not None else [nan] * 3
@@ -3214,6 +3294,7 @@ def _block_variance_rows(
             "trace_ratio_median": ratio_q[0], "trace_ratio_q99": ratio_q[1],
             "trace_ratio_max": (float(finite_ratio.max()) if finite_ratio is not None and finite_ratio.numel()
                                 else nan),
+            "var_q99": quantiles[3], "var_q999": quantiles[4],
         })
     return rows
 
@@ -3398,6 +3479,24 @@ def _feature_rows(
     return head_rows, template_rows
 
 
+def _score_term_rows(
+    sums: Mapping[Tuple[int, int], List[float]],
+    step: int,
+) -> List[Dict[str, float]]:
+    r"""``diagnostics/score_terms.csv`` rows (:data:`SCORE_TERM_FIELDS`) from the sums of ``_residual_and_attention_rows``.
+
+    Each term is the mean over chunks of the per-chunk median (audit 2026-10-20 item 38).
+    """
+    rows: List[Dict[str, float]] = []
+    for (layer, head), total in sorted(sums.items()):
+        chunks = total[4]
+        rows.append({"step": int(step), "layer": int(layer), "head": int(head),
+                     **{name: (total[index] / chunks if chunks else float("nan"))
+                        for index, name in enumerate(("query_constant", "key_logdet", "trace", "mahalanobis"))},
+                     "n_chunks": int(chunks)})
+    return rows
+
+
 def _routing_holonomy_rows(
     sums: Mapping[Any, Any],
     step: int,
@@ -3476,14 +3575,22 @@ def _eval_cadence_diagnostics(
             holonomy: Optional[Dict[Any, Any]] = {}
             features: Optional[Dict[str, Any]] = {}
             variances: Optional[Dict[Tuple[int, str], List[Any]]] = {}
+            score_terms: Optional[Dict[Tuple[int, int], List[float]]] = {}
             try:
                 residual_rows, attention_rows = _residual_and_attention_rows(
                     model, windows, step, device, counters_out=counters, holonomy_out=holonomy,
-                    features_out=features, variance_out=variances)
+                    features_out=features, variance_out=variances, score_terms_out=score_terms)
             except Exception as exc:
                 _record_diagnostic_failure(failures, "residual_attention", exc, logger)
                 residual_rows = attention_rows = None
                 counters = holonomy = features = variances = None   # their capture pass failed; counted once above
+                score_terms = None
+            if score_terms:
+                try:
+                    artifacts.append_diagnostic_rows(
+                        "score_terms.csv", SCORE_TERM_FIELDS, _score_term_rows(score_terms, step))
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "score_terms", exc, logger)
             if variances:
                 try:
                     artifacts.append_diagnostic_rows(
@@ -3877,6 +3984,9 @@ def _val_diagnostics_one(
     out["val_attn_entropy"] = vd["attn_entropy"]
     out["val_attn_entropy_min"] = vd["attn_entropy_min"]
     out["val_belief_cond_median_layer_max"] = float(vd.get("belief_cond_median_layer_max", float("nan")))
+    for key in ("belief_lam_min_layer_min", "belief_lam_min_argmin_layer", "belief_lam_max_layer_max",
+                "belief_cond_max_layer_max", "belief_eig_ratio_layer_min", "belief_eig_ratio_argmin_layer"):
+        out[f"val_{key}"] = float(vd.get(key, float("nan")))
     out.update({f"val_{key}": float(vd[key]) for key in _VAL_GEOMETRY_KEYS if key in vd})
     if "canonical_beta_tv" in vd:                               # diagnose_canonical_free_energy
         out.update(val_self_coupling=vd["self_coupling"], val_self_divergence=vd["self_divergence"],
@@ -4231,7 +4341,7 @@ def _no_update_call_with_precision_retry(
         except Exception as exc:
             if policy == "highest":
                 for note in failures:
-                    exc.add_note(f"earlier attempt of this {label} failed: {note}")
+                    add_exception_note(exc, f"earlier attempt of this {label} failed: {note}")
                 raise
             failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
     raise AssertionError("unreachable: the ladder ends at 'highest'")
@@ -4353,7 +4463,7 @@ def _train_step_with_precision_retry(
             verbs.append("skipped a non-finite update" if isinstance(exc, NonFiniteStepSkipped) else "raised")
             if updated or policy == "highest":
                 for note in failures:
-                    exc.add_note(f"earlier attempt of this step failed: {note}")
+                    add_exception_note(exc, f"earlier attempt of this step failed: {note}")
                 raise
             failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
             if replay_log is not None:
@@ -4403,6 +4513,7 @@ DIVERGENCE_ROLES: Tuple[str, ...] = ("mu", "sigma", "phi")
 # coefficients of the row's own step, and whether the row was forced by a spike.
 DIVERGENCE_COLUMNS: Tuple[str, ...] = (
     "interval_steps", "train_loss_interval_mean", "train_loss_interval_max", "train_ce_interval_mean",
+    "train_loss_interval_median", "train_ce_interval_median",
     *(f"grad_norm_{role}_interval_{stat}" for role in DIVERGENCE_ROLES for stat in ("mean", "max")),
     "grad_clip_binding_frac",
     *(f"grad_clip_coef_{role}" for role in DIVERGENCE_ROLES),
@@ -4411,16 +4522,29 @@ DIVERGENCE_COLUMNS: Tuple[str, ...] = (
 
 
 class _RunningStat:
-    r"""Count, sum and maximum of the finite values offered to it."""
+    r"""Count, sum and maximum of the finite values offered to it; with ``keep_values`` also the values, for the
+    interval median (audit 2026-10-20, spike report section 7: the interval mean includes blow-ups)."""
 
-    def __init__(self) -> None:
+    def __init__(self, keep_values: bool = False) -> None:
         self.count, self.total, self.peak = 0, 0.0, -math.inf
+        self.values: Optional[List[float]] = [] if keep_values else None
 
     def add(self, value: float) -> None:
         if math.isfinite(value):
             self.count += 1
             self.total += value
             self.peak = max(self.peak, value)
+            if self.values is not None:
+                self.values.append(float(value))
+
+    def median(self) -> float:
+        r"""The median of the kept finite values (the mean of the two middle ones for an even count); NaN when
+        none were kept."""
+        if not self.values:
+            return float("nan")
+        ordered = sorted(self.values)
+        middle = len(ordered) // 2
+        return ordered[middle] if len(ordered) % 2 else 0.5 * (ordered[middle - 1] + ordered[middle])
 
     def mean(self) -> float:
         return self.total / self.count if self.count else float("nan")
@@ -4435,6 +4559,97 @@ _SPIKE_TOP_ROWS = 3
 _SPIKE_TABLE_INDEX = {"mu_embed": "token", "sigma_log_embed": "token", "phi_embed": "token", "pos_phi": "position"}
 # Decode-side tables (untied decode bank) are read at the step's targets, so their rows are counted over targets.
 _SPIKE_DECODE_TABLES = ("decode_mu_embed", "decode_sigma_log_embed")
+_SPIKE_ROW_OCCURRENCES = 8          # (batch, position) pairs listed per top row
+# A reported spike re-runs the spike batch without gradients, row by row, to record the largest final belief
+# variance and the per-position CE maximum (audit 2026-10-20 item 11). It costs about one forward per reported spike.
+DIVERGENCE_SPIKE_FORWARD_PROBE: bool = True
+
+
+def _phi_row_head_conditions(
+    model: torch.nn.Module,
+    phi:   torch.Tensor,                   # (R, n_gen) frame-table rows
+) -> List[List[float]]:
+    r"""Per row and head the condition number :math:`\kappa_h = s_{\max}(U_h)/s_{\min}(U_h)` of the head block
+    :math:`U_h = e^{M_h}` of the row's frame :math:`U = e^{\sum_a\phi_aG_a}`, in float64.
+
+    Uses :func:`vfe3.metrics.head_block_algebra` when the basis is block-diagonal on the heads, else the diagonal
+    blocks of the dense exponential. The positional factor a token's frame also carries is not included: this is the
+    condition of the table row alone.
+    """
+    from vfe3 import metrics
+    group = getattr(model, "group", None)
+    if group is None or phi.numel() == 0:
+        return []
+    with torch.no_grad(), torch.autocast(device_type=phi.device.type, enabled=False):
+        phi = phi.detach().to(torch.float64)
+        algebra = metrics.head_block_algebra(phi, group)
+        if algebra is not None:
+            blocks = [torch.linalg.matrix_exp(M) for M in algebra]                       # per head (R, d_h, d_h)
+        else:
+            U = torch.linalg.matrix_exp(group.embed_algebra(phi, dtype=torch.float64))  # (R, K, K)
+            offsets = [0, *itertools.accumulate(group.irrep_dims)]
+            blocks = [U[:, a:b, a:b] for a, b in zip(offsets[:-1], offsets[1:])]
+        conditions = []
+        for block in blocks:
+            singular = torch.linalg.svdvals(block)                                        # (R, d_h) descending
+            conditions.append(singular[..., 0] / singular[..., -1])
+        return torch.stack(conditions, dim=-1).cpu().tolist()                             # (R, H)
+
+
+@torch.no_grad()
+def _spike_forward_state(
+    model:   torch.nn.Module,
+    tokens:  torch.Tensor,                 # (B, N) the spike step's input tokens
+    targets: torch.Tensor,                 # (B, N) its targets (-100 = ignore)
+) -> Dict[str, Any]:
+    r"""The largest final belief variance and the per-position CE maximum of a spike batch, from a no-grad forward.
+
+    The forward runs one sequence at a time (so the logits are (1, N, V)), in eval mode, with the global RNG streams
+    restored afterwards, at the parameters after the spike step's update: the step's own forward is not kept, so the
+    values describe the batch under the updated model. The variance is the largest diagonal entry of the final
+    ``belief.sigma`` (the diagonal of a matrix covariance), with its (batch, position) and the CE at that position; the
+    CE is the plug-in cross-entropy :math:`-\log p(y_{bn}\mid q_{bn})` at each scored position, and its maximum is
+    reported with its (batch, position) and the variance there.
+    """
+    import torch.nn.functional as F
+
+    was_training = model.training
+    rng_devices = [tokens.device] if tokens.device.type == "cuda" else []
+    variance_rows: List[torch.Tensor] = []                           # per sequence (N,)
+    ce_rows: List[torch.Tensor] = []                                 # per sequence (N,)
+    with torch.random.fork_rng(devices=rng_devices):
+        model.eval()
+        try:
+            for b in range(tokens.shape[0]):
+                belief, logits = model.forward_beliefs(tokens[b:b + 1], return_logits=True)
+                sigma = belief.sigma.detach()
+                if sigma.dim() == 4:                                 # (1, N, K, K) matrix covariance
+                    sigma = sigma.diagonal(dim1=-2, dim2=-1)
+                variance_rows.append(sigma.float().reshape(sigma.shape[1], -1).amax(dim=-1))       # (N,)
+                ce = F.cross_entropy(logits[0].float(), targets[b], ignore_index=-100, reduction="none")  # (N,)
+                ce_rows.append(torch.where(targets[b] == -100, torch.full_like(ce, float("nan")), ce))
+        finally:
+            model.train(was_training)
+    variance = torch.stack(variance_rows).cpu()                      # (B, N)
+    ce = torch.stack(ce_rows).cpu()                                  # (B, N)
+    n = variance.shape[1]
+    out: Dict[str, Any] = {"parameters": "after the spike step's update", "mode": "eval, one sequence at a time"}
+    finite_variance = torch.where(torch.isfinite(variance), variance, torch.full_like(variance, -math.inf))
+    flat = int(finite_variance.reshape(-1).argmax())
+    out["sigma_q_max"] = float(variance.reshape(-1)[flat])
+    out["sigma_q_max_at"] = [flat // n, flat % n]
+    out["sigma_q_nonfinite"] = int((~torch.isfinite(variance)).sum())
+    out["ce_at_sigma_q_max"] = float(ce.reshape(-1)[flat])
+    finite_ce = torch.where(torch.isnan(ce), torch.full_like(ce, -math.inf), ce)
+    if torch.isfinite(finite_ce).any() or torch.isposinf(finite_ce).any():
+        flat_ce = int(finite_ce.reshape(-1).argmax())
+        out["ce_max"] = float(ce.reshape(-1)[flat_ce])
+        out["ce_max_at"] = [flat_ce // n, flat_ce % n]
+        out["sigma_q_at_ce_max"] = float(variance.reshape(-1)[flat_ce])
+        out["ce_mean"] = float(ce[~torch.isnan(ce)].mean())
+    else:
+        out["ce_max"], out["ce_max_at"], out["sigma_q_at_ce_max"], out["ce_mean"] = None, None, None, None
+    return out
 
 
 def _spike_attribution(
@@ -4448,8 +4663,10 @@ def _spike_attribution(
     replayed:         bool,                       # the step was replayed at a stricter matmul precision
     last_group_norms: Mapping[str, float],        # pre-clip grad_norm_group_* of the last logged row
     targets:          Optional[torch.Tensor] = None,   # (B, N) the step's targets; counts decode-table rows
+    step:             Optional[int] = None,            # completed-step number of the spiking step
+    last_seen:        Optional[Mapping[str, torch.Tensor]] = None,   # "token"/"target": (V [+1],) last step seen
 ) -> Dict[str, Any]:
-    r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and why.
+    r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and what coincides.
 
     Reads the gradients that reached ``optimizer.step``: the references ``train_step`` keeps in ``status["grads"]``,
     since the table Fisher step and the manifold phi step clear ``.grad`` inside ``step()``, else the live
@@ -4457,9 +4674,14 @@ def _spike_attribution(
     coefficient (``status["clip_scales"]``), so :math:`\|g_p\|` is the pre-clip norm and a role's norm is
     :math:`(\sum_{p\in r}\|g_p\|^2)^{1/2}`. Shares are of the squared role norm. For the token and positional tables
     among the top parameters, the rows with the largest gradient are reported with their share of the table's
-    squared norm and, for token tables, their count in the batch (decode tables: their count among the targets). ``causes`` lists what coincides with the spike:
-    the loss spike (a hard batch), a binding clip, a precision replay, one parameter or a few rows carrying most of
-    the norm, and groups far above their last logged norm. One host transfer for the norms.
+    squared norm and, for token tables, their count in the batch (decode tables: their count among the targets),
+    up to ``_SPIKE_ROW_OCCURRENCES`` of their (batch, position) occurrences and, given ``step`` and ``last_seen``
+    (the last completed step at which each id occurred, -1 when not since the start or resume), the steps since the
+    row's previous occurrence. For ``phi_embed`` rows the per-head condition numbers of the row's frame
+    (:func:`_phi_row_head_conditions`, at the parameters after the update) are added (audit 2026-10-20 item 11).
+    ``causes`` lists what coincides with the spike, without asserting a cause: the loss spike on the same step, a
+    binding clip, a precision replay, one parameter or a few rows carrying most of the norm, and groups far above
+    their last logged norm. One host transfer for the norms.
     """
     scales: Mapping[int, float] = status.get("clip_scales") or {}
     stashed: Mapping[int, torch.Tensor] = status.get("grads") or {}
@@ -4514,14 +4736,33 @@ def _spike_attribution(
                                      "top_share": float(top_sq.sum() / rows.sum().clamp_min(1e-300)),
                                      "rows_with_gradient": int((rows > 0).sum())}
             if index in ("token", "target"):
-                ids = (tokens if index == "token" else targets).reshape(-1).to(rows.device)
+                source = tokens if index == "token" else targets
+                ids = source.reshape(-1).to(rows.device)
                 ids = ids[(ids >= 0) & (ids < rows.numel())]                  # drop ignore-index targets
                 counts = torch.bincount(ids, minlength=rows.numel())
                 entry["batch_counts"] = counts[top_rows].cpu().tolist()
+                host_ids = source.detach().cpu()                             # (B, N)
+                entry["occurrences"] = [
+                    [[int(b), int(n)] for b, n in (host_ids == row).nonzero().tolist()[:_SPIKE_ROW_OCCURRENCES]]
+                    for row in entry["rows"]]
+                seen = None if last_seen is None else last_seen.get(index)
+                if seen is not None and step is not None:
+                    previous = seen[top_rows.to(seen.device)].cpu().tolist()
+                    entry["steps_since_last_occurrence"] = [
+                        None if last < 0 else int(step) - int(last) for last in previous]
+            elif index == "position":
+                entry["occurrences"] = [[[b, int(row)] for b in range(int(tokens.shape[0]))][:_SPIKE_ROW_OCCURRENCES]
+                                        for row in entry["rows"]]
+            if group == "phi_embed" and grad.shape[0] == parameter.shape[0]:
+                try:
+                    entry["head_condition"] = _phi_row_head_conditions(
+                        model, parameter.detach()[top_rows.to(parameter.device)])
+                except Exception as exc:                                    # noqa: BLE001 - a diagnostic
+                    entry["head_condition_error"] = f"{type(exc).__name__}: {exc}"
         report["table_rows"][name] = entry
     causes: List[str] = report["causes"]
     if loss_spiked:
-        causes.append("the loss spiked on the same step (a hard batch drives the gradient)")
+        causes.append("the training loss spiked on the same step")
     if replayed:
         causes.append("the step was replayed at a stricter matmul precision")
     for role, info in report["roles"].items():
@@ -4533,6 +4774,14 @@ def _spike_attribution(
     for name, entry in report["table_rows"].items():
         if entry["top_share"] >= 0.5:
             counts = f", batch counts {entry['batch_counts']}" if "batch_counts" in entry else ""
+            if "occurrences" in entry:
+                counts += ", first (batch, position) " + str(
+                    [tuple(found[0]) if found else None for found in entry["occurrences"]])
+            if "steps_since_last_occurrence" in entry:
+                counts += f", steps since last occurrence {entry['steps_since_last_occurrence']}"
+            if "head_condition" in entry:
+                counts += ", max head cond(U) " + str(
+                    [float(f"{max(conds):.3g}") if conds else None for conds in entry["head_condition"]])
             causes.append(f"{name} {entry['indexed_by']} rows {entry['rows']} carry {entry['top_share']:.0%} "
                           f"of its gradient{counts}")
     for group, norm in sorted(report["group_norms"].items()):
@@ -4552,7 +4801,15 @@ def _spike_summary(report: Mapping[str, Any]) -> str:
     top = ", ".join(f"{entry['name']} {entry['pre_clip_norm']:.3g} ({entry['role_share']:.0%} of {entry['role']})"
                     for entry in report["top_parameters"][:3])
     causes = "; ".join(report["causes"]) or "none identified"
-    return f"{' | '.join(parts)}; top: {top}; causes: {causes}"
+    forward = report.get("forward_state")
+    state = ""
+    if isinstance(forward, Mapping) and "sigma_q_max" in forward:
+        state = (f"; post-update forward: max sigma_q {forward['sigma_q_max']:.4g} at (batch, position) "
+                 f"{tuple(forward['sigma_q_max_at'])}")
+        if forward.get("ce_max") is not None:
+            state += (f", max per-position CE {forward['ce_max']:.4g} at {tuple(forward['ce_max_at'])} "
+                      f"(batch mean {forward['ce_mean']:.4g})")
+    return f"{' | '.join(parts)}; top: {top}; coincident: {causes}{state}"
 
 
 def _append_spike_record(
@@ -4580,9 +4837,15 @@ class _DivergenceMonitor:
         \bar x_t = \rho\,\bar x_{t-1} + (1 - \rho)\,x_t,\qquad \rho = 0.98.
 
     Non-finite values enter neither the EMAs nor the interval statistics (the rejected-update accounting
-    covers them). On a spiking channel the EMA takes the bounded value, :math:`\min(x, 10\,\bar x)` for a norm and
-    :math:`\min(\ell, \bar\ell + 1)` for the loss, so one extreme step cannot hold the EMA above its baseline for
-    hundreds of steps (audit 2026-10-17 item 15).
+    covers them). A spiking channel's EMA is frozen on that step, :math:`\bar x_t = \bar x_{t-1}`, so a burst of
+    spikes cannot ratchet it. The earlier bounded update :math:`\min(x, 10\,\bar x)` grew a norm EMA by a factor
+    of up to :math:`0.98 + 0.02\cdot 10 = 1.18` per spiking step, which carried one run's mu-norm EMA from 0.86 to
+    1.19e4 and stopped flagging late steps (audit 2026-10-20, spike report section 7; before that, audit
+    2026-10-17 item 15). The warmup count still advances on a frozen step. A sustained shift of a level above the
+    threshold is therefore an event on every step and is reported once per cooldown until the level falls back.
+
+    The interval statistics keep the loss and CE values, so a row carries their interval median beside the mean,
+    which a single blow-up dominates.
 
     Every spike is an *event* (:attr:`event`, recorded by the caller in ``divergence_spikes.jsonl``). Its severity
     is the largest of :math:`x/(10\,\bar x)` over the spiking norms and :math:`(\ell - \bar\ell)/1` for the loss, so
@@ -4617,8 +4880,8 @@ class _DivergenceMonitor:
 
     def reset_interval(self) -> None:
         self.steps = 0
-        self._loss = _RunningStat()
-        self._ce = _RunningStat()
+        self._loss = _RunningStat(keep_values=True)
+        self._ce = _RunningStat(keep_values=True)
         self._norms = {role: _RunningStat() for role in DIVERGENCE_ROLES}
         self._clipped = 0
         self._binding = 0
@@ -4655,7 +4918,7 @@ class _DivergenceMonitor:
                 reasons.append(f"pre-clip grad_norm_{role} {value:.4g} is {value / ema:.1f}x its EMA {ema:.4g}")
                 roles.append(role)
                 severity = max(severity, value / (DIVERGENCE_NORM_SPIKE_RATIO * ema))
-                update = DIVERGENCE_NORM_SPIKE_RATIO * ema               # min(x, ratio * EMA) on a spike
+                update = ema                                             # frozen on a spike (no ratchet)
             self._norm_ema[role] = value if ema is None else (
                 DIVERGENCE_EMA_DECAY * ema + (1.0 - DIVERGENCE_EMA_DECAY) * update)
             self._norm_seen[role] = seen + 1
@@ -4668,7 +4931,7 @@ class _DivergenceMonitor:
                 loss_spiked = True
                 severity = max(severity, ((loss - ema) / DIVERGENCE_LOSS_SPIKE_MARGIN
                                           if DIVERGENCE_LOSS_SPIKE_MARGIN > 0 else math.inf))
-                update = ema + DIVERGENCE_LOSS_SPIKE_MARGIN              # min(loss, EMA + margin) on a spike
+                update = ema                                             # frozen on a spike (no ratchet)
             self._loss_ema = loss if ema is None else (
                 DIVERGENCE_EMA_DECAY * ema + (1.0 - DIVERGENCE_EMA_DECAY) * update)
             self._loss_seen += 1
@@ -4699,6 +4962,8 @@ class _DivergenceMonitor:
             "train_loss_interval_mean": self._loss.mean(),
             "train_loss_interval_max": self._loss.max(),
             "train_ce_interval_mean": self._ce.mean(),
+            "train_loss_interval_median": self._loss.median(),
+            "train_ce_interval_median": self._ce.median(),
         }
         for role in DIVERGENCE_ROLES:
             out[f"grad_norm_{role}_interval_mean"] = self._norms[role].mean()
@@ -4724,6 +4989,9 @@ class _DivergenceMonitor:
         def stat(value: _RunningStat) -> List[Any]:
             return [value.count, value.total, value.peak]
 
+        def kept(value: _RunningStat) -> List[float]:
+            return list(value.values or [])
+
         source = _DivergenceMonitor() if interval_ends else self
         return {
             "loss_ema":   self._loss_ema,
@@ -4736,6 +5004,8 @@ class _DivergenceMonitor:
                 "steps":   source.steps,
                 "loss":    stat(source._loss),
                 "ce":      stat(source._ce),
+                "loss_values": kept(source._loss),       # for the interval medians (absent in older checkpoints)
+                "ce_values":   kept(source._ce),
                 "norms":   {role: stat(source._norms[role]) for role in DIVERGENCE_ROLES},
                 "clipped": source._clipped,
                 "binding": source._binding,
@@ -4751,9 +5021,11 @@ class _DivergenceMonitor:
         if monitor is None:
             return False
 
-        def stat(values: List[Any]) -> _RunningStat:
-            out = _RunningStat()
+        def stat(values: List[Any], kept: Optional[List[float]] = None, keep: bool = False) -> _RunningStat:
+            out = _RunningStat(keep_values=keep)
             out.count, out.total, out.peak = values
+            if keep:
+                out.values = list(kept or [])      # an older checkpoint: the median covers the resumed part only
             return out
 
         interval = monitor["interval"]
@@ -4762,7 +5034,8 @@ class _DivergenceMonitor:
         self._last_spike = monitor["last_spike"]
         self._last_severity = monitor.get("last_severity")
         self.steps = interval["steps"]
-        self._loss, self._ce = stat(interval["loss"]), stat(interval["ce"])
+        self._loss = stat(interval["loss"], interval["loss_values"], keep=True)
+        self._ce = stat(interval["ce"], interval["ce_values"], keep=True)
         self._norms = {role: stat(interval["norms"][role]) for role in DIVERGENCE_ROLES}
         self._clipped, self._binding = interval["clipped"], interval["binding"]
         return True
@@ -4820,15 +5093,26 @@ def _divergence_monitor_state(
     norms = interval.get("norms")
     if not isinstance(norms, Mapping):
         return None
+    def kept(item: object) -> Optional[List[float]]:
+        if item is None:                                     # absent before the interval medians
+            return []
+        if not isinstance(item, (list, tuple)):
+            return None
+        values = [_real(entry) for entry in item]
+        return None if any(entry is None for entry in values) else values
+
     restored = {
         "steps":   _count(interval.get("steps")),
         "loss":    stat(interval.get("loss")),
         "ce":      stat(interval.get("ce")),
+        "loss_values": kept(interval.get("loss_values")),
+        "ce_values":   kept(interval.get("ce_values")),
         "norms":   {role: stat(norms.get(role)) for role in DIVERGENCE_ROLES},
         "clipped": _count(interval.get("clipped")),
         "binding": _count(interval.get("binding")),
     }
-    if (any(restored[key] is None for key in ("steps", "loss", "ce", "clipped", "binding"))
+    if (any(restored[key] is None for key in ("steps", "loss", "ce", "loss_values", "ce_values", "clipped",
+                                              "binding"))
             or any(entry is None for entry in restored["norms"].values())):
         return None
     out["interval"] = restored
@@ -4964,6 +5248,119 @@ class _PeakMemory:
         overall = max(train, self._other)
         self._train = self._other = 0.0
         return overall, train
+
+
+# Allocator and clock telemetry on every metrics row (audit 2026-10-20 item 20). NaN off CUDA and where a reading is
+# unavailable (no NVML and no nvidia-smi, an older torch without a counter).
+DEVICE_TELEMETRY_COLUMNS: Tuple[str, ...] = (
+    "cuda_mem_allocated_mb", "cuda_mem_reserved_mb", "cuda_mem_reserved_peak_mb", "cuda_mem_inactive_split_mb",
+    "cuda_alloc_retries", "cuda_device_allocs", "cuda_device_frees", "cuda_ooms",
+    "gpu_sm_clock_mhz", "gpu_temperature_c", "gpu_power_w",
+)
+_NVIDIA_SMI_TIMEOUT_S: float = 5.0
+
+
+class _DeviceTelemetry:
+    r"""Allocator counters and SM clock, temperature and power of the training device, read once per metrics row.
+
+    The allocator columns come from ``torch.cuda.memory_stats`` (host counters, no synchronization): current allocated,
+    reserved and inactive-split bytes, the reserved peak since the last peak reset (the peak-memory split resets the
+    peaks at each phase boundary, so this is the peak of the last phase window), and the cumulative counts of allocator
+    retries, ``cudaMalloc`` and ``cudaFree`` calls and OOMs. A rising retry or device-allocation count with flat peak
+    memory points at allocator churn; a falling SM clock at the same utilization points at clock drift.
+
+    The clock columns read NVML through ``pynvml`` when it imports, else one ``nvidia-smi --query-gpu`` call per row.
+    The device is matched by its UUID, so ``CUDA_VISIBLE_DEVICES`` remapping does not misattribute it. A failed or
+    slow (more than ``_NVIDIA_SMI_TIMEOUT_S``) query disables the clock source for the rest of the run; the clock
+    columns are then NaN. Nothing here raises.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._cuda = device.type == "cuda"
+        self._source: Optional[str] = None if self._cuda else "off"     # "nvml" | "smi" | "off", chosen lazily
+        self._nvml_handle: Any = None
+        self._uuid: Optional[str] = None
+
+    def _init_clock_source(self) -> None:
+        try:
+            raw = str(torch.cuda.get_device_properties(self._device).uuid)
+            self._uuid = raw if raw.startswith("GPU-") else f"GPU-{raw}"
+        except Exception:                                     # noqa: BLE001 - telemetry, never fatal
+            self._uuid = None
+        try:
+            import pynvml                                     # type: ignore[import-not-found]
+            pynvml.nvmlInit()
+            index = self._device.index if self._device.index is not None else torch.cuda.current_device()
+            self._nvml_handle = (pynvml.nvmlDeviceGetHandleByUUID(self._uuid) if self._uuid is not None
+                                 else pynvml.nvmlDeviceGetHandleByIndex(index))
+            self._source = "nvml"
+            return
+        except Exception:                                     # noqa: BLE001 - pynvml absent or NVML failed
+            self._nvml_handle = None
+        import shutil
+        self._source = "smi" if shutil.which("nvidia-smi") is not None else "off"
+
+    def _clock(self) -> Dict[str, float]:
+        nan = float("nan")
+        out = {"gpu_sm_clock_mhz": nan, "gpu_temperature_c": nan, "gpu_power_w": nan}
+        if self._source is None:
+            self._init_clock_source()
+        if self._source == "nvml":
+            try:
+                import pynvml                                 # type: ignore[import-not-found]
+                handle = self._nvml_handle
+                out["gpu_sm_clock_mhz"] = float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+                out["gpu_temperature_c"] = float(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+                out["gpu_power_w"] = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1e3
+            except Exception:                                 # noqa: BLE001
+                self._source = "off"
+        elif self._source == "smi":
+            import subprocess
+            command = ["nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu,power.draw",
+                       "--format=csv,noheader,nounits"]
+            if self._uuid is not None:
+                command += ["-i", self._uuid]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=_NVIDIA_SMI_TIMEOUT_S,
+                                        check=True)
+                fields = [field.strip() for field in result.stdout.strip().splitlines()[0].split(",")]
+                for key, field in zip(("gpu_sm_clock_mhz", "gpu_temperature_c", "gpu_power_w"), fields):
+                    try:
+                        out[key] = float(field)
+                    except ValueError:
+                        out[key] = nan                        # "[N/A]" on boards that do not report it
+            except Exception:                                 # noqa: BLE001 - missing tool, timeout, parse error
+                self._source = "off"
+        return out
+
+    def sample(self) -> Dict[str, float]:
+        r"""The :data:`DEVICE_TELEMETRY_COLUMNS` of one metrics row (NaN off CUDA)."""
+        nan = float("nan")
+        out = {column: nan for column in DEVICE_TELEMETRY_COLUMNS}
+        if not self._cuda:
+            return out
+        try:
+            stats = torch.cuda.memory_stats(self._device)
+
+            def read(key: str, scale: float = 1.0) -> float:
+                value = stats.get(key)
+                return float(value) / scale if value is not None else nan
+
+            out.update({
+                "cuda_mem_allocated_mb": read("allocated_bytes.all.current", 1e6),
+                "cuda_mem_reserved_mb": read("reserved_bytes.all.current", 1e6),
+                "cuda_mem_reserved_peak_mb": read("reserved_bytes.all.peak", 1e6),
+                "cuda_mem_inactive_split_mb": read("inactive_split_bytes.all.current", 1e6),
+                "cuda_alloc_retries": read("num_alloc_retries"),
+                "cuda_device_allocs": read("num_device_alloc"),
+                "cuda_device_frees": read("num_device_free"),
+                "cuda_ooms": read("num_ooms"),
+            })
+        except Exception:                                     # noqa: BLE001 - telemetry, never fatal
+            pass
+        out.update(self._clock())
+        return out
 
 
 RUN_LOG_NAME = "train.log"                            # run_dir: the run's log records (audit 2026-10-17 item 4)
@@ -5334,7 +5731,14 @@ def _train_loop(
     # on host values train_step already transfers.
     divergence = _DivergenceMonitor()
     last_group_norms: Dict[str, float] = {}               # pre-clip group norms of the last logged step
-    failed_step_skips = 0             # strictest-rung failures skipped under max_failed_step_skips (item 16)
+    # The last completed step at which each token id occurred as an input and as a target (-1: not since the start
+    # or resume), for the spike attribution's steps-since-last-occurrence (audit 2026-10-20 item 11). One device
+    # index_fill per step and no host read; the extra target slot absorbs ignore-index targets.
+    occurrence_steps: Dict[str, torch.Tensor] = {
+        "token":  torch.full((int(cfg.vocab_size),), -1, dtype=torch.int64, device=device),
+        "target": torch.full((int(cfg.vocab_size) + 1,), -1, dtype=torch.int64, device=device),
+    }
+    failed_step_skips = 0            # strictest-rung failures skipped under max_failed_step_skips (item 16)
     loss_spike_rejections = 0         # updates rejected under loss_spike_skip_nats (item 17)
     max_failed_skips: Optional[int] = getattr(cfg, "max_failed_step_skips", None)
     max_consecutive: Optional[int] = getattr(cfg, "max_consecutive_skips", None)
@@ -5588,6 +5992,7 @@ def _train_loop(
     last_table_step_norm: Optional[float] = None              # table_fisher_step_norm_mean of the previous row
     checkpoint_ms_pending: List[float] = []                   # checkpoint saves since the previous row
     peak_memory = _PeakMemory(device)
+    device_telemetry = _DeviceTelemetry(device)               # allocator and clock columns (audit 2026-10-20 item 20)
 
     def _data_state_for(batches: int, identity: Optional[Mapping[str, object]]) -> Optional[DataState]:
         r"""The checkpoint data cursor at ``batches`` consumed batches of the current epoch, or None."""
@@ -5666,8 +6071,13 @@ def _train_loop(
     def _on_crash(exc: BaseException) -> None:
         r"""Write the crash record, the failing batch, pending rows and replay records and the emergency checkpoint.
 
-        Every part is isolated: a failure inside the handler is listed in the record and never replaces the
-        original exception, which the caller re-raises.
+        The record and the stop line come first (audit 2026-10-20 item 12): a preliminary ``crash.json`` with the
+        exception, its traceback, the step and the recent losses is written and the error is logged before any
+        slow stage, so an interrupt during the multi-gigabyte emergency checkpoint still leaves both. Each later
+        stage is guarded by ``except BaseException``; an interrupt (``KeyboardInterrupt``, ``SystemExit``) inside a
+        stage is listed in the record and skips the remaining stages. The record is rewritten atomically after the
+        stages with ``record_complete`` True. A failure inside the handler never replaces the original exception,
+        which the caller re-raises.
         """
         if artifacts is None or getattr(artifacts, "run_dir", None) is None:
             return
@@ -5689,48 +6099,63 @@ def _train_loop(
             "recent_losses": [float(value) for value in recent_losses],
             "failed_batch": None, "checkpoint": None, "checkpoint_step": None, "checkpoint_reason": None,
             "handler_errors": [],
+            "record_complete": False,                             # True once every stage below has returned
+            "interrupted_stage": None,                            # the stage an interrupt stopped, if any
         }
         diagnostics_dir = Path(artifacts.run_dir) / "diagnostics"
-        try:
-            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+        def _write_record() -> None:
+            try:
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                _write_crash_record(diagnostics_dir, record)
+            except Exception as handler_exc:                      # noqa: BLE001 - the original exception wins
+                logger.error("crash record could not be written (%s)", handler_exc)
+
+        _write_record()                                           # preliminary record before any slow stage
+        logger.error("training stopped at step %s (%s: %s); crash record %s; writing the failing batch and the "
+                     "emergency checkpoint", record["step"], type(exc).__name__, exc,
+                     diagnostics_dir / CRASH_RECORD_NAME)
+
+        def _save_batch() -> None:
             if crash_state["tokens"] is not None:
                 batch_path = diagnostics_dir / f"crash_batch_step_{record['step']}.pt"
                 torch.save({"step": record["step"], "tokens": crash_state["tokens"],
                             "targets": crash_state["targets"]}, batch_path)
                 record["failed_batch"] = str(batch_path)
-        except Exception as handler_exc:                          # noqa: BLE001 - the original exception wins
-            record["handler_errors"].append(f"failed batch: {type(handler_exc).__name__}: {handler_exc}")
-        try:
+
+        def _flush_replays() -> None:
             if crash_state["replays"] and not crash_state["replays_flushed"]:
                 _append_replay_records(artifacts.run_dir, crash_state["replays"])
                 crash_state["replays_flushed"] = True
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["handler_errors"].append(f"replay records: {type(handler_exc).__name__}: {handler_exc}")
-        try:
+
+        def _flush_pending() -> None:
             if pending_rows:
                 union = (metrics_fields if metrics_fields is not None
                          else list(dict.fromkeys(key for pending in pending_rows for key in pending)))
                 for pending in pending_rows:
                     artifacts.log_metrics(_conform_row(pending, union))
                 pending_rows.clear()
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["handler_errors"].append(f"pending rows: {type(handler_exc).__name__}: {handler_exc}")
-        try:
-            artifacts.wait_background()
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["handler_errors"].append(f"background jobs: {type(handler_exc).__name__}: {handler_exc}")
-        try:
-            _emergency_checkpoint(record)
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["checkpoint"] = None
-            record["handler_errors"].append(f"checkpoint: {type(handler_exc).__name__}: {handler_exc}")
-        try:
-            _write_crash_record(diagnostics_dir, record)
-        except Exception as handler_exc:                          # noqa: BLE001
-            logger.error("crash record could not be written (%s)", handler_exc)
-        logger.error("training stopped at step %s (%s: %s); crash record %s, checkpoint %s",
-                     record["step"], type(exc).__name__, exc, diagnostics_dir / CRASH_RECORD_NAME,
-                     record["checkpoint"] or f"none ({record['checkpoint_reason']})")
+
+        stages = (("failed batch", _save_batch), ("replay records", _flush_replays), ("pending rows", _flush_pending),
+                  ("background jobs", artifacts.wait_background), ("checkpoint", lambda: _emergency_checkpoint(record)))
+        for name, stage in stages:
+            try:
+                stage()
+            except BaseException as handler_exc:                  # noqa: BLE001 - the original exception wins
+                if name == "checkpoint":
+                    record["checkpoint"] = None
+                record["handler_errors"].append(f"{name}: {type(handler_exc).__name__}: {handler_exc}")
+                if not isinstance(handler_exc, Exception):        # an interrupt: stop here, keep the record
+                    record["interrupted_stage"] = name
+                    break
+            _write_record()                                       # each stage's result reaches the record
+        else:
+            record["record_complete"] = True
+        _write_record()
+        logger.error("crash handling at step %s finished; checkpoint %s%s", record["step"],
+                     record["checkpoint"] or f"none ({record['checkpoint_reason']})",
+                     "" if record["interrupted_stage"] is None
+                     else f"; interrupted during the {record['interrupted_stage']} stage")
 
     def _save_failed_batch(step_number: int, exc: BaseException) -> Optional[str]:
         r"""Save the batch of a skipped failed step to ``diagnostics/failed_steps/step_<S>.pt`` (item 16)."""
@@ -5775,6 +6200,7 @@ def _train_loop(
                                              else None)})
             update_flag["fired"] = False
             router_head_tables: Optional[Mapping[str, Any]] = None
+            belief_layer_extremes: Optional[Mapping[str, Sequence[float]]] = None
             tokens_seen += int(tokens.numel())                   # input-token presentations (metadata only)
             tokens = tokens.to(device, non_blocking=True)
             targets = _transfer_targets(targets, model, device)
@@ -5818,15 +6244,19 @@ def _train_loop(
                     # prototype sums so a failed attempt is not counted.
                     if hasattr(model, "last_router_head_tables"):
                         model.last_router_head_tables = None
+                    if hasattr(model, "last_belief_layer_extremes"):
+                        model.last_belief_layer_extremes = None
                     d = _diagnostics_with_precision_retry(
                         model, tokens, before_attempt=(prototype_sums.clear if prototype_sums is not None else None))
                     router_head_tables = getattr(model, "last_router_head_tables", None)
+                    belief_layer_extremes = getattr(model, "last_belief_layer_extremes", None)
                 except Exception as exc:                         # optional probes cannot stop training
                     _record_diagnostic_failure(diagnostics_failures, "training_diagnostics", exc, logger)
                     d = {key: float("nan") for key in (diag_keys or _TRAIN_DIAGNOSTIC_FALLBACK_KEYS)}
                     diag_failed = True
                     train_features = None
                     router_head_tables = None
+                    belief_layer_extremes = None
                 finally:
                     for mlp in wrapped_templates:
                         del mlp.forward_moments                  # back to the class method
@@ -6005,7 +6435,15 @@ def _train_loop(
                         report = _spike_attribution(
                             model, optimizer, step_status, tokens,
                             roles=divergence.spike_roles or DIVERGENCE_ROLES, loss_spiked=divergence.spike_loss,
-                            replayed=replays > 0, last_group_norms=last_group_norms, targets=targets)
+                            replayed=replays > 0, last_group_norms=last_group_norms, targets=targets,
+                            step=step + 1, last_seen=occurrence_steps)
+                        report["loss_over_3_log_v"] = bool(math.isfinite(step_loss)
+                                                           and step_loss > 3.0 * math.log(cfg.vocab_size))
+                        if reported and DIVERGENCE_SPIKE_FORWARD_PROBE:
+                            try:
+                                report["forward_state"] = _spike_forward_state(model, tokens, targets)
+                            except Exception as exc:                 # noqa: BLE001 - a diagnostic
+                                report["forward_state"] = {"error": f"{type(exc).__name__}: {exc}"}
                         if reported:
                             spike_groups = report["group_norms"]
                             logger.warning("step %d: spike attribution: %s", step + 1, _spike_summary(report))
@@ -6025,6 +6463,10 @@ def _train_loop(
                         except Exception as exc:
                             _record_diagnostic_failure(diagnostics_failures, "divergence_spike_attribution", exc,
                                                        logger)
+            # This step's ids become the previous occurrence for later spikes (after the attribution read them).
+            occurrence_steps["token"].index_fill_(0, tokens.reshape(-1), step + 1)
+            occurrence_steps["target"].index_fill_(0, torch.where(
+                targets.reshape(-1) >= 0, targets.reshape(-1), int(cfg.vocab_size)), step + 1)
             if step_metrics is not None:                         # the reference for "x its last logged norm"
                 last_group_norms.update({column[len("grad_norm_group_"):]: float(step_metrics[column])
                                          for column in _GRAD_GROUP_COLUMNS if column in step_metrics})
@@ -6046,12 +6488,14 @@ def _train_loop(
                 # d (the F-decomposition) is computed PRE-step above so it shares train_ce's provenance (m7).
                 assert timer is not None
                 train_timing = timer.sample_train_window()
+                # Allocator and clock telemetry before the peak reset below (audit 2026-10-20 item 20).
+                telemetry = device_telemetry.sample()
                 # Overall peak since the previous row (as before) and the training-only peak (audit 2026-10-17 item 49).
                 peak_mem_mb, peak_mem_train_mb = peak_memory.sample()
 
             if do_log:
                 logger.info(
-                    "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | train it/s: %.2f | \n\n         Train PPL: %.1f \n",
+                    "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | train it/s: %.2f | \n\n         Batch PPL: %.1f \n",
                     step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
                     train_timing.train_steps_per_s, _perplexity_from_ce(ce),
                 )
@@ -6227,6 +6671,15 @@ def _train_loop(
                     last_val_diag["val_attn_collapsed_heads"] = last_train_sample.pop(
                         "val_attn_collapsed_heads", float("nan"))
                     phase_ms["eval_cadence_ms"] = _synced_ms(device) - _t0
+                    # The train/validation comparison on the console is the fixed training sample under the
+                    # validation protocol, not the single training batch of the step line above (audit 2026-10-20
+                    # item 7); the batch perplexity there scores one batch at every position of disjoint windows.
+                    sample_ppl = last_train_sample.get("train_sample_ppl", float("nan"))
+                    gap_fixed = last_train_sample.get("generalization_gap_fixed", float("nan"))
+                    if math.isfinite(sample_ppl) and math.isfinite(gap_fixed):
+                        logger.info("       Train sample PPL: %.2f (fixed sample, validation protocol) | "
+                                    "generalization gap (val CE - train sample CE): %.4f nats",
+                                    sample_ppl, gap_fixed)
                 torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
                 crash_state["eval_rng"] = None
                 peak_memory.end_other()
@@ -6331,7 +6784,8 @@ def _train_loop(
                         floor_reference = _covariance_floor_reference(model)
                     _warn_eigenvalue_collapse(d, dead_router_warned, logger,
                                               belief_layer=int(getattr(cfg, "n_layers", 1)) - 1,
-                                              floor_reference=floor_reference, sink=warning_sink)
+                                              floor_reference=floor_reference, sink=warning_sink,
+                                              layer_extremes=belief_layer_extremes)
                 if steps_per_epoch:
                     row.update(_training_cursor_fields(step + 1, steps_per_epoch))
                 else:
@@ -6344,6 +6798,7 @@ def _train_loop(
                 # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.
                 row["peak_mem_mb"] = peak_mem_mb
                 row["peak_mem_train_mb"] = peak_mem_train_mb   # the training phases alone (audit 2026-10-17 item 49)
+                row.update(telemetry)                          # DEVICE_TELEMETRY_COLUMNS (audit 2026-10-20 item 20)
                 # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
                 # the standard convention). The train side is this step's batch while val is the
                 # token-weighted val-set mean, so read it as a TREND, not an absolute. Under a sliding
@@ -6378,6 +6833,10 @@ def _train_loop(
                             "belief_lam_min", "belief_lam_max", "belief_cond_valid_frac",
                             "belief_lam_min_argmin_position", "belief_lam_min_from_position_1",
                             "belief_cond_median_layer_max",
+                            # every layer beside the last-layer columns (audit 2026-10-20 item 14)
+                            "belief_lam_min_layer_min", "belief_lam_min_argmin_layer", "belief_lam_max_layer_max",
+                            "belief_cond_max_layer_max", "belief_eig_ratio_layer_min",
+                            "belief_eig_ratio_argmin_layer",
                             "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
                             "fisher_trace_mean", "fisher_trace_median",
                             "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
@@ -6819,6 +7278,9 @@ def _fmt_decode_lrs(cfg: VFE3Config) -> str:
         return f"mu={mu_lr}  sigma=inactive"
     if not cfg.untie_decode_bank:
         return f"mu={cfg.m_p_mu_lr} (shared)  sigma={cfg.m_p_sigma_lr} (shared)"
+    if getattr(cfg, "m_decode_update_mode", "adamw") == "fisher":
+        return (f"decode=fisher eta={cfg.m_table_fisher_lr} r={cfg.m_table_fisher_trust_radius} "
+                f"(schedule/decay rates mu={mu_lr} sigma={sigma_lr})")
     return f"mu={mu_lr}  sigma={sigma_lr}"
 
 
@@ -7014,7 +7476,7 @@ def _banner(
     n_steps:     int,
     train_loader: object = None,
 ) -> str:
-    r"""Compact init banner (no FLOPs counter)."""
+    r"""Compact init banner (no FLOPs counter) of the test-only ``run_training``; the launcher prints its own."""
     rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []
@@ -7055,7 +7517,7 @@ def run_training(
     n_steps:    int           = 1000,
     max_tokens: Optional[int] = None,
 ) -> Tuple[VFEModel, List[float]]:
-    r"""Click-to-run entry: build a model + a cached dataloader by name and train (no CLI).
+    r"""Test-only helper: build a model + a cached dataloader by name and train (no CLI).
 
     Constructs a ``VFEModel`` from ``cfg``, a causal-LM dataloader from the tokenized
     cache for ``dataset``/``split`` (capped at ``max_tokens`` for fast runs), prints the
@@ -7063,7 +7525,7 @@ def run_training(
     logging (``cfg.log_interval``, ``cfg.eval_interval``). Returns the trained model and
     its loss history.
 
-    DEPRECATED / minimal: superseded by ``train_vfe3.main()``, which is the canonical entry
+    Not the training entry point: only tests call it. ``train_vfe3.py`` (``_run_once``) is the canonical entry
     point. This helper passes no ``artifacts`` (so ``checkpoint_interval``/best-model/CSV are
     never written), reuses ``loader`` as the validation loader (train == val), and never runs
     the end-of-run test eval. Kept only for the lightweight in-process smoke use it already had.

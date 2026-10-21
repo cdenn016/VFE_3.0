@@ -206,8 +206,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "learning_rates": {
             # Unbound, so a duck-typed config (tests pass namespaces) resolves through the same rule.
             role: VFE3Config.resolved_hyperparameter(cfg, f"m_relational_{role}_lr") for role in counts},
-        "score_covariance_contract": ("exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
-                                      if minimal_agent else "exact_full_reduced_covariance_from_local_gaussian"),
+        "score_covariance_contract": _score_covariance_contract(cfg, dims, minimal_agent),
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
         "receiver_measurement": cfg.relational_receiver_measurement if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
@@ -226,6 +225,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                          # per-head block group (audit 2026-10-09 round 2, #10).
                                          else "head_block_moment_projection_of_predictive_kernel_plus_covariant_floor"
                                          if cfg.family == "gaussian_block"
+                                         # The frame-diagonal family stores c_i^+ = diag C^att plus the floor in
+                                         # reference coordinates: frame-independent, closed under the passive action
+                                         # (audit 2026-10-17 item 3; 2026-10-20 item 25).
+                                         else "reference_diagonal_moment_projection_of_predictive_kernel_plus_covariant_floor"
+                                         if cfg.family == "gaussian_frame_diagonal"
                                          # The diagonal family stores diag of U_i(C^att + f I)U_i^T in local
                                          # coordinates: a moment projection, neither exact nor covariant.
                                          else "diagonal_local_moment_projection_of_predictive_kernel_plus_floor"
@@ -245,7 +249,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "factorization_fallback": (("fp32_failure_or_certificate_layer_fp64_recompute"
                                     + ("" if cfg.minimal_agent_inference == "exact"
                                        else "_kl_certificate_fp64_refactor")) if minimal_agent
-                                   else "failed_entries_source_square_root_qr_fp64"),
+                                   else _kernel_factorization_fallback(cfg, dims)),
         "temperature_convention": ((f"unit_temperature_{'exact' if cfg.minimal_agent_inference == 'exact' else 'mean_field'}"
                                     "_posterior_no_clamp") if minimal_agent
                                    else "unit_temperature_learned_key_noise" if noisy_key
@@ -262,8 +266,84 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "source_beliefs": "live_episode_initial" if full_link else "live_pre_update",
         "outer_operator_and_frame_graph": "live",
         "canonical_shared_objective": False,
-        "gradient_clipping": "shares_existing_mu_role_and_global_budgets",
+        "gradient_clipping": _relational_clip_policy(cfg),
     }}
+
+
+def _diagonal_comparison_covariance(cfg: VFE3Config, dims: List[int]) -> bool:
+    r"""Whether ``rope_mode='comparison_invariant'`` makes every head's commutant projection :math:`P(G)` diagonal
+    (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal` at the head's rotated-pair count)."""
+    if getattr(cfg, "rope_mode", "none") != "comparison_invariant":
+        return False
+    from vfe3.geometry.rope import rope_commutant_is_diagonal, rope_rotated_pairs
+    fraction = float(getattr(cfg, "rope_fraction", 1.0))
+    return all(rope_commutant_is_diagonal(d, rope_rotated_pairs(d, fraction)) for d in dims)
+
+
+def _score_covariance_contract(cfg: VFE3Config, dims: List[int], minimal_agent: bool) -> str:
+    r"""The comparison covariance the router scores, from the configured route (audit 2026-10-20 item 25).
+
+    The kernel router reads :math:`G = SU^{-1}\Sigma U^{-\top}S^\top`, rotated to :math:`R_iGR_i^\top` under
+    ``rope_mode='comparison'`` and replaced by its commutant projection :math:`P(G)` under
+    ``'comparison_invariant'`` (diagonal, one isotropic variance per rotating plane, when at most one coordinate of
+    each head stays unrotated); ``noisy_key`` broadens the key law by :math:`n_hI`, and ``mean_distance`` reads no
+    covariance.
+    """
+    if minimal_agent:
+        return "exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
+    routing = getattr(cfg, "relational_routing", "gaussian_kl")
+    if routing == "mean_distance":
+        return "none_mean_distance_reads_no_covariance"
+    rope_mode = getattr(cfg, "rope_mode", "none")
+    if rope_mode == "comparison_invariant":
+        contract = ("diagonal_rope_commutant_projection_of_reduced_covariance"
+                    if _diagonal_comparison_covariance(cfg, dims)
+                    else "rope_commutant_projection_of_full_reduced_covariance")
+    elif rope_mode == "comparison":
+        contract = "exact_full_reduced_covariance_from_local_gaussian_rotated_by_query_and_key_position"
+    else:
+        contract = "exact_full_reduced_covariance_from_local_gaussian"
+    return contract + ("_plus_learned_key_noise" if routing == "noisy_key" else "")
+
+
+def _kernel_factorization_fallback(cfg: VFE3Config, dims: List[int]) -> str:
+    r"""The kernel router's recovery of a failed or flagged comparison factorization (audit 2026-10-20 item 25).
+
+    ``mean_distance`` and the closed-form diagonal comparison route
+    (:func:`vfe3.gradients.relational._diagonal_comparison_route`) factor nothing. On the other routes
+    (:func:`vfe3.relational_scoring._strict_cholesky`) ``cholesky_qr2_certified`` with a source-root
+    factor route rebuilds every flagged or failed entry by the float64 QR of its source root; otherwise the rebuilt
+    entries (failures, plus certificate-flagged entries under a certified setting) are factored from the source root
+    by float32 shifted CholeskyQR3, from the commutant root under ``comparison_invariant``, with float64 QR on its
+    failure. ``noisy_query`` and ``comparison_invariant`` have no source-root factor route, so
+    ``cholesky_qr2_certified`` acts there as ``gram_certified``.
+    """
+    routing = getattr(cfg, "relational_routing", "gaussian_kl")
+    if routing == "mean_distance":
+        return "none_mean_distance_has_no_factorization"
+    factorization = getattr(cfg, "projected_factorization", "gram")
+    invariant = getattr(cfg, "rope_mode", "none") == "comparison_invariant"
+    if invariant and routing == "gaussian_kl" and factorization == "gram" and _diagonal_comparison_covariance(cfg, dims):
+        return "none_closed_form_diagonal_comparison_route"
+    if factorization == "cholesky_qr2_certified" and not invariant and routing != "noisy_query":
+        return "certificate_flagged_or_failed_entries_source_root_qr_fp64"
+    rebuilt = "failed_entries" if factorization == "gram" else "certificate_flagged_or_failed_entries"
+    root = "commutant_root" if invariant else "source_root"
+    return f"{rebuilt}_{root}_shifted_cholesky_qr3_fp32_then_qr_fp64"
+
+
+def _relational_clip_policy(cfg: VFE3Config) -> str:
+    r"""How ``grad_clip`` bounds the relational maps (audit 2026-10-20 item 25; ``vfe3.train.train_step``).
+
+    The relational optimizer groups carry role ``mu``: under ``grad_clip_scope='role'`` they share one L2 bound with
+    every other clipped ``mu``-role group, and under ``'group'`` each group has its own.
+    """
+    clip = getattr(cfg, "grad_clip", None)
+    if clip is None or not clip > 0:
+        return "off"
+    if getattr(cfg, "grad_clip_scope", "role") == "group":
+        return "own_l2_bound_per_optimizer_group"
+    return "shares_mu_role_l2_bound"
 
 
 def _conditional_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
@@ -676,6 +756,15 @@ def _migrated_config_fingerprint(
             _config_from_run_serialized(config, source="resume provenance fingerprint")))
     except (TypeError, ValueError):
         return semantic_config_fingerprint(config)
+
+
+def _realized_diag_moments_kernel() -> Dict[str, Any]:
+    r"""``diag_moments_kernel`` (``'triton'``, ``'torch'``, ``'mixed'`` or None) and the per-kernel call counts of the
+    diagonal comparison moments since the run's :class:`RunArtifacts` reset them (audit 2026-10-20 item 45)."""
+    from vfe3 import relational_scoring as scoring
+    return {"diag_moments_kernel": scoring.realized_diagonal_moments_kernel(),
+            "diag_moments_kernel_calls": {"triton": scoring.diagonal_moments_triton_calls(),
+                                          "torch": scoring.diagonal_moments_torch_calls()}}
 
 
 def _phi_chart_norm_route(
@@ -1366,6 +1455,25 @@ def _validated_saved_successful_updates(
     return count
 
 
+def _row_step_valid(
+    value:             object,
+    parameter:         torch.Tensor,
+    device:            torch.device,
+    maximum_slot_step: int,
+) -> bool:
+    r"""Whether ``value`` is a row-lazy table's per-row step count :math:`k_v` (``m_phi_sparse_rows``): shape ``(V,)``,
+    the parameter's dtype, on ``device``, finite non-negative integers no larger than the optimizer step clock."""
+    return (isinstance(value, torch.Tensor)
+            and value.device == device
+            and value.dtype == parameter.dtype
+            and value.layout == torch.strided
+            and value.shape == parameter.shape[:1]
+            and bool(torch.isfinite(value).all())
+            and bool((value >= 0).all())
+            and bool((value == value.round()).all())
+            and bool((value <= maximum_slot_step).all()))
+
+
 def _validate_optimizer_state(
     saved_state: object,
     optimizer:   torch.optim.Optimizer,
@@ -1419,8 +1527,14 @@ def _validate_optimizer_state(
             expected_keys = {"step", "exp_avg", "exp_avg_sq"}
             if bool(group.get("amsgrad", False)):
                 expected_keys.add("max_exp_avg_sq")
-            if keys != expected_keys:
+            # m_phi_sparse_rows: the row-lazy table also carries its per-row counts (absent in a dense checkpoint,
+            # which the row-lazy optimizer resumes at k_v = step).
+            row_lazy = bool(group.get("sparse_rows", False))
+            if keys != expected_keys and not (row_lazy and keys == expected_keys | {"row_step"}):
                 raise RuntimeError("checkpoint optimizer_state has an invalid AdamW slot schema")
+            if "row_step" in keys and not _row_step_valid(state["row_step"], parameter, torch.device("cpu"),
+                                                          maximum_slot_step):
+                raise RuntimeError("checkpoint optimizer_state row_step is incompatible with its parameter")
             step = state["step"]
             valid_step = (
                 isinstance(step, torch.Tensor)
@@ -1673,8 +1787,12 @@ def _validate_realized_optimizer_state(
         expected_keys = {"step", "exp_avg", "exp_avg_sq"}
         if bool(group.get("amsgrad", False)):
             expected_keys.add("max_exp_avg_sq")
-        if keys != expected_keys:
+        row_lazy = bool(group.get("sparse_rows", False))
+        if keys != expected_keys and not (row_lazy and keys == expected_keys | {"row_step"}):
             raise RuntimeError("realized optimizer has an invalid AdamW slot schema")
+        if "row_step" in keys and not _row_step_valid(state["row_step"], parameter, parameter.device,
+                                                      maximum_slot_step):
+            raise RuntimeError("realized optimizer row_step is incompatible with its parameter")
         step = state["step"]
         expected_step_device = (
             parameter.device
@@ -1923,6 +2041,9 @@ class RunArtifacts:
         self.best_path = self.run_dir / "best_model.pt"
         self.final_path = self.run_dir / "final_model.pt"
         self.cfg = cfg                                       # kept for figure scaling (lambda_beta) + guards
+        # The run starts here for the diagonal-moments kernel record in summary.json (audit 2026-10-20 item 45).
+        from vfe3.relational_scoring import reset_diagonal_moments_triton_calls
+        reset_diagonal_moments_triton_calls()
         # Import-time digest of the code this process actually executes, kept beside the (possibly
         # newer) on-disk digest so provenance can flag a mixed-generation process.
         self.process_code_identity_sha256 = _PROCESS_PACKAGE_CODE_IDENTITY
@@ -1934,7 +2055,9 @@ class RunArtifacts:
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
-        self.history: List[Dict[str, float]] = []          # in-memory copy of the CSV rows (for figures)
+        # In-memory copy of the CSV rows (for figures); cells are normalized floats and ints, and text in the str
+        # columns such as row_kind (vfe3.metrics_schema.normalize_metric_cell).
+        self.history: List[Dict[str, Union[float, int, str]]] = []
         self._fieldnames: Optional[List[str]] = None
 
         config_record = {
@@ -1995,7 +2118,10 @@ class RunArtifacts:
         r"""Append long-format rows to ``run_dir/diagnostics/<name>`` (header written once).
 
         NaN cells are written blank, as in ``metrics.csv``. A header that differs from
-        ``fieldnames`` raises rather than mixing two schemas in one file.
+        ``fieldnames`` raises rather than mixing two schemas in one file, except that a file whose
+        header is ``fieldnames`` with trailing columns missing (one written before those columns were
+        added, as ``block_variance.csv`` before its upper quantiles) is first rewritten atomically to
+        the full header with the missing cells blank, so a resumed run keeps one schema per file.
         """
         if not name or "/" in name or "\\" in name or Path(name).name != name:
             raise ValueError(f"diagnostic file name must be a bare filename, got {name!r}")
@@ -2006,6 +2132,16 @@ class RunArtifacts:
         if path.is_file() and path.stat().st_size > 0:
             with path.open("r", newline="", encoding="utf-8") as handle:
                 header = next(csv.reader(handle), None)
+            if header is not None and header != fields and header == fields[:len(header)]:
+                with path.open("r", newline="", encoding="utf-8") as handle:
+                    existing = list(csv.DictReader(handle))
+                with _unique_sibling_temp(path) as tmp:
+                    with open(tmp, "w", newline="", encoding="utf-8") as handle:
+                        migrated = csv.DictWriter(handle, fieldnames=fields, restval="")
+                        migrated.writeheader()
+                        migrated.writerows(existing)
+                    _atomic_replace(path, tmp)
+                header = fields
             if header != fields:
                 raise ValueError(f"{path} has header {header}, expected {fields}")
             write_header = False
@@ -3501,6 +3637,20 @@ def _calibration_and_strata(
                 "corpus_freq_strata_ce": strata}
 
 
+def _float64_cpu_copy(model: torch.nn.Module) -> torch.nn.Module:
+    r"""``model`` itself when every parameter is a float64 CPU tensor, else a float64 CPU copy with its state.
+
+    The copy is built from ``model.cfg`` under a forked RNG (the caller's random state is untouched) and loads the
+    state dict, so no second device-resident copy of the live model is made.
+    """
+    if all(p.dtype == torch.float64 and p.device.type == "cpu" for p in model.parameters()):
+        return model
+    with torch.random.fork_rng(devices=[]):
+        copy = type(model)(model.cfg)
+    copy.load_state_dict({key: value.detach().cpu() for key, value in model.state_dict().items()})
+    return copy.double()
+
+
 def _fd_gradient_check(
     model:       torch.nn.Module,
     test_loader: Iterable,
@@ -3508,19 +3658,30 @@ def _fd_gradient_check(
 
     *,
     n_coords:    int   = 4,
-    fd_eps:      float = 1e-3,
+    fd_eps:      float = 1e-5,
     record:      Optional[Dict[str, Any]] = None,
 ) -> float:
     r"""Worst relative error between autograd-of-CE and a central finite difference on a few DECODE
     coordinates: ``output_proj_weight`` under linear decode, else the untied decode tables
     ``decode_mu_embed`` / ``decode_sigma_log_embed`` of a prior-bank decode, whose gradient reaches the
-    loss only through the decode, so a healthy model reads ~1e-4 and a broken decode adjoint spikes far
-    above it. A tied prior-bank decode has no decode-only trainable table (``decode_log_scale`` is frozen),
-    so the check returns NaN there. The probed parameter, or the reason for a NaN, is written to ``record``
-    (``fd_gradient_probe``, ``fd_gradient_nan_reason``; audit 2026-10-07, F86). Best-effort on one tiny
-    batch; restores every coord."""
+    loss only through the decode. A tied prior-bank decode has no decode-only trainable table
+    (``decode_log_scale`` is frozen), so the check returns NaN there. The probed parameter, or the reason for a
+    NaN, is written to ``record`` (``fd_gradient_probe``, ``fd_gradient_nan_reason``; audit 2026-10-07, F86).
+    Best-effort on one tiny batch; restores every coord.
+
+    The probe runs on a float64 CPU copy of the model (audit 2026-10-20 item 60): in float32 at a step of 1e-3 the
+    rounding floor of the central difference is of order :math:`u|L|/(h|g|) \approx 0.3` relative for a correct
+    gradient, so it could not separate rounding from an adjoint error. In float64 at :math:`h = 10^{-5}` the
+    truncation error is :math:`O(h^2)` and the rounding floor
+    :math:`\varepsilon_{64}|L|/(h\min_j|g_j|)` is recorded as ``fd_gradient_noise_floor``; a correct adjoint reads
+    about that floor plus about 1e-8, and a broken one far above it. ``fd_gradient_dtype`` and ``fd_gradient_eps``
+    record the arithmetic."""
     if record is None:
         record = {}
+    model = _float64_cpu_copy(model)
+    device = torch.device("cpu")
+    record["fd_gradient_dtype"] = "float64"
+    record["fd_gradient_eps"] = float(fd_eps)
     with _diagnostic_eval_mode(model):
         batch = next(iter(test_loader))
         tok, tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
@@ -3569,6 +3730,9 @@ def _fd_gradient_check(
                     record["fd_gradient_nan_reason"] = "non-finite finite difference or autograd value"
                     return float("nan")
                 worst = max(worst, abs(fd - ana) / max(abs(fd), abs(ana), 1e-8))
+        smallest = min(abs(float(gflat[j])) for j in idx)
+        record["fd_gradient_noise_floor"] = (torch.finfo(torch.float64).eps * abs(float(loss)) / (fd_eps * smallest)
+                                             if smallest > 0 else float("inf"))
         model.zero_grad(set_to_none=True)
         return worst
 
@@ -3678,6 +3842,67 @@ def _token_table_parameter_count(model: torch.nn.Module) -> Optional[int]:
     return total
 
 
+def _measured_forward_flops(
+    model:       torch.nn.Module,
+    cfg:         VFE3Config,
+    tokens_seen: int,
+
+    *,
+    device:      Optional[torch.device] = None,
+) -> Dict[str, object]:
+    r"""Measured forward FLOPs per token of the model's belief pipeline and decode (audit 2026-10-20 item 48).
+
+    The analytic proxy of :func:`_cost_model_fields` does not model the projected routing and content route, so
+    ``est_flops_analytic`` is None there. This counts instead: one sequence of ``max_seq_len`` seeded tokens runs
+    through ``forward_beliefs`` under :class:`torch.utils.flop_counter.FlopCounterMode`, once with the logits and once
+    without, in eval mode, without gradients and with the RNG streams restored. The diagonal-moments kernel is
+    switched to its torch route for the count, since the counter does not see Triton kernels, and restored. The
+    counter counts matrix-product-class operations (``mm``, ``bmm``, ``addmm``, ``baddbmm``, convolutions,
+    attention); elementwise work, reductions and factorizations are not counted, so the numbers are a lower bound
+    on the forward work and are dominated by the GEMMs that set it on this model.
+
+    ``flops_per_token_forward_measured`` (decode included), ``flops_per_token_beliefs_measured`` (the stack, no
+    decode), ``flops_per_token_decode_measured`` (their difference), the top counted operators of the full forward,
+    and ``est_train_flops_measured_3x`` :math:`3 F_{\mathrm{fwd}} D`, the forward count times the usual factor of
+    three for forward plus backward over the run's ``tokens_seen`` :math:`D` (the E-step backward and the table
+    optimizers are not separately modeled).
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+    from vfe3.relational_scoring import set_diagonal_moments_kernel
+
+    device = device if device is not None else next(model.parameters()).device
+    n = int(cfg.max_seq_len)
+    generator = torch.Generator().manual_seed(0)
+    tokens = torch.randint(0, int(cfg.vocab_size), (1, n), generator=generator).to(device)
+    was_training = model.training
+    rng_devices = [device] if device.type == "cuda" else []
+    previous_kernel = set_diagonal_moments_kernel("torch")
+    try:
+        with torch.random.fork_rng(devices=rng_devices), torch.no_grad():
+            model.eval()
+            with FlopCounterMode(display=False) as with_decode:
+                model.forward_beliefs(tokens, return_logits=True)
+            with FlopCounterMode(display=False) as without_decode:
+                model.forward_beliefs(tokens, return_logits=False)
+    finally:
+        set_diagonal_moments_kernel(previous_kernel)
+        model.train(was_training)
+    total = float(with_decode.get_total_flops()) / n
+    beliefs = float(without_decode.get_total_flops()) / n
+    by_op = with_decode.get_flop_counts().get("Global", {})
+    top = sorted(((str(op), float(value) / n) for op, value in by_op.items()), key=lambda item: -item[1])[:8]
+    return {
+        "flops_per_token_forward_measured": total,
+        "flops_per_token_beliefs_measured": beliefs,
+        "flops_per_token_decode_measured": total - beliefs,
+        "flops_measured_top_ops": {name: value for name, value in top},
+        "flops_measured_seq_len": n,
+        "flops_measured_scope": ("torch.utils.flop_counter matrix-product operators of one forward_beliefs "
+                                 "sequence (eval, no grad); a lower bound on the forward work"),
+        "est_train_flops_measured_3x": 3.0 * total * float(tokens_seen),
+    }
+
+
 def _cost_model_fields(
     model:       torch.nn.Module,
     cfg:         VFE3Config,
@@ -3752,11 +3977,13 @@ def _cost_model_fields(
         for parameter in norm_module.parameters():
             norm_parameters[id(parameter)] = int(parameter.numel())
     active += sum(norm_parameters.values())
-    # Transparent analytic FLOP proxy. Per token: decode over all V (2VK) and L*T belief E-step
-    # iterations. Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
+    # Transparent analytic FLOP proxy. Per token: decode over all V and L*T belief E-step
+    # iterations. The prior-bank decode is one (S, 2K) x (2K, V) product in its expanded form (the mean and the
+    # second-moment features against the bank's (V, 2K) right factor; vfe3/kernels/kl_decode.py), so 4VK forward
+    # FLOPs; the linear decode is (S, K) x (K, V), 2VK (audit 2026-10-20 item 48: 2VK understated the KL decode by 2). Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
     # application (2N times the mean squared block dim, d_head^2 for equal blocks). Constants are O(1); this is a proxy, not a calibrated count.
     L, T, N = int(cfg.n_layers), int(cfg.n_e_steps), int(cfg.max_seq_len)
-    fpt_decode         = 2.0 * V * K
+    fpt_decode         = (2.0 if cfg.decode_mode == "linear" else 4.0) * V * K
     estep_kernel       = 2.0 * N * K + 2.0 * N * block_dim_sq
     belief_estep       = L * T * estep_kernel
     fpt_estep          = belief_estep
@@ -4121,10 +4348,11 @@ def finalize_run(
     # VFE-only probes, recording why under "skipped_analyses".
     vfe_model = is_vfe_model(model)
     skipped_analyses: Dict[str, str] = {} if vfe_model else _non_vfe_skipped_analyses(model)
+    # No "diagnostics" key: it was always an empty dict and nothing wrote into it (audit 2026-10-20 item 73); a
+    # reader of an older test_results.json or summary.json finds it there and empty.
     results: Dict[str, object] = {
-        "diagnostics": {},
         **_conditional_artifact_fields(cfg),
-    }                                                          # mixes scalar headlines and nested diagnostics
+    }                                                          # mixes scalar headlines and nested records
     if test_loader is not None:
         m = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
         # A padded evaluation stream of T tokens holds T - 1 transitions, each scored exactly once,
@@ -4169,6 +4397,14 @@ def finalize_run(
                               "train_sample_ce_final": None, "train_sample_ce_best": None}
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
     decode_tau_eff = _decode_tau_eff(model, cfg)
+    # Test at the validation-selected weights beside the final-weights headline in test_results.json, as in
+    # summary.json (audit 2026-10-20 item 7); the headline test_ce / test_ppl stay the final weights.
+    results.update({key: best_weight_fields.get(key) for key in (
+        "test_best_ce", "test_best_ppl", "test_best_bits_per_token", "test_best_step", "test_best_status")})
+    if test_loader is not None and results.get("test_best_ppl") is not None and results.get("test_ppl") is not None:
+        logger.info("Test perplexity: %.2f at the final weights (step %s), %.2f at the validation-selected weights "
+                    "(step %s)", float(results["test_ppl"]), final_step, float(results["test_best_ppl"]),
+                    results.get("test_best_step"))
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": False, "evaluation_weights": "final",
                     "evaluated_step": final_step, **final_val_fields,
@@ -4280,6 +4516,11 @@ def finalize_run(
     try:
         if vfe_model:
             scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
+            try:                                       # the projected route's measured cost (audit 2026-10-20 #48)
+                scaling_point.update(_measured_forward_flops(model, cfg, tokens_seen, device=device))
+            except Exception as flop_exc:
+                logger.warning("measured forward FLOPs failed (%s); scaling_point keeps the analytic fields",
+                               flop_exc)
         else:
             scaling_point.update(model.cost_model_fields(n_params, tokens_seen, wall_time=wall_time))
     except Exception as exc:
@@ -4309,7 +4550,6 @@ def finalize_run(
         "test_overlap_context_targets": results.get("test_overlap_context_targets"),
         "test_padding_targets": results.get("test_padding_targets"),
         "test_stream_transitions": results.get("test_stream_transitions"),
-        "diagnostics":  results["diagnostics"],
         # No estep_final_iterate_f_per_token / estep_final_f_per_token / estep_iterate_evidence: nothing on the
         # projected routes produces an E-step iterate sequence, so those keys were always null (audit 2026-10-16
         # F86).
@@ -4334,6 +4574,9 @@ def finalize_run(
         # The diagonal_chunked / full_chunked CE kernel that last ran ('torch' | 'triton'; None when neither
         # ran): 'triton' needs decode_ce_triton=True and CUDA tensors (2026-10-12).
         "decode_ce_kernel": getattr(getattr(model, "prior_bank", None), "realized_decode_ce_kernel", None),
+        # The diagonal comparison moments kernel that ran since this run's RunArtifacts was built ('triton' |
+        # 'torch' | 'mixed' | None when the diagonal route never ran), with its call counts (audit 2026-10-20 item 45).
+        **_realized_diag_moments_kernel(),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
         # Audit 2026-09-28: test at the validation-selected weights beside the final-weight

@@ -143,7 +143,9 @@ coupling, a `none` or `layernorm` block norm with a `coordinate` block MLP (loca
 push $U_i\operatorname{diag}(c_i)U_i^\top$ and read back $\operatorname{diag}(U_i^{-1}SU_i^{-\top})$;
 reference coordinates push $\operatorname{diag}(c_i)$ and keep the diagonal), the `linear` or
 `diagonal_chunked` decoders (the latter reads $(\xi_i, c_i)$ in reference coordinates, or
-$\operatorname{diag}\Sigma_i$ in local ones), and the table Fisher step only with `pos_phi="none"`.
+$\operatorname{diag}\Sigma_i$ in local ones, and needs `untie_decode_bank=True`, since a tied bank
+would pair the encoder's local-frame mean with the reference variance $c_v$; audit 2026-10-20 item
+59), and the table Fisher step only with `pos_phi="none"`.
 That step preconditions the mean row by the metric $U_v^{-\top}\operatorname{diag}(1/s_v)U_v^{-1}$ of
 the type's layer-0 frame, the diagonal step in $\xi_v = U_v^{-1}\mu_v$; a positional frame would
 make the metric an average over occurrences, which the step does not form.
@@ -282,8 +284,11 @@ no rotation.
 `attention_window` is read only by the windowed priors, so the launcher's value is inactive.
 
 Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
-energies; `float("inf")` removes the upper ceiling while retaining the nonnegative
-floor. The implemented energy can therefore differ from the unmodified KL above.
+energies; `float("inf")` removes the upper ceiling. Under
+`routing_kl_max_reference="absolute"` or `"row_min"` the clamped quantity also keeps a
+nonnegative floor; under `"query_shifted"` and `"query_shifted_v1"` the shifted cost is clamped from above only
+and can be negative. The implemented energy can therefore differ from the unmodified
+KL above.
 
 The message a receiver assembles from what it heard, and its revised mean, are
 
@@ -527,8 +532,8 @@ the validator for the complete admission rules.
 | `block_mlp_mode="prototype_agents"` | Replaces the feed-forward block MLP by the minimal-agent model on $M$ = `block_mlp_expansion`·$K$ template agents. `block_mlp_inference` selects `"mean_field"` (KL-label responsibilities and a power posterior, `block_mlp_cavi_steps` sweeps) or `"exact"` (the mixture posterior); `block_mlp_covariance="posterior"` returns the template posterior covariance; `block_mlp_em_weight>0` adds an EM M-step term on the templates; `block_mlp_template_init` is `"absolute"` or `"working_variance"`. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `rope_mode="none"` or comparison-space RoPE (`"comparison"` or `"comparison_invariant"`). |
-| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
-| `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays at the attention prior $\pi$ (uniform under a causal mask). Not with `predictive_readout="minimal_agent"`. |
+| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. `"query_shifted"` clamps $D_{ij}-c_i-m_i$ from above only, where $c_i$ is the query-only row constant of the cost ($-(r+\log\det G_i)/2$ for the Gaussian KL, $-\log\det G_i/2$ for `noisy_query`, $0$ for `mean_distance`) and $m_i$ is the mean of the key log-volumes $\ell_j=\tfrac12\log\det G_j$ over the row's admissible keys. Both are row constants, so $eta$ equals the absolute route's wherever nothing is capped, and the shifted costs can be negative. The tested quantity is invariant under a joint rescaling of a head's comparison maps, which leaves the KL unchanged, so map growth along that flat direction can no longer push a head onto the cap (audit 2026-10-20 item 1). `"query_shifted_v1"` is the earlier form without $m_i$, which kept the key log-determinant in the clamped cost; configurations saved with `"query_shifted"` before the change reload as `"query_shifted_v1"`. `relational_score_weight_decay` (default 0) is an opt-in decoupled decay on $S_Q,S_K$. |
+| `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(3\tanh(\delta_{\ell,h}/3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. The offset $3\tanh(\delta/3)$ equals $\delta$ to first order and stays inside $(-3,3)$ with nonzero gradient everywhere; it replaced a hard clamp of $\delta$ to $[-3,3]$ whose gradient vanished outside the window, so a saved nonzero offset reloads at a different temperature than under the clamp. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays at the attention prior $\pi$ (uniform under a causal mask). Not with `predictive_readout="minimal_agent"`. |
 | `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
@@ -570,6 +575,22 @@ trust-saturated step before $R$ binds: in the derivation of 2026-09-28 the certi
 falls from about $4\times10^{-2}$ at $\|\varphi\|_F=0.05$ to $7\times10^{-3}$ at
 $\|\varphi\|_F=1.7$ ($d=6$), and a larger $R$ changes nothing there. The optimizer reports
 the halvings as `phi_group_backtracks_mean` and `phi_group_backtracks_max` on both retractions.
+
+Two opt-in optimizer toggles address the rare-row mechanisms of the 2026-10-20 audit; both
+default to the dense AdamW behavior. `m_phi_sparse_rows=True` (only with
+`m_phi_update_mode="adamw"`) steps `phi_embed` with row-lazy AdamW (`vfe3/sparse_row_optim.py`):
+a row that is neither among the step's input tokens nor carries a nonzero gradient takes no
+moment update, no step and no decoupled decay, and a stepped row's bias correction uses its own
+step count $k_v$, which the optimizer state checkpoints as `row_step`. Under dense AdamW a row
+revisited after a long gap moves about $\min(\sqrt T, 31.6)\,\mathrm{lr}$ per coordinate whatever
+its gradient; the row-lazy step moves a first touch by $\mathrm{lr}$. The moment tables stay
+dense, so the step does not save memory. `m_decode_update_mode="fisher"` (prior-bank decode with
+`untie_decode_bank=True`) replaces AdamW on `decode_mu_embed` and `decode_sigma_log_embed` with
+the natural-gradient step of the Gaussian Fisher metric $\operatorname{diag}(1/t_v, 1/2)$
+weighted by the step's target counts, $(m_v, l_v) \mathrel{-}= \eta\,(N/\max(c_v,1))\,(t_v\odot
+\nabla_m, 2\nabla_l)$, bounded per row in Fisher norm and never clipped; it shares
+`m_table_fisher_lr` and `m_table_fisher_trust_radius` with the encoder table step
+(`vfe3/table_optim.py`), and the decode AdamW rates only schedule it and set its decay.
 
 Under `m_phi_update_mode="pullback_group"` with `m_phi_group_retraction="group_log"`, a row
 whose blocks lie inside the principal strip (margin 0.25) and satisfy
@@ -937,6 +958,32 @@ vocabulary readout can dominate parameter and memory cost.
 Setting `MIN_COUNT` in `build_wikitext103_word_cache.py` and rebuilding applies a frequency
 cutoff that trades vocabulary size against OOV.
 
+The GPT-2 BPE cache that every reported `wikitext-103` run reads
+(`wikitext-103_{train,validation,test}_tiktoken_tokens.pt`, dated 2026-05-02; validation
+245,021 tokens, SHA-256 `b88ffdc3...`, test 280,542 tokens) has no builder in this repository and
+no provenance manifest, so the loader records it as `tokenizer_provenance_status =
+"filename_inferred_unverified"`. Its sidecar records only token and source-character counts. Its
+recipe was reconstructed on 2026-10-21 by decoding it and comparing with the pinned Hugging Face
+`Salesforce/wikitext` `wikitext-103-v1` parquet (revision `6231e49f`), and is: take the split's
+rows in stored order, drop the empty rows, join the remaining rows (each of which ends in its own
+newline) with `"\n\n"`, replace the markers `" @-@ "`, `" @,@ "` and `" @.@ "` by `"-"`, `","` and
+`"."`, and encode with tiktoken's `gpt2` encoding, with no `<|endoftext|>` between rows or
+articles. The text contains no `<unk>`, so its source is the raw text (`wikitext-103-raw-v1`) rather
+than the `<unk>`-masked `wikitext-103-v1` it was compared with; the raw parquet is not in the local
+cache and was not downloaded, so the source was not confirmed byte for byte. Under this recipe every
+compared line without `<unk>` matches except 3 of 7,382 validation lines, 0 of 8,672 test lines and 5
+of the first 60,339 training lines, where a row-final comma marker keeps a trailing space or a
+similar whitespace detail differs. The other spacing of the tokenized text (spaces around ordinary
+punctuation) is kept. Per-token perplexities on this stream are therefore not comparable with
+standard raw-v1 or v1 numbers: removing the markers also removes about 1.7 GPT-2 tokens per marker
+that the standard streams score (audit 2026-10-20 item 30). Word-normalized figures
+(`vfe3/posthoc/calibration.py`) are the comparable quantity. A later source-bound GPT-2 cache of
+`wikitext-103-v1` with upstream and tokenizer manifests sits in
+`~/.cache/tokenized_cache/wikitext-103-v1_hf-6231e49_tiktoken-gpt2_source-bound-v2/`; the loader
+does not read it. `vfe3.data.datasets.publish_cache_provenance(dataset, split)` writes the
+tokenizer-provenance manifest for an existing cache without rebuilding it, which binds the payload
+digest and tokenizer but not this text recipe.
+
 ### Click-to-run workflow
 
 Entrypoints do not parse command-line configuration. Edit the configuration dictionary
@@ -978,6 +1025,11 @@ for dictionaries passed to launchers or serialized-config loaders, and monkeypat
 the launcher dictionary inside the test instead of asserting live experiment settings.
 When adding a config field, add an explicit test baseline value in `tests/profiles.py`;
 the schema coverage check in `tests/test_config_isolation.py` identifies omissions.
+A test that needs CUDA must be registered in `CUDA_TESTS` (or, for one parametrization,
+`CUDA_PARAM_TESTS`) of `tests/pytest_policy.py`, which marks it `cuda` for
+`check_gpu_tests.py`; outside the CUDA lane an unregistered test that skips for want of
+CUDA fails. `check_gpu_tests.py` keeps each run's JUnit report, with the recorded parity
+errors and kernel timings, under `.verification/gpu_tests/`.
 
 ## Outputs and diagnostics
 
@@ -994,7 +1046,7 @@ When a [`RunArtifacts`](vfe3/run_artifacts.py) instance is supplied, a run direc
 | `final_validation.json` | Validation metrics at the final training step. |
 | `test_results.json` | Held-out test evaluation of the final training weights, with the evaluated step recorded. |
 | `provenance.json` | Git, environment, and dataset provenance. |
-| `summary.json` | Headline end-of-run values and timing. |
+| `summary.json` | Headline end-of-run values and timing, and the kernels that ran (`decode_ce_kernel`, `diag_moments_kernel` with its call counts). |
 | `pure_path_report.json` | Configuration audit attempted during every finalization; write failures are logged and skipped. |
 | `research.json` and figure files | Optional research probes and diagnostic or publication-oriented plots. |
 

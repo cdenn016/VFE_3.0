@@ -248,7 +248,7 @@ def test_log_metrics_rejects_text_in_a_numeric_column(tmp_path: Path) -> None:
 
 def _reader_tuples() -> Dict[str, tuple]:
     r"""Every metrics.csv column tuple a reader reads, by reader."""
-    from vfe3.run_resources import _THROUGHPUT_COLUMNS
+    from vfe3.run_resources import _TELEMETRY_COLUMNS, _THROUGHPUT_COLUMNS
     return {
         "viz grad_norm_decomposition": figs.GRAD_NORM_DECOMPOSITION_COLUMNS,
         "viz optimizer_geometry": figs.OPTIMIZER_GEOMETRY_COLUMNS,
@@ -260,7 +260,8 @@ def _reader_tuples() -> Dict[str, tuple]:
                                       "self_divergence", "val_self_coupling", "val_belief_coupling",
                                       "val_attention_entropy", "val_self_divergence"),
         "run_artifacts resources": ("tokens_per_s", "train_step_tokens_per_s", "peak_mem_mb", "tokens_seen"),
-        "run_resources throughput": ("step", "peak_mem_mb", "train_step_ms_mean", *_THROUGHPUT_COLUMNS),
+        "run_resources throughput": ("step", "peak_mem_mb", "train_step_ms_mean", *_THROUGHPUT_COLUMNS,
+                                     *_TELEMETRY_COLUMNS),
         "multiseed curves": tuple(key for key, _ in ms.CURVE_SPECS),
         "multiseed grid": tuple(ms.GRID_COLS),
         "multiseed x axis": tuple(ms.CURVE_X_OPTIONS),

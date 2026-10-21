@@ -45,15 +45,27 @@ def test_live_profile_is_the_launcher_route() -> None:
                 if field.default is not dataclasses.MISSING}
     omitted = {name for name in values if name not in launcher and name not in resized}
     assert {name: (values[name], defaults[name]) for name in omitted if values[name] != defaults[name]} == {}
-    # kl_max keeps the launcher's nats per dimension: a launcher number scales by K_tiny / K_launcher, None (8 K)
-    # stays None and resolves to 8 K at the tiny K (audit 2026-10-17, item 38).
+    # kl_max keeps the launcher's nats per comparison coordinate: it scales by the head width d = K / H, d_tiny /
+    # d_launcher, and a launcher None (8 K) is resolved at the launcher's K first (audit 2026-10-20 item 5).
     cfg = live_config()
-    if launcher.get("kl_max") is None:
-        assert values["kl_max"] == 8.0 * cfg.embed_dim
-    else:
-        assert values["kl_max"] == launcher["kl_max"] * cfg.embed_dim / launcher["embed_dim"]
-    assert live_kl_max({"kl_max": 128.0, "embed_dim": 128}) == float(_LIVE_TINY["embed_dim"])
-    assert live_kl_max({"kl_max": None, "embed_dim": 128}) is None
+    d_tiny = cfg.embed_dim / cfg.n_heads
+    d_launcher = launcher["embed_dim"] / launcher["n_heads"]
+    launcher_cap = 8.0 * launcher["embed_dim"] if launcher.get("kl_max") is None else launcher["kl_max"]
+    assert values["kl_max"] == pytest.approx(launcher_cap * d_tiny / d_launcher, rel=1e-15)
+    # the reference run (K = 160, five heads of 32, kl_max 128) and a K = 256 eight-head launcher both give 16
+    assert live_kl_max({"kl_max": 128.0, "embed_dim": 160, "n_heads": 5}) == 16.0
+    assert live_kl_max({"kl_max": 128.0, "embed_dim": 256, "n_heads": 8}) == 16.0
+    assert live_kl_max({"kl_max": None, "embed_dim": 128, "n_heads": 4}) == 8.0 * 128 * d_tiny / 32
+
+
+def _assert_router_gradient_nonzero(model: VFEModel) -> None:
+    r"""Every comparison map (``raw_score_q``, ``raw_score_k``) receives a nonzero gradient after a backward: the
+    tiny live cap does not clamp the router dead (audit 2026-10-20 item 5, where every live-route gradient check
+    compared a router gradient of exactly zero)."""
+    grads = {name: p.grad for name, p in model.named_parameters() if "raw_score" in name and p.requires_grad}
+    assert grads, "the live route has no comparison maps"
+    dead = [name for name, grad in grads.items() if grad is None or not bool((grad != 0).any())]
+    assert dead == [], f"router gradient is exactly zero on {dead}"
 
 
 def test_live_forward_backward_is_finite() -> None:
@@ -69,6 +81,7 @@ def test_live_forward_backward_is_finite() -> None:
     grads = [p.grad for p in trainable.values()]
     assert all(bool(torch.isfinite(g).all()) for g in grads)
     assert any(bool((g != 0).any()) for g in grads)
+    _assert_router_gradient_nonzero(model)
 
 
 def _float64_live_model(**overrides: Any) -> VFEModel:
@@ -154,6 +167,7 @@ def test_live_backward_matches_float64_richardson_differences(block_norm_covaria
     loss().backward()
     trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
     assert trainable and [name for name, p in trainable.items() if p.grad is None] == []
+    _assert_router_gradient_nonzero(model)
     assert _richardson_mismatches(loss, trainable) == {}
 
 

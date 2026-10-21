@@ -10,7 +10,9 @@ RoPE folded when present). With the stack-entry covariance :math:`\Sigma_i` (the
 .. math::
     C_i = U_i^{-1}\Sigma_i U_i^{-\top}, \qquad G_i^{-1} = (U_i^\top U_i)^{-1} = U_i^{-1}U_i^{-\top},
 
-so :math:`C_i = c\,G_i^{-1}` exactly when :math:`\Sigma_i = c I`. The common scale is fitted by
+so :math:`C_i = c\,G_i^{-1}` exactly when :math:`\Sigma_i = c I`. Under ``gaussian_frame_diagonal`` the stack
+stores the reference variances :math:`c_i` with :math:`\Sigma_i = U_i\operatorname{diag}(c_i)U_i^\top`, so
+:math:`C_i = \operatorname{diag}(c_i)` is read directly (audit 2026-10-20 item 26). The common scale is fitted by
 relative least squares over the sampled pairs,
 
 .. math::
@@ -76,6 +78,15 @@ HEADLINE_SAMPLE: str = "occurrence"
 # Applicability and frames
 # ----------------------------------------------------------------------------------------------
 
+def stores_reference_variances(model: torch.nn.Module) -> bool:
+    r"""Whether the belief ``sigma`` holds the reference variances :math:`c_i` of ``gaussian_frame_diagonal``, so
+    that :math:`C_i = \operatorname{diag}(c_i)` (audit 2026-10-20 item 26)."""
+    from vfe3.families.base import get_family
+
+    family = getattr(getattr(model, "cfg", None), "family", None)
+    return family is not None and bool(get_family(family).frame_diagonal_covariance)
+
+
 def gap_applicability(model: torch.nn.Module) -> Optional[str]:
     r"""``None`` when the realized-frame routing covariance is defined for ``model``, else the reason."""
     # prior_covariance_table='block_cholesky' registers sigma_log_embed as None (audit 2026-10-09 round 2, item 33).
@@ -139,13 +150,19 @@ def routing_frame_and_covariance(
 # ----------------------------------------------------------------------------------------------
 
 def _pair_statistics_chunk(
-    inverse: torch.Tensor,                        # (P, Hb, d, d) float64 U^{-1} blocks
-    sigma:   torch.Tensor,                        # (P, K) or (P, K, K) float64
+    inverse:            torch.Tensor,             # (P, Hb, d, d) float64 U^{-1} blocks
+    sigma:              torch.Tensor,             # (P, K) or (P, K, K) float64
+    reference_diagonal: bool = False,             # sigma holds the reference variances c: C = diag(c)
 ) -> Dict[str, torch.Tensor]:
     r"""Per pair and block: <C, G^{-1}>, ||G^{-1}||^2, ||C||^2, log det C, log det G^{-1}; whole-matrix sums."""
     P, Hb, d, _ = inverse.shape
     G = inverse @ inverse.transpose(-1, -2)                                   # (P, Hb, d, d) (U^T U)^{-1}
-    if sigma.dim() == 2:                                                      # diagonal Sigma
+    if reference_diagonal:                                                    # gaussian_frame_diagonal: C = diag(c)
+        if sigma.dim() != 2:
+            raise ValueError("reference variances must be a (P, K) diagonal")
+        C = torch.diag_embed(sigma.reshape(P, Hb, d))                         # (P, Hb, d, d)
+        cc_whole = None
+    elif sigma.dim() == 2:                                                    # diagonal Sigma
         s = sigma.reshape(P, Hb, d)
         C = (inverse * s[:, :, None, :]) @ inverse.transpose(-1, -2)          # (P, Hb, d, d)
         cc_whole = None
@@ -176,6 +193,9 @@ def pair_statistics(
     inverse: torch.Tensor,                        # (B, N, Hb, d, d)
     sigma:   torch.Tensor,                        # (B, N, K) or (B, N, K, K)
     keep:    torch.Tensor,                        # (B, N) bool, the positions to keep
+
+    *,
+    reference_diagonal: bool = False,             # sigma holds the reference variances c (frame-diagonal family)
 ) -> Dict[str, np.ndarray]:
     r"""Float64 per-pair statistics of the kept positions, in chunks bounded by :data:`PAIR_CHUNK_SCALARS`."""
     Hb, d = int(inverse.shape[-3]), int(inverse.shape[-1])
@@ -186,7 +206,7 @@ def pair_statistics(
     step = max(1, PAIR_CHUNK_SCALARS // per_pair)
     parts: Dict[str, List[np.ndarray]] = {}
     for start in range(0, int(inv.shape[0]), step):
-        chunk = _pair_statistics_chunk(inv[start:start + step], sig[start:start + step])
+        chunk = _pair_statistics_chunk(inv[start:start + step], sig[start:start + step], reference_diagonal)
         for key, value in chunk.items():
             parts.setdefault(key, []).append(value.cpu().numpy())
     return {key: np.concatenate(value) for key, value in parts.items()}
@@ -250,10 +270,11 @@ def _sample_statistics(
 ) -> Tuple[Dict[str, np.ndarray], bool]:
     parts: Dict[str, List[np.ndarray]] = {}
     block_diagonal = True
+    reference = stores_reference_variances(model)
     for inputs, keep in batches:
         inverse, sigma, block_diagonal = routing_frame_and_covariance(model, inputs.to(device))
         keep_device = keep.to(inverse.device)
-        stats = pair_statistics(inverse, sigma, keep_device)
+        stats = pair_statistics(inverse, sigma, keep_device, reference_diagonal=reference)
         stats["type"] = inputs[keep].numpy().astype(np.int64)
         stats["position"] = np.nonzero(keep.numpy())[1].astype(np.int64)
         for key, value in stats.items():
@@ -346,6 +367,8 @@ def routing_covariance_gap(
         "status": "ok", "headline_sample": HEADLINE_SAMPLE, "c": head["c"],
         "median_frobenius_gap": head.get("frobenius_gap_q50"), "median_logdet_gap": head.get("logdet_gap_q50"),
         "samples": samples, "block_diagonal": block_diagonal,
+        "covariance": ("reference variances c_i of gaussian_frame_diagonal: C_i = diag(c_i)"
+                       if stores_reference_variances(model) else "stack-entry Sigma_i: C_i = U_i^{-1} Sigma_i U_i^{-T}"),
         "n_blocks": int(occurrence["ip_block"].shape[1]), "block_dim": int(occurrence["_d_block"]),
         "stack_covariance_max_rel_change": change, "covariance_fixed_through_stack": fixed,
         "scope": ("C_i depends only on (type, position): covariance and frames are fixed through the stack"

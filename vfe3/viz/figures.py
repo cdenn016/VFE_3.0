@@ -4764,9 +4764,6 @@ def plot_f_ce_relationship(
     return _save(fig, path)
 
 
-plot_f_ce_decorrelation = plot_f_ce_relationship
-
-
 # ===========================================================================
 # D1 / EXP-8  --  pullback-group gauge M-step convergence
 # ===========================================================================

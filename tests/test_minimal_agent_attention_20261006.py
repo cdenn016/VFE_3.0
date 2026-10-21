@@ -930,7 +930,7 @@ def test_optimizer_grouping_resources_and_run_record() -> None:
         "fp32_failure_or_certificate_layer_fp64_recompute_kl_certificate_fp64_refactor")
     kernel = _relational_artifact_fields(tiny_config())["relational_operators"]
     assert "predictive_readout" not in kernel
-    assert kernel["factorization_fallback"] == "failed_entries_source_square_root_qr_fp64"
+    assert kernel["factorization_fallback"] == "failed_entries_source_root_shifted_cholesky_qr3_fp32_then_qr_fp64"
     assert kernel["routing_state"] == "pre_update"
     assert kernel["score_covariance_contract"] == "exact_full_reduced_covariance_from_local_gaussian"
 

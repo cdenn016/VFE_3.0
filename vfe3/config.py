@@ -841,6 +841,14 @@ class VFE3Config:
     # su_n; refused for block_borel and block_unipotent. None: no bound.
     phi_frame_condition_max:          Optional[float] = None
 
+    # Row-lazy AdamW for the frame table phi_embed (audit 2026-10-20 items 2, 49; M2). Dense AdamW moves a row whose
+    # gradient is zero this step by its momentum tail and its decoupled decay, and a rarely visited row by about
+    # min(sqrt(T), 31.6) lr per coordinate per appearance whatever the gradient size. True: a row that is neither in
+    # the step's input tokens nor carries a nonzero gradient takes no moment update, no step and no decay, and the
+    # bias correction of a stepped row uses its own step count k_v (vfe3/sparse_row_optim.py; checkpointed).
+    # m_phi_update_mode="adamw" only. False: dense AdamW.
+    m_phi_sparse_rows:                bool            = False
+
     # pullback_group / fisher_group only: upper bound R on each row's right-factor step ||eta s xi||_F, the embedded
     # Frobenius norm of the body generator xi (under fisher_group xi = U^{-1} W U, so R bounds a Frobenius norm, not
     # the Fisher norm or per-step KL that m_table_fisher_trust_radius bounds). group_log realizes R exactly; so does
@@ -875,8 +883,20 @@ class VFE3Config:
     #           decoder that does not read these tables (decode_mode="linear" or untie_decode_bank=True) and
     #           prior_covariance_table="diagonal"
     m_table_update_mode:              str             = "adamw"
-    m_table_fisher_lr:                float           = 0.1          # fisher only: natural step size eta > 0
-    m_table_fisher_trust_radius:      float           = 0.1          # fisher only: per-row Fisher-norm bound r (KL <= r^2/2 per step to second order; decay outside the bound)
+    m_table_fisher_lr:                float           = 0.1          # fisher only (table or decode bank): natural step size eta > 0
+    m_table_fisher_trust_radius:      float           = 0.1          # fisher only (table or decode bank): per-row Fisher-norm bound r (KL <= r^2/2 per step to second order; decay outside the bound)
+
+    # "adamw" | "fisher"
+    # M-step update of the untied decode bank decode_mu_embed / decode_sigma_log_embed, p_v = N(m_v, diag t_v),
+    # t_v = e^{l_v} (audit 2026-10-20 M6).
+    #   adamw   AdamW at m_decode_mu_lr / m_decode_sigma_lr
+    #   fisher  natural-gradient step preconditioned by (c_v/N) diag(1/t_v, 1/2), the Fisher metric of p_v counted
+    #           once per scored target occurrence (c_v floored at 1, since every row takes a softmax gradient):
+    #           (m_v, l_v) -= eta (N/max(c_v, 1)) (t_v grad_m, 2 grad_l) at eta = m_table_fisher_lr, each row's step
+    #           bounded in Fisher norm by m_table_fisher_trust_radius and never gradient-clipped; the decode AdamW
+    #           rates schedule it (lr_t/lr_0) and set the decoupled decay (decode_mu_weight_decay, sigma_weight_decay).
+    #           only: a prior-bank decode (decode_mode != "linear") with untie_decode_bank=True
+    m_decode_update_mode:             str             = "adamw"
 
     ##################################################
     #   17. Learning rates (M-step)
@@ -922,6 +942,12 @@ class VFE3Config:
     # Frame tables (phi_embed, pos_phi_free) under adamw; sets a frame-norm ceiling (0 = none).
     phi_weight_decay:                 float           = 0.065
 
+    # float >= 0. Decoupled AdamW decay of the relational query/key comparison maps (raw_score_q, raw_score_k) only;
+    # the noise and temperature scalars of the score group keep 0. Each head's routing KL is exactly flat along a joint
+    # rescaling of its comparison maps, so without decay their norm drifts up and the router's effective step falls
+    # as 1/|S| (audit 2026-10-20 item 9). 0 keeps the single undecayed score group.
+    relational_score_weight_decay:    float           = 0.0
+
     ##################################################
     #   19. Numerics and precision
     ##################################################
@@ -930,15 +956,21 @@ class VFE3Config:
     # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
     # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
     kl_max:                           Optional[float] = None
-    # "absolute" | "row_min" | "query_shifted": what kl_max clamps in the kernel router, projected_predictive and
-    # projected_gradient (audit 2026-10-08 P1-4)
-    #   absolute       D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
-    #                  (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
-    #   row_min        D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
-    #   query_shifted  D_ij - c_i, clamped from above only, with c_i the query-only row constant of the cost
-    #                  (-(r + log det G_i)/2 for the Gaussian KL, -log det G_i / 2 for noisy_query, 0 for
-    #                  mean_distance), which the softmax ignores; beta equals the absolute route's wherever nothing
-    #                  is capped, and shrinking query variances no longer saturate the clamp (audit 2026-10-17 item 2)
+    # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1": what kl_max clamps in the kernel router,
+    # projected_predictive and projected_gradient (audit 2026-10-08 P1-4)
+    #   absolute          D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi
+    #                     alone (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost
+    #                     gradient
+    #   row_min           D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    #   query_shifted     D_ij - c_i - m_i, clamped from above only, with c_i the query-only row constant of the cost
+    #                     (-(r + log det G_i)/2 for the Gaussian KL, -log det G_i / 2 for noisy_query, 0 for
+    #                     mean_distance) and m_i the mean over the row's admissible keys of the key log-volume
+    #                     log det G_j / 2 (0 for mean_distance); beta is the exact softmax wherever nothing is capped,
+    #                     and the tested cost is invariant under a joint rescaling of a head's comparison maps, which
+    #                     leaves every KL unchanged (audit 2026-10-20 item 1)
+    #   query_shifted_v1  D_ij - c_i, the 2026-10-18 form (audit 2026-10-17 item 2), which keeps the key
+    #                     log-determinant and moves by r ln c under that rescaling, so heads can cross the cap by
+    #                     scale alone; retained so configs saved before 2026-10-21 reload as they ran
     routing_kl_max_reference:         str             = "absolute"
     # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
     # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
@@ -1503,6 +1535,13 @@ class VFE3Config:
                                       "diagonal KL decoder reads diag Sigma_i in local or c_i in reference coordinates)")
             if self.decode_second_order:
                 frame_problems.append("decode_second_order=True (its trace term reads a local diagonal covariance)")
+            # A tied decode bank returns the encode tables, whose mean the encoder reads in local coordinates, so the
+            # decoder would score against N(mu_embed[v], diag c_v), a local-frame mean paired with a reference-frame
+            # variance, and the gauge switch would certify it (audit 2026-10-20 item 59).
+            if self.decode_mode != "linear" and not self.untie_decode_bank:
+                frame_problems.append(f"untie_decode_bank=False with decode_mode={self.decode_mode!r} (the tied bank "
+                                      "pairs the encoder's local-frame mean with the reference variance c_v; requires "
+                                      "untie_decode_bank=True)")
             # The table Fisher step preconditions mu_v by the metric U_v^-T diag(1/s_v) U_v^-1 of the type's layer-0
             # frame U_v (vfe3.table_optim). A positional frame makes U_i depend on the position, so the exact metric
             # would be the occurrence average of U_i^-T diag(1/s_v) U_i^-1, which the step does not implement.
@@ -1939,7 +1978,8 @@ class VFE3Config:
         from vfe3.geometry.norms import _NORMS
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
-        _require(self.routing_kl_max_reference, ("absolute", "row_min", "query_shifted"), "routing_kl_max_reference")
+        _require(self.routing_kl_max_reference, ("absolute", "row_min", "query_shifted", "query_shifted_v1"),
+                 "routing_kl_max_reference")
         if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
@@ -2160,12 +2200,27 @@ class VFE3Config:
                 table_problems.append(f"prior_covariance_table='diagonal' (got {self.prior_covariance_table!r})")
             if table_problems:
                 raise ValueError("m_table_update_mode='fisher' needs " + "; ".join(table_problems))
+        if not isinstance(self.m_phi_sparse_rows, bool):
+            raise ValueError(f"m_phi_sparse_rows must be a bool, got {self.m_phi_sparse_rows!r}")
+        if self.m_phi_sparse_rows:
+            from vfe3.gauge_optim import get_phi_update_policy
+            if get_phi_update_policy(self.m_phi_update_mode).requires_manifold_optimizer:
+                raise ValueError("m_phi_sparse_rows=True is a row-lazy AdamW step of phi_embed and requires "
+                                 f"m_phi_update_mode='adamw'; got {self.m_phi_update_mode!r}")
+        _require(self.m_decode_update_mode, ("adamw", "fisher"), "m_decode_update_mode")
+        if self.m_decode_update_mode == "fisher" and (self.decode_mode == "linear" or not self.untie_decode_bank):
+            # The step preconditions the untied (V, K) decode tables by the Fisher metric of p_v = N(m_v, diag t_v);
+            # a linear readout has no such tables and a tied bank's rows are the encoder tables.
+            raise ValueError("m_decode_update_mode='fisher' needs a prior-bank decode with its own tables "
+                             f"(decode_mode != 'linear' and untie_decode_bank=True); got decode_mode="
+                             f"{self.decode_mode!r}, untie_decode_bank={self.untie_decode_bank!r}")
         if self.e_mu_q_trust is not None and not (
             math.isfinite(self.e_mu_q_trust) and self.e_mu_q_trust > 0.0
         ):
             raise ValueError(
                 f"e_mu_q_trust must be finite and > 0 or None, got {self.e_mu_q_trust}")
-        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr_frac"):
+        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr_frac",
+                     "relational_score_weight_decay"):
             v = getattr(self, name)
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
@@ -2351,9 +2406,21 @@ class VFE3Config:
         if not (phi_update_policy.requires_pullback_geometry and self.m_phi_group_retraction == "group_log"):
             mark(("m_phi_group_log_fallback",),
                  "only read by m_phi_update_mode='pullback_group' with m_phi_group_retraction='group_log'")
-        if self.m_table_update_mode != "fisher":
-            mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"), "only read by m_table_update_mode='fisher'")
-        else:
+        decode_fisher = self.m_decode_update_mode == "fisher"
+        if self.m_table_update_mode != "fisher" and not decode_fisher:
+            mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"),
+                 "only read by m_table_update_mode='fisher' or m_decode_update_mode='fisher'")
+        if decode_fisher:
+            # The decode Fisher step reads each decode rate only through lr_t/lr_0 (independent of the base rate; 0
+            # freezes the table) and the decoupled decay lr_t * lambda, as the encoder table step does (below).
+            if self.resolved_hyperparameter("decode_mu_weight_decay") == 0.0:
+                mark(("m_decode_mu_lr",), "m_decode_update_mode='fisher' steps decode_mu_embed at m_table_fisher_lr; "
+                     "its AdamW rate only shapes the schedule (0 freezes the table) and its decay is 0")
+            if self.resolved_hyperparameter("sigma_weight_decay") == 0.0:
+                mark(("m_decode_sigma_lr",), "m_decode_update_mode='fisher' steps decode_sigma_log_embed at "
+                     "m_table_fisher_lr; its AdamW rate only shapes the schedule (0 freezes the table) and its "
+                     "decay is 0")
+        if self.m_table_update_mode == "fisher":
             # The table step reads its group rate only through lr_t/lr_0 (independent of the base rate; 0 freezes
             # the table) and the decoupled decay lr_t * lambda, so a table rate is inert when that decay is 0 and no
             # other optimizer group falls back to it (vfe3/train.py build_optimizer; audit 2026-10-10 round 2,
@@ -2575,10 +2642,13 @@ class VFE3Config:
             mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"
-                and self.family == "gaussian_diagonal" and self.projected_factorization == "gram"):
+                and self.family in ("gaussian_diagonal", "gaussian_frame_diagonal")
+                and self.projected_factorization == "gram"):
+            # gaussian_frame_diagonal reaches the fused route too: its reference variances c_i are read through the
+            # identity frame (audit 2026-10-20 item 45).
             mark(("relational_diag_moments_kernel",),
                  "only read by the diagonal comparison route (comparison_invariant Gaussian-KL kernel router on "
-                 "gaussian_diagonal under projected_factorization='gram')")
+                 "gaussian_diagonal or gaussian_frame_diagonal under projected_factorization='gram')")
         if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "noisy_key"):
             mark(("kappa_beta",), "relational_routing='noisy_key' routes at temperature exactly 1: the learned key "
@@ -2613,12 +2683,14 @@ class VFE3Config:
             mark(("decode_covariance",), "the linear readout reads no covariance")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
+            mark(("m_decode_update_mode",), "the linear readout has no decode bank to precondition")
         else:
             if not self.untie_decode_bank:
                 mark(("m_decode_mu_lr", "m_decode_sigma_lr"),
                      "shared encode/decode tables use the encoder rates")
                 mark(("decode_mu_weight_decay",),
                      "shared encode/decode tables: the decode means are mu_embed, decayed by mu_weight_decay")
+                mark(("m_decode_update_mode",), "shared encode/decode tables are stepped as encoder tables")
             mark(("decode_second_order",),
                  "linear decode only; the prior-bank KL decoders already read Sigma_q")
         # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
@@ -2636,6 +2708,9 @@ class VFE3Config:
                  "with its own optimizer-group value")
         if self.beta_attention_prior != "causal_windowed":
             mark(("attention_window",), "only the causal_windowed prior reads the band width")
+        if self.gauge_transport in ("off", "frozen"):
+            mark(("m_phi_sparse_rows",),
+                 f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on phi_embed, so no row steps")
         if self.gauge_transport in ("off", "frozen"):
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
@@ -3367,7 +3442,8 @@ def _migrate_projected_factorization(
 #   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
 #   decode_logits_amp                 False at 46a3a6c (2026-10-07)
 #   decode_ce_triton                  False at 5e5a118 (2026-10-12)
-#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08)
+#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08); a saved "query_shifted" from before
+#                                     2026-10-21 reloads as "query_shifted_v1" (era rule in historical_default_pins)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
@@ -3387,7 +3463,7 @@ def historical_default_pins(
 ) -> dict[str, Any]:               # field -> the value config_from_serialized fills in for it
     r"""The values :func:`config_from_serialized` gives the fields ``payload`` lacks, other than today's defaults.
 
-    Every row of ``_HISTORICAL_DEFAULT_PINS`` whose field is absent, and one era-keyed value. The field
+    Every row of ``_HISTORICAL_DEFAULT_PINS`` whose field is absent, and the era-keyed values below. The field
     ``predictive_covariance_floor_mode`` (322843b, 2026-10-16, default ``"prior"``) selects a floor that had already
     changed at 5f5d484 (2026-10-12): before then the moment-matched readouts used the relative floor
     :math:`f\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` (``"relative"``), after it :math:`f\Sigma_{p,i}`
@@ -3400,8 +3476,17 @@ def historical_default_pins(
     record lacking both the toggle and ``phi_frame_condition_max`` ran the pushforward (and the ``delta_full``
     composite) uncapped and is pinned False; one carrying ``phi_frame_condition_max`` keeps the default True
     (audit 2026-10-17, item 51). Records older than 89eedfb run the pinned passthrough norm, where the cap is inert.
+
+    ``routing_kl_max_reference="query_shifted"`` is the one era rule that maps a value the record carries. Until
+    2026-10-21 that value clamped :math:`D_{ij} - c_i`; it now clamps :math:`D_{ij} - c_i - m_i`, invariant under a
+    joint rescaling of the comparison maps (audit 2026-10-20 item 1), and the old form is ``"query_shifted_v1"``.
+    ``relational_score_weight_decay`` was added in the same change and every later record carries it, so a record
+    with ``"query_shifted"`` and without that field is pinned to ``"query_shifted_v1"`` and reloads bit-identically.
     """
     pins = {name: value for name, value in _HISTORICAL_DEFAULT_PINS.items() if name not in payload}
+    if (payload.get("routing_kl_max_reference") == "query_shifted"
+            and "relational_score_weight_decay" not in payload):
+        pins["routing_kl_max_reference"] = "query_shifted_v1"
     if "predictive_covariance_floor_mode" not in payload and "phi_frame_condition_max" not in payload:
         pins["predictive_covariance_floor_mode"] = "relative"
     if "block_norm_trace_cap" not in payload and "phi_frame_condition_max" not in payload:

@@ -10,6 +10,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from vfe3.contracts import CanonicalFrameContext, host_read
+from vfe3.cpu_linalg import single_thread_for_batched_cpu
 from vfe3.model import edge_links, minimal_agent
 from vfe3.model.covariance_ceiling import covariance_ceiling
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
@@ -372,8 +373,11 @@ def _chart_receive(
     item 31). Against a 60-digit reference (K = 6, cond(T) up to 1e9) the two forms have the same relative error;
     they differ by up to 3.5e-12 in absolute value at :math:`\|O'\|\approx 7\times10^2` (cond(T) = 1e3).
     """
-    # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
-    inverse = torch.linalg.inv_ex(T_stack).inverse                                      # (..., K, K) order zero
+    # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps. A batched CPU
+    # stack runs under one thread: multi-threaded batched CPU LU returns a wrong inverse at K >= 160 (audit 2026-10-20
+    # item 28; vfe3.cpu_linalg).
+    with single_thread_for_batched_cpu(T_stack):
+        inverse = torch.linalg.inv_ex(T_stack).inverse                                  # (..., K, K) order zero
     if chart == "first_order":
         return inverse, inverse + O_stack
     return inverse, _content_link_exp(O_stack @ T_stack) @ inverse                      # all orders
@@ -658,7 +662,7 @@ class RelationalOperators(nn.Module):
         elbo_diagnostic:       bool  = False,
     ) -> None:
         super().__init__()
-        self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
+        self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1" kernel-router clamp reference
         self.pair_kl_gemm_tol = pair_kl_gemm_tol      # None, or the opt-in pair-KL GEMM fallback tolerance (nats)
         # comparison rope_mode: the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.

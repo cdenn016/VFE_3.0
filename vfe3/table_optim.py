@@ -8,6 +8,10 @@ with :math:`(n_v/N)G_v`, the Fisher metric of the prior family :math:`p_v` count
 matrix is the exact Hessian of the self-coupling term :math:`\frac1N\sum_i \mathrm{KL}(q_i\|p_{x_i})` in
 :math:`\mu_v` (and its expected Hessian in :math:`l_v`) and of nothing else; for the cross-entropy the step
 trains it is a chosen preconditioner, not the metric of that objective (audit 2026-10-10 round 2, item 35).
+The implemented M-step self term (``mstep_self_coupling_weight > 0``) is that type-prior KL only at ``n_layers = 1``
+or ``prior_handoff_rho = 0`` (and ``prior_handoff_sigma = 0``): otherwise it reads the prior handed into the final
+block, whose mean :math:`(1-\rho)\mu_p + \rho\mu_{\mathrm{belief}}` carries the previous block's output, so the
+metric above is not its Hessian either (audit 2026-10-20 item 70).
 The natural direction is
 
 .. math::
@@ -54,6 +58,37 @@ the decay order and the diagnostics are those of the diagonal step, evaluated on
 frames are built detached, before the base step moves ``phi_embed``, for the step's distinct types only (one
 ``unique`` over the step's tokens, a host read the diagonal step does not make). Every other family, and this
 family on identity frames, takes the diagonal step unchanged.
+
+Untied decode bank (``m_decode_update_mode='fisher'``; audit 2026-10-20 M6). The decode row of type :math:`v` is
+:math:`p_v = \mathcal N(m_v, \operatorname{diag}t_v)`, :math:`t_v = e^{l_v}` (``decode_mu_embed``,
+``decode_sigma_log_embed``), and it enters the cross-entropy through the logit :math:`-\mathrm{KL}(q_i\|p_v)/\tau`.
+The Fisher metric of :math:`p_v` in :math:`(m_v, l_v)` is :math:`G_v = \operatorname{diag}(1/t_v, 1/2)`: from
+:math:`\log p_v(x) = -\tfrac12\sum_k[(x_k - m_{vk})^2 e^{-l_{vk}} + l_{vk} + \log 2\pi]` the scores are
+:math:`\partial_{m_{vk}}\log p_v = (x_k - m_{vk})/t_{vk}` and :math:`\partial_{l_{vk}}\log p_v =
+\tfrac12[(x_k - m_{vk})^2/t_{vk} - 1]`, whose second moments under :math:`p_v` are :math:`1/t_{vk}` and
+:math:`\tfrac14\operatorname{Var}(\chi^2_1) = \tfrac12`, and whose cross moments (odd moments) vanish. The same matrix
+is the Hessian of :math:`\mathrm{KL}(q\|p_v)` in :math:`m_v` (exactly) and in :math:`l_v` at :math:`q = p_v`
+(:math:`\partial^2_{l_{vk}}\mathrm{KL} = \tfrac12(s_k + \Delta_k^2)/t_{vk}`), so :math:`(c_v/(N\tau))\,G_v` is the
+Hessian of the target (pull) term :math:`\frac{1}{N\tau}\sum_{i:y_i=v}\mathrm{KL}(q_i\|p_v)` of the cross-entropy at
+:math:`q_i = p_v`, with :math:`c_v` the number of scored targets equal to :math:`v`. The softmax (push) term is not
+described by it, so for the cross-entropy it is a chosen preconditioner, as on the encoder side; the factor
+:math:`1/\tau` is absorbed into :math:`\eta`. Every decode row takes a softmax gradient whether or not it is a target,
+where the metric :math:`(c_v/N)G_v` is singular, so the weight is :math:`N/\max(c_v, 1)`: a row that is no target of
+the step is preconditioned as one occurrence. The step is
+
+.. math::
+    \Delta_v = -\eta\,\frac{N}{\max(c_v,1)}\bigl(t_v\odot\partial_{m_v}\mathcal L,\ 2\,\partial_{l_v}\mathcal L\bigr),
+    \qquad \|\Delta_v\|_{G_v}^2 = \sum_k\Bigl(\frac{\Delta m_{vk}^2}{t_{vk}} + \frac{\Delta l_{vk}^2}{2}\Bigr) \le r^2,
+
+at the encoder step's :math:`\eta` (``m_table_fisher_lr``) and :math:`r` (``m_table_fisher_trust_radius``): the
+direction is scaled back to Fisher norm at most :math:`r` and multiplied by the schedule factor of the decode AdamW
+group, and the decoupled decay :math:`p \leftarrow p(1 - \mathrm{lr}_t\lambda)` (``decode_mu_weight_decay``,
+``sigma_weight_decay``) sits outside the bound. The two banks share :math:`(\eta, r)` because both are Gaussian rows in
+the same metric, the radius bounds the same quantity (a row's per-step KL to second order), and the audit measured
+nothing that sets them apart. The bound also caps the logit shift one step of row :math:`v` causes for every query,
+:math:`|\delta\mathrm{KL}(q\|p_v)| \le \|\partial\mathrm{KL}\|_{G_v^{-1}}\,r` to first order, which is the M6 channel.
+The step is computed in float64 (:func:`_robust_table_steps`), keeps no state and reads the step's targets
+(:meth:`TableFisherStatistics.set_batch`), ``-100`` ignored as in the cross-entropy.
 """
 
 import math
@@ -93,16 +128,35 @@ class TableFisherStatistics:
         self._frame_builder = frame_builder
         self._tokens: Optional[torch.Tensor] = None
         self._scored: Optional[torch.Tensor] = None
+        self._targets: Optional[torch.Tensor] = None
         self._frames: Optional[Tuple[torch.Tensor, Any]] = None
 
     def set_batch(
         self,
-        tokens: Optional[torch.Tensor],                 # (B_tot, N) input ids, or None to clear
-        scored: Optional[torch.Tensor],                 # () scored-target count, or None
+        tokens:  Optional[torch.Tensor],                # (B_tot, N) input ids, or None to clear
+        scored:  Optional[torch.Tensor],                # () scored-target count, or None
+        targets: Optional[torch.Tensor] = None,         # (B_tot, N) next-token ids (-100 = ignore), or None
     ) -> None:
         self._tokens = tokens
         self._scored = scored
+        self._targets = targets
         self._frames = None
+
+    def step_tokens(self) -> Optional[torch.Tensor]:
+        r"""The step's input ids, or ``None`` outside ``train_step`` (the row-lazy frame step's occurrence mask)."""
+        return self._tokens
+
+    def targets(self) -> torch.Tensor:
+        r"""The step's target ids (``-100`` = ignored), read by the decode-bank Fisher step."""
+        if self._targets is None:
+            raise RuntimeError("m_decode_update_mode='fisher' needs the step's targets; train_step passes them to "
+                               "set_batch immediately before the optimizer step")
+        return self._targets
+
+    def decode_variances(self, dtype: torch.dtype) -> torch.Tensor:   # (V, K) t_v
+        r"""The decode-bank variances :math:`t_v` as the decoder reads them (``bounded_variance_from_log``, floor eps)."""
+        pb = self._prior_bank
+        return bounded_variance_from_log(pb._decode_sigma_log_table().detach().to(dtype), eps=pb.eps)
 
     @property
     def reads_frames(self) -> bool:
@@ -154,6 +208,18 @@ def type_counts(
     """
     ids = tokens.reshape(-1).to(device)
     return torch.zeros(V, dtype=torch.int64, device=device).index_add_(0, ids, torch.ones_like(ids))
+
+
+def target_counts(
+    targets: torch.Tensor,                    # (...) target ids in [0, V), -100 = ignored
+    V:       int,
+    device:  torch.device,
+) -> torch.Tensor:                            # (V,) int64 c_v
+    r"""Scored occurrences :math:`c_v` of each type among the targets (``-100`` ignored), without a host read."""
+    ids = targets.reshape(-1).to(device)
+    valid = ids >= 0
+    return torch.zeros(V, dtype=torch.int64, device=device).index_add_(
+        0, torch.where(valid, ids, torch.zeros_like(ids)), valid.to(torch.int64))
 
 
 def _schedule_factor(group: Dict[str, object]) -> float:
@@ -220,6 +286,58 @@ class _TableFisherMixin:
     def _table_fisher_groups(self) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
         marked = {group["table_fisher"]: group for group in self.param_groups if group.get("table_fisher")}
         return marked.get("mu"), marked.get("sigma")
+
+    def _decode_fisher_groups(self) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
+        marked = {group["table_fisher"]: group for group in self.param_groups if group.get("table_fisher")}
+        return marked.get("decode_mu"), marked.get("decode_sigma")
+
+    @torch.no_grad()
+    def _decode_fisher_step(self) -> None:
+        r"""The natural-gradient step of the untied decode bank (module docstring, ``m_decode_update_mode``)."""
+        mu_group, sigma_group = self._decode_fisher_groups()
+        m = mu_group["params"][0] if mu_group is not None else None               # (V, K) decode_mu_embed
+        log_t = sigma_group["params"][0] if sigma_group is not None else None     # (V, K) decode_sigma_log_embed
+        live = [p for p in (m, log_t) if p is not None and p.grad is not None]
+        if not live:
+            return
+        grad_scale, found_inf = getattr(self, "grad_scale", None), getattr(self, "found_inf", None)
+        statistics = self.table_statistics_provider
+        targets = statistics.targets()
+        _, scored = statistics.batch()
+        reference = live[0]
+        dtype = torch.promote_types(reference.dtype, torch.float32)
+        V = reference.shape[0]
+        skip = None if found_inf is None else found_inf.to(device=reference.device) != 0             # () bool
+        count = target_counts(targets, V, reference.device).to(dtype)                               # (V,) c_v
+        total = scored.to(device=reference.device, dtype=dtype).clamp_min(1.0)                       # () N
+        weight = (total / count.clamp_min(1.0)).unsqueeze(-1)                                       # (V, 1)
+        t = statistics.decode_variances(dtype)                                                      # (V, K) t_v
+
+        def gradient(p: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if p is None or p.grad is None:
+                return None
+            g = p.grad.to(dtype)
+            return g if grad_scale is None else g / grad_scale.to(device=g.device, dtype=dtype)
+
+        every_row = torch.ones(V, dtype=torch.bool, device=reference.device)
+        step_m, step_l, _, _, _ = _robust_table_steps(gradient(m), gradient(log_t), weight, t,
+                                                      self._table_fisher_lr, self._table_fisher_trust_radius,
+                                                      every_row)                                    # (V, K) float64
+        for p, step, group in ((m, step_m, mu_group), (log_t, step_l, sigma_group)):
+            if p is None or p.grad is None:
+                continue
+            decay = float(group["lr"]) * float(group.get("weight_decay", 0.0))
+            if decay != 0.0:
+                if skip is None:
+                    p.mul_(1.0 - decay)
+                else:
+                    keep = torch.full((), 1.0 - decay, dtype=p.dtype, device=p.device)
+                    p.mul_(torch.where(skip, torch.ones_like(keep), keep))
+            factor = _schedule_factor(group)
+            if factor != 0.0:
+                update = (factor * step).to(p.dtype)                                                # (V, K)
+                p.add_(update if skip is None else torch.where(skip, torch.zeros_like(update), update))
+            p.grad = None
 
     @torch.no_grad()
     def _table_fisher_step(self) -> None:
@@ -334,7 +452,8 @@ class _TableFisherMixin:
         tables = [group["params"][0] for group in self._table_fisher_groups() if group is not None]
         if self.table_statistics_provider.reads_frames and any(p.grad is not None for p in tables):
             self.table_statistics_provider.capture_frames()                 # U_v at the pre-step phi
-        stashed = [(p, p.grad) for p in tables]
+        decode_tables = [group["params"][0] for group in self._decode_fisher_groups() if group is not None]
+        stashed = [(p, p.grad) for p in tables + decode_tables]
         for p, _ in stashed:
             p.grad = None
         try:
@@ -343,6 +462,7 @@ class _TableFisherMixin:
             for p, grad in stashed:
                 p.grad = grad
         self._table_fisher_step()
+        self._decode_fisher_step()
         return result
 
 

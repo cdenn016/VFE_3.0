@@ -251,6 +251,9 @@ class SemanticRun:
         $\log\operatorname{diag}C_v$ of the per-head blocks that
         :func:`vfe3.model.prior_bank.packed_cholesky_covariance` builds from ``sigma_chol_embed``
         (audit 2026-10-09 round 2, item 33).
+
+        Under ``gaussian_frame_diagonal`` it is $\log c_v$, the reference variances, NOT the local diagonal
+        (:attr:`reference_variances`; audit 2026-10-20 item 26).
         """
         from vfe3.families.base import get_family
         from vfe3.numerics import bounded_variance_from_log
@@ -295,14 +298,30 @@ class SemanticRun:
         r"""Whether the prior covariance is the dense per-head ``block_cholesky`` table (not a diagonal)."""
         return SIGMA_LOG_KEY not in self.state and SIGMA_CHOL_KEY in self.state
 
+    @property
+    def reference_variances(self) -> bool:
+        r"""Whether the family stores reference variances $c_v$ (``gaussian_frame_diagonal``), so that
+        :meth:`log_var` is $\log c_v$ with $\Sigma_v = U_v\operatorname{diag}(c_v)U_v^\top$ rather than
+        $\log\operatorname{diag}\Sigma_v$ (audit 2026-10-20 item 26)."""
+        from vfe3.families.base import get_family
+
+        return bool(get_family(self.cfg.family).frame_diagonal_covariance)
+
     def log_det(self, ids: Sequence[int]) -> np.ndarray:
         r"""(n,) $\log\det\Sigma_v$ of the prior covariance.
 
         For a diagonal table (and a full family's exactly diagonal promoted prior) this is the row sum
         of :meth:`log_var`. Under ``block_cholesky`` it is $\sum_h\log\det C_v^{(h)}$ over the per-head
         blocks, from their Cholesky factors; the diagonal sum $\sum_k\log C_{v,kk}$ is only an upper
-        bound on it (Hadamard's inequality; audit 2026-10-10 #20).
+        bound on it (Hadamard's inequality; audit 2026-10-10 #20). Under ``gaussian_frame_diagonal`` it is
+        $\sum_k\log c_{vk} + 2\operatorname{tr}X_v$, since $\det\Sigma_v = \det(e^{X_v})^2\prod_k c_{vk}$ with the
+        type frame $U_v = e^{X_v}$ (audit 2026-10-20 item 26).
         """
+        if self.reference_variances:
+            log_c = self.log_var(ids).sum(axis=1)                              # (n,) sum_k log c_vk
+            if PHI_KEY not in self.state:
+                return log_c
+            return log_c + 2.0 * sum(np.trace(X, axis1=-2, axis2=-1) for X in self.phi_blocks(ids))
         if not self.prior_covariance_blocks:
             return self.log_var(ids).sum(axis=1)
         parts = [2.0 * torch.linalg.cholesky(C).diagonal(dim1=-2, dim2=-1).log().sum(dim=(-2, -1))   # (c,)

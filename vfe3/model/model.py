@@ -261,9 +261,9 @@ class VFEModel(nn.Module):
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
-        # Reproducibility is pinned at the entry point run_training (torch.manual_seed(cfg.seed)
-        # before model + loader are built), NOT here: seeding inside __init__ would clobber a
-        # caller-set RNG state (e.g. a test that seeds then constructs several models).
+        # Reproducibility is pinned at the training entry point (train_vfe3._run_once seeds cfg.seed before the
+        # model and loader are built), NOT here: seeding inside __init__ would clobber a caller-set RNG state
+        # (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
         # projected_factorization: the certificate and factor route; tolerances and the recovery precision
         # (fp32 with a float64 fallback on the Gram routes, float64 on cholesky_qr2_certified's factor route) are
@@ -541,7 +541,7 @@ class VFEModel(nn.Module):
             # position, so its init does not depend on how much RNG the prior-bank tables consumed
             # before it. Its stream is derived from (cfg.seed, 'pos_phi_free'), distinct from every
             # relational operator stream. A separate generator does NOT clobber the caller's global
-            # RNG, so the reproducibility seam stays at run_training; mu/sigma/phi inits are unchanged.
+            # RNG, so the reproducibility seam stays at the entry point (train_vfe3._run_once); mu/sigma/phi inits are unchanged.
             _g = torch.Generator().manual_seed(_derived_seed(cfg.seed, "pos_phi_free"))
             self.pos_phi_free = nn.Parameter(
                 torch.randn(cfg.max_seq_len, n_gen, generator=_g) * cfg.pos_phi_scale)
@@ -1047,9 +1047,12 @@ class VFEModel(nn.Module):
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
         through it, the ordinary autoregressive sampler in ``generate``.
 
-        Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
-        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent),
-        i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*). No norm runs
+        The pipeline is encode -> frames -> stack -> (optional) decode: q_i(0) = p_i = encode(token); the
+        positional frame (``pos_phi``) is applied to phi; the relational frames, with any RoPE fold, are realized
+        once; and ``vfe_stack`` runs L blocks, each one relational readout (one predictive readout per layer on
+        ``projected_predictive``, ``n_e_steps`` unrolled receiver updates on ``projected_gradient``) followed by
+        the block norm and the block MLP, handing the belief mean off to the next block's prior. The result is the
+        Gaussian tuple q* = (mu*, Sigma*, phi*) of the last block. No norm runs
         between the stack and the decoder (the final norm was removed on 2026-10-12), so the returned
         ``BeliefState`` carries the stack output's mu, sigma and phi, and a caller reads q*.phi for
         the M-step gauge penalty exactly as forward does. ``return_logits`` decodes p(o | q*_i) via
@@ -1063,7 +1066,7 @@ class VFEModel(nn.Module):
         from the returned belief: ``capture['converged']`` (the last block's converged
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
-        (post s-refine), and ``capture['out']`` retains the raw stack output. A capture also receives the
+        (with the positional frame applied), and ``capture['out']`` retains the raw stack output. A capture also receives the
         relational diagnostics (``capture['relational_capture']``: router labels, receiver costs, the minimal-agent
         diagnostics); ``forward``'s M-step capture passes ``_relational_capture=False``, since no M-step term reads
         them (audit 2026-10-12 round 2, item 6).
@@ -1200,7 +1203,7 @@ class VFEModel(nn.Module):
                              right_phi=out.right_phi)   # carry the exact positional right factor
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
-            # encode-time prior p (post s-refine) and the raw stack output for callers
+            # encode-time prior p (with the positional frame applied) and the raw stack output for callers
             # that need the complete pipeline state.
             capture["prior"] = beliefs
             capture["out"]   = out
@@ -1434,6 +1437,11 @@ class VFEModel(nn.Module):
             # derivative against finite differences.
             # Capturing the final-block input preserves the exact stack recurrence at
             # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
+            # Scope (audit 2026-10-20 item 70): the prior mean read here is the type prior mu_embed[x_i] only at
+            # n_layers=1 or prior_handoff_rho=0 (its variance only at prior_handoff_sigma=0). At n_layers>1 with
+            # rho>0, the reference setting, it is (1 - rho) mu_p + rho mu_belief, the previous block's output for
+            # rho=1, so this term is not KL(q_i*||p_{x_i}) and the table Fisher step's metric (n_v/N) G_v
+            # (vfe3/table_optim.py), the exact Hessian of that type-prior term, is not its Hessian.
             from vfe3.families import get_family
             from vfe3.free_energy import self_divergence_for_alpha
             from vfe3.alpha_i import self_coupling_alpha, alpha_is_per_coord
@@ -1469,8 +1477,7 @@ class VFEModel(nn.Module):
             # NEVER routed through hierarchical_free_energy_terms and never reweighting the canonical
             # q/p/s/h total. Each block already appended its grad-connected D(q_post||q_pre) rows.
             # The token-then-layer mean (each row.mean() over tokens, then
-            # mean over layers) is weighted and added; the per-layer values and the assembled
-            # objective_total_with_cg are reported on the diagnostic side channel only.
+            # mean over layers) is weighted and added. The per-layer values are not logged.
             cfg = self.cfg
             per_layer_rows = cap["cg_moment_energy_rows"]
             if (len(per_layer_rows) != cfg.n_layers
@@ -1484,11 +1491,6 @@ class VFEModel(nn.Module):
             layer_means = torch.stack([rows.mean() for rows in per_layer_rows])   # (n_layers,)
             cg_moment_energy = layer_means.mean()
             loss = loss + cfg.cg_energy_weight * cg_moment_energy
-            self._cg_energy_diagnostics = {
-                "cg_moment_energy":        cg_moment_energy.detach(),
-                "cg_moment_energy_layers": layer_means.detach(),
-                "objective_total_with_cg": loss.detach(),
-            }
         if em_weight > 0.0:
             # EM M-step term on the prototype templates (audit 2026-10-10, item 24; round 2, item 15):
             # L_EM = -w sum_l mean_i Q_il, the mean over the scored tokens (targets != -100) of each layer's rows
@@ -1852,6 +1854,7 @@ class VFEModel(nn.Module):
         layer_index: int,
         score:       torch.Tensor,             # (B, H, N, N) clamped routing cost as captured
         support:     torch.Tensor,             # (B, H, N, N) bool causal support
+        row_shift:   Optional[torch.Tensor] = None,   # (B, H, N) score_row_shift_pre of the shifted references
     ) -> float:
         r"""Per-token label free energy of one layer's kernel router (audit 2026-10-16 F114).
 
@@ -1861,7 +1864,13 @@ class VFEModel(nn.Module):
               + \tau_h\sum_j\beta^h_{ij}\log\frac{\beta^h_{ij}}{\pi^h_{ij}}\Big],
 
         with :math:`D` the clamped cost the router read (``score_energy_pre``; the row gaps under the ``row_min``
-        reference, so there the value omits each row's minimum cost), :math:`\pi = \operatorname{softmax}_j` of the
+        reference, so there the value omits each row's minimum cost). Under ``query_shifted`` and ``query_shifted_v1``
+        the captured cost omits the row constant :math:`s_i` (``score_row_shift_pre``: the query constant
+        :math:`c_i`, plus the key log-volume mean :math:`m_i` under ``query_shifted``), and ``row_shift`` adds it back,
+        :math:`F_i = \sum_h (s^h_i - \tau_h\log\sum_j\pi^h_{ij}e^{-\bar D^h_{ij}/\tau_h})`, the free energy of the
+        absolute cost :math:`\min(D_{ij}, \kappa + s_i)` the router read; without it the column carried the dropped
+        constant, about 383 of 531 nats on the reference run, and was unbounded below (audit 2026-10-20 item 39).
+        :math:`\pi = \operatorname{softmax}_j` of the
         attention log-prior on the causal support :math:`S_i` and :math:`\tau_h` the temperature the router ran at
         (:meth:`RelationalOperators.routing_temperature`: learned under ``learn_attention_temperature``, 1 under
         ``noisy_key``). The minimizer is the model's router :math:`\beta`, and each head's term is :math:`\tau_h`
@@ -1884,6 +1893,8 @@ class VFEModel(nn.Module):
         bias = torch.where(support, bias.expand_as(score), float("-inf"))       # (B, H, N, N)
         logits = torch.log_softmax(bias, dim=-1) - score.double() / tau_h[:, None, None]   # log pi - D / tau_h
         rows = -tau_h[:, None] * torch.logsumexp(logits, dim=-1)               # (B, H, N) -tau_h log Z_i^h
+        if row_shift is not None:
+            rows = rows + row_shift.double().to(device).reshape(rows.shape)     # (B, H, N) back to the absolute cost
         rows = torch.where(support.any(dim=-1), rows, torch.zeros_like(rows))  # empty rows (NaN above) give 0
         return float(rows.sum(dim=1).mean())
 
@@ -1902,8 +1913,8 @@ class VFEModel(nn.Module):
         ``clamped_row_frac`` the share of scored rows whose every entry is capped (the
         ``_capture_numerics_counts`` rule: such a row has zero router gradient and routes by the attention prior
         alone, :math:`\beta_{ij} \propto e^{\log\pi_{ij}}` (uniform over the sources only under a flat prior such as
-        plain causal; by the ALiBi distance profile under ``causal_alibi``), which happens only under the absolute
-        reference); ``self_weight`` the mean :math:`\beta_{ii}` and
+        plain causal; by the ALiBi distance profile under ``causal_alibi``), which happens under the absolute and
+        the shifted references, never under ``row_min``); ``self_weight`` the mean :math:`\beta_{ii}` and
         ``self_argmax_frac`` the share of rows with :math:`\beta_{ii} = \max_{j \in S_i}\beta_{ij}`, both
         over scored rows that admit self (NaN for a head with none, e.g. a ``*_noself`` prior).
 
@@ -2322,10 +2333,20 @@ class VFEModel(nn.Module):
         ``relational_raw_row_min_median_head_max`` is the largest per-head median of the raw row minimum, at
         ``relational_raw_row_min_median_argmax_{layer,head}``, and ``relational_capped_mass_mean_head_max`` the largest
         per-head mean routing mass on capped entries.
+
+        Every layer beside the last-layer headline columns (audit 2026-10-20 item 14): the layer maximum of the pooled
+        capped mass ``relational_capped_mass_mean_layer_max`` (with ``_argmax_layer``) and of the query-constant
+        median ``relational_score_term_query_constant_median_layer_max``; over the converged belief spectra the layer
+        minimum ``belief_lam_min_layer_min`` (with ``_argmin_layer``), the layer maxima ``belief_lam_max_layer_max``
+        and ``belief_cond_max_layer_max``, and the layer minimum of :math:`\lambda_{\min}/\lambda_{\max}` (each over
+        the layer's tokens) ``belief_eig_ratio_layer_min`` with ``_argmin_layer``. The per-layer
+        :math:`(\lambda_{\min}, \lambda_{\max})` are kept in ``last_belief_layer_extremes`` for the per-layer
+        eigenvalue-collapse alarm (``vfe3.train._warn_eigenvalue_collapse``).
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
         frac, nonfinite, condition, median, min_eigenvalue = [], [], [], [], []
+        capped_mass, query_constant, lam_min, lam_max, cond_max = [], [], [], [], []
         scale: List[Dict[str, float]] = []
         unit_distance: List[Optional[torch.Tensor]] = []
         heads: Dict[str, List[torch.Tensor]] = {}
@@ -2349,13 +2370,28 @@ class VFEModel(nn.Module):
             min_eigenvalue.append(extremes[0])
             condition.append(extremes[1])
             scale.append(self._covariance_scale_statistics(snapshot, layer_index, cap))
-            median.append(float(self._belief_spectrum(snapshot, layer_index)["condition"].median()))
+            spectrum = self._belief_spectrum(snapshot, layer_index)
+            median.append(float(spectrum["condition"].median()))
+            lam_min.append(float(spectrum["lam_min"].min()))
+            lam_max.append(float(spectrum["lam_max"].max()))
+            cond_max.append(float(spectrum["condition"].double().max()))
+            rows = support.sum(dim=-1) >= 2                                    # (B, H, N) scored rows
+            capped = support & rows.unsqueeze(-1) & (score >= cap_level)       # (B, H, N, N)
+            mass = (beta.double() * capped).sum(dim=-1)[rows]                  # (n_rows,) as in the headline column
+            capped_mass.append(float(mass.mean()) if mass.numel() else float("nan"))
+            medians = cap.get("score_term_medians_pre")                        # (4, H + 1) or absent
+            query_constant.append(float(medians[0, -1]) if medians is not None else float("nan"))
         frac.append(last["relational_score_klmax_frac"])
         nonfinite.append(last["relational_score_nonfinite_frac"])
         condition.append(last["relational_projected_cov_max_condition"])
         min_eigenvalue.append(last["relational_projected_cov_min_eigenvalue"])
         scale.append({key: last[key] for key in _COVARIANCE_SCALE_KEYS})
         median.append(last["belief_cond_median"])
+        capped_mass.append(last.get("relational_capped_mass_mean", float("nan")))
+        query_constant.append(last.get("relational_score_term_query_constant_median", float("nan")))
+        lam_min.append(last.get("belief_lam_min", float("nan")))
+        lam_max.append(last.get("belief_lam_max", float("nan")))
+        cond_max.append(last.get("belief_cond_max", float("nan")))
         top = max(range(n_layers), key=lambda layer: (frac[layer], -layer))
 
         def layer_extreme(values: List[float], largest: bool) -> Tuple[float, float]:
@@ -2376,6 +2412,20 @@ class VFEModel(nn.Module):
         extremes_out["relational_comparison_map_norm_spread_layer_max"] = layer_extreme(
             [row["relational_comparison_map_norm_spread"] for row in scale], largest=True)[0]
         extremes_out["relational_score_nonfinite_frac_layer_max"] = layer_extreme(nonfinite, largest=True)[0]
+        # Every layer beside the last-layer headline columns (audit 2026-10-20 item 14).
+        (extremes_out["relational_capped_mass_mean_layer_max"],
+         extremes_out["relational_capped_mass_mean_argmax_layer"]) = layer_extreme(capped_mass, largest=True)
+        extremes_out["relational_score_term_query_constant_median_layer_max"] = layer_extreme(
+            query_constant, largest=True)[0]
+        extremes_out["belief_lam_min_layer_min"], extremes_out["belief_lam_min_argmin_layer"] = layer_extreme(
+            lam_min, largest=False)
+        extremes_out["belief_lam_max_layer_max"] = layer_extreme(lam_max, largest=True)[0]
+        extremes_out["belief_cond_max_layer_max"] = layer_extreme(cond_max, largest=True)[0]
+        ratio = [low / high if math.isfinite(low) and math.isfinite(high) and high > 0 else float("nan")
+                 for low, high in zip(lam_min, lam_max)]
+        extremes_out["belief_eig_ratio_layer_min"], extremes_out["belief_eig_ratio_argmin_layer"] = layer_extreme(
+            ratio, largest=False)
+        self.last_belief_layer_extremes = {"lam_min": list(lam_min), "lam_max": list(lam_max)}
 
         def head_max(key: str) -> Tuple[float, float, float]:
             r"""Maximum over (layer, head) and the first (layer, head) attaining it; NaN if all NaN."""
@@ -2679,7 +2729,8 @@ class VFEModel(nn.Module):
             # The capped share above includes failed (non-finite) costs; this column separates them.
             relational_score_nonfinite_frac=self._nonfinite_frac(cap, score, support, minimal_agent),
             relational_routing_free_energy=(float("nan") if minimal_agent
-                                            else self._routing_free_energy(snapshot, layer_index, score, support)),
+                                            else self._routing_free_energy(snapshot, layer_index, score, support,
+                                                                           cap.get("score_row_shift_pre"))),
         )
         d.update(self._raw_router_cost_statistics(cap, score, beta, support, cap_level))
         if self.cfg.diagnose_canonical_free_energy:

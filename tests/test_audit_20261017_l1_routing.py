@@ -33,9 +33,12 @@ def _causal_log_prior(n: int) -> torch.Tensor:                       # (N, N), -
     return torch.zeros(n, n).masked_fill(torch.ones(n, n, dtype=torch.bool).triu(1), -math.inf)
 
 
-def _clamp(score: torch.Tensor, reference: str, kl_max: float, log_prior: torch.Tensor) -> torch.Tensor:
+def _clamp(score: torch.Tensor, reference: str, kl_max: float, log_prior: torch.Tensor,
+           key_variances: "torch.Tensor | None" = None) -> torch.Tensor:
+    # key_variances (B, N, H, r): the diagonal key covariances, whose log-volumes 'query_shifted' reads (2026-10-20)
+    volume = None if key_variances is None else .5 * key_variances.log().sum(-1).movedim(-1, -2)   # (B, H, N)
     return clamped_routing_cost(score, SimpleNamespace(kl_max_reference=reference), kl_max=kl_max,
-                                log_prior=log_prior)
+                                log_prior=log_prior, key_log_volume=volume)
 
 
 def _model(**overrides: Any) -> VFEModel:
@@ -91,7 +94,7 @@ def test_query_shifted_does_not_saturate_on_shrunk_query_variances() -> None:
                       "absolute", kl_max, log_prior)
     shifted = _clamp(scoring.projected_gaussian_kl(a, 1e-4 * var, a, var, diagonal_covariance=True,
                                                    drop_query_constant=True),
-                     "query_shifted", kl_max, log_prior)
+                     "query_shifted", kl_max, log_prior, key_variances=var)
 
     def fully_clamped(score: torch.Tensor) -> int:
         capped = (score >= kl_max) & support
@@ -118,13 +121,19 @@ def test_query_shifted_beta_equals_absolute_below_the_cap() -> None:
     shifted = scoring.projected_gaussian_kl(a_q, g_q, a_k, g_k, diagonal_covariance=True, drop_query_constant=True)
     assert float(D.min()) >= -1e-12 and float(shifted.max()) < kl_max         # nothing clamps on either route
     beta_abs = attention_weights(_clamp(D, "absolute", kl_max, log_prior), tau=2.0, log_prior=log_prior)
-    beta_shift = attention_weights(_clamp(shifted, "query_shifted", kl_max, log_prior), tau=2.0, log_prior=log_prior)
-    torch.testing.assert_close(beta_shift, beta_abs, rtol=0, atol=1e-13)
+    for reference, keys in (("query_shifted", g_k), ("query_shifted_v1", None)):
+        beta_shift = attention_weights(_clamp(shifted, reference, kl_max, log_prior, key_variances=keys), tau=2.0,
+                                       log_prior=log_prior)
+        torch.testing.assert_close(beta_shift, beta_abs, rtol=0, atol=1e-13)
 
 
 def test_query_shifted_clamps_from_above_only() -> None:
     score = torch.tensor([[-3.0, 0.5, 9.0, float("nan"), float("inf")]])
-    out = _clamp(score, "query_shifted", 2.0, None)
+    out = _clamp(score, "query_shifted_v1", 2.0, None)
+    assert out.tolist() == [[-3.0, 0.5, 2.0, 2.0, 2.0]]
+    # 'query_shifted' with zero key log-volumes subtracts m_i = 0 and clamps the same way
+    out = clamped_routing_cost(score, SimpleNamespace(kl_max_reference="query_shifted"), kl_max=2.0,
+                               key_log_volume=torch.zeros(5))
     assert out.tolist() == [[-3.0, 0.5, 2.0, 2.0, 2.0]]
 
 

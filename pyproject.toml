@@ -44,7 +44,6 @@ addopts = "-q --strict-config --strict-markers"
 # evidence source.
 junit_family = "xunit1"
 markers = [
-    "slow: heavy figure or artifact integration test; skipped unless --runslow",
     "cuda: test that requires a CUDA device",
     "external: test that requires externally supplied artifacts or bundles",
     "registry_mutation: test that temporarily changes a process-global registry",

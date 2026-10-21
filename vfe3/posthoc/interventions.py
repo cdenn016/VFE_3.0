@@ -384,6 +384,7 @@ def _reference_coordinate_score(
     row_invariant: bool,
     scorer:        Optional[Callable[..., torch.Tensor]],
     public:        torch.dtype,                      # the dtype the trained call on the original inputs returns
+    routing_aux:   Optional[Dict[str, torch.Tensor]] = None,   # relational_score's out-param (key log-volumes)
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""The trained router scored on reference moments: :math:`\xi_i = U_i^{-1}\mu_i`, covariance ``C``, frame :math:`I`.
 
@@ -411,7 +412,10 @@ def _reference_coordinate_score(
         source_xi = xi if source_mu is mu else _frame_matvec(frame.inverse, source_mu.to(dtype), frame.block_diagonal)
     score = (scorer or _unpatched_relational_score())(
         xi, C, source_xi, source_C, _identity_frame(frame, operators, dtype), operators, capture,
-        row_invariant=row_invariant)
+        row_invariant=row_invariant, **({"routing_aux": routing_aux} if routing_aux is not None else {}))
+    if routing_aux is not None and isinstance(routing_aux.get("key_log_volume"), torch.Tensor):
+        # the substituted covariances' key log-volumes, which the query_shifted clamp reads (audit 2026-10-20 item 1)
+        routing_aux["key_log_volume"] = routing_aux["key_log_volume"].to(public)
     if capture is not None:
         for key in ("projected_covariance_pre", "projected_key_covariance_pre"):
             if isinstance(capture.get(key), torch.Tensor):
@@ -444,6 +448,7 @@ def _identity_covariance_score(
     *,
     row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
     scorer:        Optional[Callable[..., torch.Tensor]] = None,   # the unpatched relational_score
+    routing_aux:   Optional[Dict[str, torch.Tensor]] = None,       # relational_score's out-param, passed through
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with every reference covariance :math:`C_i` replaced by :math:`I`.
 
@@ -461,7 +466,8 @@ def _identity_covariance_score(
     else:                                                                          # (..., N, K) diagonal layout
         C = torch.ones((), dtype=work, device=mu.device).expand(sigma.shape)
     return _reference_coordinate_score(mu, C, source_mu, C, frame, operators, capture,
-                                       row_invariant=row_invariant, scorer=scorer, public=public)
+                                       row_invariant=row_invariant, scorer=scorer, public=public,
+                                       routing_aux=routing_aux)
 
 
 @contextmanager
@@ -681,6 +687,7 @@ def _frame_free_covariance_score(
     *,
     row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
     scorer:        Optional[Callable[..., torch.Tensor]] = None,   # the unpatched relational_score
+    routing_aux:   Optional[Dict[str, torch.Tensor]] = None,       # relational_score's out-param, passed through
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with the frame removed from the routing covariance only (row 10).
 
@@ -697,7 +704,8 @@ def _frame_free_covariance_score(
     C = sigma.to(work)                                                             # (..., N, K[, K]) C_i = Sigma_i
     source_C = C if source_sigma is sigma else source_sigma.to(work)
     return _reference_coordinate_score(mu, C, source_mu, source_C, frame, operators, capture,
-                                       row_invariant=row_invariant, scorer=scorer, public=public)
+                                       row_invariant=row_invariant, scorer=scorer, public=public,
+                                       routing_aux=routing_aux)
 
 
 @contextmanager

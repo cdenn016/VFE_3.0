@@ -156,6 +156,8 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_table_update_mode': 'adamw',
     'm_table_fisher_lr': 0.1,
     'm_table_fisher_trust_radius': 0.1,
+    'm_decode_update_mode': 'adamw',
+    'm_phi_sparse_rows': False,
     'm_phi_group_trust_radius': 0.1,
     'm_phi_group_retraction': 'chart',
     'm_phi_group_log_fallback': 'series',
@@ -167,6 +169,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'mu_weight_decay': None,
     'decode_mu_weight_decay': None,
     'phi_weight_decay': 0.065,
+    'relational_score_weight_decay': 0.0,
     'eps': 1e-06,
     'kl_max': 100.0,
     'routing_kl_max_reference': 'absolute',
@@ -251,7 +254,7 @@ _LIVE_TINY: dict[str, Any] = {
     'max_steps': 10,
     'warmup_steps': 1,
     'block_mlp_expansion': 2,
-    'kl_max': None,                   # None: the launcher's 8 K at the tiny K; a launcher number scales (live_tiny)
+    'kl_max': None,                   # replaced by live_kl_max: the launcher's nats per comparison coordinate
     'amp_dtype': None,                # CPU unit tests run in fp32
     'log_interval': 0,                # run-only fields: no unit test reaches the logging or saving of train()
     'eval_interval': 0,
@@ -266,17 +269,23 @@ def launcher_values() -> dict[str, Any]:
     return deepcopy(train_vfe3.config)
 
 
-def live_kl_max(launcher: dict[str, Any]) -> "float | None":
-    r"""The tiny profile's ``kl_max``: :math:`\mathrm{kl\_max}_{\mathrm{launcher}}K_{\mathrm{tiny}}/K_{\mathrm{launcher}}`.
+def live_kl_max(launcher: dict[str, Any]) -> float:
+    r"""The tiny profile's ``kl_max``: :math:`\mathrm{kl\_max}_{\mathrm{launcher}}\,d_{\mathrm{tiny}}/d_{\mathrm{launcher}}`.
 
-    The divergence clamp scales with the belief dimension (its default is :math:`8K`), so the tiny profile keeps the
-    launcher's nats per dimension and the clamp binds in the same regime. ``None`` (the :math:`8K` default) stays
-    ``None`` (audit 2026-10-17, item 38).
+    :math:`d = K/H` is the head width, the rank :math:`r` of each head's comparison space. The router cost the clamp
+    tests is a per-head sum over :math:`r` comparison coordinates (and under ``query_shifted_v1`` carried
+    :math:`\tfrac r2(1 + \ln\sigma_{\mathrm{init}})` at initialization), so keeping the launcher's nats per comparison
+    coordinate keeps the cap binding in the launcher's regime. Scaling by total :math:`K` instead (audit 2026-10-17
+    item 38) capped every pair of the tiny live route, whose router gradients were then exactly zero and every
+    live-route gradient check compared zero with zero (audit 2026-10-20 item 5). A launcher ``None`` (the :math:`8K`
+    default) is resolved at the launcher's :math:`K` first, so it scales the same way.
     """
     kl_max = launcher.get("kl_max")
     if kl_max is None:
-        return None
-    return float(kl_max) * _LIVE_TINY['embed_dim'] / launcher["embed_dim"]
+        kl_max = 8.0 * launcher["embed_dim"]
+    d_tiny = _LIVE_TINY['embed_dim'] / _LIVE_TINY['n_heads']
+    d_launcher = launcher["embed_dim"] / launcher["n_heads"]
+    return float(kl_max) * d_tiny / d_launcher
 
 
 def live_tiny(launcher: dict[str, Any]) -> dict[str, Any]:
@@ -296,6 +305,94 @@ def live_config(**overrides: Any) -> VFE3Config:
 
 
 live_config.__test__ = False
+
+
+# The reference route, frozen: the route switches of vfe3_runs/30.37_wikitext-103_K160_5-epochs_6-layer/config.json
+# (validation 29.43, test 30.37; audit 2026-10-20 item 23) where they differ from _CONFIG_VALUES, so the route is
+# pinned by tests independently of whatever train_vfe3.py holds. Shape, run and precision fields are left out and set
+# by _REFERENCE_TINY. 'query_shifted' is today's scale-invariant reference (the run itself ran the form now called
+# 'query_shifted_v1', which its saved config reloads as).
+_REFERENCE_ROUTE: dict[str, Any] = {
+    'attention_mode': 'projected_predictive',
+    'predictive_covariance': 'moment_matched',
+    'predictive_covariance_floor_mode': 'max',
+    'predictive_covariance_spread_squares': True,
+    'content_link_chart': 'exponential',
+    'rope_mode': 'comparison_invariant',
+    'routing_kl_max_reference': 'query_shifted',
+    'pos_phi': 'none',
+    'relational_receiver_measurement': 'inverse',
+    'relational_receiver_update': 'closed_form',
+    'minimal_agent_inference': 'mean_field',
+    'decode_mode': 'diagonal_chunked',
+    'decode_tau': 0.1,
+    'decode_av_precision': 'fp32',
+    'decode_ranking_fp64_escalation': False,
+    'block_mlp_template_init': 'working_variance',
+    'm_table_update_mode': 'fisher',
+    'm_table_fisher_trust_radius': 0.5,
+    'skip_belief_sigma_update': False,
+    'sigma_init': 15,
+    'mu_init_std': 0.065,
+    'phi_scale': 0.035,
+    'transport_chart_max_norm': 50.0,
+    'e_q_mu_lr': 0.2,
+    'e_q_sigma_lr': 0.01,
+    'e_sigma_q_trust': 1.0,
+    'grad_clip_scope': 'group',
+    'm_block_mlp_lr': 0.005,
+    'm_decode_mu_lr': 0.005,
+    'm_decode_sigma_lr': 0.001,
+    'm_layernorm_lr': 0.005,
+    'm_p_sigma_lr': 0.001,
+    'm_per_type_hidden_bias_lr': 0.0025,
+    'm_phi_lr': 0.003,
+    'm_pos_phi_lr': 0.003,
+    'm_relational_content_lr': 0.0025,
+    'm_relational_score_lr': 0.01,
+    'weight_decay': 0.01,
+    'phi_weight_decay': 0.1,
+    'sigma_weight_decay': 0,
+    'mu_weight_decay': 0,
+    'decode_mu_weight_decay': 0,
+}
+
+# The reference route at tiny scale: five heads (the H = 5 ALiBi slopes, the non-power-of-two branch) of width 4, so
+# kl_max keeps the reference's 4 nats per comparison coordinate (128 at d = 32 -> 16 at d = 4, as live_kl_max).
+# Precision and kernel toggles that only act on CUDA (fp32_matmul_precision 'high', the Triton decode and moments
+# kernels, decode_logits_amp, a 512 MiB tile) are left at the CPU baseline, so this profile installs no global state.
+_REFERENCE_TINY: dict[str, Any] = {
+    'vocab_size': 7,
+    'embed_dim': 20,
+    'n_heads': 5,
+    'max_seq_len': 4,
+    'eval_stride': None,
+    'batch_size': 2,
+    'n_layers': 2,
+    'max_steps': 10,
+    'warmup_steps': 1,
+    'block_mlp_expansion': 2,
+    'kl_max': 16.0,
+    'amp_dtype': None,
+    'fp32_matmul_precision': None,
+    'log_interval': 0,
+    'eval_interval': 0,
+    'checkpoint_interval': 0,
+    'generate_embedding_figures': False,
+}
+
+
+def reference_values(**overrides: Any) -> dict[str, Any]:
+    """Return a fresh complete reference-route configuration dictionary at tiny scale (no launcher read)."""
+    return deepcopy({**_CONFIG_VALUES, **_REFERENCE_ROUTE, **_REFERENCE_TINY, **overrides})
+
+
+def reference_config(**overrides: Any) -> VFE3Config:
+    """Construct the validated frozen reference route at tiny scale."""
+    return VFE3Config(**reference_values(**overrides))
+
+
+reference_config.__test__ = False
 
 
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:

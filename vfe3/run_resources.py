@@ -78,6 +78,12 @@ _WRAPPER_PREFIXES: Tuple[str, ...] = ("_orig_mod.", "module.")
 # Metrics columns read by throughput_summary.
 _THROUGHPUT_COLUMNS: Tuple[str, ...] = (
     "tokens_per_s", "train_step_tokens_per_s", "pipeline_tokens_per_s")
+# Allocator and clock telemetry read by throughput_summary (vfe3.train.DEVICE_TELEMETRY_COLUMNS; audit 2026-10-20
+# item 20). Absent in older runs, where every summary entry is None.
+_TELEMETRY_COLUMNS: Tuple[str, ...] = (
+    "cuda_mem_allocated_mb", "cuda_mem_reserved_mb", "cuda_mem_reserved_peak_mb", "cuda_mem_inactive_split_mb",
+    "cuda_alloc_retries", "cuda_device_allocs", "cuda_device_frees", "cuda_ooms",
+    "gpu_sm_clock_mhz", "gpu_temperature_c", "gpu_power_w")
 
 
 def _leaf(name: str) -> str:
@@ -452,7 +458,10 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
 
     Reads ``metrics.csv`` (``tokens_per_s``, ``train_step_tokens_per_s``, ``pipeline_tokens_per_s``,
     ``peak_mem_mb``, ``train_step_ms_mean``, ``step``; the throughput quantiles leave out divergence-spike
-    rows, counted in ``spike_rows_excluded``), ``summary.json`` (``wall_time_s``) and
+    rows, counted in ``spike_rows_excluded``; and the allocator and clock telemetry of ``_TELEMETRY_COLUMNS``,
+    summarized under ``"device_telemetry"`` as the first and last finite value and the quantiles over the
+    non-spike rows, so a throughput decline can be set beside allocator retries and the SM clock),
+    ``summary.json`` (``wall_time_s``) and
     ``provenance.json`` (``device_name``); a ``resources.json`` written at finalize, when present, is
     returned under ``"resources_json"``. The training-only time estimate is
     :math:`\sum_r \bar t_r \Delta s_r`, the logged mean step time times the steps in each logging
@@ -463,7 +472,7 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
     metrics = run_dir / "metrics.csv"
     if metrics.is_file():
         cols = _read_metric_columns(
-            metrics, ("step", "peak_mem_mb", "train_step_ms_mean", *_THROUGHPUT_COLUMNS))
+            metrics, ("step", "peak_mem_mb", "train_step_ms_mean", *_THROUGHPUT_COLUMNS, *_TELEMETRY_COLUMNS))
         # Quantiles over the log and eval rows only: a divergence-spike row closes a short window around one
         # anomalous step (vfe3.metrics_schema; audit 2026-10-17 item 5). The time estimate below keeps every
         # row, since the rows' windows partition the run.
@@ -473,6 +482,12 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
             c: _quantiles([v for v, is_spike in zip(cols[c], spike) if not is_spike])
             for c in _THROUGHPUT_COLUMNS}
         out["spike_rows_excluded"] = int(sum(spike))
+        telemetry: Dict[str, Any] = {}
+        for c in _TELEMETRY_COLUMNS:
+            kept = [v for v, is_spike in zip(cols[c], spike) if not is_spike and math.isfinite(v)]
+            telemetry[c] = {"first": kept[0] if kept else None, "last": kept[-1] if kept else None,
+                            **_quantiles(kept)}
+        out["device_telemetry"] = telemetry
         peak = [v for v in cols["peak_mem_mb"] if math.isfinite(v)]
         out["peak_mem_mb"] = max(peak) if peak else None
         steps = cols["step"]
@@ -489,6 +504,7 @@ def throughput_summary(run_dir: Union[str, Path]) -> Dict[str, Any]:
     else:
         out["throughput_tokens_per_s"] = None
         out["spike_rows_excluded"] = None
+        out["device_telemetry"] = None
         out["peak_mem_mb"] = None
         out["train_only_hours_estimate"] = None
     summary = run_dir / "summary.json"
