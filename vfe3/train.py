@@ -5666,8 +5666,13 @@ def _train_loop(
     def _on_crash(exc: BaseException) -> None:
         r"""Write the crash record, the failing batch, pending rows and replay records and the emergency checkpoint.
 
-        Every part is isolated: a failure inside the handler is listed in the record and never replaces the
-        original exception, which the caller re-raises.
+        The record and the stop line come first (audit 2026-10-20 item 12): a preliminary ``crash.json`` with the
+        exception, its traceback, the step and the recent losses is written and the error is logged before any
+        slow stage, so an interrupt during the multi-gigabyte emergency checkpoint still leaves both. Each later
+        stage is guarded by ``except BaseException``; an interrupt (``KeyboardInterrupt``, ``SystemExit``) inside a
+        stage is listed in the record and skips the remaining stages. The record is rewritten atomically after the
+        stages with ``record_complete`` True. A failure inside the handler never replaces the original exception,
+        which the caller re-raises.
         """
         if artifacts is None or getattr(artifacts, "run_dir", None) is None:
             return
@@ -5689,48 +5694,63 @@ def _train_loop(
             "recent_losses": [float(value) for value in recent_losses],
             "failed_batch": None, "checkpoint": None, "checkpoint_step": None, "checkpoint_reason": None,
             "handler_errors": [],
+            "record_complete": False,                             # True once every stage below has returned
+            "interrupted_stage": None,                            # the stage an interrupt stopped, if any
         }
         diagnostics_dir = Path(artifacts.run_dir) / "diagnostics"
-        try:
-            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+        def _write_record() -> None:
+            try:
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                _write_crash_record(diagnostics_dir, record)
+            except Exception as handler_exc:                      # noqa: BLE001 - the original exception wins
+                logger.error("crash record could not be written (%s)", handler_exc)
+
+        _write_record()                                           # preliminary record before any slow stage
+        logger.error("training stopped at step %s (%s: %s); crash record %s; writing the failing batch and the "
+                     "emergency checkpoint", record["step"], type(exc).__name__, exc,
+                     diagnostics_dir / CRASH_RECORD_NAME)
+
+        def _save_batch() -> None:
             if crash_state["tokens"] is not None:
                 batch_path = diagnostics_dir / f"crash_batch_step_{record['step']}.pt"
                 torch.save({"step": record["step"], "tokens": crash_state["tokens"],
                             "targets": crash_state["targets"]}, batch_path)
                 record["failed_batch"] = str(batch_path)
-        except Exception as handler_exc:                          # noqa: BLE001 - the original exception wins
-            record["handler_errors"].append(f"failed batch: {type(handler_exc).__name__}: {handler_exc}")
-        try:
+
+        def _flush_replays() -> None:
             if crash_state["replays"] and not crash_state["replays_flushed"]:
                 _append_replay_records(artifacts.run_dir, crash_state["replays"])
                 crash_state["replays_flushed"] = True
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["handler_errors"].append(f"replay records: {type(handler_exc).__name__}: {handler_exc}")
-        try:
+
+        def _flush_pending() -> None:
             if pending_rows:
                 union = (metrics_fields if metrics_fields is not None
                          else list(dict.fromkeys(key for pending in pending_rows for key in pending)))
                 for pending in pending_rows:
                     artifacts.log_metrics(_conform_row(pending, union))
                 pending_rows.clear()
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["handler_errors"].append(f"pending rows: {type(handler_exc).__name__}: {handler_exc}")
-        try:
-            artifacts.wait_background()
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["handler_errors"].append(f"background jobs: {type(handler_exc).__name__}: {handler_exc}")
-        try:
-            _emergency_checkpoint(record)
-        except Exception as handler_exc:                          # noqa: BLE001
-            record["checkpoint"] = None
-            record["handler_errors"].append(f"checkpoint: {type(handler_exc).__name__}: {handler_exc}")
-        try:
-            _write_crash_record(diagnostics_dir, record)
-        except Exception as handler_exc:                          # noqa: BLE001
-            logger.error("crash record could not be written (%s)", handler_exc)
-        logger.error("training stopped at step %s (%s: %s); crash record %s, checkpoint %s",
-                     record["step"], type(exc).__name__, exc, diagnostics_dir / CRASH_RECORD_NAME,
-                     record["checkpoint"] or f"none ({record['checkpoint_reason']})")
+
+        stages = (("failed batch", _save_batch), ("replay records", _flush_replays), ("pending rows", _flush_pending),
+                  ("background jobs", artifacts.wait_background), ("checkpoint", lambda: _emergency_checkpoint(record)))
+        for name, stage in stages:
+            try:
+                stage()
+            except BaseException as handler_exc:                  # noqa: BLE001 - the original exception wins
+                if name == "checkpoint":
+                    record["checkpoint"] = None
+                record["handler_errors"].append(f"{name}: {type(handler_exc).__name__}: {handler_exc}")
+                if not isinstance(handler_exc, Exception):        # an interrupt: stop here, keep the record
+                    record["interrupted_stage"] = name
+                    break
+            _write_record()                                       # each stage's result reaches the record
+        else:
+            record["record_complete"] = True
+        _write_record()
+        logger.error("crash handling at step %s finished; checkpoint %s%s", record["step"],
+                     record["checkpoint"] or f"none ({record['checkpoint_reason']})",
+                     "" if record["interrupted_stage"] is None
+                     else f"; interrupted during the {record['interrupted_stage']} stage")
 
     def _save_failed_batch(step_number: int, exc: BaseException) -> Optional[str]:
         r"""Save the batch of a skipped failed step to ``diagnostics/failed_steps/step_<S>.pt`` (item 16)."""
