@@ -922,6 +922,12 @@ class VFE3Config:
     # Frame tables (phi_embed, pos_phi_free) under adamw; sets a frame-norm ceiling (0 = none).
     phi_weight_decay:                 float           = 0.065
 
+    # float >= 0. Decoupled AdamW decay of the relational query/key comparison maps (raw_score_q, raw_score_k) only;
+    # the noise and temperature scalars of the score group keep 0. Each head's routing KL is exactly flat along a joint
+    # rescaling of its comparison maps, so without decay their norm drifts up and the router's effective step falls
+    # as 1/|S| (audit 2026-10-20 item 9). 0 keeps the single undecayed score group.
+    relational_score_weight_decay:    float           = 0.0
+
     ##################################################
     #   19. Numerics and precision
     ##################################################
@@ -930,15 +936,21 @@ class VFE3Config:
     # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
     # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
     kl_max:                           Optional[float] = None
-    # "absolute" | "row_min" | "query_shifted": what kl_max clamps in the kernel router, projected_predictive and
-    # projected_gradient (audit 2026-10-08 P1-4)
-    #   absolute       D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi alone
-    #                  (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost gradient
-    #   row_min        D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
-    #   query_shifted  D_ij - c_i, clamped from above only, with c_i the query-only row constant of the cost
-    #                  (-(r + log det G_i)/2 for the Gaussian KL, -log det G_i / 2 for noisy_query, 0 for
-    #                  mean_distance), which the softmax ignores; beta equals the absolute route's wherever nothing
-    #                  is capped, and shrinking query variances no longer saturate the clamp (audit 2026-10-17 item 2)
+    # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1": what kl_max clamps in the kernel router,
+    # projected_predictive and projected_gradient (audit 2026-10-08 P1-4)
+    #   absolute          D_ij; a row whose every admissible cost exceeds kl_max routes by the attention prior pi
+    #                     alone (uniform under a causal mask, the ALiBi weights under causal_alibi) with zero cost
+    #                     gradient
+    #   row_min           D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    #   query_shifted     D_ij - c_i - m_i, clamped from above only, with c_i the query-only row constant of the cost
+    #                     (-(r + log det G_i)/2 for the Gaussian KL, -log det G_i / 2 for noisy_query, 0 for
+    #                     mean_distance) and m_i the mean over the row's admissible keys of the key log-volume
+    #                     log det G_j / 2 (0 for mean_distance); beta is the exact softmax wherever nothing is capped,
+    #                     and the tested cost is invariant under a joint rescaling of a head's comparison maps, which
+    #                     leaves every KL unchanged (audit 2026-10-20 item 1)
+    #   query_shifted_v1  D_ij - c_i, the 2026-10-18 form (audit 2026-10-17 item 2), which keeps the key
+    #                     log-determinant and moves by r ln c under that rescaling, so heads can cross the cap by
+    #                     scale alone; retained so configs saved before 2026-10-21 reload as they ran
     routing_kl_max_reference:         str             = "absolute"
     # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
     # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
@@ -1939,7 +1951,8 @@ class VFE3Config:
         from vfe3.geometry.norms import _NORMS
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
-        _require(self.routing_kl_max_reference, ("absolute", "row_min", "query_shifted"), "routing_kl_max_reference")
+        _require(self.routing_kl_max_reference, ("absolute", "row_min", "query_shifted", "query_shifted_v1"),
+                 "routing_kl_max_reference")
         if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
@@ -2165,7 +2178,8 @@ class VFE3Config:
         ):
             raise ValueError(
                 f"e_mu_q_trust must be finite and > 0 or None, got {self.e_mu_q_trust}")
-        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr_frac"):
+        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr_frac",
+                     "relational_score_weight_decay"):
             v = getattr(self, name)
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
@@ -3367,7 +3381,8 @@ def _migrate_projected_factorization(
 #   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
 #   decode_logits_amp                 False at 46a3a6c (2026-10-07)
 #   decode_ce_triton                  False at 5e5a118 (2026-10-12)
-#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08)
+#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08); a saved "query_shifted" from before
+#                                     2026-10-21 reloads as "query_shifted_v1" (era rule in historical_default_pins)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
@@ -3387,7 +3402,7 @@ def historical_default_pins(
 ) -> dict[str, Any]:               # field -> the value config_from_serialized fills in for it
     r"""The values :func:`config_from_serialized` gives the fields ``payload`` lacks, other than today's defaults.
 
-    Every row of ``_HISTORICAL_DEFAULT_PINS`` whose field is absent, and one era-keyed value. The field
+    Every row of ``_HISTORICAL_DEFAULT_PINS`` whose field is absent, and the era-keyed values below. The field
     ``predictive_covariance_floor_mode`` (322843b, 2026-10-16, default ``"prior"``) selects a floor that had already
     changed at 5f5d484 (2026-10-12): before then the moment-matched readouts used the relative floor
     :math:`f\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` (``"relative"``), after it :math:`f\Sigma_{p,i}`
@@ -3400,8 +3415,17 @@ def historical_default_pins(
     record lacking both the toggle and ``phi_frame_condition_max`` ran the pushforward (and the ``delta_full``
     composite) uncapped and is pinned False; one carrying ``phi_frame_condition_max`` keeps the default True
     (audit 2026-10-17, item 51). Records older than 89eedfb run the pinned passthrough norm, where the cap is inert.
+
+    ``routing_kl_max_reference="query_shifted"`` is the one era rule that maps a value the record carries. Until
+    2026-10-21 that value clamped :math:`D_{ij} - c_i`; it now clamps :math:`D_{ij} - c_i - m_i`, invariant under a
+    joint rescaling of the comparison maps (audit 2026-10-20 item 1), and the old form is ``"query_shifted_v1"``.
+    ``relational_score_weight_decay`` was added in the same change and every later record carries it, so a record
+    with ``"query_shifted"`` and without that field is pinned to ``"query_shifted_v1"`` and reloads bit-identically.
     """
     pins = {name: value for name, value in _HISTORICAL_DEFAULT_PINS.items() if name not in payload}
+    if (payload.get("routing_kl_max_reference") == "query_shifted"
+            and "relational_score_weight_decay" not in payload):
+        pins["routing_kl_max_reference"] = "query_shifted_v1"
     if "predictive_covariance_floor_mode" not in payload and "phi_frame_condition_max" not in payload:
         pins["predictive_covariance_floor_mode"] = "relative"
     if "block_norm_trace_cap" not in payload and "phi_frame_condition_max" not in payload:

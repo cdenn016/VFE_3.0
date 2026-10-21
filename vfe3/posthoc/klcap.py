@@ -4,8 +4,9 @@ The relational router bounds every cost to :math:`[0, \kappa]` before the softma
 :math:`\bar D_{ij} = \min(D_{ij} - m_i, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (non-finite costs are
 also set to :math:`\kappa`) and the clamp reference :math:`m_i` of ``routing_kl_max_reference``: :math:`m_i = 0`
 under ``'absolute'``, the row minimum :math:`\min_{j \in \mathcal S_i} D_{ij}` under ``'row_min'``
-(:func:`vfe3.gradients.relational.clamped_routing_cost`), and the query-only row constant :math:`c_i` of the cost
-under ``'query_shifted'``, where the bound is from above only (audit 2026-10-17 item 2). The captured ``score_energy_pre`` is
+(:func:`vfe3.gradients.relational.clamped_routing_cost`), the query-only row constant :math:`c_i` of the cost plus
+the admissible row mean of the key log-volumes under ``'query_shifted'`` (audit 2026-10-20 item 1), and :math:`c_i`
+alone under ``'query_shifted_v1'``; under both the bound is from above only (audit 2026-10-17 item 2). The captured ``score_energy_pre`` is
 :math:`\bar D_{ij}` either way, so an entry is *at the cap* when :math:`\bar D_{ij} \ge \kappa`; under
 ``'row_min'`` that is a gap to the row's best source, ``max_cost_uncapped`` is the largest uncapped gap, and
 the reference is recorded in the summary (``kl_max_reference``). The unweighted

@@ -351,8 +351,24 @@ def build_optimizer(
                 # content_link_edges: the edge factor maps are content-link parameters (absent when off).
                 parameters += [p for ops in layers for p in getattr(ops, "edge_parameters", list)()]
             parameters = [p for p in parameters if p.requires_grad]
-            if parameters:
-                groups.append({"params": parameters, "lr": cfg.resolved_hyperparameter(f"m_relational_{role}_lr"),
+            lr = cfg.resolved_hyperparameter(f"m_relational_{role}_lr")
+            map_decay = float(getattr(cfg, "relational_score_weight_decay", 0.0))
+            if role == "score" and map_decay > 0.0:
+                # relational_score_weight_decay (audit 2026-10-20 item 9): the comparison maps take the decay, the
+                # noise and temperature scalars stay undecayed in a second group of the same rate without the
+                # auxiliary role (one group per role), so grad_norm_relational_score then reads the maps alone.
+                # At 0 the single group below is kept, so optimizer state from earlier runs loads unchanged.
+                maps = {id(p) for ops in layers for name in ("raw_score_q", "raw_score_k")
+                        for p in (ops._stored_runs(name) if getattr(ops, name, None) is not None else [])}
+                decayed = [p for p in parameters if id(p) in maps]
+                scalars = [p for p in parameters if id(p) not in maps]
+                if decayed:
+                    groups.append({"params": decayed, "lr": lr, "weight_decay": map_decay, "role": "mu",
+                                   "lr_aux_role": "relational_score"})
+                if scalars:
+                    groups.append({"params": scalars, "lr": lr, "weight_decay": 0.0, "role": "mu"})
+            elif parameters:
+                groups.append({"params": parameters, "lr": lr,
                                "weight_decay": 0.0, "role": "mu", "lr_aux_role": f"relational_{role}"})
 
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
@@ -1783,6 +1799,13 @@ ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
 # mean and RMS of log rho_ijk = log(beta_ij beta_jk / beta_ik) over strict triangles, for the learned
 # router and for its prior alone (zero for flat routing beta_ij = c_i / c_j); path_mass is the mean
 # two-step path weight per query row.
+# Per-(layer, head) medians of the four diagonal-route router cost terms (score_term_medians_pre of
+# vfe3.gradients.relational.relational_score: query constant c_i, key log-determinant ell_j, trace, Mahalanobis), the
+# per-head split of the pooled relational_score_term_*_median columns, so a fully clamped head can be attributed to
+# one term (audit 2026-10-20 item 38). Each value is the mean over the diagnostic chunks of the chunk's median (the
+# median itself when the fixed windows fit one chunk); no rows on the dense route, which does not form the terms.
+SCORE_TERM_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "head", "query_constant", "key_logdet", "trace", "mahalanobis", "n_chunks")
 ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "path_mass", "log_defect_mean", "log_defect_rms",
     "prior_log_defect_mean", "prior_log_defect_rms", "n_rows")
@@ -1945,7 +1968,8 @@ def _warn_dead_router(
 
     ``clamped``: ``relational_clamped_row_frac_head_max`` above :data:`DEAD_ROUTER_CLAMPED_ROW_FRAC`, at
     ``relational_clamped_row_frac_argmax_{layer,head}``: fully clamped rows route by the attention prior pi alone,
-    with zero router gradient. Only the absolute reference without the tie can clamp a whole row; the value is zero otherwise.
+    with zero router gradient. Under ``'row_min'`` and the tie no whole row is clamped; the absolute and the shifted
+    references can clamp one (under ``'query_shifted_v1'`` by the comparison-map scale alone, audit 2026-10-20 item 1).
 
     ``capped``: ``relational_score_klmax_frac_head_max`` above :data:`DEAD_ROUTER_CAPPED_FRAC`, at
     ``relational_score_klmax_frac_head_argmax_{layer,head}``: the capped entries carry a constant cost and get no
@@ -2964,8 +2988,13 @@ def _residual_and_attention_rows(
     holonomy_out: Optional[Dict[Any, Any]] = None,
     features_out: Optional[Dict[str, Any]] = None,
     variance_out: Optional[Dict[Tuple[int, str], List[Any]]] = None,
+    score_terms_out: Optional[Dict[Tuple[int, int], List[float]]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
     r"""Per-layer residual-ratio quantiles and per-head attention statistics on fixed windows.
+
+    ``score_terms_out``: when a dict is given, per (layer, head) the sums over chunks of the four router cost-term
+    medians of the capture (``score_term_medians_pre``, diagonal route only) and the chunk count are accumulated into
+    it (``[query constant, key log-determinant, trace, Mahalanobis, chunks]``), for :func:`_score_term_rows`.
 
     ``variance_out``: when a dict is given, per (layer, stage) of :data:`_BLOCK_VARIANCE_STAGES` the local variances
     :math:`\mathrm{diag}(\Sigma_i)` and per-token mean rms values of the same captures are collected into it, for
@@ -3056,6 +3085,17 @@ def _residual_and_attention_rows(
                     ln_changes.setdefault(layer, []).append(
                         change[torch.isfinite(change)].reshape(-1).cpu())
             log_prior = diagnostic.get("log_prior")
+            if score_terms_out is not None:
+                for layer, capture_l in enumerate(diagnostic["layer_conditional_captures"]):
+                    medians = capture_l.get("score_term_medians_pre")              # (4, H + 1) or absent
+                    if medians is None:
+                        continue
+                    values = medians.detach().double().cpu()[:, :-1]                # (4, H) per head
+                    for head in range(values.shape[1]):
+                        total = score_terms_out.setdefault((layer, head), [0.0] * 5)
+                        for index in range(4):
+                            total[index] += float(values[index, head])
+                        total[4] += 1.0
             betas = [capture_l["beta_pre"].float()
                      for capture_l in diagnostic["layer_conditional_captures"]]
             for layer, beta in enumerate(betas):
@@ -3398,6 +3438,24 @@ def _feature_rows(
     return head_rows, template_rows
 
 
+def _score_term_rows(
+    sums: Mapping[Tuple[int, int], List[float]],
+    step: int,
+) -> List[Dict[str, float]]:
+    r"""``diagnostics/score_terms.csv`` rows (:data:`SCORE_TERM_FIELDS`) from the sums of ``_residual_and_attention_rows``.
+
+    Each term is the mean over chunks of the per-chunk median (audit 2026-10-20 item 38).
+    """
+    rows: List[Dict[str, float]] = []
+    for (layer, head), total in sorted(sums.items()):
+        chunks = total[4]
+        rows.append({"step": int(step), "layer": int(layer), "head": int(head),
+                     **{name: (total[index] / chunks if chunks else float("nan"))
+                        for index, name in enumerate(("query_constant", "key_logdet", "trace", "mahalanobis"))},
+                     "n_chunks": int(chunks)})
+    return rows
+
+
 def _routing_holonomy_rows(
     sums: Mapping[Any, Any],
     step: int,
@@ -3476,14 +3534,22 @@ def _eval_cadence_diagnostics(
             holonomy: Optional[Dict[Any, Any]] = {}
             features: Optional[Dict[str, Any]] = {}
             variances: Optional[Dict[Tuple[int, str], List[Any]]] = {}
+            score_terms: Optional[Dict[Tuple[int, int], List[float]]] = {}
             try:
                 residual_rows, attention_rows = _residual_and_attention_rows(
                     model, windows, step, device, counters_out=counters, holonomy_out=holonomy,
-                    features_out=features, variance_out=variances)
+                    features_out=features, variance_out=variances, score_terms_out=score_terms)
             except Exception as exc:
                 _record_diagnostic_failure(failures, "residual_attention", exc, logger)
                 residual_rows = attention_rows = None
                 counters = holonomy = features = variances = None   # their capture pass failed; counted once above
+                score_terms = None
+            if score_terms:
+                try:
+                    artifacts.append_diagnostic_rows(
+                        "score_terms.csv", SCORE_TERM_FIELDS, _score_term_rows(score_terms, step))
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "score_terms", exc, logger)
             if variances:
                 try:
                     artifacts.append_diagnostic_rows(
