@@ -71,6 +71,9 @@ _DIAG_MOMENTS_KERNEL: str = "torch"
 
 # Calls of projected_moments that ran the fused kernels since the last reset (a host integer, no sync).
 _DIAG_MOMENTS_TRITON_CALLS: int = 0
+# Diagonal-only calls of a diagonal covariance that ran the torch route since the last reset (CPU tensors, the
+# "torch" kernel, or a fused fallback), so the realized kernel can be recorded (audit 2026-10-20 item 45).
+_DIAG_MOMENTS_TORCH_CALLS: int = 0
 
 
 def set_diagonal_moments_kernel(kernel: str) -> str:
@@ -94,9 +97,28 @@ def diagonal_moments_triton_calls() -> int:
 
 
 def reset_diagonal_moments_triton_calls() -> None:
-    r"""Zero the fused diagonal moments call counter."""
-    global _DIAG_MOMENTS_TRITON_CALLS
+    r"""Zero the fused and the torch diagonal moments call counters."""
+    global _DIAG_MOMENTS_TRITON_CALLS, _DIAG_MOMENTS_TORCH_CALLS
     _DIAG_MOMENTS_TRITON_CALLS = 0
+    _DIAG_MOMENTS_TORCH_CALLS = 0
+
+
+def diagonal_moments_torch_calls() -> int:
+    r"""Diagonal-only calls of :func:`projected_moments` on a diagonal covariance that ran the torch route."""
+    return _DIAG_MOMENTS_TORCH_CALLS
+
+
+def realized_diagonal_moments_kernel() -> Optional[str]:
+    r"""The diagonal comparison moments kernel that ran since the last reset: ``"triton"``, ``"torch"``, ``"mixed"``
+    (both, e.g. a fused fallback for per-head variances or blocks wider than the kernels take), or ``None`` when the
+    diagonal route never ran (audit 2026-10-20 item 45)."""
+    if _DIAG_MOMENTS_TRITON_CALLS and _DIAG_MOMENTS_TORCH_CALLS:
+        return "mixed"
+    if _DIAG_MOMENTS_TRITON_CALLS:
+        return "triton"
+    if _DIAG_MOMENTS_TORCH_CALLS:
+        return "torch"
+    return None
 
 
 def _diagonal_moments_triton_active(*tensors: torch.Tensor) -> bool:
@@ -313,6 +335,9 @@ def projected_moments(
         fused = _fused_diagonal_moments(mu_h, Sigma_h, inverse_blocks, S, dtype, batch)
         if fused is not None:
             return fused
+    if diagonal_only and diagonal:
+        global _DIAG_MOMENTS_TORCH_CALLS
+        _DIAG_MOMENTS_TORCH_CALLS += 1
     bytes_per_token = math.prod(batch) * roles * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.

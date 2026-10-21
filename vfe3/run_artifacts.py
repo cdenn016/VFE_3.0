@@ -678,6 +678,15 @@ def _migrated_config_fingerprint(
         return semantic_config_fingerprint(config)
 
 
+def _realized_diag_moments_kernel() -> Dict[str, Any]:
+    r"""``diag_moments_kernel`` (``'triton'``, ``'torch'``, ``'mixed'`` or None) and the per-kernel call counts of the
+    diagonal comparison moments since the run's :class:`RunArtifacts` reset them (audit 2026-10-20 item 45)."""
+    from vfe3 import relational_scoring as scoring
+    return {"diag_moments_kernel": scoring.realized_diagonal_moments_kernel(),
+            "diag_moments_kernel_calls": {"triton": scoring.diagonal_moments_triton_calls(),
+                                          "torch": scoring.diagonal_moments_torch_calls()}}
+
+
 def _phi_chart_norm_route(
     model: torch.nn.Module,
     cfg:   object,
@@ -1923,6 +1932,9 @@ class RunArtifacts:
         self.best_path = self.run_dir / "best_model.pt"
         self.final_path = self.run_dir / "final_model.pt"
         self.cfg = cfg                                       # kept for figure scaling (lambda_beta) + guards
+        # The run starts here for the diagonal-moments kernel record in summary.json (audit 2026-10-20 item 45).
+        from vfe3.relational_scoring import reset_diagonal_moments_triton_calls
+        reset_diagonal_moments_triton_calls()
         # Import-time digest of the code this process actually executes, kept beside the (possibly
         # newer) on-disk digest so provenance can flag a mixed-generation process.
         self.process_code_identity_sha256 = _PROCESS_PACKAGE_CODE_IDENTITY
@@ -4334,6 +4346,9 @@ def finalize_run(
         # The diagonal_chunked / full_chunked CE kernel that last ran ('torch' | 'triton'; None when neither
         # ran): 'triton' needs decode_ce_triton=True and CUDA tensors (2026-10-12).
         "decode_ce_kernel": getattr(getattr(model, "prior_bank", None), "realized_decode_ce_kernel", None),
+        # The diagonal comparison moments kernel that ran since this run's RunArtifacts was built ('triton' |
+        # 'torch' | 'mixed' | None when the diagonal route never ran), with its call counts (audit 2026-10-20 item 45).
+        **_realized_diag_moments_kernel(),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
         # Audit 2026-09-28: test at the validation-selected weights beside the final-weight
