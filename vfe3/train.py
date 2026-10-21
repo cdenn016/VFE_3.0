@@ -37,7 +37,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _redirect_logging = contextlib.nullcontext
 
 from vfe3.attention_prior import get_prior_registration
-from vfe3.contracts import deferred_host_checks, is_vfe_model, model_family_of
+from vfe3.contracts import add_exception_note, deferred_host_checks, is_vfe_model, model_family_of
 from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
@@ -4231,7 +4231,7 @@ def _no_update_call_with_precision_retry(
         except Exception as exc:
             if policy == "highest":
                 for note in failures:
-                    exc.add_note(f"earlier attempt of this {label} failed: {note}")
+                    add_exception_note(exc, f"earlier attempt of this {label} failed: {note}")
                 raise
             failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
     raise AssertionError("unreachable: the ladder ends at 'highest'")
@@ -4353,7 +4353,7 @@ def _train_step_with_precision_retry(
             verbs.append("skipped a non-finite update" if isinstance(exc, NonFiniteStepSkipped) else "raised")
             if updated or policy == "highest":
                 for note in failures:
-                    exc.add_note(f"earlier attempt of this step failed: {note}")
+                    add_exception_note(exc, f"earlier attempt of this step failed: {note}")
                 raise
             failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
             if replay_log is not None:

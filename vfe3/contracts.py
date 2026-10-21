@@ -3,7 +3,12 @@
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, List, Mapping, NotRequired, Optional, Tuple, TypedDict
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypedDict
+
+try:                                            # PEP 655 (Python 3.11); torch depends on typing_extensions
+    from typing import NotRequired
+except ImportError:                             # pragma: no cover - Python 3.10
+    from typing_extensions import NotRequired
 
 import torch
 
@@ -12,6 +17,22 @@ from vfe3.belief import BeliefState
 
 # Raise-only on-device verdicts waiting for the next mandatory host read; None outside a deferral scope.
 _DEFERRED_CHECKS: Optional[List[Tuple[torch.Tensor, Callable[[List[bool]], None]]]] = None
+
+
+def add_exception_note(exc: BaseException, note: str) -> None:
+    r"""Attach ``note`` to ``exc`` through PEP 678 ``add_note`` (Python 3.11), or ``__notes__`` on 3.10."""
+    add_note = getattr(exc, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = getattr(exc, "__notes__", None)
+    if not isinstance(notes, list):
+        notes = []
+        try:
+            exc.__notes__ = notes
+        except (AttributeError, TypeError):     # pragma: no cover - exceptions without a __dict__
+            return
+    notes.append(note)
 
 
 @contextmanager
@@ -70,7 +91,7 @@ def _with_failure_detail(
                 text = detail()
             except Exception as detail_exc:                     # noqa: BLE001 - never mask the verdict
                 text = f"failure detail unavailable ({type(detail_exc).__name__}: {detail_exc})"
-            exc.add_note((f"registered at layer {layer}: " if layer is not None else "") + text)
+            add_exception_note(exc, (f"registered at layer {layer}: " if layer is not None else "") + text)
             raise
     return checked
 
