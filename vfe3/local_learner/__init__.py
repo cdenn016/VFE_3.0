@@ -12,12 +12,13 @@ from vfe3.local_learner.core import (
     evaluate_filter,
     forecast,
     init_params,
+    init_runs,
     sample_sequences,
 )
 from vfe3.local_learner.learners import train_backprop, train_local
 from vfe3.local_learner.baselines import ngram_nll, particle_filter_nll
 
 __all__ = [
-    "Params", "TreeSensor", "assimilate", "evaluate_filter", "forecast", "init_params", "sample_sequences",
+    "Params", "TreeSensor", "assimilate", "evaluate_filter", "forecast", "init_params", "init_runs", "sample_sequences",
     "train_backprop", "train_local", "ngram_nll", "particle_filter_nll",
 ]

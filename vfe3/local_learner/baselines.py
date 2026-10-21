@@ -32,8 +32,9 @@ def ngram_nll(train: np.ndarray, streams: np.ndarray, V: int, order: int, k: flo
 
 
 @torch.no_grad()
-def particle_filter_nll(prm: Params, streams: Tensor, tree: TreeSensor, n_particles: int, seed: int) -> tuple[float, int]:
-    r"""Bootstrap particle estimate of the exact model's summed predictive NLL on streams (S, L).
+def particle_filter_nll(prm: Params, streams: Tensor, tree: TreeSensor, n_particles: int, seed: int) -> tuple[Tensor, int]:
+    r"""Bootstrap particle estimate of the exact model's summed predictive NLL on streams (S, L), per run
+    ((R,) on the host).
 
     :math:`\hat p(y_t\mid y_{<t})=\frac1N\sum_iP(y_t\mid z_t^{(i)})` with :math:`z_t^{(i)}` propagated from
     resampled particles; position 0 conditions the prior particles and is not scored.
@@ -41,27 +42,28 @@ def particle_filter_nll(prm: Params, streams: Tensor, tree: TreeSensor, n_partic
     dev = prm.G.device
     g = torch.Generator(device=dev).manual_seed(seed)
     S, L = streams.shape
-    d = prm.d
-    cholQ = torch.linalg.cholesky(prm.Q)
+    R, d = prm.R, prm.d
+    cholQt = torch.linalg.cholesky(prm.Q).transpose(-1, -2).unsqueeze(1)   # (R, 1, d, d)
+    Gt = prm.G.transpose(-1, -2).unsqueeze(1)                              # (R, 1, d, d)
 
-    def loglik(z: Tensor, y: Tensor) -> Tensor:                       # z (S, N, d), y (S,) -> (S, N)
+    def loglik(z: Tensor, y: Tensor) -> Tensor:                       # z (R, S, N, d), y (S,) -> (R, S, N)
         nodes, dirs = tree.nodes[y], tree.dirs[y]                     # (S, D)
-        a = prm.A[nodes]                                              # (S, D, d)
-        util = torch.einsum("snd,skd->snk", z, a) + prm.b[nodes].unsqueeze(1)
+        a = prm.A[:, nodes]                                           # (R, S, D, d)
+        util = torch.einsum("rsnd,rskd->rsnk", z, a) + prm.b[:, nodes].unsqueeze(2)
         return torch.special.log_ndtr(util * dirs.unsqueeze(1)).sum(-1)
 
     def resample(z: Tensor, logw: Tensor) -> Tensor:
-        w = torch.softmax(logw, -1)
-        idx = torch.multinomial(w, n_particles, replacement=True, generator=g)
-        return torch.gather(z, 1, idx.unsqueeze(-1).expand(-1, -1, d))
+        w = torch.softmax(logw, -1).reshape(R * S, n_particles)
+        idx = torch.multinomial(w, n_particles, replacement=True, generator=g).reshape(R, S, n_particles)
+        return torch.gather(z, 2, idx.unsqueeze(-1).expand(-1, -1, -1, d))
 
-    z = torch.randn(S, n_particles, d, generator=g, dtype=torch.float64, device=dev)
+    z = torch.randn(R, S, n_particles, d, generator=g, dtype=torch.float64, device=dev)
     z = resample(z, loglik(z, streams[:, 0]))
-    total = torch.zeros((), dtype=torch.float64, device=dev)             # no host read per step
+    total = torch.zeros(R, dtype=torch.float64, device=dev)           # no host read per step
     for t in range(1, L):
-        noise = torch.randn(S, n_particles, d, generator=g, dtype=torch.float64, device=dev) @ cholQ.T
-        z = z @ prm.G.T + prm.E[streams[:, t - 1]].unsqueeze(1) + noise
+        noise = torch.randn(R, S, n_particles, d, generator=g, dtype=torch.float64, device=dev) @ cholQt
+        z = z @ Gt + prm.E[:, streams[:, t - 1]].unsqueeze(2) + noise
         ll = loglik(z, streams[:, t])
-        total -= (torch.logsumexp(ll, -1) - math.log(n_particles)).sum()
+        total -= (torch.logsumexp(ll, -1) - math.log(n_particles)).sum(-1)
         z = resample(z, ll)
-    return float(total), S * (L - 1)
+    return total.cpu(), S * (L - 1)
