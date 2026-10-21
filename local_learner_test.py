@@ -1,0 +1,207 @@
+r"""Click-to-run local-learner test (design: docs/research/2026-10-21-local-learner-test/design.md).
+
+Edit CONFIG and run. Stage "timing" measures one chunk per arm; "A" is the synthetic identifiability check;
+"B" is WikiText-103 bytes. Results append to ``<out_dir>/results_<stage>.jsonl`` and completed runs are
+skipped on relaunch. With ``device = "cuda"`` run it under the CUDA interpreter (``$CUDA_PYTHON``,
+``C:/anaconda/python.exe``); the n-gram references and synthetic sampling stay on the CPU.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+CONFIG = {
+    "stage":            "A",                    # "timing" | "A" | "B"
+    "device":           "cuda",                 # "cuda" | "cpu"
+    "threads":          4,                      # CPU intra-op threads (machine stays usable)
+    "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
+    "chunk":            16,                     # M-step / truncated-BPTT length (smoothing windows must divide it)
+    "streams":          512,                    # parallel training streams (512 * 16 = 8192 tokens per update)
+    "arms":             ["local_w1", "local_w4", "local_w16", "blind", "backprop"],   # local_w<window> | blind | backprop
+    "backprop_lr":      1e-2,                   # chosen on stage A only
+    "ridge":            1e-6,
+    "q_floor":          1e-4,
+    # stage A (synthetic, known theta*)
+    "A_d":              8,
+    "A_train_len":      2000,                   # per stream: 512 * 2000 = 1.02M tokens
+    "A_epochs":         8,                      # passes over the synthetic training set
+    "A_val_streams":    64,
+    "A_val_len":        1000,
+    "A_seeds":          [0],
+    # stage B (WikiText-103 bytes)
+    "B_dims":           [8, 16, 32],
+    "B_seeds":          [0, 1, 2],
+    "B_train_bytes":    5_000_000,
+    "B_val_bytes":      200_000,
+    "B_val_streams":    64,
+    "ngram_k_grid":     [1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0],
+    # particle-filter approximation gap
+    "pf_streams":       8,
+    "pf_len":           2500,                   # 8 * 2500 = 20k scored-region bytes
+    "pf_particles":     4096,
+}
+
+os.environ.setdefault("OMP_NUM_THREADS", str(CONFIG["threads"]))
+os.environ.setdefault("MKL_NUM_THREADS", str(CONFIG["threads"]))
+
+import numpy as np   # noqa: E402
+import torch         # noqa: E402
+
+from vfe3.local_learner import (TreeSensor, evaluate_filter, init_params, ngram_nll,   # noqa: E402
+                                particle_filter_nll, sample_sequences, train_backprop, train_local)
+from vfe3.local_learner.core import Params   # noqa: E402
+
+LN2 = math.log(2.0)
+DEVICE = torch.device("cpu")                    # set from CONFIG["device"] in main()
+CACHE = Path.home() / ".cache" / "tokenized_cache"
+
+
+def load_bytes(split: str, n: int) -> np.ndarray:
+    r"""First n bytes of the cached WikiText-103 byte stream (cache-only; fails if absent)."""
+    path = CACHE / f"wikitext-103_{split}_bytes_tokens.bin"
+    meta = json.loads(path.with_suffix(".bin.meta.json").read_text())
+    arr = np.memmap(path, dtype=np.dtype(meta["dtype"]), mode="r")[:n]
+    if len(arr) < n or arr.min() < 0 or arr.max() > 255:
+        raise ValueError(f"{path}: expected {n} byte tokens in [0, 255]")
+    return np.asarray(arr, dtype=np.int64)
+
+
+def as_streams(x: np.ndarray, S: int) -> torch.Tensor:
+    L = len(x) // S
+    return torch.from_numpy(x[:S * L].reshape(S, L).copy())
+
+
+def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log) -> Params:
+    c = CONFIG
+    if arm == "backprop":
+        return train_backprop(prm0, train, tree, chunk=c["chunk"], lr=c["backprop_lr"], log=log)
+    if arm == "blind":
+        return train_local(prm0, train, tree, chunk=c["chunk"], window=1, blind=True,
+                           ridge=c["ridge"], q_floor=c["q_floor"], log=log)
+    if arm.startswith("local_w"):
+        return train_local(prm0, train, tree, chunk=c["chunk"], window=int(arm[7:]),
+                           ridge=c["ridge"], q_floor=c["q_floor"], log=log)
+    raise ValueError(arm)
+
+
+def scores(prm: Params, val: torch.Tensor, pf: torch.Tensor, tree: TreeSensor, seed: int) -> dict:
+    nll, n = evaluate_filter(prm, val, tree)
+    a_nll, a_n = evaluate_filter(prm, pf, tree)
+    p_nll, p_n = particle_filter_nll(prm, pf, tree, CONFIG["pf_particles"], seed)
+    return {"val_bits": nll / n / LN2, "pf_subset_filter_bits": a_nll / a_n / LN2,
+            "pf_subset_exact_bits": p_nll / p_n / LN2, "n_val": n, "n_pf": p_n}
+
+
+def done_keys(path: Path) -> set:
+    if not path.exists():
+        return set()
+    return {(r["arm"], r["d"], r["seed"]) for r in map(json.loads, path.read_text().splitlines()) if "arm" in r}
+
+
+def append(path: Path, row: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+    print(json.dumps(row), flush=True)
+
+
+def run_timing(tree: TreeSensor) -> None:
+    chunks = 20
+    x = load_bytes("train", CONFIG["streams"] * (chunks * CONFIG["chunk"] + 1))
+    train = as_streams(x, CONFIG["streams"]).to(DEVICE)
+    for d in CONFIG["B_dims"]:
+        for arm in CONFIG["arms"]:
+            train_arm(arm, init_params(d, tree.V, 0, DEVICE), train[:, :CONFIG["chunk"] + 1], tree, None)   # warm-up
+            sync()
+            t0 = time.perf_counter()
+            train_arm(arm, init_params(d, tree.V, 0, DEVICE), train, tree, None)
+            sync()
+            sec = (time.perf_counter() - t0) / chunks
+            print(f"d={d:3d} {arm:11s} {sec:7.3f} s per chunk of {CONFIG['streams'] * CONFIG['chunk']} tokens", flush=True)
+
+
+def run_stage(stage: str, tree: TreeSensor) -> None:
+    c = CONFIG
+    out = Path(c["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    seeds = os.environ.get("LOCAL_LEARNER_SEEDS")              # optional override for parallel launches
+    if seeds is not None:
+        c["B_seeds"] = [int(x) for x in seeds.split(",")]
+    path = out / (f"results_{stage}.jsonl" if seeds is None else f"results_{stage}_seeds{seeds.replace(',', '-')}.jsonl")
+    done = done_keys(path)
+    if stage == "A":
+        g = torch.Generator().manual_seed(1234)
+        d = c["A_d"]
+        q, _ = torch.linalg.qr(torch.randn(d, d, generator=g, dtype=torch.float64))
+        truth = Params(G=0.9 * q, E=0.5 * torch.randn(tree.V, d, generator=g, dtype=torch.float64),
+                       Q=0.2 * torch.eye(d, dtype=torch.float64),
+                       A=torch.randn(tree.V - 1, d, generator=g, dtype=torch.float64),
+                       b=0.5 * torch.randn(tree.V - 1, generator=g, dtype=torch.float64))
+        train_cpu = sample_sequences(truth, tree, c["streams"], c["A_train_len"], seed=1)
+        val_cpu = sample_sequences(truth, tree, c["A_val_streams"], c["A_val_len"], seed=2)
+        train = train_cpu.repeat(1, c["A_epochs"]).to(DEVICE)
+        val = val_cpu.to(DEVICE)
+        pf = sample_sequences(truth, tree, c["pf_streams"], c["pf_len"], seed=3).to(DEVICE)
+        truth = truth.to(DEVICE)
+        configs = [(d, s) for s in c["A_seeds"]]
+        if ("truth", d, -1) not in done:
+            append(path, {"stage": "A", "arm": "truth", "d": d, "seed": -1, **scores(truth, val, pf, tree, 0)})
+        uni, n = ngram_nll(train_cpu.reshape(-1).numpy(), val_cpu.numpy(), tree.V, 1, 1.0)
+        if ("unigram", 0, 0) not in done:
+            append(path, {"stage": "A", "arm": "unigram", "d": 0, "seed": 0, "val_bits": uni / n / LN2})
+    else:
+        xtrain = load_bytes("train", c["B_train_bytes"])
+        xval = load_bytes("validation", c["B_val_bytes"])
+        val_cpu = as_streams(xval, c["B_val_streams"])
+        train = as_streams(xtrain, c["streams"]).to(DEVICE)
+        val = val_cpu.to(DEVICE)
+        pf = as_streams(xval[:c["pf_streams"] * c["pf_len"]], c["pf_streams"]).to(DEVICE)
+        for order in ((1, 2, 3) if 0 in c["B_seeds"] else ()):
+            key = (f"{order}-gram", 0, 0)
+            if key in done:
+                continue
+            best = min((ngram_nll(xtrain, val_cpu.numpy(), tree.V, order, k), k) for k in c["ngram_k_grid"])
+            (nll, n), k = best
+            append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k})
+        configs = [(d, s) for s in c["B_seeds"] for d in c["B_dims"]]
+    for d, seed in configs:
+        for arm in c["arms"]:
+            if (arm, d, seed) in done:
+                continue
+            t0 = time.perf_counter()
+            history: list[dict] = []
+            prm = train_arm(arm, init_params(d, tree.V, seed, DEVICE), train, tree, history.append)
+            sync()
+            sec = time.perf_counter() - t0
+            row = {"stage": stage, "arm": arm, "d": d, "seed": seed, "train_sec": sec,
+                   "train_tokens": int(train.shape[0] * (train.shape[1] - 1)),
+                   "final_train_bits": history[-1]["train_bits"] if history else None,
+                   "G_spectral": float(torch.linalg.matrix_norm(prm.G, 2)),
+                   **scores(prm, val, pf, tree, seed)}
+            append(path, row)
+
+
+def sync() -> None:
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def main() -> None:
+    global DEVICE
+    torch.set_num_threads(CONFIG["threads"])
+    torch.set_default_dtype(torch.float64)
+    DEVICE = torch.device(CONFIG["device"])
+    if DEVICE.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("device='cuda' but CUDA is unavailable: run under $CUDA_PYTHON (C:/anaconda/python.exe)")
+    tree = TreeSensor(8, DEVICE)
+    if CONFIG["stage"] == "timing":
+        run_timing(tree)
+    else:
+        run_stage(CONFIG["stage"], tree)
+
+
+if __name__ == "__main__":
+    main()

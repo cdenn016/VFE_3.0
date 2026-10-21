@@ -42,6 +42,8 @@ CUDA_TESTS: frozenset[str] = frozenset({
     # The frame condition bound at the live head shape under 'high' precision: no float64 recomputation, no repeated
     # eigendecomposition of rows inside the bound, a fixed number of host reads (2026-10-21).
     'test_frame_bound_cost_20261021.py::test_cuda_frame_bound_at_the_live_shape',
+    # The local-learner test's filter, local M-step and backprop step on CUDA agree with the CPU (2026-10-21).
+    'test_local_learner_20261021.py::test_cuda_filter_and_learners_match_cpu',
 })
 
 # CUDA parametrizations of tests whose other parameters run in the CPU lane, keyed with the parameter id
