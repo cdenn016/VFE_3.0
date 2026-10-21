@@ -1188,6 +1188,9 @@ def routing_covariance_summary(run: Any, ctx: AnalysisContext, ids: Sequence[int
     versions (n, B), ``log_cond_block`` (n, B), ``rel_gap`` (n,), ``rel_gap_block`` (n, B); plus
     ``identity_max_abs_error``, ``variance_shares``, ``spearman_log_count``, ``summary``, ``note``.
     """
+    # gaussian_frame_diagonal stores the reference variances c_v with Sigma_v = U_v diag(c_v) U_v^T, so
+    # C_v = diag(c_v) and the frame part is identically zero (audit 2026-10-20 item 26).
+    reference = bool(getattr(run, "reference_variances", False))
     ids = np.asarray(ids, dtype=np.int64).reshape(-1)
     n, slices = ids.size, list(run.block_slices)
     B = len(slices)
@@ -1202,14 +1205,19 @@ def routing_covariance_summary(run: Any, ctx: AnalysisContext, ids: Sequence[int
             Einv = torch.matrix_exp(-Xb)                                            # e^{-X} = U^{-1}
             lvb = _t(lv[:, sl])
             var = torch.exp(lvb)                                                     # (c, d)
-            C = (Einv * var[:, None, :]) @ Einv.transpose(-1, -2)                   # (c, d, d) SPD
             sigma_b[sl_rows, b] = lvb.sum(1).numpy()
-            frame_b[sl_rows, b] = (-2.0 * torch.diagonal(Xb, dim1=-2, dim2=-1).sum(-1)).numpy()
+            cbar = var.mean(1)
+            if reference:
+                C = torch.diag_embed(var)                                            # (c, d, d) diag(c_v)
+                frame_b[sl_rows, b] = 0.0
+                dev = C - cbar[:, None, None] * (Einv @ Einv.transpose(-1, -2))     # C - cbar U^{-1}U^{-T}
+            else:
+                C = (Einv * var[:, None, :]) @ Einv.transpose(-1, -2)               # (c, d, d) SPD
+                frame_b[sl_rows, b] = (-2.0 * torch.diagonal(Xb, dim1=-2, dim2=-1).sum(-1)).numpy()
+                dev = (Einv * (var - cbar[:, None])[:, None, :]) @ Einv.transpose(-1, -2)  # C - cbar U^{-1}U^{-T}
             logdet_b[sl_rows, b] = torch.linalg.slogdet(C).logabsdet.numpy()
             ev = torch.linalg.eigvalsh(C)
             cond_b[sl_rows, b] = torch.log(ev[:, -1] / ev[:, 0]).numpy()
-            cbar = var.mean(1)
-            dev = (Einv * (var - cbar[:, None])[:, None, :]) @ Einv.transpose(-1, -2)  # C - cbar U^{-1}U^{-T}
             gap_num_b[sl_rows, b] = (_fro(dev) ** 2).numpy()
             cnorm_b[sl_rows, b] = (_fro(C) ** 2).numpy()
     sigma_part, frame_part = sigma_b.sum(1), frame_b.sum(1)
@@ -1223,7 +1231,14 @@ def routing_covariance_summary(run: Any, ctx: AnalysisContext, ids: Sequence[int
     spear = ({"log_det_C": _spearman(log_det, lc), "sigma_part": _spearman(sigma_part, lc),
               "frame_part": _spearman(frame_part, lc)} if lc is not None else None)
     rel_gap = np.sqrt(gap_num_b.sum(1) / cnorm_b.sum(1))
+    note = ("log det C = sum log var - 2 tr X is exact and gauge-invariant up to one global constant "
+            "per block; eigen-spread and the gap to cbar (U^T U)^{-1} are trained-trivialization quantities.")
+    if reference:
+        note = ("gaussian_frame_diagonal stores the reference variances c_v: C_v = diag(c_v), so log det C = "
+                "sum log c is the whole determinant and the frame part is identically zero; the gap to "
+                "cbar (U^T U)^{-1} is a trained-trivialization quantity.")
     return {
+        "covariance": "reference variances: C_v = diag(c_v)" if reference else "C_v = U_v^{-1} diag(var_v) U_v^{-T}",
         "ids": ids, "log_det_C": log_det, "sigma_part": sigma_part, "frame_part": frame_part,
         "sigma_part_block": sigma_b, "frame_part_block": frame_b, "log_cond_block": cond_b,
         "rel_gap": rel_gap, "rel_gap_block": np.sqrt(gap_num_b / cnorm_b),
@@ -1231,10 +1246,7 @@ def routing_covariance_summary(run: Any, ctx: AnalysisContext, ids: Sequence[int
         "summary": {"log_det_C": _summary(log_det), "sigma_part": _summary(sigma_part),
                     "frame_part": _summary(frame_part), "rel_gap": _summary(rel_gap),
                     "log_cond": [_summary(cond_b[:, k]) for k in range(B)]},
-        "note": ("log det C = sum log var - 2 tr X is exact and gauge-invariant up to one global constant "
-                 "per block; eigen-spread and the gap to cbar (U^T U)^{-1} are trained-trivialization "
-                 "quantities."
-                 + ("" if lc is not None else " Counts unavailable: no frequency correlations.")),
+        "note": note + ("" if lc is not None else " Counts unavailable: no frequency correlations."),
     }
 
 
