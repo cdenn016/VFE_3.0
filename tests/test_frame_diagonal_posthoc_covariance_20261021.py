@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.profiles import live_config
+from tests.profiles import reference_k8_config
 from vfe3.model.model import VFEModel
 from vfe3.posthoc import covariance as cv
 from vfe3.semantics import frames
@@ -23,9 +23,10 @@ F64 = torch.float64
 
 
 def _frame_diagonal_model() -> VFEModel:
-    cfg = live_config(family="gaussian_frame_diagonal", predictive_readout="kernel", block_mlp_mode="coordinate",
-                      block_mlp_covariance="passthrough", decode_mode="diagonal_chunked", norm_type_block="layernorm",
-                      untie_decode_bank=True)
+    cfg = reference_k8_config(family="gaussian_frame_diagonal", predictive_readout="kernel",
+                              block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
+                              decode_mode="diagonal_chunked", norm_type_block="layernorm", untie_decode_bank=True,
+                              pos_phi="none")
     torch.manual_seed(0)
     model = VFEModel(cfg)
     g = torch.Generator().manual_seed(5)

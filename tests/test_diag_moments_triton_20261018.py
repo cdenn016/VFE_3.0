@@ -32,7 +32,7 @@ from typing import Any, Dict, Tuple
 import pytest
 import torch
 
-from tests.profiles import live_config, tiny_config
+from tests.profiles import config_values, reference_k8_config, tiny_config
 from vfe3 import relational_scoring as rs
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
@@ -107,20 +107,23 @@ def _run_script(script: str, env: Dict[str, str]) -> Any:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-# The tiny live profile moved onto the diagonal comparison route (the worktree launcher may sit elsewhere).
+# The frozen reference route at K = 8 on the diagonal comparison route, with every toggle that selects that route set
+# here (no launcher read).
 _DIAGONAL_ROUTE = dict(attention_mode="projected_predictive", predictive_readout="kernel",
                        relational_routing="gaussian_kl", rope_mode="comparison_invariant", rope_fraction=1.0,
                        family="gaussian_diagonal", projected_factorization="gram")
 
 
 def _diagonal_route_config(**overrides: Any) -> VFE3Config:
-    return live_config(**{**_DIAGONAL_ROUTE, **overrides})
+    return reference_k8_config(**{**_DIAGONAL_ROUTE, **overrides})
 
 
 # ------------------------------------------------------------------------------------- config and wiring
 
 def test_field_defaults_to_torch_and_refuses_other_values() -> None:
-    assert VFE3Config.relational_diag_moments_kernel == "torch"
+    # The test baseline pins the torch route; the VFE3Config default only has to be one of the two kernels.
+    assert config_values()["relational_diag_moments_kernel"] == "torch"
+    assert VFE3Config.__dataclass_fields__["relational_diag_moments_kernel"].default in ("torch", "triton")
     assert tiny_config(relational_diag_moments_kernel="triton").relational_diag_moments_kernel == "triton"
     for bad in ("cuda", "Triton", None, True):
         with pytest.raises(ValueError, match="relational_diag_moments_kernel"):

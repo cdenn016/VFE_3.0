@@ -19,7 +19,7 @@ dropped ``rope_position_channel``, although the writer flags ``energy_includes_r
 ``rope_mode`` other than ``'none'``. Under that flag both now label the bar as the routing cost (content plus
 RoPE position) and show the rotation-only arm beside it; a record without the flag keeps the two bars.
 
-Tiny CPU models only (K=4, two heads, N=4, vocab 7; F24 runs ``tests.profiles.live_config`` with three layers).
+Tiny CPU models only (K=4, two heads, N=4, vocab 7; F24 runs the frozen ``tests.profiles.reference_config`` with three layers).
 """
 import csv
 import dataclasses
@@ -39,7 +39,7 @@ import vfe3.train as T
 import vfe3.viz.figures as figs
 import matplotlib.pyplot as plt
 
-from tests.profiles import live_config
+from tests.profiles import reference_config
 from tests.test_audit2_20261011_training import _cfg
 from vfe3 import metrics
 from vfe3.config import VFE3Config
@@ -179,7 +179,7 @@ def test_finalize_request_requires_the_loss_start_step() -> None:
 
 def _three_layer_model() -> VFEModel:
     torch.manual_seed(0)
-    return VFEModel(live_config(n_layers=3)).eval()
+    return VFEModel(reference_config(n_layers=3)).eval()
 
 
 def _layer_conditions(model: VFEModel, snapshot: Any) -> List[float]:

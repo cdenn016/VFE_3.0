@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import torch
 
-from tests.profiles import config_values, live_config
+from tests.profiles import config_values, reference_k8_config
 from vfe3 import relational_scoring as rs
 from vfe3.config import VFE3Config
 from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
@@ -25,11 +25,13 @@ _FRAME_DIAGONAL_ROUTE = dict(family=FAMILY, predictive_readout="kernel", block_m
                              block_mlp_covariance="passthrough", decode_mode="diagonal_chunked",
                              norm_type_block="layernorm", untie_decode_bank=True,
                              attention_mode="projected_predictive", relational_routing="gaussian_kl",
-                             rope_mode="comparison_invariant", rope_fraction=1.0, projected_factorization="gram")
+                             rope_mode="comparison_invariant", rope_fraction=1.0, projected_factorization="gram",
+                             pos_phi="none")
 
 
 def _route(**over: Any) -> VFE3Config:
-    return live_config(**{**_FRAME_DIAGONAL_ROUTE, **over})
+    r"""The frozen reference route at K = 8 on the frame-diagonal family's diagonal comparison route (no launcher read)."""
+    return reference_k8_config(**{**_FRAME_DIAGONAL_ROUTE, **over})
 
 
 # ------------------------------------------------------------------------------------- item 45

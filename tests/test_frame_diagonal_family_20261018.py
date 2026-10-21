@@ -16,7 +16,7 @@ from typing import Any, Dict, Tuple
 import pytest
 import torch
 
-from tests.profiles import config_values, live_config, make_relational_operators
+from tests.profiles import config_values, make_relational_operators, reference_k8_config
 from tests.test_audit_20261017_l2_covariance import _conditioned_frames, _dense
 from tests.test_blockwise_moment_matched_20261004 import _case
 from vfe3.belief import BeliefState
@@ -49,12 +49,14 @@ def _spd(*shape: int, generator: torch.Generator) -> torch.Tensor:          # (.
 
 
 def _live(**over: Any) -> VFE3Config:
-    r"""The launcher's live route at tiny scale with the frame-diagonal family on the kernel readout and a coordinate
-    block MLP behind the LayerNorm (the family's envelope; the launcher's minimal agent and prototype MLP are outside
-    it)."""
+    r"""The frozen reference route at K = 8 (``tests.profiles.reference_k8_config``) with the frame-diagonal family on
+    the kernel readout and a coordinate block MLP behind the LayerNorm (the family's envelope). Every toggle the
+    envelope couples to the family is set here, including the token-only frames (``pos_phi='none'``) the Fisher table
+    step needs and the untied decode bank the KL decoder needs, so the route does not depend on ``train_vfe3.py``."""
     values = dict(family=FAMILY, predictive_readout="kernel", block_mlp_mode="coordinate",
-                  block_mlp_covariance="passthrough", decode_mode="diagonal_chunked", norm_type_block="layernorm")
-    return live_config(**{**values, **over})
+                  block_mlp_covariance="passthrough", decode_mode="diagonal_chunked", norm_type_block="layernorm",
+                  pos_phi="none", untie_decode_bank=True)
+    return reference_k8_config(**{**values, **over})
 
 
 # 4. KL closed form against a dense float64 reference.

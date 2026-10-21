@@ -9,6 +9,9 @@ switched route is built at the launcher's initialization scale (``mu_init_std=0.
 sphere-bound cap binds), stepped once, and its post-norm covariances are checked for positive definiteness and
 conditioning: ``'pushforward_moment'`` passes; the capped ``'pushforward'``, kept for saved runs, is the documented
 failure (strict xfail). Tiny CPU cases only.
+
+The route is the frozen reference route of ``tests.profiles.reference_values`` with every toggle the cases depend on
+set here (2026-10-21), so the cases exercise the same path whatever ``train_vfe3.py`` holds.
 """
 from __future__ import annotations
 
@@ -17,7 +20,7 @@ import warnings
 import pytest
 import torch
 
-from tests.profiles import live_values
+from tests.profiles import reference_values
 from vfe3.config import VFE3Config
 from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
 from vfe3.geometry.norms import AffineLayerNorm
@@ -28,6 +31,8 @@ from vfe3.train import build_optimizer
 F64 = torch.float64
 MODE = "pushforward_moment"
 CONDITION_BOUND = 1e6
+# The prior-bank KL decoder whose covariance rank matches each family (the coupling the validator enforces).
+_KL_DECODE_MODE = {"gaussian_diagonal": "diagonal_chunked", "gaussian_full": "full_chunked"}
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +41,11 @@ def _one_thread() -> None:
 
 
 def _switched_values(**overrides) -> dict:
-    r"""The live route at tiny scale and the launcher's initialization, with the switch's overrides applied."""
-    values = live_values(norm_type_block="layernorm", layernorm_affine=True, mu_init_std=0.03, sigma_init=5.0,
-                         block_norm_covariance="pushforward", **overrides)
+    r"""The frozen reference route at tiny scale and the launcher's initialization of 2026-10-16, with the switch's
+    overrides applied. Every route toggle is test-owned (``tests.profiles.reference_values``), not read from
+    ``train_vfe3.py``."""
+    values = reference_values(norm_type_block="layernorm", layernorm_affine=True, mu_init_std=0.03, sigma_init=5.0,
+                              block_norm_covariance="pushforward", **overrides)
     return {**values, **fully_gauge_covariant_overrides(values)}
 
 
@@ -131,9 +138,9 @@ def test_switched_live_route_post_norm_covariances_are_well_conditioned(mode: st
 def test_local_live_route_carries_the_selected_pushforward(mode: str, family: str) -> None:
     r"""The un-switched live route (local block coordinates): each layer's post-norm covariance is the selected
     pushforward of its converged pre-norm belief, so ``block_norm_covariance`` reaches the block as configured."""
-    values = live_values(norm_type_block="layernorm", layernorm_affine=True, mu_init_std=0.03, sigma_init=5.0,
-                         block_norm_covariance="pushforward", block_coordinates="local", family=family,
-                         use_cg_coupling=False)
+    values = reference_values(norm_type_block="layernorm", layernorm_affine=True, mu_init_std=0.03, sigma_init=5.0,
+                              block_norm_covariance="pushforward", block_coordinates="local", family=family,
+                              decode_mode=_KL_DECODE_MODE[family], use_cg_coupling=False)
     cfg = _config(values, mode)
     model = _model(cfg)
     tokens, _ = _batch(cfg)
