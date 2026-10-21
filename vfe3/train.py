@@ -3898,19 +3898,47 @@ def _attention_structure_metrics(
     return out
 
 
+def _unmasked_position_targets(
+    tokens:  torch.Tensor,                    # (B, N) window input ids
+    targets: torch.Tensor,                    # (B, N) next-token ids, -100 on the overlap prefix and padded tail
+) -> torch.Tensor:                            # (B, N) next-token ids at every real position
+    r"""Restore the next-token target of every real position of a strided evaluation window.
+
+    Under ``eval_stride`` a window scores only its last ``stride`` targets; the overlap prefix is masked to -100
+    although its next token is known, :math:`y_t = x_{t+1}`. The padded final window also masks its tail, where
+    there is no real next token. The prefix is everything before a row's first scored target and the padding
+    everything after its last, so the prefix is refilled from the inputs and the padding stays masked. A row
+    with no scored target is left as it is.
+    """
+    b, n = targets.shape
+    scored = targets != -100                                                          # (B, N)
+    positions = torch.arange(n, device=targets.device).expand(b, n)                   # (B, N)
+    first = torch.where(scored, positions, n).amin(dim=1, keepdim=True)               # (B, 1)
+    shifted = torch.cat([tokens[:, 1:], targets[:, -1:]], dim=1).to(targets.dtype)    # (B, N) x_{t+1}
+    prefix = (positions < first) & (first < n)                                        # (B, N) masked overlap
+    return torch.where(prefix, shifted, targets)
+
+
 def _position_loss_metrics(
     logits:  torch.Tensor,                    # (B, N, V) captured held-out logits
     targets: torch.Tensor,                    # (B, N) next-token ids (-100 = ignore)
+    tokens:  Optional[torch.Tensor] = None,   # (B, N) window inputs: restores the strided overlap prefix
 ) -> Dict[str, float]:
-    r"""Per-position within-sequence loss: mean CE over the scored positions of the first and last quarter.
+    r"""Per-position within-sequence loss: mean CE at the positions of the first and last quarter of the window.
 
-    A position with no scored target (the masked overlap prefix of a sliding-window eval window, or the padded
-    tail of a final window) has no CE, so it is left out of its quarter's mean rather than counted as 0; a quarter
-    with no scored position is NaN, which the multi-batch average skips (audit 2026-10-12 #13).
+    With ``tokens``, the targets of a strided evaluation window's masked overlap prefix are restored from the
+    inputs (:func:`_unmasked_position_targets`), so every real position is scored and the two quarters compare
+    CE at short against long in-window context. Without it (or where a position has no real next token, the
+    padded tail of a final window) a position with no scored target is left out of its quarter's mean rather
+    than counted as 0; a quarter with no scored position is NaN, which the multi-batch average skips (audit
+    2026-10-12 #13). Under a stride without ``tokens`` the first quarter is scored only in a stream's first
+    window, which made the columns meaningless (audit 2026-10-20 item 40).
     """
     import torch.nn.functional as F
 
     out: Dict[str, float] = {}
+    if tokens is not None and tokens.shape == targets.shape:
+        targets = _unmasked_position_targets(tokens, targets)
     b, n = targets.shape
     per = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1),
                           ignore_index=-100, reduction="none").reshape(b, n)
@@ -4012,7 +4040,7 @@ def _val_diagnostics_one(
         structure.update(_attention_structure_metrics(
             snapshot.beta_maps.float(), _snapshot_key_support(snapshot.log_prior)))
         if diagnostic_targets is not None:
-            structure.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
+            structure.update(_position_loss_metrics(snapshot.logits, diagnostic_targets, diagnostic_tokens))
         out.update(structure)
     except Exception as exc:
         if failures is not None:
@@ -6521,10 +6549,15 @@ def _train_loop(
                     if tokens_per_char is not None
                     else " | BPC unavailable"
                 )
+                energy = (d["self_coupling"], d["belief_coupling"], d["attention_entropy"], d["total"])
+                if all(isinstance(v, float) and math.isnan(v) for v in energy):
+                    # Routes without the shared free energy (projected_predictive) carry no decomposition.
+                    energy_text = "n/a on this route"
+                else:
+                    energy_text = "self %.4f | belief %.4f | entropy %.4f | total %.4f" % energy
                 logger.info(
-                    "    Inner alignment energy: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPT %.4f%s",
-                    d["self_coupling"], d["belief_coupling"], d["attention_entropy"],
-                    d["total"], d["effective_rank"], bits_per_token, bpc_text,
+                    "    Inner alignment energy: %s | eff_rank %.2f | BPT %.4f%s",
+                    energy_text, d["effective_rank"], bits_per_token, bpc_text,
                 )
 
             if do_eval:

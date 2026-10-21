@@ -173,8 +173,28 @@ def test_multi_batch_position_loss_skips_masked_prefix_windows() -> None:
                      batch_size=1, shuffle=False)
     one = T._val_diagnostics(model, val, CPU, batches=1).metrics
     two = T._val_diagnostics(model, val, CPU, batches=2).metrics
-    assert two["pos_loss_first_q"] == pytest.approx(one["pos_loss_first_q"])
+    # The diagnostics restore the masked prefix from the window inputs (audit 2026-10-20 item 40), so window 1
+    # now contributes its own first quarter instead of NaN; both quarters stay finite and the ratio bounded.
+    assert math.isfinite(one["pos_loss_first_q"]) and math.isfinite(two["pos_loss_first_q"])
     assert two["pos_loss_ratio"] < 1e3
+
+
+def test_unmasked_position_targets_restore_the_prefix_and_keep_the_padding() -> None:
+    tokens = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17],
+                           [20, 21, 22, 23, 24, 25, 0, 0]])
+    targets = torch.tensor([[-100, -100, -100, -100, -100, -100, 17, 18],      # stride-2 overlap prefix
+                            [-100, -100, -100, -100, 25, -100, -100, -100]])   # padded final window
+    restored = T._unmasked_position_targets(tokens, targets)
+    assert restored[0].tolist() == [11, 12, 13, 14, 15, 16, 17, 18]
+    assert restored[1].tolist() == [21, 22, 23, 24, 25, -100, -100, -100]
+    empty = torch.full((1, 4), -100)
+    assert torch.equal(T._unmasked_position_targets(torch.arange(4).unsqueeze(0), empty), empty)
+
+    torch.manual_seed(0)
+    logits = torch.randn(2, 8, 30)
+    with_tokens = T._position_loss_metrics(logits, targets, tokens)
+    assert with_tokens == T._position_loss_metrics(logits, restored)
+    assert math.isfinite(with_tokens["pos_loss_first_q"])
 
 
 # ------------------------------------------------------------------------- #15: finalize probe failures
