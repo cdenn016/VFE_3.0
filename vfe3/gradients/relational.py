@@ -9,7 +9,7 @@ from vfe3.geometry.rope import (
     rope_commutant_diagonal, rope_commutant_is_diagonal, rope_commutant_projection, rope_rotated_pairs,
 )
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
-from vfe3.model.relational_operators import RelationalOperators
+from vfe3.model.relational_operators import RelationalOperators, strictly_causal_routing_prior
 from vfe3.relational_scoring import (
     _compute_dtype, diagonal_kl_term_medians, projected_condition_recovery, projected_moments, routing_cost,
 )
@@ -560,8 +560,11 @@ def relational_predictive_readout(
                                               **shared).to(mu.dtype)
         if operators.attention_residual:
             result = mu + result
+        # beta_ij = 0 exactly wherever the prior is -inf, so a strictly causal prior lets the routed spreads skip the
+        # sources after each query tile (audit 2026-10-20 item 18); read from the prior object the routing used.
         sigma_plus = (operators.predictive_covariance_update(mu_work, sigma_work, beta, value_frame or frame,
                                                              receive, floor_anchor=floor_anchor,
+                                                             causal_sources=strictly_causal_routing_prior(log_prior),
                                                              **shared).to(sigma.dtype)
                       if return_covariance else None)
     if capture is not None:

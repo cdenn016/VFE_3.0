@@ -8,6 +8,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from vfe3.contracts import CanonicalFrameContext, host_read
 from vfe3.cpu_linalg import single_thread_for_batched_cpu
@@ -27,6 +28,47 @@ _SPREAD_TILE_BYTES = 32 * 1024 ** 2
 # leaves it one tile, so the budget sets the tile count, never what autograd saves (audit 2026-10-16 F26). It equals
 # the default budget, so at the default the spread tiles and checkpoints exactly as before the knob.
 _SPREAD_CHECKPOINT_BYTES = 32 * 1024 ** 2
+
+# Under a causal routing prior the routed spreads use at least this many query-row tiles, so the causal truncation of
+# each tile's sources (audit 2026-10-20 item 18) skips about (1 - 1/T)/2 of the source columns with T tiles.
+_CAUSAL_SPREAD_MIN_TILES = 4
+
+# Whether an attention log-prior tensor is -inf strictly above its diagonal, keyed weakly by the tensor and checked
+# against its version counter (one host read per prior tensor; the model caches its prior per sequence length).
+_CAUSAL_PRIOR_CACHE: "WeakTensorKeyDictionary" = WeakTensorKeyDictionary()
+
+
+def strictly_causal_routing_prior(
+    log_prior: Optional[torch.Tensor],   # (..., N, N) additive routing prior, -inf on masked pairs, or None
+) -> bool:
+    r"""Whether ``log_prior`` forbids every source after its query, :math:`B_{ij} = -\infty` for all :math:`j > i`.
+
+    Then :math:`\beta_{ij} = \mathrm{softmax}_j(B_{ij} - E_{ij}/\tau) = 0` exactly for :math:`j > i` (the exponential
+    of :math:`-\infty` is zero), which licenses the causal truncation of the routed spreads
+    (``causal_sources`` of :meth:`RelationalOperators.predictive_covariance_update`). This reads the prior object the
+    routing used, not its configured name, so a caller that passes another prior, or none, gets the full source
+    range. A ``None``, non-square or meta-device prior returns False. The answer is cached per tensor and version, so
+    the host read happens once per cached prior.
+    """
+    if log_prior is None or log_prior.dim() < 2 or log_prior.shape[-1] != log_prior.shape[-2]:
+        return False
+    if log_prior.device.type == "meta":
+        return False
+    try:
+        version: Optional[int] = log_prior._version
+    except RuntimeError:                                  # inference tensors carry no version counter
+        version = None
+    if version is not None:
+        cached = _CAUSAL_PRIOR_CACHE.get(log_prior)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+    with torch.no_grad():
+        above = torch.isneginf(log_prior.detach()).triu(1)
+        upper = torch.ones_like(above).triu(1)
+        causal = bool(host_read((above == upper).all().reshape(1))[0])
+    if version is not None:
+        _CAUSAL_PRIOR_CACHE[log_prior] = (version, causal)
+    return causal
 
 
 def set_spread_tile_bytes(nbytes: int) -> int:
@@ -72,23 +114,49 @@ def _content_link_exp(X: torch.Tensor) -> torch.Tensor:   # (..., K, K) -> (...,
     return torch.linalg.matrix_exp(X)
 
 
+def _spread_tile_plan(
+    N:       int,
+    per_row: int,    # bytes of the tile transient per query row, every leading axis included
+    causal:  bool,
+) -> Tuple[int, bool]:
+    r"""Query rows per tile of a routed spread and whether its tiles are checkpointed under autograd.
+
+    The budget :data:`_SPREAD_TILE_BYTES` bounds the transient of one tile, and the checkpoint decision depends on
+    the budget and on the whole transient :math:`N\cdot\mathrm{per\_row}` only (audit 2026-10-16 F26). Under
+    ``causal`` a tile of rows :math:`[i, i + s)` reads only its causal sources :math:`[0, i + s)`, so the rows are
+    also cut to at most :math:`\lceil N/4\rceil` per tile (audit 2026-10-20 item 18); that cut does not checkpoint,
+    and the truncated tiles save fewer bytes than one full tile.
+    """
+    step = max(1, min(N, _SPREAD_TILE_BYTES // max(1, per_row)))
+    checkpointed = step < N or N * per_row > _SPREAD_CHECKPOINT_BYTES
+    if causal:
+        step = min(step, max(1, -(-N // _CAUSAL_SPREAD_MIN_TILES)))
+    return step, checkpointed
+
+
 def _centered_spread_tile(
-    b:      torch.Tensor,  # (..., H, I, N) routing rows of the tile
-    values: torch.Tensor,  # (..., N, H, d) source values
+    b:      torch.Tensor,  # (..., H, I, S) routing rows of the tile over its S source columns
+    values: torch.Tensor,  # (..., H, S, d) source values, head-major
     mean:   torch.Tensor,  # (..., I, H, d) routed means of the tile's rows
 ) -> torch.Tensor:         # (..., I, H, d, d)
-    r"""One query-row tile of :func:`_centered_spread`."""
-    diff = values.unsqueeze(-4) - mean.unsqueeze(-3)                          # (..., I, N, H, d) v_j - m_i
-    weighted = b.movedim(-3, -1).unsqueeze(-1) * diff                          # (..., I, N, H, d)
-    spread = torch.einsum("...ijhs,...ijht->...ihst", weighted, diff)         # (..., I, H, d, d)
-    residual = weighted.sum(dim=-3)                                            # (..., I, H, d) sum_j b (v_j - m_i)
-    return spread - residual.unsqueeze(-1) * residual.unsqueeze(-2)
+    r"""One query-row tile of :func:`_centered_spread`.
+
+    The rows lead and the heads precede the sources, (I, ..., H, S, d), so the source contraction is one batched GEMM
+    on views of a fresh difference tensor (audit 2026-10-20 item 17).
+    """
+    # The small row-first copy of the means makes the broadcast difference row-major (I, ..., H, S, d).
+    diff = values.unsqueeze(0) - mean.movedim(-3, 0).contiguous().unsqueeze(-2)   # (I, ..., H, S, d) v_j - m_i
+    weighted = b.movedim(-2, 0).unsqueeze(-1) * diff                           # (I, ..., H, S, d) beta_ij (v_j - m_i)
+    spread = (diff.transpose(-1, -2) @ weighted).transpose(-1, -2)             # (I, ..., H, d, d)
+    residual = weighted.sum(dim=-2)                                            # (I, ..., H, d) sum_j b (v_j - m_i)
+    return (spread - residual.unsqueeze(-1) * residual.unsqueeze(-2)).movedim(0, -4)   # (..., I, H, d, d)
 
 
 def _centered_spread(
     b:      torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
     values: torch.Tensor,  # (..., N, H, d) source values v_j^h
     mean:   torch.Tensor,  # (..., N, H, d) routed means m_i^h = sum_j beta_ij^h v_j^h
+    causal: bool = False,  # beta_ij = 0 exactly for j > i: each tile reads its causal sources only
 ) -> torch.Tensor:         # (..., N, H, d, d)
     r"""Routed spread accumulated about each row's own routed mean (audit 2026-10-08 P2-20).
 
@@ -100,17 +168,26 @@ def _centered_spread(
     :math:`\hat m_i` when the row sums to one; :math:`\delta_i` is the rounding error of the computed
     mean, a second-order correction. The one-pass uncentered form cancels :math:`m_im_i^\top` against the
     second moment, so its error grows with the routed sources' offset from the common shift and returned
-    nonpositive variances in fp32 under sharp routing. Query rows are tiled to a fixed byte budget and
-    each tile is checkpointed under autograd, so the saved differences stay bounded.
+    nonpositive variances in fp32 under sharp routing. Query rows are tiled to a byte budget on the whole
+    (batch included) difference tensor and the tiles are checkpointed under autograd
+    (:func:`_spread_tile_plan`), so the saved differences stay bounded.
+
+    With ``causal`` (every :math:`\beta_{ij}` with :math:`j > i` exactly zero, as under every causal attention prior)
+    the tile of rows :math:`[i, i + s)` contracts only the sources :math:`[0, i + s)`. The dropped terms are
+    :math:`0\cdot x`, so values and every gradient upstream of a softmax are unchanged; only the gradient with respect
+    to a masked :math:`\beta_{ij}` itself loses the spread's term, which the softmax multiplies by
+    :math:`\beta_{ij} = 0`.
     """
     N = b.shape[-2]
-    per_row = values[..., 0, :, :].numel() * values.element_size() * max(1, values.shape[-3])
-    step = max(1, min(N, _SPREAD_TILE_BYTES // max(1, per_row)))
+    per_row = math.prod(mean.shape[:-3]) * N * values.shape[-2] * values.shape[-1] * values.element_size()
+    step, checkpointed = _spread_tile_plan(N, per_row, causal)
+    values_h = values.movedim(-3, -2).contiguous()                             # (..., H, N, d) head-major copy
     tiles = []
-    for i in range(0, N, step):
-        args = (b[..., i:i + step, :], values, mean[..., i:i + step, :, :])
-        if (torch.is_grad_enabled() and (step < N or N * per_row > _SPREAD_CHECKPOINT_BYTES)
-                and any(x.requires_grad for x in args)):
+    for t, (b_t, mean_t) in enumerate(zip(b.split(step, dim=-2), mean.split(step, dim=-3))):
+        sources = min(N, (t + 1) * step) if causal else N
+        args = (b_t if sources == N else b_t[..., :sources],
+                values_h if sources == N else values_h[..., :sources, :], mean_t)
+        if torch.is_grad_enabled() and checkpointed and any(x.requires_grad for x in args):
             tiles.append(checkpoint(_centered_spread_tile, *args, use_reentrant=False, preserve_rng_state=False))
         else:
             tiles.append(_centered_spread_tile(*args))
@@ -118,23 +195,29 @@ def _centered_spread(
 
 
 def _spread_squares_tile(
-    b:      torch.Tensor,  # (..., H, I, N) routing rows of the tile
-    values: torch.Tensor,  # (..., N, H, d) source values v_j^h
+    b:      torch.Tensor,  # (..., H, I, S) routing rows of the tile over its S source columns
+    values: torch.Tensor,  # (..., H, S, d) source values v_j^h, head-major
     mean:   torch.Tensor,  # (..., I, H, d) routed means of the tile's rows
     lift:   torch.Tensor,  # (..., I, H, A, d) per-row maps W_ih = U_i O'_h, A output coordinates
     layout: str,           # "diag" | "blocks" | "full"
     block:  int,           # head-block size of the "blocks" layout
 ) -> torch.Tensor:         # (..., I, A), (..., I, A/block, block, block) or (..., I, A, A)
-    r"""One query-row tile of :func:`_spread_squares`."""
-    diff = values.unsqueeze(-4) - mean.unsqueeze(-3)                          # (..., I, N, H, d) v_j - m_i
-    w = torch.einsum("...ihas,...ijhs->...ijha", lift, diff)                   # (..., I, N, H, A) W_ih (v_j - m_i)
-    weight = b.movedim(-3, -1)                                                 # (..., I, N, H) beta_ij^h
+    r"""One query-row tile of :func:`_spread_squares`.
+
+    The rows lead, (I, ..., H, A, S), so :math:`W_{ih}(v_j - m_i)` is one batched GEMM that reads the row-major lift
+    of :meth:`RelationalOperators._predictive_covariance_update_blockwise` in place (audit 2026-10-20 item 17).
+    """
+    # The small row-first copy of the means makes the broadcast difference row-major (I, ..., H, S, d).
+    diff = values.unsqueeze(0) - mean.movedim(-3, 0).contiguous().unsqueeze(-2)   # (I, ..., H, S, d) v_j - m_i
+    w = lift.movedim(-4, 0) @ diff.transpose(-1, -2)                           # (I, ..., H, A, S) W_ih (v_j - m_i)
+    weight = b.movedim(-2, 0)                                                  # (I, ..., H, S) beta_ij^h
     if layout == "diag":
-        return torch.einsum("...ijh,...ijha->...ia", weight, w.square())      # (..., I, A)
+        out = (w.square() @ weight.unsqueeze(-1)).squeeze(-1).sum(dim=-2)      # (I, ..., A)
+        return out.movedim(0, -2)                                              # (..., I, A)
     if layout == "blocks":
-        w = w.reshape(*w.shape[:-1], w.shape[-1] // block, block)              # (..., I, N, H, A/block, block)
-        return torch.einsum("...ijh,...ijhls,...ijhlt->...ilst", weight, w, w)
-    return torch.einsum("...ijh,...ijha,...ijhc->...iac", weight, w, w)       # (..., I, A, A)
+        w = w.reshape(*w.shape[:-2], w.shape[-2] // block, block, w.shape[-1])  # (I, ..., H, A/block, block, S)
+        return torch.einsum("i...hj,i...hlsj,i...hltj->...ilst", weight, w, w)
+    return torch.einsum("i...hj,i...haj,i...hcj->...iac", weight, w, w)       # (..., I, A, A)
 
 
 def _spread_squares(
@@ -144,6 +227,7 @@ def _spread_squares(
     lift:   torch.Tensor,  # (..., N, H, A, d) per-receiver maps W_ih = U_i O'_h (broadcastable over the batch)
     layout: str,           # "diag" | "blocks" | "full"
     block:  int = 1,       # head-block size of the "blocks" layout
+    causal: bool = False,  # beta_ij = 0 exactly for j > i: each tile reads its causal sources only
 ) -> torch.Tensor:         # (..., N, A), (..., N, A/block, block, block) or (..., N, A, A)
     r"""The routed spread after the sandwich as a sum of squares (``predictive_covariance_spread_squares``).
 
@@ -157,19 +241,23 @@ def _spread_squares(
     mean's rounding. Through the pooled head-pair covariance the spread enters
     :math:`\mathrm{diag}(U_iC^{\mathrm{att}}_iU_i^\top)` after :math:`U_i` has undone :math:`U_i^{-1}`, which cancels
     and amplifies its float32 rounding by about :math:`\kappa(U_i)^2`; here the squares are formed after the frame
-    acts. Query rows are tiled and checkpointed as in :func:`_centered_spread`; about :math:`NK^2` multiply-adds per
-    token on block frames.
+    acts. Query rows are tiled and checkpointed as in :func:`_centered_spread`, the budget bounding the whole
+    (batch included) tile of :math:`W(v_j - m_i)` (audit 2026-10-20 item 16), and ``causal`` truncates each tile's
+    sources as there (item 18); about :math:`NK^2` multiply-adds per token on block frames.
     """
     N = b.shape[-2]
     A = lift.shape[-2]
-    per_row = max(1, N * values.shape[-2] * A * values.element_size())
-    step = max(1, min(N, _SPREAD_TILE_BYTES // per_row))
+    per_row = math.prod(mean.shape[:-3]) * N * values.shape[-2] * A * values.element_size()
+    step, checkpointed = _spread_tile_plan(N, per_row, causal)
     lift = torch.broadcast_to(lift, (*mean.shape[:-2], *lift.shape[-3:]))     # (..., N, H, A, d)
+    values_h = values.movedim(-3, -2).contiguous()                             # (..., H, N, d) head-major copy
     tiles = []
-    for i in range(0, N, step):
-        args = (b[..., i:i + step, :], values, mean[..., i:i + step, :, :], lift[..., i:i + step, :, :, :])
-        if (torch.is_grad_enabled() and (step < N or N * per_row > _SPREAD_CHECKPOINT_BYTES)
-                and any(x.requires_grad for x in args)):
+    for t, (b_t, mean_t, lift_t) in enumerate(zip(b.split(step, dim=-2), mean.split(step, dim=-3),
+                                                  lift.split(step, dim=-4))):
+        sources = min(N, (t + 1) * step) if causal else N
+        args = (b_t if sources == N else b_t[..., :sources],
+                values_h if sources == N else values_h[..., :sources, :], mean_t, lift_t)
+        if torch.is_grad_enabled() and checkpointed and any(x.requires_grad for x in args):
             tiles.append(checkpoint(_spread_squares_tile, *args, layout, block, use_reentrant=False,
                                     preserve_rng_state=False))
         else:
@@ -1496,6 +1584,7 @@ class RelationalOperators(nn.Module):
         *,
         edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context (built when None)
         floor_anchor: Optional[torch.Tensor] = None,   # the local prior covariance Sigma_p (required)
+        causal_sources: bool = False,             # beta_ij = 0 exactly for j > i (strictly_causal_routing_prior)
     ) -> torch.Tensor:        # same layout as sigma: the moment-matched covariance Sigma_i^+
         r"""Moment-matched covariance of the predictive kernel (GL(K) v2, Theorem thm:probabilistic_status (2)).
 
@@ -1550,6 +1639,14 @@ class RelationalOperators(nn.Module):
 
         with :math:`X_i, Y_i` of :func:`vfe3.model.edge_links.edge_covariance_factors`; the edge context is
         computed outside the checkpointed region and enters it as an input.
+
+        ``causal_sources`` asserts that :math:`\beta_{ij} = 0` exactly for every :math:`j > i`, which the readout
+        derives from the routing prior it used (:func:`strictly_causal_routing_prior`). The routed-spread tiles then
+        contract each query tile only against its causal sources (audit 2026-10-20 item 18): the dropped terms are
+        :math:`0\cdot x`, so the values, and every gradient upstream of the routing softmax, are those of the full
+        contraction. The gradient with respect to a masked :math:`\beta_{ij}` itself loses the spread's term, and the
+        softmax multiplies it by :math:`\beta_{ij} = 0`. With a routing that is not causal the flag gives a wrong
+        result, so it defaults to False.
         """
         self._require_kernel_readout("predictive_covariance_update")
         if self.frame_diagonal:
@@ -1565,7 +1662,8 @@ class RelationalOperators(nn.Module):
             return self.predictive_covariance_update(
                 mu.double(), sigma.double(), beta.double(), frame, wide_receive,
                 edges=None if edges is None else edge_links.cast_context(edges, torch.float64),
-                floor_anchor=None if floor_anchor is None else floor_anchor.double()).to(sigma.dtype)
+                floor_anchor=None if floor_anchor is None else floor_anchor.double(),
+                causal_sources=causal_sources).to(sigma.dtype)
         floor = self.floor_term(floor_anchor, sigma, frame, diagonal=sigma.dim() == mu.dim())
         if edges is None and self.content_link_edges != "off":
             edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
@@ -1577,7 +1675,8 @@ class RelationalOperators(nn.Module):
         stash = ({} if self.diagnose_diagonal_projection and diagonal and not torch.is_grad_enabled() else None)
         self._projection_stash = stash
         try:
-            sigma_plus = self._kernel_covariance(mu, sigma, beta, frame, receive, extra) + floor   # f Sigma_p, local
+            sigma_plus = (self._kernel_covariance(mu, sigma, beta, frame, receive, extra, causal_sources)
+                          + floor)                                               # f Sigma_p, local
         finally:
             self._projection_stash = None
         if stash:
@@ -1585,7 +1684,7 @@ class RelationalOperators(nn.Module):
                 stash["blocks"], stash["inverse"], floor.detach().double())
         if self.predictive_covariance_fp64_escalation and sigma_plus.dtype != torch.float64:
             sigma_plus = self._escalate_failed_sequences(sigma_plus, floor, mu, sigma, beta, frame, receive, extra,
-                                                         diagonal)
+                                                         diagonal, causal_sources)
         return self.ceiling_term(sigma_plus, floor_anchor, diagonal=diagonal)   # at most c Sigma_p when set
 
     def _escalate_failed_sequences(
@@ -1599,6 +1698,7 @@ class RelationalOperators(nn.Module):
         receive:    Optional[torch.Tensor],
         extra:      Tuple[EdgeContext, ...],
         diagonal:   bool,
+        causal_sources: bool = False,
     ) -> torch.Tensor:                             # sigma_plus with every failing sequence recomputed in float64
         r"""The float64 escalation of :meth:`predictive_covariance_update`, restricted to the failing sequences.
 
@@ -1631,7 +1731,7 @@ class RelationalOperators(nn.Module):
             # float64 beliefs make the body compute in float64; it casts the frame and the content maps itself.
             sigma_wide = self._kernel_covariance(
                 mu.double(), sigma.double(), beta.double(), frame, wide_receive,
-                tuple(edge_links.cast_context(e, torch.float64) for e in extra)) + floor.double()
+                tuple(edge_links.cast_context(e, torch.float64) for e in extra), causal_sources) + floor.double()
             if not _covariance_positive(sigma_wide, diagonal):
                 raise ValueError(_FP64_ESCALATION_FAILURE)
             _count_covariance_escalation(math.prod(mu.shape[:-1]), mu.device)
@@ -1642,7 +1742,7 @@ class RelationalOperators(nn.Module):
         sub_frame = (CanonicalFrameContext(frame.forward[rows], frame.inverse[rows],
                                            block_diagonal=frame.block_diagonal) if per_sequence else frame)
         sigma_wide = (self._kernel_covariance(mu[rows].double(), sigma[rows].double(), beta[rows].double(),
-                                              sub_frame, wide_receive, ())
+                                              sub_frame, wide_receive, (), causal_sources)
                       + floor[rows].double())
         if not _covariance_positive(sigma_wide, diagonal):
             raise ValueError(_FP64_ESCALATION_FAILURE)
@@ -1659,12 +1759,14 @@ class RelationalOperators(nn.Module):
         frame:   CanonicalFrameContext,
         receive: Optional[torch.Tensor],           # (H, K, d) or None
         extra:   Tuple[EdgeContext, ...],          # () or (edges,)
+        causal_sources: bool = False,              # beta_ij = 0 exactly for j > i
     ) -> torch.Tensor:                             # sigma's layout: U C^att U^T, without the floor
         r""":meth:`_predictive_covariance_update`, one non-reentrant checkpoint under ``predictive_covariance_checkpoint``."""
+        causal = {"causal_sources": True} if causal_sources else {}   # the keyword only when set (wrapped bodies)
         if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
             return checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive, *extra,
-                              use_reentrant=False, preserve_rng_state=False)
-        return self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
+                              use_reentrant=False, preserve_rng_state=False, **causal)
+        return self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra, **causal)
 
     @ieee_fp32_matmul()
     def _predictive_covariance_update(
@@ -1675,6 +1777,8 @@ class RelationalOperators(nn.Module):
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d)
         edges: Optional[EdgeContext] = None,
+        *,
+        causal_sources: bool = False,             # beta_ij = 0 exactly for j > i
     ) -> torch.Tensor:
         r"""Body of :meth:`predictive_covariance_update`: blockwise for diagonal beliefs on block frames.
 
@@ -1690,9 +1794,10 @@ class RelationalOperators(nn.Module):
         if self.block_covariance and not frame.block_diagonal:
             raise ValueError("block_covariance (gaussian_block) reads the compact (..., N, H, d, d) block frame; "
                              "a dense frame was supplied")
+        causal = {"causal_sources": True} if causal_sources else {}   # the keyword only when set (wrapped bodies)
         if frame.block_diagonal and (sigma.dim() == mu.dim() or self.block_covariance):
-            return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive, edges)
-        return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive, edges)
+            return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive, edges, **causal)
+        return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive, edges, **causal)
 
     def _predictive_covariance_update_blockwise(
         self,
@@ -1702,6 +1807,8 @@ class RelationalOperators(nn.Module):
         frame: CanonicalFrameContext,             # block_diagonal: (..., N, H, d, d) blocks U_{i,m}
         receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
         edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context
+        *,
+        causal_sources: bool = False,             # beta_ij = 0 exactly for j > i: causal spread tiles
     ) -> torch.Tensor:        # (..., N, K) diag(Sigma_i^+), or (..., N, K, K) its head blocks
         r"""Diagonal (or head blocks) of the moment-matched covariance on block-diagonal frames.
 
@@ -1772,29 +1879,44 @@ class RelationalOperators(nn.Module):
             xi = xi - xi[..., :1, :]                                                   # (..., N, K)
             values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                      # (..., N, H, d)
             nl = C.dim() - 4                                                           # leading batch dims
-            C_cols = C.movedim(-3, 0).movedim(-2, 1).reshape(H, d, -1)                # (m, k, [..., n, t])
-            T_rows = T_blocks.permute(2, 0, 1, 3).reshape(H, H * d, d)                # (m, [h, s], k)
-            TC = _per_block_bmm(T_rows, C_cols).view(H, H, d, *C.shape[:-3], d)       # (m, h, s, ..., n, t)
-            TC = TC.permute(*range(3, nl + 4), 1, 0, 2, nl + 4)                        # (..., N, H, H, d, d) T_h^{(m)} C_{i,m}
+            lead, N = C.shape[:-4], C.shape[-4]
+            # Every head-pair tensor is emitted in the physical order its next GEMM reads, as a view in the logical
+            # (..., N, H, H, d, d) layout for the edge and symmetric-pair consumers (audit 2026-10-20 item 17).
+            # CT_{m,g} = C_{i,m} T_g^{(m)T}, the transpose of T_g^{(m)} C_{i,m} (C_{i,m} is symmetric bitwise), m- and
+            # k-major so that the source GEMM below reads it in place.
+            C_rows = C.permute(nl + 1, nl + 2, *range(nl + 1), nl + 3).reshape(H, -1, d)   # (m, [k, ..., n], k')
+            T_rows = T_blocks.permute(2, 0, 1, 3).reshape(H, H * d, d)                # (m, [g, t], k') view
+            CT = _per_block_bmm(C_rows, T_rows.transpose(-1, -2))                      # (m, [k, ..., n], [g, t])
+            CT = CT.view(H, d, *lead, N, H, d)                                         # (m, k, ..., n, g, t)
+            TC = CT.permute(*range(2, nl + 3), nl + 3, 0, nl + 4, 1)                   # (..., N, H, H, d, d) T_h^{(m)} C_{i,m}
             mean = torch.einsum("...hij,...jhs->...ihs", b, values)                    # (..., N, H, d)
             squares = self.predictive_covariance_spread_squares
-            spread = None if squares else _centered_spread(b, values, mean)            # (..., N, H, d, d)
+            spread = None if squares else _centered_spread(b, values, mean, causal_sources)   # (..., N, H, d, d)
             if self.predictive_covariance_symmetric_pairs:
                 C_att = self._symmetric_pair_blocks(TC, T_blocks, O_blocks, b, spread)  # (..., N, H, d, d), not symmetric
                 c = source = pooled = None                                             # edges are refused here
             else:
-                source = torch.einsum("...nhmsk,gtmk->...nhgst", TC, T_blocks)        # (..., N, H, H, d, d) T_h C_i T_g^T
-                c = torch.einsum("...hij,...gij->...hgij", b, b)
-                c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
-                pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)        # (..., N, H, H, d, d)
+                # T_h C_i T_g^T = sum_m T_h^{(m)} CT_{m,g}: one GEMM over (m, k), rows (h, s), columns (..., n, g, t).
+                source_hs = T_hat.reshape(H * d, H * d) @ CT.reshape(H * d, -1)        # ([h, s], [..., n, g, t])
+                source_hs = source_hs.view(H, d, *lead, N, H, d)                       # (h, s, ..., n, g, t)
+                source = source_hs.permute(*range(2, nl + 3), 0, nl + 3, 1, nl + 4)   # (..., N, H, H, d, d) view
+                c = b.unsqueeze(-3) * b.unsqueeze(-4)                                  # (..., H, H, N, N) beta^h beta^g
+                c.diagonal(dim1=-4, dim2=-3).copy_(b.movedim(-3, -1))                  # c^{hh} = beta^h, bitwise as before
+                # The pooling over sources j, one GEMM per (..., h, g) with the source block as columns (one copy).
+                pooled_hg = c @ source_hs.permute(*range(2, nl + 2), 0, nl + 3, nl + 2, 1, nl + 4).reshape(
+                    *lead, H, H, N, d * d)                                             # (..., h, g, i, [s, t])
+                pooled_hg = pooled_hg.view(*lead, H, H, N, d, d)                       # (..., h, g, i, s, t)
+                pooled = pooled_hg.permute(*range(nl), nl + 2, nl, nl + 1, nl + 3, nl + 4)   # (..., N, H, H, d, d) view
                 if spread is not None:
                     pooled.diagonal(dim1=-4, dim2=-3).add_(spread.movedim(-3, -1))    # P_hh += S^h, in place
-                lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)         # (..., N, H, K, d) sum_h O'_h P_hg
-                lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                   # (..., N, g, l, k, t)
-                rows = lifted.permute(nl + 2, *range(nl + 1), nl + 3, nl + 1, nl + 4)  # (l, ..., n, k, g, t)
+                # [C^att]_ll = sum_{h,g} O_h^{(l)} P_hg O_g^{(l)T}: Z = O' P over (h, s) in one GEMM on the (h, s)-major
+                # copy of P, then one GEMM per block l over (g, t), reading Z in place.
+                O_flat = O_hat.permute(1, 0, 2).reshape(H * d, H * d)                  # ([l, k], [h, s])
+                P_hs = pooled_hg.permute(nl, nl + 3, *range(nl), nl + 2, nl + 1, nl + 4).reshape(H * d, -1)
+                Z = O_flat @ P_hs                                                      # ([l, k], [..., i, g, t])
                 O_cols = O_blocks.permute(1, 0, 3, 2).reshape(H, H * d, d)            # (l, [g, t], m)
-                C_att = _per_block_bmm(rows.reshape(H, -1, H * d), O_cols)             # (l, [..., n, k], m)
-                C_att = C_att.view(H, *C.shape[:-3], d, d).movedim(0, -3)              # (..., N, H, d, d) blocks [ll]
+                C_att = _per_block_bmm(Z.view(H, -1, H * d), O_cols)                   # (l, [k, ..., i], m)
+                C_att = C_att.view(H, d, *lead, N, d).permute(*range(2, nl + 3), 0, 1, nl + 3)  # (..., N, H, d, d) [ll]
             if edges is not None:
                 # [g_i F (P^ + R Sigma~ R^T + A X + X^T A^T + A Y A^T) F^T g_i^T]_ll (edge_links).
                 A_hat, X_hat, Y = edge_links.edge_covariance_factors(edges, b, c, source, values, mean)
@@ -1804,20 +1926,23 @@ class RelationalOperators(nn.Module):
                     if edges.mode == "pure_gauge" else inner)
             if self.attention_residual:
                 self_weight = b.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)          # (..., N, H) beta_ii^h
-                weighted = TC * self_weight[..., None, None, None]                    # (..., N, H, H, d, d)
-                weighted = weighted.permute(nl + 2, nl + 1, nl + 3, *range(nl + 1), nl + 4)   # (l, h, s, ..., n, m)
+                # X_{i,l}^T = sum_h beta_ii^h CT_{l,h} O_h^{(l)T}: one GEMM per block l over (h, s), reading CT in place.
+                weighted = CT * self_weight[..., None]                                 # (l, m, ..., n, h, s)
                 O_rows = O_blocks.permute(1, 2, 0, 3).reshape(H, d, H * d)            # (l, k, [h, s])
-                cross = _per_block_bmm(O_rows, weighted.reshape(H, H * d, -1))         # (l, k, [..., n, m])
-                cross = cross.view(H, d, *C.shape[:-3], d).movedim((0, 1), (-3, -2))   # (..., N, H, d, d) X_{i,l}
+                cross = _per_block_bmm(weighted.reshape(H, -1, H * d), O_rows.transpose(-1, -2))   # (l, [m, ..., n], k)
+                cross = cross.view(H, d, *lead, N, d).permute(*range(2, nl + 3), 0, nl + 3, 1)  # (..., N, H, d, d) X_{i,l}
                 if edges is not None:                                                  # blocks of sum_h beta_ii M_h^{ii} C_i
                     cross = edge_links.edge_residual_cross_blocks(edges, A_hat, self_weight, TC, cross)
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
             stash = self._projection_stash
             if squares:
                 # W_ih = U_{i,l} O_h^{(l)} stacked over l: (..., N, H(h), H(l) d, d); the spread after the sandwich.
-                lift = torch.einsum("...lak,hlks->...hlas", forward, O_blocks).flatten(-3, -2)
+                # Row-major (N, ..., H, K, d) storage, so each query tile of the squares is one contiguous slab.
+                lift = torch.einsum("...lak,hlks->...hlas", forward.movedim(-4, 0), O_blocks).flatten(-3, -2)
+                lift = lift.movedim(0, -4)                                             # (..., N, H, K, d) view
                 layout = "blocks" if (block or stash is not None) else "diag"
-                spread_out = _spread_squares(b, values, mean, lift, layout, d)        # (..., N, H, d, d) or (..., N, K)
+                spread_out = _spread_squares(b, values, mean, lift, layout, d,
+                                             causal_sources)                   # (..., N, H, d, d) or (..., N, K)
             if block:
                 blocks = forward @ C_att @ forward.transpose(-1, -2)                   # (..., N, H, d, d) U_l [C_att]_ll U_l^T
                 blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
@@ -1882,6 +2007,8 @@ class RelationalOperators(nn.Module):
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d)
         edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context
+        *,
+        causal_sources: bool = False,             # beta_ij = 0 exactly for j > i: causal spread tiles
     ) -> torch.Tensor:
         r"""Dense K x K evaluation of :meth:`predictive_covariance_update` (full family or dense frames).
 
@@ -1935,10 +2062,11 @@ class RelationalOperators(nn.Module):
                         if self.predictive_covariance_spread_squares:
                             # The spread after the sandwich (audit 2026-10-17 item 12): W_ih = U_i O'_h.
                             lift = torch.einsum("...ak,hks->...has", forward, O_r)  # (..., N, n_r, K, d_r)
-                            term = _spread_squares(b_r, values, mean, lift, "diag" if diagonal else "full")
+                            term = _spread_squares(b_r, values, mean, lift, "diag" if diagonal else "full",
+                                                   causal=causal_sources)
                             squares_out = term if squares_out is None else squares_out + term
                         else:
-                            spread = _centered_spread(b_r, values, mean)           # (..., N, n_r, d_r, d_r)
+                            spread = _centered_spread(b_r, values, mean, causal_sources)   # (..., N, n_r, d_r, d_r)
                             pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
                     lifted = torch.einsum("hks,...nhgst->...ngkt", O_r, pooled)   # (..., N, n_g, K, d_g)
                     term = torch.einsum("...ngkt,gmt->...nkm", lifted, O_g)        # (..., N, K, K)
