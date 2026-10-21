@@ -208,6 +208,7 @@ def test_launcher_accepts_mode_and_covariance_controls() -> None:
 
 def test_ablation_registers_mode_and_covariance_sweeps(monkeypatch):
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values())
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     ablation.validate_sweeps(
         ["block_mlp_mode", "block_mlp_covariance"], require_construction=False,
     )

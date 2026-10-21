@@ -46,8 +46,10 @@ def _wide(**overrides) -> VFE3Config:
 # Config ------------------------------------------------------------------------------------------------
 
 def test_default_is_the_series_fallback() -> None:
-    assert VFE3Config.m_phi_group_log_fallback == "series"
+    # The test baseline pins the series fallback; the VFE3Config default only has to be admitted.
     assert config_values()["m_phi_group_log_fallback"] == "series"
+    default = VFE3Config.__dataclass_fields__["m_phi_group_log_fallback"].default
+    assert test_config(m_phi_group_log_fallback=default).m_phi_group_log_fallback == default
     with pytest.raises(ValueError, match="m_phi_group_log_fallback"):
         test_config(m_phi_group_log_fallback="exact")
 

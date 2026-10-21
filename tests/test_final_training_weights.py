@@ -35,6 +35,7 @@ def test_launcher_saves_and_tests_all_training_without_periodic_checkpoints(
     training = importlib.import_module("vfe3.train")
     datasets = importlib.import_module("vfe3.data.datasets")
     monkeypatch.setattr(launcher, "config", asdict(cfg))
+    monkeypatch.setattr(launcher, "fully_gauge_covariant", False)    # the launcher switch is the user's; off here
     monkeypatch.setattr(launcher, "DEVICE", "cpu")
     monkeypatch.setattr(launcher, "MAX_TOKENS", None)
     monkeypatch.setattr(launcher, "_select_loader", lambda *args, **kwargs: loader)

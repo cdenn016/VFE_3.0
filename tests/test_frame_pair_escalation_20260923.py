@@ -553,8 +553,7 @@ def test_an_escalating_terminal_validation_is_not_handed_off(forced: bool, monke
 # -- the opt-in switch and its threshold ------------------------------------------------------------
 
 def test_escalation_is_off_by_default_and_installed_from_config() -> None:
-    assert VFE3Config.frame_pair_escalation_tol is None             # dataclass default: off
-    assert test_config().frame_pair_escalation_tol is None
+    assert test_config().frame_pair_escalation_tol is None            # the test baseline: off
     VFEModel(_profile_tiny_config())
     assert transport.frame_pair_fp64_escalation() is False
     VFEModel(tiny_config(frame_pair_escalation_tol=3e-4))

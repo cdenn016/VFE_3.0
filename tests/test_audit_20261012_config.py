@@ -178,6 +178,7 @@ def _run_experiment_arm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: 
 def test_none_precision_cell_does_not_inherit_the_previous_cell_policy(tmp_path, monkeypatch, runner) -> None:
     baseline = config_values(fp32_matmul_precision=None)
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", baseline)
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     monkeypatch.setattr(scaling, "BASELINE", baseline)
     monkeypatch.setattr(scaling, "CONFIG", {**scaling.CONFIG, "resume": False})
     observed: list = []

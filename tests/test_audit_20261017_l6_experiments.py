@@ -85,6 +85,7 @@ def _stub_ablation(monkeypatch: pytest.MonkeyPatch, crash: Dict[str, int],
 
     monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(_FIXED_CODE))
     monkeypatch.setattr(ablation, "cache_source_identity", _fake_source)
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(max_seq_len=8, max_steps=2, warmup_steps=1))
     monkeypatch.setattr(ablation, "SWEEPS", {"probe": {

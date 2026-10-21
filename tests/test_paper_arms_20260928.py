@@ -458,7 +458,7 @@ def test_run_vfe_reproduces_the_launcher_run_bitwise(tmp_path: Path, caches: Pat
     cfg = _tiny_cfg(vocab_size=V_WORD)
     config = {key: value for key, value in serialize_config(cfg).items() if key != "seed"}
     for name, value in (("config", config), ("DATASET", WORD), ("DEVICE", "cpu"), ("MAX_TOKENS", None),
-                        ("DATA_SEED", 5)):
+                        ("DATA_SEED", 5), ("fully_gauge_covariant", False)):
         monkeypatch.setattr(launcher, name, value)
     logger = logging.getLogger("paper-arms-test")
     launcher._run_once(3, logger, run_root=str(tmp_path / "launcher"))

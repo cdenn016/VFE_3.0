@@ -98,7 +98,9 @@ def test_pullback_structure_budget_replaces_the_flat_k12_cap() -> None:
 
 
 def test_offset_law_needs_five_sizes_and_the_width_sweep_has_five() -> None:
-    """gap-stats: the three-parameter offset law is testable from five sizes; the shipped sweep has five."""
+    """gap-stats: the three-parameter offset law is testable from five sizes, and a width sweep is classified
+    against that threshold. The shipped sweep is the user's setting (2026-10-21: a driver value must not fail a
+    test), so its classification is checked for whatever size it has, not its size."""
     import scaling
     import scaling_analysis
 
@@ -107,4 +109,8 @@ def test_offset_law_needs_five_sizes_and_the_width_sweep_has_five() -> None:
     assert scaling_min_testable_sizes(True) == 5 and scaling_min_testable_sizes(False) == 4
     assert scaling_analysis._min_testable_sizes() == scaling_min_testable_sizes(
         bool(scaling_analysis.CONFIG["with_offset"]))
-    assert len(set(scaling.SWEEPS["widths"])) >= scaling_min_testable_sizes(True)
+    clean_fit = dict(has_fit=True, n_routes=1, lack_of_fit={"rejected": False, "testable": True})
+    for n_sizes in sorted({len(set(scaling.SWEEPS["widths"])), scaling_analysis._min_testable_sizes() - 1,
+                           scaling_analysis._min_testable_sizes()}):
+        status, _ = scaling_analysis._pooled_status({}, {}, n_distinct_sizes=n_sizes, **clean_fit)
+        assert (status == "not_testable") is (n_sizes < scaling_analysis._min_testable_sizes()), n_sizes

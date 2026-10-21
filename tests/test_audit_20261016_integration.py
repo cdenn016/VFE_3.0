@@ -239,7 +239,7 @@ def test_the_gauge_covariant_switch_warns_when_it_keeps_the_capped_pushforward()
 # ------------------------------------------------------------------------------------------------- F7
 
 def test_predictive_covariance_precision_reaches_every_layer() -> None:
-    assert VFE3Config.predictive_covariance_precision == "fp32"
+    assert VFE3Config.__dataclass_fields__["predictive_covariance_precision"].default in ("fp32", "fp64")
     assert config_values()["predictive_covariance_precision"] == "fp32"
     cfg = tiny_config(n_layers=2, predictive_covariance_precision="fp64")
     model = VFEModel(cfg)
@@ -260,7 +260,8 @@ def test_relational_tile_mib_installs_both_tile_budgets() -> None:
     import vfe3.model.relational_operators as ro
     import vfe3.relational_scoring as scoring
 
-    assert VFE3Config.relational_tile_mib == 32 and config_values()["relational_tile_mib"] == 32
+    default = VFE3Config.__dataclass_fields__["relational_tile_mib"].default
+    assert isinstance(default, int) and default >= 1 and config_values()["relational_tile_mib"] == 32
     for bad in (0, -1, True, 1.5):
         with pytest.raises(ValueError, match="relational_tile_mib"):
             tiny_config(relational_tile_mib=bad)

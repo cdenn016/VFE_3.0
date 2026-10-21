@@ -43,7 +43,7 @@ from typing import Callable, Dict, List, Sequence, Tuple
 import pytest
 import torch
 
-from tests.profiles import test_config
+from tests.profiles import config_values, test_config
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.contracts import CanonicalFrameContext
@@ -1143,10 +1143,15 @@ def _cfg(**overrides):
 
 
 def test_config_defaults_validation_and_inactive_fields() -> None:
+    # The test baseline pins these values; the VFE3Config defaults are the user's to choose and only have to be
+    # admitted (2026-10-21: a changed default must not fail a test).
     defaults = {f.name: f.default for f in dataclasses.fields(VFE3Config)}
-    assert defaults["block_mlp_inference"] == "mean_field"
-    assert defaults["block_mlp_template_init_variance"] == 10.0
-    assert defaults["block_mlp_mode"] == "coordinate" and defaults["block_mlp_covariance"] == "passthrough"
+    baseline = config_values()
+    assert baseline["block_mlp_inference"] == "mean_field"
+    assert baseline["block_mlp_template_init_variance"] == 10.0
+    assert baseline["block_mlp_mode"] == "coordinate" and baseline["block_mlp_covariance"] == "passthrough"
+    assert defaults["block_mlp_inference"] in ("mean_field", "exact")
+    assert defaults["block_mlp_template_init_variance"] > 0.0
     assert _cfg().block_mlp_inference == "mean_field"
     cfg = _cfg(block_mlp_inference="exact", block_mlp_covariance="posterior", block_mlp_template_init_variance=2.5)
     assert cfg.block_mlp_inference == "exact" and cfg.block_mlp_template_init_variance == 2.5

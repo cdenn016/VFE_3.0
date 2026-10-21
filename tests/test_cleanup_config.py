@@ -63,6 +63,7 @@ def test_disabled_mlp_expansion_sweep_is_rejected(monkeypatch: pytest.MonkeyPatc
     import ablation
     baseline = serialize_config(_tiny(use_block_mlp=False))
     monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     monkeypatch.setitem(ablation.SWEEPS, "cleanup_mlp", {
         "param": "block_mlp_expansion", "values": [2, 4], "scale": "linear"})
     with pytest.raises(ValueError, match="block_mlp_expansion.*INERT on EVERY"):
@@ -73,6 +74,7 @@ def test_mixed_live_mlp_contrast_is_allowed(monkeypatch: pytest.MonkeyPatch) -> 
     import ablation
     baseline = serialize_config(_tiny(use_block_mlp=False))
     monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)               # the driver switch is the user's; off here
     monkeypatch.setitem(ablation.SWEEPS, "cleanup_mixed", {"configs": [
         {"label": "off", "use_block_mlp": False, "block_mlp_expansion": 2},
         {"label": "on", "use_block_mlp": True, "block_mlp_expansion": 4},

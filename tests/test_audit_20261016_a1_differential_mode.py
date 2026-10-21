@@ -32,8 +32,11 @@ def _pullback(**overrides) -> VFE3Config:
 
 
 def test_default_is_the_series_route() -> None:
-    assert VFE3Config.m_phi_group_differential_mode == "series"
+    # The test baseline pins the series route; the VFE3Config default is the user's to choose and only has to be
+    # admitted (2026-10-21: a changed default must not fail a test).
     assert config_values()["m_phi_group_differential_mode"] == "series"
+    default = VFE3Config.__dataclass_fields__["m_phi_group_differential_mode"].default
+    assert _pullback(m_phi_group_differential_mode=default).m_phi_group_differential_mode == default
 
 
 def test_spectral_is_accepted_and_unknown_values_refused() -> None:
