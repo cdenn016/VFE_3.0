@@ -1650,6 +1650,11 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_self_weight_head_max", "val_relational_self_argmax_frac_head_max",
     "val_relational_self_lock_argmax_layer", "val_relational_self_lock_argmax_head",
     "val_belief_cond_median_layer_max",
+    # every layer beside the last-layer headline columns (VFEModel._layer_guard_maxima; audit 2026-10-20 item 14)
+    "val_relational_capped_mass_mean_layer_max", "val_relational_capped_mass_mean_argmax_layer",
+    "val_relational_score_term_query_constant_median_layer_max",
+    "val_belief_lam_min_layer_min", "val_belief_lam_min_argmin_layer", "val_belief_lam_max_layer_max",
+    "val_belief_cond_max_layer_max", "val_belief_eig_ratio_layer_min", "val_belief_eig_ratio_argmin_layer",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
     "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
@@ -2060,14 +2065,16 @@ def _covariance_floor_reference(
 
     Under ``predictive_covariance='moment_matched'`` with ``predictive_covariance_floor_mode='prior'`` the readout
     adds :math:`f\Sigma_p` to the predictive covariance, so its smallest eigenvalue cannot fall below
-    :math:`f\lambda_{\min}(\Sigma_p) \ge f\min_{v,k}s_{vk}` for the diagonal prior table. The projected covariance the
+    :math:`f\lambda_{\min}(\Sigma_p) \ge f\min_{v,k}s_{vk}` for the diagonal prior table. Under ``'max'`` the floor
+    is the larger of the relative floor and :math:`f\Sigma_p` (``RelationalOperators.covariance_floor``), so the same
+    lower bound holds and the alarm is armed there too (audit 2026-10-20 item 14). The projected covariance the
     router reads is that covariance carried by the comparison maps, so the comparison against this value is an alarm
     in the reference coordinates, not an exact bound. None under the relative floor (no absolute value exists),
     another readout, another table, or another model family. One host read, at log cadence.
     """
     cfg = getattr(model, "cfg", None)
     if (cfg is None or getattr(cfg, "predictive_covariance", None) != "moment_matched"
-            or getattr(cfg, "predictive_covariance_floor_mode", None) != "prior"
+            or getattr(cfg, "predictive_covariance_floor_mode", None) not in ("prior", "max")
             or getattr(cfg, "prior_covariance_table", "diagonal") != "diagonal"):
         return None
     try:
@@ -2091,26 +2098,35 @@ def _warn_eigenvalue_collapse(
     belief_layer:    int,                         # the layer belief_lam_min / belief_lam_max are read at
     floor_reference: Optional[float] = None,      # _covariance_floor_reference(model)
     sink:            Optional[WarningSink] = None,
+    layer_extremes:  Optional[Mapping[str, Sequence[float]]] = None,   # VFEModel.last_belief_layer_extremes
 ) -> None:
     r"""Warn once per layer on an eigenvalue collapse that a trace ratio cannot see (audit 2026-10-17 item 14).
 
-    ``belief_eigenvalue_ratio``: :math:`\lambda_{\min}/\lambda_{\max}` of the converged belief covariances
-    (``belief_lam_min`` / ``belief_lam_max``) below :data:`EIGENVALUE_COLLAPSE_RATIO` :math:`= 10^3\epsilon_{32}`,
-    where float32 arithmetic on that covariance has lost all but about three digits of its smallest direction.
+    ``belief_eigenvalue_ratio``: :math:`\lambda_{\min}/\lambda_{\max}` of the converged belief covariances below
+    :data:`EIGENVALUE_COLLAPSE_RATIO` :math:`= 10^3\epsilon_{32}`, where float32 arithmetic on that covariance has lost
+    all but about three digits of its smallest direction. With ``layer_extremes`` (``{"lam_min": [...], "lam_max":
+    [...]}``, one entry per layer) every layer is tested (audit 2026-10-20 item 14: an early layer at 3.5e-5 was never
+    warned because only the last layer was read); without it the unsuffixed ``belief_lam_min`` / ``belief_lam_max``
+    are read as layer ``belief_layer``.
     ``projected_floor``: ``relational_projected_cov_min_eigenvalue_layer_min`` below ``floor_reference``
     (:func:`_covariance_floor_reference`), at its ``_argmin_layer``.
     """
-    lam_min = _finite_or_none(diagnostics.get("belief_lam_min"))
-    lam_max = _finite_or_none(diagnostics.get("belief_lam_max"))
-    if lam_min is not None and lam_max is not None and lam_max > 0.0:
+    if layer_extremes is not None:
+        pairs = list(enumerate(zip(layer_extremes.get("lam_min", ()), layer_extremes.get("lam_max", ()))))
+    else:
+        pairs = [(int(belief_layer), (diagnostics.get("belief_lam_min"), diagnostics.get("belief_lam_max")))]
+    for layer, (low, high) in pairs:
+        lam_min, lam_max = _finite_or_none(low), _finite_or_none(high)
+        if lam_min is None or lam_max is None or lam_max <= 0.0:
+            continue
         ratio = lam_min / lam_max
-        key = ("belief_eigenvalue_ratio", int(belief_layer), -1)
+        key = ("belief_eigenvalue_ratio", int(layer), -1)
         if ratio < EIGENVALUE_COLLAPSE_RATIO and key not in warned:
             warned.add(key)
             message = (" covariance layer %d: converged belief lambda_min / lambda_max = %.3g (lambda_min %.3g, "
                        "lambda_max %.3g) is below 1e3 eps32 = %.3g; the smallest covariance direction has collapsed"
-                       % (belief_layer, ratio, lam_min, lam_max, EIGENVALUE_COLLAPSE_RATIO))
-            _emit_warning(logger, sink, "belief_eigenvalue_ratio", message, layer=int(belief_layer), value=ratio,
+                       % (layer, ratio, lam_min, lam_max, EIGENVALUE_COLLAPSE_RATIO))
+            _emit_warning(logger, sink, "belief_eigenvalue_ratio", message, layer=int(layer), value=ratio,
                           threshold=EIGENVALUE_COLLAPSE_RATIO)
     projected = _finite_or_none(diagnostics.get("relational_projected_cov_min_eigenvalue_layer_min"))
     if projected is not None and floor_reference is not None and projected < floor_reference:
@@ -3882,6 +3898,9 @@ def _val_diagnostics_one(
     out["val_attn_entropy"] = vd["attn_entropy"]
     out["val_attn_entropy_min"] = vd["attn_entropy_min"]
     out["val_belief_cond_median_layer_max"] = float(vd.get("belief_cond_median_layer_max", float("nan")))
+    for key in ("belief_lam_min_layer_min", "belief_lam_min_argmin_layer", "belief_lam_max_layer_max",
+                "belief_cond_max_layer_max", "belief_eig_ratio_layer_min", "belief_eig_ratio_argmin_layer"):
+        out[f"val_{key}"] = float(vd.get(key, float("nan")))
     out.update({f"val_{key}": float(vd[key]) for key in _VAL_GEOMETRY_KEYS if key in vd})
     if "canonical_beta_tv" in vd:                               # diagnose_canonical_free_energy
         out.update(val_self_coupling=vd["self_coupling"], val_self_divergence=vd["self_divergence"],
@@ -5981,6 +6000,7 @@ def _train_loop(
                                              else None)})
             update_flag["fired"] = False
             router_head_tables: Optional[Mapping[str, Any]] = None
+            belief_layer_extremes: Optional[Mapping[str, Sequence[float]]] = None
             tokens_seen += int(tokens.numel())                   # input-token presentations (metadata only)
             tokens = tokens.to(device, non_blocking=True)
             targets = _transfer_targets(targets, model, device)
@@ -6024,15 +6044,19 @@ def _train_loop(
                     # prototype sums so a failed attempt is not counted.
                     if hasattr(model, "last_router_head_tables"):
                         model.last_router_head_tables = None
+                    if hasattr(model, "last_belief_layer_extremes"):
+                        model.last_belief_layer_extremes = None
                     d = _diagnostics_with_precision_retry(
                         model, tokens, before_attempt=(prototype_sums.clear if prototype_sums is not None else None))
                     router_head_tables = getattr(model, "last_router_head_tables", None)
+                    belief_layer_extremes = getattr(model, "last_belief_layer_extremes", None)
                 except Exception as exc:                         # optional probes cannot stop training
                     _record_diagnostic_failure(diagnostics_failures, "training_diagnostics", exc, logger)
                     d = {key: float("nan") for key in (diag_keys or _TRAIN_DIAGNOSTIC_FALLBACK_KEYS)}
                     diag_failed = True
                     train_features = None
                     router_head_tables = None
+                    belief_layer_extremes = None
                 finally:
                     for mlp in wrapped_templates:
                         del mlp.forward_moments                  # back to the class method
@@ -6549,7 +6573,8 @@ def _train_loop(
                         floor_reference = _covariance_floor_reference(model)
                     _warn_eigenvalue_collapse(d, dead_router_warned, logger,
                                               belief_layer=int(getattr(cfg, "n_layers", 1)) - 1,
-                                              floor_reference=floor_reference, sink=warning_sink)
+                                              floor_reference=floor_reference, sink=warning_sink,
+                                              layer_extremes=belief_layer_extremes)
                 if steps_per_epoch:
                     row.update(_training_cursor_fields(step + 1, steps_per_epoch))
                 else:
@@ -6596,6 +6621,10 @@ def _train_loop(
                             "belief_lam_min", "belief_lam_max", "belief_cond_valid_frac",
                             "belief_lam_min_argmin_position", "belief_lam_min_from_position_1",
                             "belief_cond_median_layer_max",
+                            # every layer beside the last-layer columns (audit 2026-10-20 item 14)
+                            "belief_lam_min_layer_min", "belief_lam_min_argmin_layer", "belief_lam_max_layer_max",
+                            "belief_cond_max_layer_max", "belief_eig_ratio_layer_min",
+                            "belief_eig_ratio_argmin_layer",
                             "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
                             "fisher_trace_mean", "fisher_trace_median",
                             "guard_sigma_floor_frac", "guard_sigma_ceil_frac",

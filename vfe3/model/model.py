@@ -2322,10 +2322,20 @@ class VFEModel(nn.Module):
         ``relational_raw_row_min_median_head_max`` is the largest per-head median of the raw row minimum, at
         ``relational_raw_row_min_median_argmax_{layer,head}``, and ``relational_capped_mass_mean_head_max`` the largest
         per-head mean routing mass on capped entries.
+
+        Every layer beside the last-layer headline columns (audit 2026-10-20 item 14): the layer maximum of the pooled
+        capped mass ``relational_capped_mass_mean_layer_max`` (with ``_argmax_layer``) and of the query-constant
+        median ``relational_score_term_query_constant_median_layer_max``; over the converged belief spectra the layer
+        minimum ``belief_lam_min_layer_min`` (with ``_argmin_layer``), the layer maxima ``belief_lam_max_layer_max``
+        and ``belief_cond_max_layer_max``, and the layer minimum of :math:`\lambda_{\min}/\lambda_{\max}` (each over
+        the layer's tokens) ``belief_eig_ratio_layer_min`` with ``_argmin_layer``. The per-layer
+        :math:`(\lambda_{\min}, \lambda_{\max})` are kept in ``last_belief_layer_extremes`` for the per-layer
+        eigenvalue-collapse alarm (``vfe3.train._warn_eigenvalue_collapse``).
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
         frac, nonfinite, condition, median, min_eigenvalue = [], [], [], [], []
+        capped_mass, query_constant, lam_min, lam_max, cond_max = [], [], [], [], []
         scale: List[Dict[str, float]] = []
         unit_distance: List[Optional[torch.Tensor]] = []
         heads: Dict[str, List[torch.Tensor]] = {}
@@ -2349,13 +2359,28 @@ class VFEModel(nn.Module):
             min_eigenvalue.append(extremes[0])
             condition.append(extremes[1])
             scale.append(self._covariance_scale_statistics(snapshot, layer_index, cap))
-            median.append(float(self._belief_spectrum(snapshot, layer_index)["condition"].median()))
+            spectrum = self._belief_spectrum(snapshot, layer_index)
+            median.append(float(spectrum["condition"].median()))
+            lam_min.append(float(spectrum["lam_min"].min()))
+            lam_max.append(float(spectrum["lam_max"].max()))
+            cond_max.append(float(spectrum["condition"].double().max()))
+            rows = support.sum(dim=-1) >= 2                                    # (B, H, N) scored rows
+            capped = support & rows.unsqueeze(-1) & (score >= cap_level)       # (B, H, N, N)
+            mass = (beta.double() * capped).sum(dim=-1)[rows]                  # (n_rows,) as in the headline column
+            capped_mass.append(float(mass.mean()) if mass.numel() else float("nan"))
+            medians = cap.get("score_term_medians_pre")                        # (4, H + 1) or absent
+            query_constant.append(float(medians[0, -1]) if medians is not None else float("nan"))
         frac.append(last["relational_score_klmax_frac"])
         nonfinite.append(last["relational_score_nonfinite_frac"])
         condition.append(last["relational_projected_cov_max_condition"])
         min_eigenvalue.append(last["relational_projected_cov_min_eigenvalue"])
         scale.append({key: last[key] for key in _COVARIANCE_SCALE_KEYS})
         median.append(last["belief_cond_median"])
+        capped_mass.append(last.get("relational_capped_mass_mean", float("nan")))
+        query_constant.append(last.get("relational_score_term_query_constant_median", float("nan")))
+        lam_min.append(last.get("belief_lam_min", float("nan")))
+        lam_max.append(last.get("belief_lam_max", float("nan")))
+        cond_max.append(last.get("belief_cond_max", float("nan")))
         top = max(range(n_layers), key=lambda layer: (frac[layer], -layer))
 
         def layer_extreme(values: List[float], largest: bool) -> Tuple[float, float]:
@@ -2376,6 +2401,20 @@ class VFEModel(nn.Module):
         extremes_out["relational_comparison_map_norm_spread_layer_max"] = layer_extreme(
             [row["relational_comparison_map_norm_spread"] for row in scale], largest=True)[0]
         extremes_out["relational_score_nonfinite_frac_layer_max"] = layer_extreme(nonfinite, largest=True)[0]
+        # Every layer beside the last-layer headline columns (audit 2026-10-20 item 14).
+        (extremes_out["relational_capped_mass_mean_layer_max"],
+         extremes_out["relational_capped_mass_mean_argmax_layer"]) = layer_extreme(capped_mass, largest=True)
+        extremes_out["relational_score_term_query_constant_median_layer_max"] = layer_extreme(
+            query_constant, largest=True)[0]
+        extremes_out["belief_lam_min_layer_min"], extremes_out["belief_lam_min_argmin_layer"] = layer_extreme(
+            lam_min, largest=False)
+        extremes_out["belief_lam_max_layer_max"] = layer_extreme(lam_max, largest=True)[0]
+        extremes_out["belief_cond_max_layer_max"] = layer_extreme(cond_max, largest=True)[0]
+        ratio = [low / high if math.isfinite(low) and math.isfinite(high) and high > 0 else float("nan")
+                 for low, high in zip(lam_min, lam_max)]
+        extremes_out["belief_eig_ratio_layer_min"], extremes_out["belief_eig_ratio_argmin_layer"] = layer_extreme(
+            ratio, largest=False)
+        self.last_belief_layer_extremes = {"lam_min": list(lam_min), "lam_max": list(lam_max)}
 
         def head_max(key: str) -> Tuple[float, float, float]:
             r"""Maximum over (layer, head) and the first (layer, head) attaining it; NaN if all NaN."""
