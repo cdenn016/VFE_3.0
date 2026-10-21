@@ -28,3 +28,20 @@ Each is a short K=128 run (5k steps, with the prototype diagnostic interval redu
 3. If (1) alone fixes it, consider a lower LR (or weight decay toward zero) for `log_pi` specifically, since it is the unrestored direction.
 
 Two instrumentation gaps surfaced here and were closed the same day (`docs/2026-10-09.md`): the calibration statistics (`working_variance`, `lambda0`) were not written to the run directory, and prototype diagnostics were only recorded at `eval_interval`, which missed the entire collapse. Runs now write `prototype_calibration.json` and `diagnostics/prototype_templates_train.csv` (every log step), so the short runs above only need `log_interval` set to 500 or less.
+
+## Follow-up: 2x2 of template init and block LR (5k steps)
+
+Four runs in `vfe3_runs/prototype-testing/`, identical to the 52.03 config except `block_mlp_template_init` and `m_block_mlp_lr` (and the shorter schedule with `log_interval=100`, `eval_interval=1000`). One seed each.
+
+| run | final val PPL | prior entropy at 5k (layers 0 to 3, nats; uniform is 6.93) | gain fraction at 5k |
+|---|---|---|---|
+| working_variance, 0.005 | 101.55 | 6.92, 6.92, 6.91, 6.66 | 0.14 to 0.22 |
+| working_variance, 0.05 | 102.04 | 0.0 in every layer by step 3000 | 0.04 to 0.10 |
+| absolute, 0.05 | 102.25 | 0.0 in every layer by step 3000 | 0.06 to 0.11 |
+| absolute, 0.005 | 103.79 | 4.50, 4.38, 4.37, 6.52 | 0.01 to 0.08 |
+
+The block LR is what causes the collapse: at 0.05 both inits drive the prior entropy to zero in every layer between steps 500 and 3000, and at 0.005 neither does. The init decides whether the block stays active at the lower LR. Under `absolute` at 0.005 the template variances grow from log lambda of about 2.4 to about 6 in layers 0 to 2, and the gain fraction falls to 1 to 2 percent, so the block switches itself off much as it did in 52.03. Under `working_variance` at 0.005 log lambda moves only from 3.3 to 3.4 (layer 0) and the gain fraction holds at 14 to 22 percent with hundreds of templates in use in layers 0 to 2.
+
+This corrects two statements above. The measured working variance at the block input is 2.7, 1.44, 0.84 and 0.53 for layers 0 to 3 (`prototype_calibration.json`), not about 5, so lambda_0 is 27, 15, 8.5 and 5.4. And `log_pi` is not the first thing to give way. At LR 0.05 the training-batch routing is already concentrated on one to three templates by step 100 to 300, while the prior entropy is still near 6.9. The prior collapses afterwards. The high LR on the whole block (nu and lambda as well as log_pi) concentrates the routing, and the prior follows it.
+
+The PPL ordering is not established. The spread is 2.2 PPL across single-seed 5k-step runs. The only measured noise floor is at K=30, about 0.9 PPL at two standard deviations for a single-seed difference, and none has been measured at K=128. The diagnostics separate the arms clearly. The perplexities do not yet.

@@ -264,7 +264,7 @@ CONFIG: Dict[str, Any] = {
 
     # Optional absolute stopping step, capped at max_steps; None runs the full horizon.
     # Example: max_steps=15000, stop_after_steps=5000 keeps the 15000-step cosine.
-    "stop_after_steps": 10000,    
+    "stop_after_steps": None,    
 
     "seed":        6,
 
@@ -295,14 +295,14 @@ CONFIG: Dict[str, Any] = {
 # Instability shows within a few hundred steps here, so a short max_steps screens well. The defaults keep the head
 # block d = K / n_heads = 10 of the K=20 operating point fixed.
 LR_WIDTH_TRANSFER: Dict[str, Any] = {
-    "enabled":     False,                                  # True | False
-    "widths":      [(20, 2), (40, 4), (80, 8)],             # (embed_dim, n_heads) pairs; n_heads must divide embed_dim
-    "lr_fields":   ["m_block_mlp_lr", "m_relational_score_lr", "m_relational_content_lr", "m_phi_lr",
-                    "m_table_fisher_lr", "m_decode_mu_lr", "m_decode_sigma_lr"],
+    "enabled":     False,                                   # True | False
+    "widths":      [(128, 4), (96, 3), (64, 2)],             # (embed_dim, n_heads) pairs; n_heads must divide embed_dim
+    "lr_fields":   ["m_block_mlp_lr", "m_relational_score_lr",  "m_phi_lr",
+                     "m_decode_mu_lr", "m_decode_sigma_lr"],
                    # any M-step *_lr field active in BASELINE_CONFIG (m_p_mu_lr / m_p_sigma_lr only under
                    # m_table_update_mode="adamw"; an inert rate is refused at startup)
-    "multipliers": [0.25, 0.5, 1.0, 2.0, 4.0],              # applied to each rate's BASELINE_CONFIG value
-    "max_steps":   1000,                                    # replaces CONFIG["max_steps"] for this sweep
+    "multipliers": [0.5, 1.0, 2.0, 4.0],              # applied to each rate's BASELINE_CONFIG value
+    "max_steps":   1500,                                    # replaces CONFIG["max_steps"] for this sweep
 }
 
 
@@ -325,71 +325,87 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     vocab_size                       = 50257,   # (gpt2 50257 / cl100k 100277 / word 267735)
                                                                   
-    embed_dim                        = 20,                  # K, total belief dim (must be divisible by n_heads)
+    embed_dim                        = 64,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                          = 2,                   # = number of irrep blocks (alibi priors require this)
 
     max_seq_len                      = 128,                 # N, context length
     eval_stride                      = 32,
 
-    batch_size                       = 64,
-    max_steps                        = 15000,
+    batch_size                       = 32,
+    max_steps                        = 30000,
 
-    n_layers                         = 2,                   # L, number of blocks
+    n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
 
     #################################
     #         Misc/Logging
     #################################
 
-    log_interval                     = 100000,       # console log every N steps (0 = off)
-    eval_interval                    = 5000,      # periodic validation every N steps (0 = off)
+    log_interval                     = 375001,       # console log every N steps (0 = off)
+    eval_interval                    = 300000,      # periodic validation every N steps (0 = off)
     checkpoint_interval              = 150000,     # save a resumable checkpoint every N steps (0 = off)   
     
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
-    encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
-    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
-        
+    
+    family                           = "gaussian_diagonal",     # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
+    decode_mode                      = 'diagonal_chunked',       # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
+    prior_covariance_table           = "diagonal",               # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
+    decode_covariance                = "belief",                 # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
+    
+    content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1        
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-    predictive_covariance            = 'moment_matched',  # "passthrough" | "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) | "spread_corrected" (minimal_agent mean_field: plus the label spread)
-    content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
-        
-    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_query: projected_predictive only; noisy_key: kernel readout, temperature 1)
-    relational_receiver_measurement  = "inverse",             # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
-    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
+    predictive_covariance            = 'moment_matched',        # "passthrough" 
+                                                                # "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) 
+                                                                 # "spread_corrected" (minimal_agent mean_field: plus the label spread)
+            
+    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: kernel readout, temperature 1)
+    relational_receiver_measurement  = "inverse",    # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
+    relational_receiver_update       = "closed_form",           # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step-projected_gradient only)
        
-    predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
-    minimal_agent_inference          = "mean_field",         # "exact" | "mean_field" (minimal_agent only)
+    predictive_readout               = "kernel",         # "kernel" | "minimal_agent" (projected_predictive only)
+    minimal_agent_inference          = "mean_field",            # "exact" | "mean_field" (minimal_agent only)
+    minimal_agent_cavi_steps         = 1,                       # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
    
     block_coordinates                = "local",       # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
     decode_coordinates               = "local",       # "local" | "reference" (reference: decode_mode "linear" | "diagonal_chunked" | "full_chunked")
-              
+             
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
+    relational_key_noise             = 1,         # relational_routing="noisy_key" only: initial per-head key noise n_h > 0 (learned; routes at temperature 1)
     predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
+     
+    predictive_covariance_ceiling    = None,        # None (off) | c > floor, e.g. 100: Loewner ceiling Sigma^+ <= c * Sigma_p (a clamp; counted in metrics.csv)
+     
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
     relational_receiver_noise        = 1.0,         # channel floor nu I_d, nu > 0 (projected_gradient only)
      
+    tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
+    decode_second_order              = False,         # linear decode, diagonal family, local coords: train on CE(mu) + 1/2 tr(Sigma Cov_p(w)); pushes Sigma to its floor, ablation arm first
+    
+    attention_residual               = False,      #ignored with minimal_agent
     #################################
     #     Optional Block MLP        #
     #################################
     
     use_block_mlp                    = True,
-    per_type_hidden_bias             = False,       # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
+    per_type_hidden_bias             = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
+     
+    block_mlp_activation             = "gelu",         # "gelu" | "silu" | "relu" (not read by gaussian_template / prototype_agents)   
+    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
+    block_mlp_covariance             = "passthrough",   # "passthrough" | "posterior" (prototype_agents) | "delta_full" (block norm "none"/"layernorm", no post-norm)  | gaussian_template: "passthrough" only
     
-    block_mlp_activation             = "gelu",  # "gelu" | "silu" | "relu" (not read by gaussian_template / prototype_agents)
-    
-    block_mlp_mode                   = "prototype_agents",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
-    block_mlp_covariance             = "passthrough",  # "passthrough" | "delta_full" (coordinate, canonical_frame, gauge_gate) | "posterior" (prototype_agents); gaussian_template: "passthrough" only
-    
+      
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
+    block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
+    block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
+    block_mlp_em_weight              = 0.0,            # prototype_agents only: EM M-step term on the templates (nu, lambda, pi); 0 = off
     
-    block_mlp_expansion              = 8,    #K*block_mlp_expansion = number of templates
-    
-    block_mlp_template_init_variance = 10.0,    # initial template variance lambda_0 > 0
+    block_mlp_expansion              = 8,              #K*block_mlp_expansion = number of templates
+    block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 
+    block_mlp_template_init_pull     = 0.09,            # working_variance only: initial pull p in (0, 1)
     block_mlp_dropout                = 0.00,
-    block_mlp_covariance_floor       = 1e-4,          # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
+    block_mlp_covariance_floor       = 1e-4,            # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
     
   
     #################################
@@ -399,31 +415,24 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
+    block_norm_covariance            = "pushforward",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal)
 
     #################################
     #        Initialization
     #################################
        
-    mu_init_std                      = 0.065,     # std of the random mean table mu_embed
-    sigma_init                       = 15,         # constant initial coordinate variance (sigma_log = log of this)
+    mu_init_std                      = 0.03,     # std of the random mean table mu_embed
+    sigma_init                       = 5,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                        = 0.035,      # std
     pos_phi_scale                    = 0.02,      # learned-table init scale AND frozen per-position step
-    sigma_max                        = 100.0,
-
-    decode_tau                       = 1,       #tau =1 principled bayes
+    
+    decode_tau                       = 0.1,       # tau =1 principled bayes 0.01 works well for some reason
     unigram_kappa                    = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
     decode_chunk_size                = 8192,
-        
-    pos_phi_project_slk              = False,      # per-block trace projection (det Omega = 1)    
-    attention_residual               = False,        #ignored with minimal_agent
-    
+   
     decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
       
-    deterministic                    = True,
-    generate_embedding_figures       = False,
-    
-
     #################################
     #          Gauge Group
     #################################
@@ -440,16 +449,17 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #     gauge-RoPE (rope_mode)
     ####################################
 
-    pos_phi                          = "learned",           # "none" | "learned" | "frozen"
-    rope_mode                        = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
-         
-
+    pos_phi                          = "none",     # "none" | "learned" | "frozen"
+    rope_mode                        = "comparison_invariant",  # "none" | "frame" | "frame_value" 
+                                                                #"comparison" | "comparison_invariant" (rotation-invariant comparison)
+    rope_base                        = 100,
+    rope_fraction                    = 1,       # p-RoPE: fraction of each head's pairs rotated (fastest first); 1.0 = RoPE
     ######################################
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
     
-    lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode                = "state_dependent",  # "state_dependent" | "state_dependent_per_coord" (not gauge covariant)
   
     ########################################
     #     Attention Belief/Model Settings
@@ -457,8 +467,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ########################################
     lambda_beta                      = 1.0,        # belief-coupling block weight (1.0 = pure F)
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
+    learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
+    beta_attention_prior             = 'causal_alibi',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
     
     #################################
     #         Belief E-step
@@ -476,16 +487,20 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     m_phi_update_mode                = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
     m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
-        
+    
     m_phi_group_trust_radius         = 0.1,
-    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
+    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on every rotation (also damps Fisher-visible ones)
+
+    m_table_update_mode              = "fisher",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
+    m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
+    m_table_fisher_trust_radius      = 0.5,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step to second order; decay outside)
 
     #################################
     #    Embedding/Priors M-step
     #        Learning Rates
     #################################
 
-    m_p_mu_lr                        = 0.005,     #0.005
+    m_p_mu_lr                        = 0.025,     #0.025
     m_p_sigma_lr                     = 0.001,       
     m_phi_lr                         = 0.003,     #0.003
     
@@ -494,10 +509,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #      Other M-Step LR's
     #################################
       
-    m_pos_phi_lr                     = 0.003,      #0.001?
+    m_pos_phi_lr                     = 0.003,      #0.0025?
      
     m_decode_mu_lr                   = 0.005,       # 0.025?
-    m_decode_sigma_lr                = 0.001,       # 0.001
+    m_decode_sigma_lr                = 0.003,       # 0.001
       
     m_relational_score_lr            = 0.01,        # 0.005 0.01
     m_relational_content_lr          = 0.0025,      # 0.005   0.0025
@@ -515,22 +530,42 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     sigma_weight_decay               = 0,      
     mu_weight_decay                  = 0,       
 
+    decode_mu_weight_decay           = 0,   # decode-side means only (untied decode bank / linear readout); None = mu_weight_decay; try ~1e-3 to bound rare-type rows
+
     #################################
     #   Numerics/Speed
     #################################
-  
-    kl_max                           = None,          # None (8 * embed_dim, per cell) | nats: the safety clamp on every divergence
-    amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
-    fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
-        
-    decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
-    projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
-   
-    frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
-    predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
-        
-   
+     
+    grad_clip_scope                  = "group",      # "role" | "group" (one L2 clip per optimizer role, or per optimizer group)
+    amp_dtype                        = None,     # None (fp32) | "bf16" | "fp16".
+    fp32_matmul_precision            = "high",  # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     
+    decode_ce_checkpoint             = "auto",    # "auto" | "auto_aggregate" (saves memory with recompute)    
+    decode_logits_amp                = True,      # True | False: linear decode with amp_dtype set only: logits matmul under amp_dtype (CE stays fp32)
+    decode_ce_triton                 = True,      # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)
+    
+    decode_av_precision              = "fp32",
+    
+    projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" 
+    
+    routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
+    
+    pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128) 
+    phi_frame_condition_max          = None,      # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc)
+    frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
+    decode_ranking_fp64_escalation   = False, 
+    
+   
+    diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
+    diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
+   
+    deterministic                    = False,
+    generate_embedding_figures       = False,
+    
+    predictive_covariance_checkpoint      = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
+    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo a non-PD fp32 update in fp64 (counted in source_recovery_elements)
+    
+   
 )
 
 
@@ -553,92 +588,78 @@ SWEEP_ORDER: List[str] = [
 
    
    
-  # "block_mlp_expansion",
+   
+ # "m_phi_lr",     
+   "m_table_fisher_lr",
+    "m_decode_sigma_lr", 
+    "m_decode_mu_lr",
+   #"relational_key_noise",
+   #"m_table_fisher_trust_radius", 
+   
+   
+    
+   "m_relational_score_lr", 
+   "m_relational_content_lr",
+    
+   
+    "m_block_mlp_lr",
+   
+    "weight_decay",  
+   "phi_weight_decay",
+  #  "mu_weight_decay",
+  # "sigma_weight_decay",
+   #"decode_mu_weight_decay", 
+    
+  
+    "decode_tau",
+   "m_layernorm_lr",
+    
+   "m_p_mu_lr",  
+    "m_p_sigma_lr",
+    
+  "block_mlp_expansion",
+   
    
   
-   
-   "m_p_mu_lr",  
-   
-   "m_phi_lr",   
-   "m_p_sigma_lr",
-   # "m_table_fisher_lr",
-    
- 
-    "m_decode_mu_lr",
-    "m_decode_sigma_lr",
- 
-    # "m_block_mlp_lr",
-    # "m_layernorm_lr",
-   "m_pos_phi_lr",
+  
    
    
+   #"unigram_kappa", 
+   
+   "phi_scale",   
+     "mu_init_std",
+    "sigma_init",
+  
    # "m_relational_lr_tied",
    
-   #"m_relational_score_lr", 
-   #"m_relational_content_lr",
+  
    
    
-   
-   
-    "sigma_init",
-   # "rope_base", 
-    
-     # "unigram_kappa",
-    # "decode_tau",
-      #  
      
-
-    #   "phi_scale",   
-    # "mu_init_std",
-   # "pos_phi_scale",
   
-    "weight_decay",  
-    "phi_weight_decay",
-  
- #"relational_receiver_damping",
-   
-   
     
-   # "mu_weight_decay",
-   #"sigma_weight_decay",
-
+   # "predictive_covariance_floor",
+#"m_pos_phi_lr",
   
- # "mstep_self_coupling_weight",
-  
-   
-  # "block_mlp_dropout",
- 
-   
-   
- 
-  # "lambda_beta",
-   
-  
-   
-  # "rope_fraction",
-  # "block_mlp_cavi_steps",
   # "block_mlp_em_weight",
-  # "block_mlp_template_init_variance",
-  # "block_mlp_template_init_pull",
-  # "block_mlp_covariance_floor",
-  # "minimal_agent_channel_noise",
-  # "minimal_agent_cavi_steps",
+   #"block_mlp_cavi_steps",
+   # "minimal_agent_cavi_steps",
+   #"block_mlp_template_init_variance",
+   #"block_mlp_template_init_pull",
+ #  "block_mlp_covariance_floor",
+  #"minimal_agent_channel_noise",
   # "relational_key_noise",
-  # "predictive_covariance_floor",
+  # 
   # "relational_receiver_noise",
+  # "relational_receiver_damping",
+   
+  
 ]
 
 
 SWEEPS: Dict[str, Dict[str, Any]] = {
 
-    "relational_receiver_damping": {
-        "description": "relational_receiver_damping for gradient",
-        "param": "relational_receiver_damping",
-        "values": [0.001, 0.1, 0.25, 0.5, 0.75, 1],
-        "scale": "linear",
-       "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "closed_form",
-                    "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
-    },
+    
 
     
 
@@ -647,7 +668,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
         "param": "m_p_mu_lr", 
-        "values": [0.0025, 0.005, 0.0075, 0.01],
+        "values": [0.005, 0.01, 0.025, 0.05],
         "scale": "linear",
         "requires": {"m_table_update_mode": "adamw"},   # under "fisher" the table steps at m_table_fisher_lr
     },
@@ -655,7 +676,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
         "param": "m_phi_lr",
-        "values": [0.0025, 0.005, 0.0075, 0.01],
+        "values": [0.002, 0.003, 0.004],
         "scale": "linear",
     },
 
@@ -663,7 +684,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    "m_p_sigma_lr": {
        "description": "M-step LR for the prior-bank variances",
        "param": "m_p_sigma_lr", 
-       "values": [0.001, 0.0025, 0.005, 0.0075],
+       "values": [0.0005, 0.001, 0.005, 0.01],
        "scale": "linear",
        "requires": {"m_table_update_mode": "adamw"},   # under "fisher" the table steps at m_table_fisher_lr
    },
@@ -671,15 +692,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    "m_table_fisher_lr": {
        "description": "natural-gradient step size eta of the prior-bank tables (m_table_update_mode='fisher')",
        "param": "m_table_fisher_lr",
-       "values": [0.025, 0.05, 0.1, 0.2, 0.4],
+       "values": [0.05, 0.1, 0.3,  0.5],
        "scale": "log",
        "requires": {"m_table_update_mode": "fisher"},
    },
    
    
-   
-   
-   
+  
 
    "m_decode_mu_lr": {
        "description": "M-step LR for untied decoder means or linear projection",
@@ -691,10 +710,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    "m_decode_sigma_lr": {
        "description": "M-step LR for untied decoder log variances",
        "param": "m_decode_sigma_lr",
-       "values": [0.001, 0.0025, 0.005, 0.0075],
+       "values": [0.0005, 0.001, 0.002, 0.003, 0.004],
        "scale": "linear",
-       # live only with an untied prior-bank decoder; the family and decode mode must agree in rank
-       "requires": {"family": "gaussian_full", "decode_mode": "full_chunked", "untie_decode_bank": True},
+       
    },
 
    
@@ -703,7 +721,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "M-step LR for the learned POSITIONAL frame table (the 0.0015 arm is the "
                        "inherited m_phi_lr baseline)",
         "param": "m_pos_phi_lr",
-        "values": [0.001, 0.0025, 0.003, 0.004, 0.005],
+        "values": [0.001, 0.0025, 0.0035, 0.005],
         "scale": "linear",
         "requires": {"pos_phi": "learned"},
     },
@@ -712,7 +730,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "M-step LR for the LayerNorm affine gamma/beta (the 0.009 arm is the "
                        "inherited m_p_mu_lr baseline)",
         "param": "m_layernorm_lr",
-        "values": [0.001, 0.0025, 0.005, 0.0075, 0.01],
+        "values": [0, 0.0025, 0.005, 0.0075, 0.01],
         "scale": "linear",
         "requires": {"layernorm_affine": True, "norm_type_block": "layernorm"},
     },
@@ -721,7 +739,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    "m_block_mlp_lr": {
        "description": "M-step LR for the block MLP parameters",
        "param": "m_block_mlp_lr",
-       "values": [0.001, 0.0025, 0.005, 0.0075, 0.01],  
+       "values": [0.0025, 0.005, 0.0075, 0.01, 0.025, 0.05],  
        "scale": "log",
        "requires": {"use_block_mlp": True},
    },
@@ -738,7 +756,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "m_relational_score_lr": {
         "description": "M-step LR for independent relational Q/K score maps (0 freezes)",
         "param": "m_relational_score_lr",
-        "values": [0.0025, 0.005, 0.0075, 0.01, 0.02],
+        "values": [0.005, 0.0075, 0.01, 0.02],
         "scale": "linear",
         "requires": {
             "attention_mode": "projected_predictive",
@@ -748,12 +766,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "m_relational_content_lr": {
         "description": "M-step LR for learned relational T/O content maps (0 freezes)",
         "param": "m_relational_content_lr",
-        "values": [0.001, 0.0025, 0.0035, 0.005, 0.01],
+        "values": [0.00075, 0.001,0.0025, 0.005],
         "scale": "linear",
         "requires": {
             "attention_mode": "projected_predictive",
         },
     },
+
 
     "m_relational_lr_tied": {
         "description": "Q/K score-map and T/O content-map M-step LRs swept together at equal values",
@@ -768,6 +787,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
     
     
+    "m_table_fisher_trust_radius": {
+        "description": "m_table_fisher_trust_radius",
+        "param": "m_table_fisher_trust_radius",
+        "values": [0.05, 0.1, 0.25, 0.5, 0.75, 1],
+        "scale": "linear",
+        
+        },
     
 
 
@@ -784,34 +810,39 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "weight_decay": {
         "description": "AdamW weight decay",
         "param": "weight_decay", 
-        "values": [0.001, 0.005, 0.01, 0.025, 0.05],  
-        "scale": "log",
+        "values": [0, 0.001, 0.005, 0.01, 0.025],  
+        "scale": "linear",
     },
 
     "phi_weight_decay":{
         "description": "weight decay on phi",
         "param": "phi_weight_decay",  
-        "values": [0.005, 0.01, 0.05, 0.1, 0.2, 0.5],  
-        "scale": "log",
+        "values": [0, 0.005, 0.01, 0.05, 0.1, 0.2],  
+        "scale": "linear",
         },
 
 
     "mu_weight_decay": {
         "description": "AdamW weight decay",
         "param": "mu_weight_decay",  
-        "log_range": [0.001, 0.1, 5],  
-        "scale": "log",
+        "values": [0, 0.001, 0.005, 0.01, 0.025],  
+        "scale": "linear",
     }, 
     
     
     "sigma_weight_decay": {  
         "description": "AdamW weight decay on the log-variance (sigma) tables",
         "param": "sigma_weight_decay",  
-        "log_range": [0.001, 0.1, 5],  
-        "scale": "log",
+        "values": [0, 0.001, 0.005, 0.01, 0.025],  
+        "scale": "linear",
     },
     
-    
+    "decode_mu_weight_decay": {  
+        "description": "AdamW weight decay on the decoder",
+        "param": "decode_mu_weight_decay",  
+        "values": [0, 0.001, 0.005, 0.01],  
+        "scale": "linear",
+    },
     
     
     
@@ -824,20 +855,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
         "param": "mu_init_std", 
-        "values": [0.025, 0.04, 0.065, 0.09],
+        "log_range": [0.001, 1, 10],
         "scale": "log",
     },
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
         "param": "sigma_init", 
-        "values": [0.5, 1, 5, 10, 15],
+        "values": [0.25, 0.75, 1, 5, 10, 15],
     },
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
         "param": "phi_scale", 
-        "values": [0.01, 0.02, 0.035, 0.05],
+        "log_range": [0.001, 1, 10],
         "scale": "log",
     },
     
@@ -856,14 +887,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "rope_base", 
         "values": [25, 75, 100, 150, 250, 1000],
         "scale": "log",
-        "requires": {"rope_mode": "frame_value"},             # the minimal-agent baseline refuses "frame"
+        "requires": {"rope_mode": "comparison"},
     },    
 
     "rope_fraction": {
         "description": "p-RoPE fraction of each head's planes rotated (fastest first); under comparison_invariant "
                        "the unrotated coordinates keep their full comparison covariance",
         "param": "rope_fraction",
-        "values": [0.2, 0.4, 0.6, 0.8, 1.0],
+        "values": [0.4, 0.6, 0.8, 1.0],
         "requires": {"rope_mode": "comparison_invariant", "predictive_readout": "kernel"},
     },
 
@@ -921,9 +952,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.0025, 0.01, 0.05, 0.1, 0.25, 1],
+        "param": "decode_tau", "values": [0.01, 0.05, 0.25, 0.5, 1],
         "scale": "log",
-        "requires": {"family": "gaussian_full", "decode_mode": "full_chunked"},      # read only by the prior-bank KL decode
+        
     },
     
 
@@ -963,8 +994,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    
    
-   
-   
+  
    
    
    
@@ -988,6 +1018,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
   
 
     
+   
+   
+   
+   
     
 
     "content_link_chart": {
@@ -1039,8 +1073,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             },
         ],
     },
+    
+    
+    
+    
+    
+    
+    
 
-   
     "block_mlp_cavi_steps": {
         "description": "prototype_agents mean-field coordinate-ascent sweeps (1 = labels at the input moments)",
         "param": "block_mlp_cavi_steps",
@@ -1082,6 +1122,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"use_block_mlp": True, "block_mlp_mode": "coordinate",
                      "block_mlp_covariance": "delta_full"},
     },
+    
+    
+    
+    
+    
+    
 
     "minimal_agent_channel_noise": {
         "description": "minimal agent initial channel noise n_h (learned)",
@@ -1100,22 +1146,34 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
                      "minimal_agent_inference": "mean_field", "rope_mode": "comparison"},
     },
 
+
+
+
+
+
+
+
+    "predictive_covariance_floor": {
+            "description": "predictive covariance floor: floor * Sigma_p (moment_matched)",
+            "param": "predictive_covariance_floor",
+            "values": [1e-6, 1e-5, 1e-4, 1e-3],
+            "scale": "log",
+            "requires": {"attention_mode": "projected_predictive", "predictive_covariance": "moment_matched"},
+        },
+
+
+
+
     "relational_key_noise": {
         "description": "noisy_key routing: initial per-head key noise n_h (learned; temperature 1)",
         "param": "relational_key_noise",
-        "values": [0.1, 0.3, 1.0, 3.0, 10.0],
+        "values": [0.5, 1.0, 3.0, 10.0],
         "scale": "log",
         "requires": {"attention_mode": "projected_predictive", "predictive_readout": "kernel",
                      "relational_routing": "noisy_key", "learn_attention_temperature": False},
     },
 
-    "predictive_covariance_floor": {
-        "description": "predictive covariance floor: floor * Sigma_p (moment_matched)",
-        "param": "predictive_covariance_floor",
-        "values": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2],
-        "scale": "log",
-        "requires": {"attention_mode": "projected_predictive", "predictive_covariance": "moment_matched"},
-    },
+    
 
     "relational_receiver_noise": {
         "description": "projected_gradient receiver channel floor nu I_d",
@@ -1127,6 +1185,16 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "lambda_alpha_mode": "state_dependent",
                      "rope_mode": "frame"},
     },
+    
+    "relational_receiver_damping": {
+        "description": "relational_receiver_damping for gradient",
+        "param": "relational_receiver_damping",
+        "values": [0.001, 0.1, 0.25, 0.5, 0.75, 1],
+        "scale": "linear",
+        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "closed_form",
+                     "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
+    },
+    
 
 }
 
@@ -5092,12 +5160,14 @@ _LR_WIDTH_TRANSFER_LABEL = re.compile(r"^K=(\d+),H=(\d+),([A-Za-z0-9_]+)=x([0-9.
 def fit_lr_width_transfer(
     rows:     Sequence[Mapping[str, Any]],   # sweep_results.csv rows of the lr_width_transfer sweep
     baseline: Mapping[str, Any],             # BASELINE_CONFIG (the rates the multipliers scale)
+    requested: Sequence[str] = (),           # labels of every requested cell; one without a row counts as diverged
 ) -> Dict[str, Any]:
     r"""Per rate and width, the best multiplier by final validation PPL; per rate, the fit
     :math:`\log \eta^*(K) = a + b \log K` over the widths whose best multiplier is interior.
 
-    A cell with an error or a non-finite PPL counts as diverged; a finite cell whose run rejected optimizer
-    updates is listed under ``skipped_update_multipliers``. Seeds of one cell are averaged. ``b`` is the width
+    A cell with an error or a non-finite PPL counts as diverged, and so does a ``requested`` cell with no row (a cell
+    whose run failed before it wrote one, which leaves the sweep incomplete); a finite cell whose run rejected
+    optimizer updates is listed under ``skipped_update_multipliers``. Seeds of one cell are averaged. ``b`` is the width
     exponent (``eta* ~ K^b``) and ``eta_at`` extrapolates it; a rate with fewer than two interior widths gets no fit.
     """
     cells: Dict[Tuple[str, int, int, float], List[float]] = {}
@@ -5114,6 +5184,10 @@ def fit_lr_width_transfer(
         cells.setdefault((field, embed_dim, n_heads, multiplier), []).append(float("inf") if failed else ppl)
         if _skipped_updates(row):
             skipped_cells.add((field, embed_dim, n_heads, multiplier))
+    for label in requested:
+        match = _LR_WIDTH_TRANSFER_LABEL.match(str(label))
+        if match is not None:
+            cells.setdefault((match[3], int(match[1]), int(match[2]), float(match[4])), [float("inf")])
     fields: Dict[str, Any] = {}
     for field in sorted({key[0] for key in cells}):
         widths = sorted({(key[1], key[2]) for key in cells if key[0] == field})
@@ -5153,7 +5227,8 @@ def fit_lr_width_transfer(
 
 def analyze_lr_width_transfer(sweep_dir: Path) -> Dict[str, Any]:
     r"""Write ``lr_width_transfer_fit.json`` for the sweep in ``sweep_dir`` and print the per-rate exponents."""
-    report = fit_lr_width_transfer(_read_sweep_csv(sweep_dir), BASELINE_CONFIG)
+    requested = [arm["label"] for arm in SWEEPS[_LR_WIDTH_TRANSFER_SWEEP]["configs"]]
+    report = fit_lr_width_transfer(_read_sweep_csv(sweep_dir), BASELINE_CONFIG, requested)
     (sweep_dir / "lr_width_transfer_fit.json").write_text(json.dumps(report, indent=2, sort_keys=True),
                                                          encoding="utf-8")
     print(f"\n{'=' * 70}\nLR WIDTH TRANSFER: {sweep_dir.name}\n{'=' * 70}")
@@ -6079,6 +6154,9 @@ def main() -> int:
             logger.error(
                 "sweep %s is incomplete; later requested sweeps will still run", name)
             incomplete_sweeps.append(name)
+            if name == _LR_WIDTH_TRANSFER_SWEEP and (sweep_dir / "sweep_results.csv").exists():
+                # A diverged cell is the transfer fit's data: fit what finished, failed cells counted as diverged.
+                analyze_lr_width_transfer(sweep_dir)
             continue
         try:
             sweep_cohort = _cross_sweep_cohort_identity(meta["aggregation_contract"])

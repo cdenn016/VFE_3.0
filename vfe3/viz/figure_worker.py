@@ -442,6 +442,9 @@ def main() -> int:
     if not isinstance(request, Mapping):
         raise ValueError("figure request must be a JSON object")
 
+    # PDF font subsetting emits per-glyph INFO chatter; keep library warnings visible.
+    logging.getLogger("fontTools.subset").setLevel(logging.WARNING)
+
     mode = request.get("mode", "finalize")
     if mode == "finalize":
         (

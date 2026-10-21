@@ -2039,13 +2039,13 @@ def _warn_dead_router(
                 message = (
                     " router layer %s head %s: mean self weight beta_ii %.3f (> %.2f) under %s; the softmax saturates "
                     "on the self pair, so the head routes near one-hot to self and its off-self keys get a vanishing "
-                    "router gradient (self-map identity distance rho(T O' - I) = %s)"
+                    "router gradient (self-map identity distance rho(T O' - I) = %s) \n\n"
                     % (*where, head_value, threshold, clamp, "n/a" if distance is None else f"{distance:.3g}"))
             elif kind == "clamped":
                 message = (
                     " router layer %s head %s: %.3f of its scored rows are fully clamped at kl_max (> %.2f); those rows "
                     "route by the attention prior alone with zero router gradient "
-                    "(consider routing_kl_max_reference='row_min')" % (*where, head_value, threshold))
+                    "(consider routing_kl_max_reference='row_min') \n\n" % (*where, head_value, threshold))
             else:
                 message = (
                     " router layer %s head %s: %.3f of its admissible costs are capped at kl_max%s (> %.2f) under %s; "
@@ -6442,7 +6442,7 @@ def _train_loop(
                                 "severity": divergence.event_severity,
                                 "spiking_roles": list(divergence.spike_roles), "loss": step_loss}
                 if reported:
-                    logger.warning("step %d: divergence spike: %s", step + 1, spike)
+                    logger.warning("step %d: divergence spike: %s \n\n", step + 1, spike)
                 if step_status["did_step"]:                      # a rejected update dropped its gradients
                     try:
                         report = _spike_attribution(
@@ -6459,7 +6459,7 @@ def _train_loop(
                                 report["forward_state"] = {"error": f"{type(exc).__name__}: {exc}"}
                         if reported:
                             spike_groups = report["group_norms"]
-                            logger.warning("step %d: spike attribution: %s", step + 1, _spike_summary(report))
+                            logger.warning("step %d: spike attribution: %s \n\n", step + 1, _spike_summary(report))
                         if artifacts is not None:
                             _append_spike_record(artifacts.run_dir, {**event_record, **report})
                     except Exception as exc:
