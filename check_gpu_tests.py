@@ -20,10 +20,10 @@ import sys
 import torch
 
 from check_junit import junit_is_exact_all_pass, run_pytest_junit
-from tests.pytest_policy import CUDA_MIRROR_TESTS, CUDA_TESTS
+from tests.pytest_policy import required_cuda_node_keys
 
 
-REQUIRED_CUDA_TEST_KEYS = CUDA_TESTS | CUDA_MIRROR_TESTS
+REQUIRED_CUDA_TEST_KEYS = required_cuda_node_keys()
 
 
 def main() -> int:
