@@ -1995,7 +1995,10 @@ class RunArtifacts:
         r"""Append long-format rows to ``run_dir/diagnostics/<name>`` (header written once).
 
         NaN cells are written blank, as in ``metrics.csv``. A header that differs from
-        ``fieldnames`` raises rather than mixing two schemas in one file.
+        ``fieldnames`` raises rather than mixing two schemas in one file, except that a file whose
+        header is ``fieldnames`` with trailing columns missing (one written before those columns were
+        added, as ``block_variance.csv`` before its upper quantiles) is first rewritten atomically to
+        the full header with the missing cells blank, so a resumed run keeps one schema per file.
         """
         if not name or "/" in name or "\\" in name or Path(name).name != name:
             raise ValueError(f"diagnostic file name must be a bare filename, got {name!r}")
@@ -2006,6 +2009,16 @@ class RunArtifacts:
         if path.is_file() and path.stat().st_size > 0:
             with path.open("r", newline="", encoding="utf-8") as handle:
                 header = next(csv.reader(handle), None)
+            if header is not None and header != fields and header == fields[:len(header)]:
+                with path.open("r", newline="", encoding="utf-8") as handle:
+                    existing = list(csv.DictReader(handle))
+                with _unique_sibling_temp(path) as tmp:
+                    with open(tmp, "w", newline="", encoding="utf-8") as handle:
+                        migrated = csv.DictWriter(handle, fieldnames=fields, restval="")
+                        migrated.writeheader()
+                        migrated.writerows(existing)
+                    _atomic_replace(path, tmp)
+                header = fields
             if header != fields:
                 raise ValueError(f"{path} has header {header}, expected {fields}")
             write_header = False

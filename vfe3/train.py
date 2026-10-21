@@ -15,6 +15,7 @@ unrolls its ``n_e_steps`` receiver updates into the graph. Click-to-run: edit a 
 
 import collections
 import contextlib
+import itertools
 import json
 import logging
 import math
@@ -1840,10 +1841,13 @@ CAP_CLAMPED_ROW_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "clamped_row
 # var_min / var_max are taken before any subsampling; scale_* are quantiles of the centered LayerNorm scale
 # s_i = ||Pi mu_i|| / sqrt(K) (Pi = I - 1 1^T / K, no epsilon) and trace_ratio_* of r_i = tr(Pi Sigma_i Pi) / (K s_i^2),
 # the ratio that decides whether the delta-method pushforward of the norm is in its regime (r << 1).
+# Audit 2026-10-20 (spike report section 7): var_q99 and var_q999 give the upper tail between the median and the
+# maximum, so the share of entries with an exploded variance can be read off; they are appended last, and an older
+# file is migrated to the wider header on the next append (RunArtifacts.append_diagnostic_rows).
 BLOCK_VARIANCE_FIELDS: Tuple[str, ...] = (
     "step", "layer", "stage", "var_min", "var_q001", "var_q01", "var_median", "var_max", "mean_rms_median",
     "n_entries", "n_nonfinite", "scale_q01", "scale_median", "scale_q99",
-    "trace_ratio_median", "trace_ratio_q99", "trace_ratio_max")
+    "trace_ratio_median", "trace_ratio_q99", "trace_ratio_max", "var_q99", "var_q999")
 _BLOCK_VARIANCE_STAGES: Tuple[Tuple[str, str], ...] = (
     ("pre_norm", "layer_converged"), ("post_norm", "layer_block_mlp_inputs"), ("block_out", "layer_outputs"))
 _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
@@ -3196,7 +3200,7 @@ def _block_variance_rows(
         variances = torch.cat(slot[0]).double()
         rms = torch.cat(slot[1]).double()
         finite = variances[torch.isfinite(variances)]
-        quantiles = _quantiles_of_finite(finite, (0.001, 0.01, 0.5))
+        quantiles = _quantiles_of_finite(finite, (0.001, 0.01, 0.5, 0.99, 0.999))
         scale = torch.cat(slot[2]).double() if len(slot) > 2 and slot[2] else None
         ratio = torch.cat(slot[3]).double() if len(slot) > 3 and slot[3] else None
         scale_q = _quantiles_of_finite(scale, (0.01, 0.5, 0.99)) if scale is not None else [nan] * 3
@@ -3214,6 +3218,7 @@ def _block_variance_rows(
             "trace_ratio_median": ratio_q[0], "trace_ratio_q99": ratio_q[1],
             "trace_ratio_max": (float(finite_ratio.max()) if finite_ratio is not None and finite_ratio.numel()
                                 else nan),
+            "var_q99": quantiles[3], "var_q999": quantiles[4],
         })
     return rows
 
@@ -4403,6 +4408,7 @@ DIVERGENCE_ROLES: Tuple[str, ...] = ("mu", "sigma", "phi")
 # coefficients of the row's own step, and whether the row was forced by a spike.
 DIVERGENCE_COLUMNS: Tuple[str, ...] = (
     "interval_steps", "train_loss_interval_mean", "train_loss_interval_max", "train_ce_interval_mean",
+    "train_loss_interval_median", "train_ce_interval_median",
     *(f"grad_norm_{role}_interval_{stat}" for role in DIVERGENCE_ROLES for stat in ("mean", "max")),
     "grad_clip_binding_frac",
     *(f"grad_clip_coef_{role}" for role in DIVERGENCE_ROLES),
@@ -4411,16 +4417,29 @@ DIVERGENCE_COLUMNS: Tuple[str, ...] = (
 
 
 class _RunningStat:
-    r"""Count, sum and maximum of the finite values offered to it."""
+    r"""Count, sum and maximum of the finite values offered to it; with ``keep_values`` also the values, for the
+    interval median (audit 2026-10-20, spike report section 7: the interval mean includes blow-ups)."""
 
-    def __init__(self) -> None:
+    def __init__(self, keep_values: bool = False) -> None:
         self.count, self.total, self.peak = 0, 0.0, -math.inf
+        self.values: Optional[List[float]] = [] if keep_values else None
 
     def add(self, value: float) -> None:
         if math.isfinite(value):
             self.count += 1
             self.total += value
             self.peak = max(self.peak, value)
+            if self.values is not None:
+                self.values.append(float(value))
+
+    def median(self) -> float:
+        r"""The median of the kept finite values (the mean of the two middle ones for an even count); NaN when
+        none were kept."""
+        if not self.values:
+            return float("nan")
+        ordered = sorted(self.values)
+        middle = len(ordered) // 2
+        return ordered[middle] if len(ordered) % 2 else 0.5 * (ordered[middle - 1] + ordered[middle])
 
     def mean(self) -> float:
         return self.total / self.count if self.count else float("nan")
@@ -4435,6 +4454,97 @@ _SPIKE_TOP_ROWS = 3
 _SPIKE_TABLE_INDEX = {"mu_embed": "token", "sigma_log_embed": "token", "phi_embed": "token", "pos_phi": "position"}
 # Decode-side tables (untied decode bank) are read at the step's targets, so their rows are counted over targets.
 _SPIKE_DECODE_TABLES = ("decode_mu_embed", "decode_sigma_log_embed")
+_SPIKE_ROW_OCCURRENCES = 8          # (batch, position) pairs listed per top row
+# A reported spike re-runs the spike batch without gradients, row by row, to record the largest final belief
+# variance and the per-position CE maximum (audit 2026-10-20 item 11). It costs about one forward per reported spike.
+DIVERGENCE_SPIKE_FORWARD_PROBE: bool = True
+
+
+def _phi_row_head_conditions(
+    model: torch.nn.Module,
+    phi:   torch.Tensor,                   # (R, n_gen) frame-table rows
+) -> List[List[float]]:
+    r"""Per row and head the condition number :math:`\kappa_h = s_{\max}(U_h)/s_{\min}(U_h)` of the head block
+    :math:`U_h = e^{M_h}` of the row's frame :math:`U = e^{\sum_a\phi_aG_a}`, in float64.
+
+    Uses :func:`vfe3.metrics.head_block_algebra` when the basis is block-diagonal on the heads, else the diagonal
+    blocks of the dense exponential. The positional factor a token's frame also carries is not included: this is the
+    condition of the table row alone.
+    """
+    from vfe3 import metrics
+    group = getattr(model, "group", None)
+    if group is None or phi.numel() == 0:
+        return []
+    with torch.no_grad(), torch.autocast(device_type=phi.device.type, enabled=False):
+        phi = phi.detach().to(torch.float64)
+        algebra = metrics.head_block_algebra(phi, group)
+        if algebra is not None:
+            blocks = [torch.linalg.matrix_exp(M) for M in algebra]                       # per head (R, d_h, d_h)
+        else:
+            U = torch.linalg.matrix_exp(group.embed_algebra(phi, dtype=torch.float64))  # (R, K, K)
+            offsets = [0, *itertools.accumulate(group.irrep_dims)]
+            blocks = [U[:, a:b, a:b] for a, b in zip(offsets[:-1], offsets[1:])]
+        conditions = []
+        for block in blocks:
+            singular = torch.linalg.svdvals(block)                                        # (R, d_h) descending
+            conditions.append(singular[..., 0] / singular[..., -1])
+        return torch.stack(conditions, dim=-1).cpu().tolist()                             # (R, H)
+
+
+@torch.no_grad()
+def _spike_forward_state(
+    model:   torch.nn.Module,
+    tokens:  torch.Tensor,                 # (B, N) the spike step's input tokens
+    targets: torch.Tensor,                 # (B, N) its targets (-100 = ignore)
+) -> Dict[str, Any]:
+    r"""The largest final belief variance and the per-position CE maximum of a spike batch, from a no-grad forward.
+
+    The forward runs one sequence at a time (so the logits are (1, N, V)), in eval mode, with the global RNG streams
+    restored afterwards, at the parameters after the spike step's update: the step's own forward is not kept, so the
+    values describe the batch under the updated model. The variance is the largest diagonal entry of the final
+    ``belief.sigma`` (the diagonal of a matrix covariance), with its (batch, position) and the CE at that position; the
+    CE is the plug-in cross-entropy :math:`-\log p(y_{bn}\mid q_{bn})` at each scored position, and its maximum is
+    reported with its (batch, position) and the variance there.
+    """
+    import torch.nn.functional as F
+
+    was_training = model.training
+    rng_devices = [tokens.device] if tokens.device.type == "cuda" else []
+    variance_rows: List[torch.Tensor] = []                           # per sequence (N,)
+    ce_rows: List[torch.Tensor] = []                                 # per sequence (N,)
+    with torch.random.fork_rng(devices=rng_devices):
+        model.eval()
+        try:
+            for b in range(tokens.shape[0]):
+                belief, logits = model.forward_beliefs(tokens[b:b + 1], return_logits=True)
+                sigma = belief.sigma.detach()
+                if sigma.dim() == 4:                                 # (1, N, K, K) matrix covariance
+                    sigma = sigma.diagonal(dim1=-2, dim2=-1)
+                variance_rows.append(sigma.float().reshape(sigma.shape[1], -1).amax(dim=-1))       # (N,)
+                ce = F.cross_entropy(logits[0].float(), targets[b], ignore_index=-100, reduction="none")  # (N,)
+                ce_rows.append(torch.where(targets[b] == -100, torch.full_like(ce, float("nan")), ce))
+        finally:
+            model.train(was_training)
+    variance = torch.stack(variance_rows).cpu()                      # (B, N)
+    ce = torch.stack(ce_rows).cpu()                                  # (B, N)
+    n = variance.shape[1]
+    out: Dict[str, Any] = {"parameters": "after the spike step's update", "mode": "eval, one sequence at a time"}
+    finite_variance = torch.where(torch.isfinite(variance), variance, torch.full_like(variance, -math.inf))
+    flat = int(finite_variance.reshape(-1).argmax())
+    out["sigma_q_max"] = float(variance.reshape(-1)[flat])
+    out["sigma_q_max_at"] = [flat // n, flat % n]
+    out["sigma_q_nonfinite"] = int((~torch.isfinite(variance)).sum())
+    out["ce_at_sigma_q_max"] = float(ce.reshape(-1)[flat])
+    finite_ce = torch.where(torch.isnan(ce), torch.full_like(ce, -math.inf), ce)
+    if torch.isfinite(finite_ce).any() or torch.isposinf(finite_ce).any():
+        flat_ce = int(finite_ce.reshape(-1).argmax())
+        out["ce_max"] = float(ce.reshape(-1)[flat_ce])
+        out["ce_max_at"] = [flat_ce // n, flat_ce % n]
+        out["sigma_q_at_ce_max"] = float(variance.reshape(-1)[flat_ce])
+        out["ce_mean"] = float(ce[~torch.isnan(ce)].mean())
+    else:
+        out["ce_max"], out["ce_max_at"], out["sigma_q_at_ce_max"], out["ce_mean"] = None, None, None, None
+    return out
 
 
 def _spike_attribution(
@@ -4448,8 +4558,10 @@ def _spike_attribution(
     replayed:         bool,                       # the step was replayed at a stricter matmul precision
     last_group_norms: Mapping[str, float],        # pre-clip grad_norm_group_* of the last logged row
     targets:          Optional[torch.Tensor] = None,   # (B, N) the step's targets; counts decode-table rows
+    step:             Optional[int] = None,            # completed-step number of the spiking step
+    last_seen:        Optional[Mapping[str, torch.Tensor]] = None,   # "token"/"target": (V [+1],) last step seen
 ) -> Dict[str, Any]:
-    r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and why.
+    r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and what coincides.
 
     Reads the gradients that reached ``optimizer.step``: the references ``train_step`` keeps in ``status["grads"]``,
     since the table Fisher step and the manifold phi step clear ``.grad`` inside ``step()``, else the live
@@ -4457,9 +4569,14 @@ def _spike_attribution(
     coefficient (``status["clip_scales"]``), so :math:`\|g_p\|` is the pre-clip norm and a role's norm is
     :math:`(\sum_{p\in r}\|g_p\|^2)^{1/2}`. Shares are of the squared role norm. For the token and positional tables
     among the top parameters, the rows with the largest gradient are reported with their share of the table's
-    squared norm and, for token tables, their count in the batch (decode tables: their count among the targets). ``causes`` lists what coincides with the spike:
-    the loss spike (a hard batch), a binding clip, a precision replay, one parameter or a few rows carrying most of
-    the norm, and groups far above their last logged norm. One host transfer for the norms.
+    squared norm and, for token tables, their count in the batch (decode tables: their count among the targets),
+    up to ``_SPIKE_ROW_OCCURRENCES`` of their (batch, position) occurrences and, given ``step`` and ``last_seen``
+    (the last completed step at which each id occurred, -1 when not since the start or resume), the steps since the
+    row's previous occurrence. For ``phi_embed`` rows the per-head condition numbers of the row's frame
+    (:func:`_phi_row_head_conditions`, at the parameters after the update) are added (audit 2026-10-20 item 11).
+    ``causes`` lists what coincides with the spike, without asserting a cause: the loss spike on the same step, a
+    binding clip, a precision replay, one parameter or a few rows carrying most of the norm, and groups far above
+    their last logged norm. One host transfer for the norms.
     """
     scales: Mapping[int, float] = status.get("clip_scales") or {}
     stashed: Mapping[int, torch.Tensor] = status.get("grads") or {}
@@ -4514,14 +4631,33 @@ def _spike_attribution(
                                      "top_share": float(top_sq.sum() / rows.sum().clamp_min(1e-300)),
                                      "rows_with_gradient": int((rows > 0).sum())}
             if index in ("token", "target"):
-                ids = (tokens if index == "token" else targets).reshape(-1).to(rows.device)
+                source = tokens if index == "token" else targets
+                ids = source.reshape(-1).to(rows.device)
                 ids = ids[(ids >= 0) & (ids < rows.numel())]                  # drop ignore-index targets
                 counts = torch.bincount(ids, minlength=rows.numel())
                 entry["batch_counts"] = counts[top_rows].cpu().tolist()
+                host_ids = source.detach().cpu()                             # (B, N)
+                entry["occurrences"] = [
+                    [[int(b), int(n)] for b, n in (host_ids == row).nonzero().tolist()[:_SPIKE_ROW_OCCURRENCES]]
+                    for row in entry["rows"]]
+                seen = None if last_seen is None else last_seen.get(index)
+                if seen is not None and step is not None:
+                    previous = seen[top_rows.to(seen.device)].cpu().tolist()
+                    entry["steps_since_last_occurrence"] = [
+                        None if last < 0 else int(step) - int(last) for last in previous]
+            elif index == "position":
+                entry["occurrences"] = [[[b, int(row)] for b in range(int(tokens.shape[0]))][:_SPIKE_ROW_OCCURRENCES]
+                                        for row in entry["rows"]]
+            if group == "phi_embed" and grad.shape[0] == parameter.shape[0]:
+                try:
+                    entry["head_condition"] = _phi_row_head_conditions(
+                        model, parameter.detach()[top_rows.to(parameter.device)])
+                except Exception as exc:                                    # noqa: BLE001 - a diagnostic
+                    entry["head_condition_error"] = f"{type(exc).__name__}: {exc}"
         report["table_rows"][name] = entry
     causes: List[str] = report["causes"]
     if loss_spiked:
-        causes.append("the loss spiked on the same step (a hard batch drives the gradient)")
+        causes.append("the training loss spiked on the same step")
     if replayed:
         causes.append("the step was replayed at a stricter matmul precision")
     for role, info in report["roles"].items():
@@ -4533,6 +4669,14 @@ def _spike_attribution(
     for name, entry in report["table_rows"].items():
         if entry["top_share"] >= 0.5:
             counts = f", batch counts {entry['batch_counts']}" if "batch_counts" in entry else ""
+            if "occurrences" in entry:
+                counts += ", first (batch, position) " + str(
+                    [tuple(found[0]) if found else None for found in entry["occurrences"]])
+            if "steps_since_last_occurrence" in entry:
+                counts += f", steps since last occurrence {entry['steps_since_last_occurrence']}"
+            if "head_condition" in entry:
+                counts += ", max head cond(U) " + str(
+                    [float(f"{max(conds):.3g}") if conds else None for conds in entry["head_condition"]])
             causes.append(f"{name} {entry['indexed_by']} rows {entry['rows']} carry {entry['top_share']:.0%} "
                           f"of its gradient{counts}")
     for group, norm in sorted(report["group_norms"].items()):
@@ -4552,7 +4696,15 @@ def _spike_summary(report: Mapping[str, Any]) -> str:
     top = ", ".join(f"{entry['name']} {entry['pre_clip_norm']:.3g} ({entry['role_share']:.0%} of {entry['role']})"
                     for entry in report["top_parameters"][:3])
     causes = "; ".join(report["causes"]) or "none identified"
-    return f"{' | '.join(parts)}; top: {top}; causes: {causes}"
+    forward = report.get("forward_state")
+    state = ""
+    if isinstance(forward, Mapping) and "sigma_q_max" in forward:
+        state = (f"; post-update forward: max sigma_q {forward['sigma_q_max']:.4g} at (batch, position) "
+                 f"{tuple(forward['sigma_q_max_at'])}")
+        if forward.get("ce_max") is not None:
+            state += (f", max per-position CE {forward['ce_max']:.4g} at {tuple(forward['ce_max_at'])} "
+                      f"(batch mean {forward['ce_mean']:.4g})")
+    return f"{' | '.join(parts)}; top: {top}; coincident: {causes}{state}"
 
 
 def _append_spike_record(
@@ -4580,9 +4732,15 @@ class _DivergenceMonitor:
         \bar x_t = \rho\,\bar x_{t-1} + (1 - \rho)\,x_t,\qquad \rho = 0.98.
 
     Non-finite values enter neither the EMAs nor the interval statistics (the rejected-update accounting
-    covers them). On a spiking channel the EMA takes the bounded value, :math:`\min(x, 10\,\bar x)` for a norm and
-    :math:`\min(\ell, \bar\ell + 1)` for the loss, so one extreme step cannot hold the EMA above its baseline for
-    hundreds of steps (audit 2026-10-17 item 15).
+    covers them). A spiking channel's EMA is frozen on that step, :math:`\bar x_t = \bar x_{t-1}`, so a burst of
+    spikes cannot ratchet it. The earlier bounded update :math:`\min(x, 10\,\bar x)` grew a norm EMA by a factor
+    of up to :math:`0.98 + 0.02\cdot 10 = 1.18` per spiking step, which carried one run's mu-norm EMA from 0.86 to
+    1.19e4 and stopped flagging late steps (audit 2026-10-20, spike report section 7; before that, audit
+    2026-10-17 item 15). The warmup count still advances on a frozen step. A sustained shift of a level above the
+    threshold is therefore an event on every step and is reported once per cooldown until the level falls back.
+
+    The interval statistics keep the loss and CE values, so a row carries their interval median beside the mean,
+    which a single blow-up dominates.
 
     Every spike is an *event* (:attr:`event`, recorded by the caller in ``divergence_spikes.jsonl``). Its severity
     is the largest of :math:`x/(10\,\bar x)` over the spiking norms and :math:`(\ell - \bar\ell)/1` for the loss, so
@@ -4617,8 +4775,8 @@ class _DivergenceMonitor:
 
     def reset_interval(self) -> None:
         self.steps = 0
-        self._loss = _RunningStat()
-        self._ce = _RunningStat()
+        self._loss = _RunningStat(keep_values=True)
+        self._ce = _RunningStat(keep_values=True)
         self._norms = {role: _RunningStat() for role in DIVERGENCE_ROLES}
         self._clipped = 0
         self._binding = 0
@@ -4655,7 +4813,7 @@ class _DivergenceMonitor:
                 reasons.append(f"pre-clip grad_norm_{role} {value:.4g} is {value / ema:.1f}x its EMA {ema:.4g}")
                 roles.append(role)
                 severity = max(severity, value / (DIVERGENCE_NORM_SPIKE_RATIO * ema))
-                update = DIVERGENCE_NORM_SPIKE_RATIO * ema               # min(x, ratio * EMA) on a spike
+                update = ema                                             # frozen on a spike (no ratchet)
             self._norm_ema[role] = value if ema is None else (
                 DIVERGENCE_EMA_DECAY * ema + (1.0 - DIVERGENCE_EMA_DECAY) * update)
             self._norm_seen[role] = seen + 1
@@ -4668,7 +4826,7 @@ class _DivergenceMonitor:
                 loss_spiked = True
                 severity = max(severity, ((loss - ema) / DIVERGENCE_LOSS_SPIKE_MARGIN
                                           if DIVERGENCE_LOSS_SPIKE_MARGIN > 0 else math.inf))
-                update = ema + DIVERGENCE_LOSS_SPIKE_MARGIN              # min(loss, EMA + margin) on a spike
+                update = ema                                             # frozen on a spike (no ratchet)
             self._loss_ema = loss if ema is None else (
                 DIVERGENCE_EMA_DECAY * ema + (1.0 - DIVERGENCE_EMA_DECAY) * update)
             self._loss_seen += 1
@@ -4699,6 +4857,8 @@ class _DivergenceMonitor:
             "train_loss_interval_mean": self._loss.mean(),
             "train_loss_interval_max": self._loss.max(),
             "train_ce_interval_mean": self._ce.mean(),
+            "train_loss_interval_median": self._loss.median(),
+            "train_ce_interval_median": self._ce.median(),
         }
         for role in DIVERGENCE_ROLES:
             out[f"grad_norm_{role}_interval_mean"] = self._norms[role].mean()
@@ -4724,6 +4884,9 @@ class _DivergenceMonitor:
         def stat(value: _RunningStat) -> List[Any]:
             return [value.count, value.total, value.peak]
 
+        def kept(value: _RunningStat) -> List[float]:
+            return list(value.values or [])
+
         source = _DivergenceMonitor() if interval_ends else self
         return {
             "loss_ema":   self._loss_ema,
@@ -4736,6 +4899,8 @@ class _DivergenceMonitor:
                 "steps":   source.steps,
                 "loss":    stat(source._loss),
                 "ce":      stat(source._ce),
+                "loss_values": kept(source._loss),       # for the interval medians (absent in older checkpoints)
+                "ce_values":   kept(source._ce),
                 "norms":   {role: stat(source._norms[role]) for role in DIVERGENCE_ROLES},
                 "clipped": source._clipped,
                 "binding": source._binding,
@@ -4751,9 +4916,11 @@ class _DivergenceMonitor:
         if monitor is None:
             return False
 
-        def stat(values: List[Any]) -> _RunningStat:
-            out = _RunningStat()
+        def stat(values: List[Any], kept: Optional[List[float]] = None, keep: bool = False) -> _RunningStat:
+            out = _RunningStat(keep_values=keep)
             out.count, out.total, out.peak = values
+            if keep:
+                out.values = list(kept or [])      # an older checkpoint: the median covers the resumed part only
             return out
 
         interval = monitor["interval"]
@@ -4762,7 +4929,8 @@ class _DivergenceMonitor:
         self._last_spike = monitor["last_spike"]
         self._last_severity = monitor.get("last_severity")
         self.steps = interval["steps"]
-        self._loss, self._ce = stat(interval["loss"]), stat(interval["ce"])
+        self._loss = stat(interval["loss"], interval["loss_values"], keep=True)
+        self._ce = stat(interval["ce"], interval["ce_values"], keep=True)
         self._norms = {role: stat(interval["norms"][role]) for role in DIVERGENCE_ROLES}
         self._clipped, self._binding = interval["clipped"], interval["binding"]
         return True
@@ -4820,15 +4988,26 @@ def _divergence_monitor_state(
     norms = interval.get("norms")
     if not isinstance(norms, Mapping):
         return None
+    def kept(item: object) -> Optional[List[float]]:
+        if item is None:                                     # absent before the interval medians
+            return []
+        if not isinstance(item, (list, tuple)):
+            return None
+        values = [_real(entry) for entry in item]
+        return None if any(entry is None for entry in values) else values
+
     restored = {
         "steps":   _count(interval.get("steps")),
         "loss":    stat(interval.get("loss")),
         "ce":      stat(interval.get("ce")),
+        "loss_values": kept(interval.get("loss_values")),
+        "ce_values":   kept(interval.get("ce_values")),
         "norms":   {role: stat(norms.get(role)) for role in DIVERGENCE_ROLES},
         "clipped": _count(interval.get("clipped")),
         "binding": _count(interval.get("binding")),
     }
-    if (any(restored[key] is None for key in ("steps", "loss", "ce", "clipped", "binding"))
+    if (any(restored[key] is None for key in ("steps", "loss", "ce", "loss_values", "ce_values", "clipped",
+                                              "binding"))
             or any(entry is None for entry in restored["norms"].values())):
         return None
     out["interval"] = restored
@@ -5334,7 +5513,14 @@ def _train_loop(
     # on host values train_step already transfers.
     divergence = _DivergenceMonitor()
     last_group_norms: Dict[str, float] = {}               # pre-clip group norms of the last logged step
-    failed_step_skips = 0             # strictest-rung failures skipped under max_failed_step_skips (item 16)
+    # The last completed step at which each token id occurred as an input and as a target (-1: not since the start
+    # or resume), for the spike attribution's steps-since-last-occurrence (audit 2026-10-20 item 11). One device
+    # index_fill per step and no host read; the extra target slot absorbs ignore-index targets.
+    occurrence_steps: Dict[str, torch.Tensor] = {
+        "token":  torch.full((int(cfg.vocab_size),), -1, dtype=torch.int64, device=device),
+        "target": torch.full((int(cfg.vocab_size) + 1,), -1, dtype=torch.int64, device=device),
+    }
+    failed_step_skips = 0            # strictest-rung failures skipped under max_failed_step_skips (item 16)
     loss_spike_rejections = 0         # updates rejected under loss_spike_skip_nats (item 17)
     max_failed_skips: Optional[int] = getattr(cfg, "max_failed_step_skips", None)
     max_consecutive: Optional[int] = getattr(cfg, "max_consecutive_skips", None)
@@ -6025,7 +6211,15 @@ def _train_loop(
                         report = _spike_attribution(
                             model, optimizer, step_status, tokens,
                             roles=divergence.spike_roles or DIVERGENCE_ROLES, loss_spiked=divergence.spike_loss,
-                            replayed=replays > 0, last_group_norms=last_group_norms, targets=targets)
+                            replayed=replays > 0, last_group_norms=last_group_norms, targets=targets,
+                            step=step + 1, last_seen=occurrence_steps)
+                        report["loss_over_3_log_v"] = bool(math.isfinite(step_loss)
+                                                           and step_loss > 3.0 * math.log(cfg.vocab_size))
+                        if reported and DIVERGENCE_SPIKE_FORWARD_PROBE:
+                            try:
+                                report["forward_state"] = _spike_forward_state(model, tokens, targets)
+                            except Exception as exc:                 # noqa: BLE001 - a diagnostic
+                                report["forward_state"] = {"error": f"{type(exc).__name__}: {exc}"}
                         if reported:
                             spike_groups = report["group_norms"]
                             logger.warning("step %d: spike attribution: %s", step + 1, _spike_summary(report))
@@ -6045,6 +6239,10 @@ def _train_loop(
                         except Exception as exc:
                             _record_diagnostic_failure(diagnostics_failures, "divergence_spike_attribution", exc,
                                                        logger)
+            # This step's ids become the previous occurrence for later spikes (after the attribution read them).
+            occurrence_steps["token"].index_fill_(0, tokens.reshape(-1), step + 1)
+            occurrence_steps["target"].index_fill_(0, torch.where(
+                targets.reshape(-1) >= 0, targets.reshape(-1), int(cfg.vocab_size)), step + 1)
             if step_metrics is not None:                         # the reference for "x its last logged norm"
                 last_group_norms.update({column[len("grad_norm_group_"):]: float(step_metrics[column])
                                          for column in _GRAD_GROUP_COLUMNS if column in step_metrics})
