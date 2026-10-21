@@ -252,7 +252,7 @@ _LIVE_TINY: dict[str, Any] = {
     'max_steps': 10,
     'warmup_steps': 1,
     'block_mlp_expansion': 2,
-    'kl_max': None,                   # None: the launcher's 8 K at the tiny K; a launcher number scales (live_tiny)
+    'kl_max': None,                   # replaced by live_kl_max: the launcher's nats per comparison coordinate
     'amp_dtype': None,                # CPU unit tests run in fp32
     'log_interval': 0,                # run-only fields: no unit test reaches the logging or saving of train()
     'eval_interval': 0,
@@ -267,17 +267,23 @@ def launcher_values() -> dict[str, Any]:
     return deepcopy(train_vfe3.config)
 
 
-def live_kl_max(launcher: dict[str, Any]) -> "float | None":
-    r"""The tiny profile's ``kl_max``: :math:`\mathrm{kl\_max}_{\mathrm{launcher}}K_{\mathrm{tiny}}/K_{\mathrm{launcher}}`.
+def live_kl_max(launcher: dict[str, Any]) -> float:
+    r"""The tiny profile's ``kl_max``: :math:`\mathrm{kl\_max}_{\mathrm{launcher}}\,d_{\mathrm{tiny}}/d_{\mathrm{launcher}}`.
 
-    The divergence clamp scales with the belief dimension (its default is :math:`8K`), so the tiny profile keeps the
-    launcher's nats per dimension and the clamp binds in the same regime. ``None`` (the :math:`8K` default) stays
-    ``None`` (audit 2026-10-17, item 38).
+    :math:`d = K/H` is the head width, the rank :math:`r` of each head's comparison space. The router cost the clamp
+    tests is a per-head sum over :math:`r` comparison coordinates (and under ``query_shifted_v1`` carried
+    :math:`\tfrac r2(1 + \ln\sigma_{\mathrm{init}})` at initialization), so keeping the launcher's nats per comparison
+    coordinate keeps the cap binding in the launcher's regime. Scaling by total :math:`K` instead (audit 2026-10-17
+    item 38) capped every pair of the tiny live route, whose router gradients were then exactly zero and every
+    live-route gradient check compared zero with zero (audit 2026-10-20 item 5). A launcher ``None`` (the :math:`8K`
+    default) is resolved at the launcher's :math:`K` first, so it scales the same way.
     """
     kl_max = launcher.get("kl_max")
     if kl_max is None:
-        return None
-    return float(kl_max) * _LIVE_TINY['embed_dim'] / launcher["embed_dim"]
+        kl_max = 8.0 * launcher["embed_dim"]
+    d_tiny = _LIVE_TINY['embed_dim'] / _LIVE_TINY['n_heads']
+    d_launcher = launcher["embed_dim"] / launcher["n_heads"]
+    return float(kl_max) * d_tiny / d_launcher
 
 
 def live_tiny(launcher: dict[str, Any]) -> dict[str, Any]:
