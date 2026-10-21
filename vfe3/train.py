@@ -5164,6 +5164,119 @@ class _PeakMemory:
         return overall, train
 
 
+# Allocator and clock telemetry on every metrics row (audit 2026-10-20 item 20). NaN off CUDA and where a reading is
+# unavailable (no NVML and no nvidia-smi, an older torch without a counter).
+DEVICE_TELEMETRY_COLUMNS: Tuple[str, ...] = (
+    "cuda_mem_allocated_mb", "cuda_mem_reserved_mb", "cuda_mem_reserved_peak_mb", "cuda_mem_inactive_split_mb",
+    "cuda_alloc_retries", "cuda_device_allocs", "cuda_device_frees", "cuda_ooms",
+    "gpu_sm_clock_mhz", "gpu_temperature_c", "gpu_power_w",
+)
+_NVIDIA_SMI_TIMEOUT_S: float = 5.0
+
+
+class _DeviceTelemetry:
+    r"""Allocator counters and SM clock, temperature and power of the training device, read once per metrics row.
+
+    The allocator columns come from ``torch.cuda.memory_stats`` (host counters, no synchronization): current allocated,
+    reserved and inactive-split bytes, the reserved peak since the last peak reset (the peak-memory split resets the
+    peaks at each phase boundary, so this is the peak of the last phase window), and the cumulative counts of allocator
+    retries, ``cudaMalloc`` and ``cudaFree`` calls and OOMs. A rising retry or device-allocation count with flat peak
+    memory points at allocator churn; a falling SM clock at the same utilization points at clock drift.
+
+    The clock columns read NVML through ``pynvml`` when it imports, else one ``nvidia-smi --query-gpu`` call per row.
+    The device is matched by its UUID, so ``CUDA_VISIBLE_DEVICES`` remapping does not misattribute it. A failed or
+    slow (more than ``_NVIDIA_SMI_TIMEOUT_S``) query disables the clock source for the rest of the run; the clock
+    columns are then NaN. Nothing here raises.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._cuda = device.type == "cuda"
+        self._source: Optional[str] = None if self._cuda else "off"     # "nvml" | "smi" | "off", chosen lazily
+        self._nvml_handle: Any = None
+        self._uuid: Optional[str] = None
+
+    def _init_clock_source(self) -> None:
+        try:
+            raw = str(torch.cuda.get_device_properties(self._device).uuid)
+            self._uuid = raw if raw.startswith("GPU-") else f"GPU-{raw}"
+        except Exception:                                     # noqa: BLE001 - telemetry, never fatal
+            self._uuid = None
+        try:
+            import pynvml                                     # type: ignore[import-not-found]
+            pynvml.nvmlInit()
+            index = self._device.index if self._device.index is not None else torch.cuda.current_device()
+            self._nvml_handle = (pynvml.nvmlDeviceGetHandleByUUID(self._uuid) if self._uuid is not None
+                                 else pynvml.nvmlDeviceGetHandleByIndex(index))
+            self._source = "nvml"
+            return
+        except Exception:                                     # noqa: BLE001 - pynvml absent or NVML failed
+            self._nvml_handle = None
+        import shutil
+        self._source = "smi" if shutil.which("nvidia-smi") is not None else "off"
+
+    def _clock(self) -> Dict[str, float]:
+        nan = float("nan")
+        out = {"gpu_sm_clock_mhz": nan, "gpu_temperature_c": nan, "gpu_power_w": nan}
+        if self._source is None:
+            self._init_clock_source()
+        if self._source == "nvml":
+            try:
+                import pynvml                                 # type: ignore[import-not-found]
+                handle = self._nvml_handle
+                out["gpu_sm_clock_mhz"] = float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+                out["gpu_temperature_c"] = float(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+                out["gpu_power_w"] = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1e3
+            except Exception:                                 # noqa: BLE001
+                self._source = "off"
+        elif self._source == "smi":
+            import subprocess
+            command = ["nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu,power.draw",
+                       "--format=csv,noheader,nounits"]
+            if self._uuid is not None:
+                command += ["-i", self._uuid]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=_NVIDIA_SMI_TIMEOUT_S,
+                                        check=True)
+                fields = [field.strip() for field in result.stdout.strip().splitlines()[0].split(",")]
+                for key, field in zip(("gpu_sm_clock_mhz", "gpu_temperature_c", "gpu_power_w"), fields):
+                    try:
+                        out[key] = float(field)
+                    except ValueError:
+                        out[key] = nan                        # "[N/A]" on boards that do not report it
+            except Exception:                                 # noqa: BLE001 - missing tool, timeout, parse error
+                self._source = "off"
+        return out
+
+    def sample(self) -> Dict[str, float]:
+        r"""The :data:`DEVICE_TELEMETRY_COLUMNS` of one metrics row (NaN off CUDA)."""
+        nan = float("nan")
+        out = {column: nan for column in DEVICE_TELEMETRY_COLUMNS}
+        if not self._cuda:
+            return out
+        try:
+            stats = torch.cuda.memory_stats(self._device)
+
+            def read(key: str, scale: float = 1.0) -> float:
+                value = stats.get(key)
+                return float(value) / scale if value is not None else nan
+
+            out.update({
+                "cuda_mem_allocated_mb": read("allocated_bytes.all.current", 1e6),
+                "cuda_mem_reserved_mb": read("reserved_bytes.all.current", 1e6),
+                "cuda_mem_reserved_peak_mb": read("reserved_bytes.all.peak", 1e6),
+                "cuda_mem_inactive_split_mb": read("inactive_split_bytes.all.current", 1e6),
+                "cuda_alloc_retries": read("num_alloc_retries"),
+                "cuda_device_allocs": read("num_device_alloc"),
+                "cuda_device_frees": read("num_device_free"),
+                "cuda_ooms": read("num_ooms"),
+            })
+        except Exception:                                     # noqa: BLE001 - telemetry, never fatal
+            pass
+        out.update(self._clock())
+        return out
+
+
 RUN_LOG_NAME = "train.log"                            # run_dir: the run's log records (audit 2026-10-17 item 4)
 _RUN_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -5793,6 +5906,7 @@ def _train_loop(
     last_table_step_norm: Optional[float] = None              # table_fisher_step_norm_mean of the previous row
     checkpoint_ms_pending: List[float] = []                   # checkpoint saves since the previous row
     peak_memory = _PeakMemory(device)
+    device_telemetry = _DeviceTelemetry(device)               # allocator and clock columns (audit 2026-10-20 item 20)
 
     def _data_state_for(batches: int, identity: Optional[Mapping[str, object]]) -> Optional[DataState]:
         r"""The checkpoint data cursor at ``batches`` consumed batches of the current epoch, or None."""
@@ -6288,6 +6402,8 @@ def _train_loop(
                 # d (the F-decomposition) is computed PRE-step above so it shares train_ce's provenance (m7).
                 assert timer is not None
                 train_timing = timer.sample_train_window()
+                # Allocator and clock telemetry before the peak reset below (audit 2026-10-20 item 20).
+                telemetry = device_telemetry.sample()
                 # Overall peak since the previous row (as before) and the training-only peak (audit 2026-10-17 item 49).
                 peak_mem_mb, peak_mem_train_mb = peak_memory.sample()
 
@@ -6587,6 +6703,7 @@ def _train_loop(
                 # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.
                 row["peak_mem_mb"] = peak_mem_mb
                 row["peak_mem_train_mb"] = peak_mem_train_mb   # the training phases alone (audit 2026-10-17 item 49)
+                row.update(telemetry)                          # DEVICE_TELEMETRY_COLUMNS (audit 2026-10-20 item 20)
                 # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
                 # the standard convention). The train side is this step's batch while val is the
                 # token-weighted val-set mean, so read it as a TREND, not an absolute. Under a sliding

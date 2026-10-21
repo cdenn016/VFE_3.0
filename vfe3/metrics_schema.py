@@ -291,6 +291,13 @@ _REGISTRY: List[MetricColumn] = [
     # Resources.
     *_declare("row", "float", ("tokens_per_s", "train_step_tokens_per_s", "pipeline_tokens_per_s",
                                "train_step_ms_mean", "peak_mem_mb")),
+    # Allocator and clock telemetry (vfe3.train.DEVICE_TELEMETRY_COLUMNS; audit 2026-10-20 item 20). NaN off CUDA
+    # and absent in runs written before it; vfe3.run_resources.throughput_summary reads them.
+    *_declare("row", "float", ("cuda_mem_allocated_mb", "cuda_mem_reserved_mb", "cuda_mem_reserved_peak_mb",
+                               "cuda_mem_inactive_split_mb", "gpu_sm_clock_mhz", "gpu_temperature_c",
+                               "gpu_power_w")),
+    *_declare("cumulative", "count", ("cuda_alloc_retries", "cuda_device_allocs", "cuda_device_frees",
+                                      "cuda_ooms")),
     # Validation (eval rows only).
     *_declare("eval", "float", ("val_ce", "val_ppl", "val_bits_per_token", "val_bpc",
                                 "generalization_gap", "generalization_gap_fixed", "train_sample_ce",
