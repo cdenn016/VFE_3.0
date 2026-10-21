@@ -6,6 +6,11 @@ rotate by theta_{n,k} = n * base^{-2k/d}. The executable laws are:
 
 - rope_mode 'frame' / 'frame_value': RIGHT insertion, V_i = U_i R(theta_i)^T, so transport composes as
   Omega_ij = U_i R(theta_i)^T R(theta_j) U_j^{-1} = U_i R(theta_j - theta_i) U_j^{-1} (transport.py; config pins ``rope_insertion='right'``).
+  This relative form holds for the flat transport Omega_ij only. On the projected routes the learned maps act
+  between the two frames, so the routing comparison reads absolute positions (config.py); under 'frame_value'
+  the content link is U_i R(theta_i)^T L R(theta_j) U_j^{-1}, with L the learned content map (O'T in the
+  relational operators' chart), and since L does not commute with R in general the content message depends on
+  absolute position, not only on theta_j - theta_i (audit 2026-10-20 item 69).
   The retired left insertion R(theta_i) Omega_ij R(theta_j)^T is gauge-breaking and survives only as
   a test reference.
 - rope_mode 'comparison' / 'comparison_invariant': the rotation acts only on the projected routing moments,

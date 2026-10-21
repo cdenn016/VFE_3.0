@@ -261,9 +261,9 @@ class VFEModel(nn.Module):
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
-        # Reproducibility is pinned at the entry point run_training (torch.manual_seed(cfg.seed)
-        # before model + loader are built), NOT here: seeding inside __init__ would clobber a
-        # caller-set RNG state (e.g. a test that seeds then constructs several models).
+        # Reproducibility is pinned at the training entry point (train_vfe3._run_once seeds cfg.seed before the
+        # model and loader are built), NOT here: seeding inside __init__ would clobber a caller-set RNG state
+        # (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
         # projected_factorization: the certificate and factor route; tolerances and the recovery precision
         # (fp32 with a float64 fallback on the Gram routes, float64 on cholesky_qr2_certified's factor route) are
@@ -541,7 +541,7 @@ class VFEModel(nn.Module):
             # position, so its init does not depend on how much RNG the prior-bank tables consumed
             # before it. Its stream is derived from (cfg.seed, 'pos_phi_free'), distinct from every
             # relational operator stream. A separate generator does NOT clobber the caller's global
-            # RNG, so the reproducibility seam stays at run_training; mu/sigma/phi inits are unchanged.
+            # RNG, so the reproducibility seam stays at the entry point (train_vfe3._run_once); mu/sigma/phi inits are unchanged.
             _g = torch.Generator().manual_seed(_derived_seed(cfg.seed, "pos_phi_free"))
             self.pos_phi_free = nn.Parameter(
                 torch.randn(cfg.max_seq_len, n_gen, generator=_g) * cfg.pos_phi_scale)
@@ -1047,9 +1047,12 @@ class VFEModel(nn.Module):
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
         through it, the ordinary autoregressive sampler in ``generate``.
 
-        Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
-        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent),
-        i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*). No norm runs
+        The pipeline is encode -> frames -> stack -> (optional) decode: q_i(0) = p_i = encode(token); the
+        positional frame (``pos_phi``) is applied to phi; the relational frames, with any RoPE fold, are realized
+        once; and ``vfe_stack`` runs L blocks, each one relational readout (one predictive readout per layer on
+        ``projected_predictive``, ``n_e_steps`` unrolled receiver updates on ``projected_gradient``) followed by
+        the block norm and the block MLP, handing the belief mean off to the next block's prior. The result is the
+        Gaussian tuple q* = (mu*, Sigma*, phi*) of the last block. No norm runs
         between the stack and the decoder (the final norm was removed on 2026-10-12), so the returned
         ``BeliefState`` carries the stack output's mu, sigma and phi, and a caller reads q*.phi for
         the M-step gauge penalty exactly as forward does. ``return_logits`` decodes p(o | q*_i) via
@@ -1063,7 +1066,7 @@ class VFEModel(nn.Module):
         from the returned belief: ``capture['converged']`` (the last block's converged
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
-        (post s-refine), and ``capture['out']`` retains the raw stack output. A capture also receives the
+        (with the positional frame applied), and ``capture['out']`` retains the raw stack output. A capture also receives the
         relational diagnostics (``capture['relational_capture']``: router labels, receiver costs, the minimal-agent
         diagnostics); ``forward``'s M-step capture passes ``_relational_capture=False``, since no M-step term reads
         them (audit 2026-10-12 round 2, item 6).
@@ -1200,7 +1203,7 @@ class VFEModel(nn.Module):
                              right_phi=out.right_phi)   # carry the exact positional right factor
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
-            # encode-time prior p (post s-refine) and the raw stack output for callers
+            # encode-time prior p (with the positional frame applied) and the raw stack output for callers
             # that need the complete pipeline state.
             capture["prior"] = beliefs
             capture["out"]   = out
@@ -1434,6 +1437,11 @@ class VFEModel(nn.Module):
             # derivative against finite differences.
             # Capturing the final-block input preserves the exact stack recurrence at
             # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
+            # Scope (audit 2026-10-20 item 70): the prior mean read here is the type prior mu_embed[x_i] only at
+            # n_layers=1 or prior_handoff_rho=0 (its variance only at prior_handoff_sigma=0). At n_layers>1 with
+            # rho>0, the reference setting, it is (1 - rho) mu_p + rho mu_belief, the previous block's output for
+            # rho=1, so this term is not KL(q_i*||p_{x_i}) and the table Fisher step's metric (n_v/N) G_v
+            # (vfe3/table_optim.py), the exact Hessian of that type-prior term, is not its Hessian.
             from vfe3.families import get_family
             from vfe3.free_energy import self_divergence_for_alpha
             from vfe3.alpha_i import self_coupling_alpha, alpha_is_per_coord
@@ -1469,8 +1477,7 @@ class VFEModel(nn.Module):
             # NEVER routed through hierarchical_free_energy_terms and never reweighting the canonical
             # q/p/s/h total. Each block already appended its grad-connected D(q_post||q_pre) rows.
             # The token-then-layer mean (each row.mean() over tokens, then
-            # mean over layers) is weighted and added; the per-layer values and the assembled
-            # objective_total_with_cg are reported on the diagnostic side channel only.
+            # mean over layers) is weighted and added. The per-layer values are not logged.
             cfg = self.cfg
             per_layer_rows = cap["cg_moment_energy_rows"]
             if (len(per_layer_rows) != cfg.n_layers
@@ -1484,11 +1491,6 @@ class VFEModel(nn.Module):
             layer_means = torch.stack([rows.mean() for rows in per_layer_rows])   # (n_layers,)
             cg_moment_energy = layer_means.mean()
             loss = loss + cfg.cg_energy_weight * cg_moment_energy
-            self._cg_energy_diagnostics = {
-                "cg_moment_energy":        cg_moment_energy.detach(),
-                "cg_moment_energy_layers": layer_means.detach(),
-                "objective_total_with_cg": loss.detach(),
-            }
         if em_weight > 0.0:
             # EM M-step term on the prototype templates (audit 2026-10-10, item 24; round 2, item 15):
             # L_EM = -w sum_l mean_i Q_il, the mean over the scored tokens (targets != -100) of each layer's rows

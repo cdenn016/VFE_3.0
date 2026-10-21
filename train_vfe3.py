@@ -120,6 +120,11 @@ config = dict(
 
     batch_size                       = 32,
     max_steps                        = 30000,
+    # Launcher entries for VFE3Config fields at their defaults (audit 2026-10-20 item 66).
+    warmup_steps                     = 100,         # int >= 0: linear warmup steps before the cosine decay
+    min_lr_frac                      = 0.01,        # float in [0, 1]: LR floor as a fraction of each group's base LR (0 = decay to 0)
+    grad_accum_steps                 = 1,           # int >= 1: microbatches per optimizer step (1 = no accumulation)
+    grad_clip                        = 1.0,         # None or 0 (off) | float > 0: L2 clip per grad_clip_scope set after accumulation (table_fisher groups never clipped)
     grad_clip_scope                  = "role",      # "role" | "group" (one L2 clip per optimizer role, or per optimizer group)
     max_failed_step_skips            = None,        # None (a step failing at the strictest precision aborts) | int >= 1 (skip up to N such steps)
     max_consecutive_skips            = None,        # None (never abort on skips) | int >= 1 (abort with crash.json + checkpoint after N rejected updates in a row)
@@ -139,6 +144,9 @@ config = dict(
     checkpoint_keep_last             = None,      # None (keep every checkpoint) | int >= 1 (keep the newest N)
     checkpoint_at_end                = False,     # True | False (also save a resumable checkpoint after the last step)
     block_variance_at_log            = False,     # True | False (also write diagnostics/block_variance.csv at log steps)
+    val_diagnostic_batches           = 1,         # int >= 1: validation batches the val_* probes average over
+    resume_from                      = None,      # None (train from scratch) | path to a checkpoints/step_<N>.pt (weights, optimizer, RNG, schedule; single run only)
+    trust_resume_checkpoint          = False,     # True | False: allow the unsafe weights_only=False load of a legacy checkpoint (trusted files only)
     
     #################################
     #           Modes               #
@@ -148,10 +156,20 @@ config = dict(
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
     decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I, in reference coordinates under decode_coordinates="reference"); prior-bank decode only
+    decode_av_precision              = "fp32",                    # "fp32" | "fp64": prior-bank Gaussian decoders only, precision of the a_v = sum 1/sigma_v reduction
+    decode_ranking_fp64_escalation   = False,                     # True | False: prior-bank Gaussian decoders only, recompute an uncertain fp32 decode argmax in fp64
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',        # "passthrough" | "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) | "spread_corrected" (minimal_agent mean_field: plus the label spread)
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
+    content_link_edges               = "off",                # "off" | "lowrank" (curved G_ij = g_i e^L exp(A_i B_j^T); expensive) | "pure_gauge" (coboundary control); exponential chart, projected_predictive, equal heads
+    content_link_edge_rank           = 4,                    # edges on only: factor rank r, 1 <= r <= embed_dim
+    content_link_latent              = False,                # True | False: lowrank edges only, per-context MAP receiver factors (expensive)
+    content_link_latent_steps        = 1,                    # content_link_latent only: fixed-point steps >= 1
+    content_link_latent_sigma        = 0.1,                  # content_link_latent only: prior scale sigma_L > 0
+    content_link_latent_damping      = 1.0,                  # content_link_latent only: damping rho in (0, 1]
+    content_link_loop_weight         = 0.0,                  # float >= 0: loop prior lambda_W (> 0 needs content_link_latent)
+    content_link_loop_window         = 1,                    # int >= 1 | None (every loop, O(N^3) per layer): loop window
         
     tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
         
@@ -211,6 +229,8 @@ config = dict(
     block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal) | "pushforward_moment" (the same at the effective scale s^2 + tr(Pi Sigma Pi)/K with a span floor; a moment estimate at every Sigma/s^2)
     block_norm_trace_cap             = True,               # True | False: cap the LayerNorm covariance pushforward at the sphere bound K max(gamma^2) (False: uncapped delta method)
     block_norm_cap_moment_fallback   = False,              # True | False: capped 'pushforward' only: where the cap binds, return the 'pushforward_moment' estimate instead of the capped delta method
+    prior_handoff_rho                = 1.0,                # float in [0, 1]: next block's prior mean (1 - rho) mu_p + rho mu_q (1 = full flow, 0 = frozen priors)
+    prior_handoff_sigma              = 0.0,                # float in [0, 1]: the same blend for the prior variance (0 = frozen at the embedding)
 
     #################################
     #        Initialization
@@ -245,6 +265,13 @@ config = dict(
     
     group_n                          = None,                # so_n / su_n only: the N of SO(N) (>= 2) or SU(N) (>= 3); None for every other group
     irrep_spec                       = None,                # so_n: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; su_n: [("pq<p>_<q>", mult), ...] (p >= q; SU(3) dims pq1_0 6, pq1_1 8, pq2_0 12); None otherwise
+    irrep_max_rank                   = None,                # irrep_spec="random" only: None (every rank that fits) | int >= irrep_min_rank
+    irrep_spec_seed                  = 0,                   # irrep_spec="random" only: int seed of the draw
+    irrep_min_rank                   = 1,                   # irrep_spec="random" only: int >= 0 (1 skips the gauge-invariant trivial irrep l0)
+    use_cg_coupling                  = False,               # True | False: so_n / su_n with gauge_tying="shared" only, Clebsch-Gordan coupling between irrep blocks
+    cg_covariance_mode               = "passthrough",       # "passthrough" | "delta_full" (J Sigma J^T + cg_covariance_floor Sigma; gaussian_full); use_cg_coupling only
+    cg_covariance_floor              = 1e-6,                # float > 0: delta_full floor scale
+    cg_energy_weight                 = 0.0,                 # float >= 0: post-CG moment divergence in the loss (> 0 needs use_cg_coupling)
    
     ####################################
     #       Positional Encoding
@@ -256,6 +283,7 @@ config = dict(
     rope_mode                        = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
          
     rope_fraction                    = 1.0,       # p-RoPE: fraction of each head's pairs rotated (fastest first); 1.0 = RoPE
+    rope_base                        = 100.0,     # float > 0: rope_mode != "none" only, frequency base
 
     ######################################
     #                Self Energy:
@@ -265,6 +293,8 @@ config = dict(
     lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
     mstep_self_coupling_weight       = 0.0,      # float >= 0: alpha_hat of the M-step term alpha_hat * mean_i alpha_i D(q_i*||p_i), gradient through q*; 0.0 = off
     self_kl_max                      = None,     # None | float > 0 (float("inf") allowed): divergence clamp of the M-step self term; None = kl_max
+    b0                               = 1.0,      # float | K-list (state_dependent_per_coord only): alpha_i = c0 / (b0 + D)
+    c0                               = 1.0,      # float | K-list (state_dependent_per_coord only): alpha_i = c0 / (b0 + D)
   
     ########################################
     #     Attention Belief/Model Settings
@@ -275,6 +305,8 @@ config = dict(
     learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
     beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
+    alibi_slope                      = 1.0,         # float >= 0: alibi priors only, base multiplier on the ALiBi head slopes alibi_slope * 2^(-8h/H)
+    attention_window                 = 128,         # int >= 1: causal_windowed only, band width
     
     #################################
     #         Belief E-step
@@ -285,6 +317,7 @@ config = dict(
      
     e_mu_q_trust                     = 2,
     e_sigma_q_trust                  = 1.0,
+    skip_belief_sigma_update         = False,      # True | False: projected_gradient only, skip the sigma E-step
     
     #################################
     #        M-step Settings  
@@ -296,6 +329,7 @@ config = dict(
     m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
     phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
     m_phi_sparse_rows                = False,          # False (dense AdamW) | True (row-lazy AdamW on phi_embed: rows absent from the step take no moment update, step or decay; per-row bias correction; adamw only)
+    phi_mstep_max_matrix_norm        = None,           # None (off) | float in (0, transport_chart_max_norm): interior radius for phi after each M-step (adamw projects rows back; pullback_group rejects the step)
 
     m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
     m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight lambda (under "rotation" it also damps Fisher-visible rotations)
@@ -348,6 +382,8 @@ config = dict(
     #################################
   
     kl_max                           = None,          # None (8 * embed_dim) | float > 0 nats (inf disables): safety clamp on every divergence, binding only on blowups
+    eps                              = 1e-6,          # float > 0: variance floor of the log and division terms of every divergence (also the norm epsilon)
+    transport_chart_max_norm         = 50.0,          # float > 0: fail-closed ||M||_F radius of every transport exponential
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, D_ij less its query constant and the row mean of the key log-volumes (scale-invariant), or the pre-2026-10-21 form without the key term)

@@ -368,7 +368,6 @@ class MStepCapture(TypedDict, total=False):
     block_mlp_output:   BeliefState
     converged:          BeliefState
     final_block_prior:  Tuple[torch.Tensor, torch.Tensor]
-    final_block_tau:    'float | torch.Tensor'
     prior:              BeliefState
     out:                BeliefState
     canonical_frame:    CanonicalFrameContext

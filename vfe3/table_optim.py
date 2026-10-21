@@ -8,6 +8,10 @@ with :math:`(n_v/N)G_v`, the Fisher metric of the prior family :math:`p_v` count
 matrix is the exact Hessian of the self-coupling term :math:`\frac1N\sum_i \mathrm{KL}(q_i\|p_{x_i})` in
 :math:`\mu_v` (and its expected Hessian in :math:`l_v`) and of nothing else; for the cross-entropy the step
 trains it is a chosen preconditioner, not the metric of that objective (audit 2026-10-10 round 2, item 35).
+The implemented M-step self term (``mstep_self_coupling_weight > 0``) is that type-prior KL only at ``n_layers = 1``
+or ``prior_handoff_rho = 0`` (and ``prior_handoff_sigma = 0``): otherwise it reads the prior handed into the final
+block, whose mean :math:`(1-\rho)\mu_p + \rho\mu_{\mathrm{belief}}` carries the previous block's output, so the
+metric above is not its Hessian either (audit 2026-10-20 item 70).
 The natural direction is
 
 .. math::
