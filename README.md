@@ -553,7 +553,12 @@ Four numerical safeguards trade cost for conditioning; each is at its cheapest s
 scorer and of the routed spread's query rows. A larger budget dispatches fewer kernels and holds
 more transient memory; values change only by float32 reduction order, and every loop above
 32 MiB stays checkpointed, so a raised budget changes the tile count and never what autograd
-saves. Its step-time effect on CUDA is not measured.
+saves. A routed-spread tile is sized with every batch axis included, so the budget bounds the
+whole tile rather than one sequence's share. When the routing prior is $-\infty$ above the
+diagonal (every causal prior), the readout sees it from the prior tensor and each spread tile of
+query rows $[i, i+s)$ contracts only the sources $[0, i+s)$, with at least four tiles; the dropped
+terms are $0\cdot x$, so values and gradients are unchanged. Its step-time effect on CUDA is not
+measured.
 
 Under `m_phi_update_mode="pullback_group"`, `m_phi_group_differential_mode` selects how the
 strict Frobenius-pullback direction evaluates the trivialized exponential differentials
