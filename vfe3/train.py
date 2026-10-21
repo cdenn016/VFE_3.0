@@ -6409,7 +6409,7 @@ def _train_loop(
 
             if do_log:
                 logger.info(
-                    "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | train it/s: %.2f | \n\n         Train PPL: %.1f \n",
+                    "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | train it/s: %.2f | \n\n         Batch PPL: %.1f \n",
                     step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
                     train_timing.train_steps_per_s, _perplexity_from_ce(ce),
                 )
@@ -6585,6 +6585,15 @@ def _train_loop(
                     last_val_diag["val_attn_collapsed_heads"] = last_train_sample.pop(
                         "val_attn_collapsed_heads", float("nan"))
                     phase_ms["eval_cadence_ms"] = _synced_ms(device) - _t0
+                    # The train/validation comparison on the console is the fixed training sample under the
+                    # validation protocol, not the single training batch of the step line above (audit 2026-10-20
+                    # item 7); the batch perplexity there scores one batch at every position of disjoint windows.
+                    sample_ppl = last_train_sample.get("train_sample_ppl", float("nan"))
+                    gap_fixed = last_train_sample.get("generalization_gap_fixed", float("nan"))
+                    if math.isfinite(sample_ppl) and math.isfinite(gap_fixed):
+                        logger.info("       Train sample PPL: %.2f (fixed sample, validation protocol) | "
+                                    "generalization gap (val CE - train sample CE): %.4f nats",
+                                    sample_ppl, gap_fixed)
                 torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
                 crash_state["eval_rng"] = None
                 peak_memory.end_other()

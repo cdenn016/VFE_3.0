@@ -1934,7 +1934,9 @@ class RunArtifacts:
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
-        self.history: List[Dict[str, float]] = []          # in-memory copy of the CSV rows (for figures)
+        # In-memory copy of the CSV rows (for figures); cells are normalized floats and ints, and text in the str
+        # columns such as row_kind (vfe3.metrics_schema.normalize_metric_cell).
+        self.history: List[Dict[str, Union[float, int, str]]] = []
         self._fieldnames: Optional[List[str]] = None
 
         config_record = {
@@ -3691,6 +3693,67 @@ def _token_table_parameter_count(model: torch.nn.Module) -> Optional[int]:
     return total
 
 
+def _measured_forward_flops(
+    model:       torch.nn.Module,
+    cfg:         VFE3Config,
+    tokens_seen: int,
+
+    *,
+    device:      Optional[torch.device] = None,
+) -> Dict[str, object]:
+    r"""Measured forward FLOPs per token of the model's belief pipeline and decode (audit 2026-10-20 item 48).
+
+    The analytic proxy of :func:`_cost_model_fields` does not model the projected routing and content route, so
+    ``est_flops_analytic`` is None there. This counts instead: one sequence of ``max_seq_len`` seeded tokens runs
+    through ``forward_beliefs`` under :class:`torch.utils.flop_counter.FlopCounterMode`, once with the logits and once
+    without, in eval mode, without gradients and with the RNG streams restored. The diagonal-moments kernel is
+    switched to its torch route for the count, since the counter does not see Triton kernels, and restored. The
+    counter counts matrix-product-class operations (``mm``, ``bmm``, ``addmm``, ``baddbmm``, convolutions,
+    attention); elementwise work, reductions and factorizations are not counted, so the numbers are a lower bound
+    on the forward work and are dominated by the GEMMs that set it on this model.
+
+    ``flops_per_token_forward_measured`` (decode included), ``flops_per_token_beliefs_measured`` (the stack, no
+    decode), ``flops_per_token_decode_measured`` (their difference), the top counted operators of the full forward,
+    and ``est_train_flops_measured_3x`` :math:`3 F_{\mathrm{fwd}} D`, the forward count times the usual factor of
+    three for forward plus backward over the run's ``tokens_seen`` :math:`D` (the E-step backward and the table
+    optimizers are not separately modeled).
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+    from vfe3.relational_scoring import set_diagonal_moments_kernel
+
+    device = device if device is not None else next(model.parameters()).device
+    n = int(cfg.max_seq_len)
+    generator = torch.Generator().manual_seed(0)
+    tokens = torch.randint(0, int(cfg.vocab_size), (1, n), generator=generator).to(device)
+    was_training = model.training
+    rng_devices = [device] if device.type == "cuda" else []
+    previous_kernel = set_diagonal_moments_kernel("torch")
+    try:
+        with torch.random.fork_rng(devices=rng_devices), torch.no_grad():
+            model.eval()
+            with FlopCounterMode(display=False) as with_decode:
+                model.forward_beliefs(tokens, return_logits=True)
+            with FlopCounterMode(display=False) as without_decode:
+                model.forward_beliefs(tokens, return_logits=False)
+    finally:
+        set_diagonal_moments_kernel(previous_kernel)
+        model.train(was_training)
+    total = float(with_decode.get_total_flops()) / n
+    beliefs = float(without_decode.get_total_flops()) / n
+    by_op = with_decode.get_flop_counts().get("Global", {})
+    top = sorted(((str(op), float(value) / n) for op, value in by_op.items()), key=lambda item: -item[1])[:8]
+    return {
+        "flops_per_token_forward_measured": total,
+        "flops_per_token_beliefs_measured": beliefs,
+        "flops_per_token_decode_measured": total - beliefs,
+        "flops_measured_top_ops": {name: value for name, value in top},
+        "flops_measured_seq_len": n,
+        "flops_measured_scope": ("torch.utils.flop_counter matrix-product operators of one forward_beliefs "
+                                 "sequence (eval, no grad); a lower bound on the forward work"),
+        "est_train_flops_measured_3x": 3.0 * total * float(tokens_seen),
+    }
+
+
 def _cost_model_fields(
     model:       torch.nn.Module,
     cfg:         VFE3Config,
@@ -3765,11 +3828,13 @@ def _cost_model_fields(
         for parameter in norm_module.parameters():
             norm_parameters[id(parameter)] = int(parameter.numel())
     active += sum(norm_parameters.values())
-    # Transparent analytic FLOP proxy. Per token: decode over all V (2VK) and L*T belief E-step
-    # iterations. Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
+    # Transparent analytic FLOP proxy. Per token: decode over all V and L*T belief E-step
+    # iterations. The prior-bank decode is one (S, 2K) x (2K, V) product in its expanded form (the mean and the
+    # second-moment features against the bank's (V, 2K) right factor; vfe3/kernels/kl_decode.py), so 4VK forward
+    # FLOPs; the linear decode is (S, K) x (K, V), 2VK (audit 2026-10-20 item 48: 2VK understated the KL decode by 2). Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
     # application (2N times the mean squared block dim, d_head^2 for equal blocks). Constants are O(1); this is a proxy, not a calibrated count.
     L, T, N = int(cfg.n_layers), int(cfg.n_e_steps), int(cfg.max_seq_len)
-    fpt_decode         = 2.0 * V * K
+    fpt_decode         = (2.0 if cfg.decode_mode == "linear" else 4.0) * V * K
     estep_kernel       = 2.0 * N * K + 2.0 * N * block_dim_sq
     belief_estep       = L * T * estep_kernel
     fpt_estep          = belief_estep
@@ -4134,10 +4199,11 @@ def finalize_run(
     # VFE-only probes, recording why under "skipped_analyses".
     vfe_model = is_vfe_model(model)
     skipped_analyses: Dict[str, str] = {} if vfe_model else _non_vfe_skipped_analyses(model)
+    # No "diagnostics" key: it was always an empty dict and nothing wrote into it (audit 2026-10-20 item 73); a
+    # reader of an older test_results.json or summary.json finds it there and empty.
     results: Dict[str, object] = {
-        "diagnostics": {},
         **_conditional_artifact_fields(cfg),
-    }                                                          # mixes scalar headlines and nested diagnostics
+    }                                                          # mixes scalar headlines and nested records
     if test_loader is not None:
         m = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
         # A padded evaluation stream of T tokens holds T - 1 transitions, each scored exactly once,
@@ -4182,6 +4248,14 @@ def finalize_run(
                               "train_sample_ce_final": None, "train_sample_ce_best": None}
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
     decode_tau_eff = _decode_tau_eff(model, cfg)
+    # Test at the validation-selected weights beside the final-weights headline in test_results.json, as in
+    # summary.json (audit 2026-10-20 item 7); the headline test_ce / test_ppl stay the final weights.
+    results.update({key: best_weight_fields.get(key) for key in (
+        "test_best_ce", "test_best_ppl", "test_best_bits_per_token", "test_best_step", "test_best_status")})
+    if test_loader is not None and results.get("test_best_ppl") is not None and results.get("test_ppl") is not None:
+        logger.info("Test perplexity: %.2f at the final weights (step %s), %.2f at the validation-selected weights "
+                    "(step %s)", float(results["test_ppl"]), final_step, float(results["test_best_ppl"]),
+                    results.get("test_best_step"))
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": False, "evaluation_weights": "final",
                     "evaluated_step": final_step, **final_val_fields,
@@ -4293,6 +4367,11 @@ def finalize_run(
     try:
         if vfe_model:
             scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
+            try:                                       # the projected route's measured cost (audit 2026-10-20 #48)
+                scaling_point.update(_measured_forward_flops(model, cfg, tokens_seen, device=device))
+            except Exception as flop_exc:
+                logger.warning("measured forward FLOPs failed (%s); scaling_point keeps the analytic fields",
+                               flop_exc)
         else:
             scaling_point.update(model.cost_model_fields(n_params, tokens_seen, wall_time=wall_time))
     except Exception as exc:
@@ -4322,7 +4401,6 @@ def finalize_run(
         "test_overlap_context_targets": results.get("test_overlap_context_targets"),
         "test_padding_targets": results.get("test_padding_targets"),
         "test_stream_transitions": results.get("test_stream_transitions"),
-        "diagnostics":  results["diagnostics"],
         # No estep_final_iterate_f_per_token / estep_final_f_per_token / estep_iterate_evidence: nothing on the
         # projected routes produces an E-step iterate sequence, so those keys were always null (audit 2026-10-16
         # F86).
