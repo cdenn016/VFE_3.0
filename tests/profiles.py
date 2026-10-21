@@ -156,6 +156,8 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_table_update_mode': 'adamw',
     'm_table_fisher_lr': 0.1,
     'm_table_fisher_trust_radius': 0.1,
+    'm_decode_update_mode': 'adamw',
+    'm_phi_sparse_rows': False,
     'm_phi_group_trust_radius': 0.1,
     'm_phi_group_retraction': 'chart',
     'm_phi_group_log_fallback': 'series',

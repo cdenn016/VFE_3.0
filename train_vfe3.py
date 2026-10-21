@@ -295,6 +295,7 @@ config = dict(
     m_phi_group_log_fallback         = "series",       # "series" (certified series direction; structure-constant budget, block_glk d_head <= 16) | "eigenbasis" (off-strip blocks by the eigenbasis Psi inverse, kappa_2(U) > 1e3 rows take no step; no width budget); pullback_group with group_log only
     m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
     phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
+    m_phi_sparse_rows                = False,          # False (dense AdamW) | True (row-lazy AdamW on phi_embed: rows absent from the step take no moment update, step or decay; per-row bias correction; adamw only)
 
     m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
     m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight lambda (under "rotation" it also damps Fisher-visible rotations)
@@ -303,6 +304,7 @@ config = dict(
     m_table_update_mode              = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
     m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
     m_table_fisher_trust_radius      = 0.1,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step to second order; decay outside)
+    m_decode_update_mode             = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on the untied decode bank at m_table_fisher_lr / m_table_fisher_trust_radius; untie_decode_bank=True, prior-bank decode)
 
     #################################
     #    Embedding/Priors M-step

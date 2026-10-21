@@ -1366,6 +1366,25 @@ def _validated_saved_successful_updates(
     return count
 
 
+def _row_step_valid(
+    value:             object,
+    parameter:         torch.Tensor,
+    device:            torch.device,
+    maximum_slot_step: int,
+) -> bool:
+    r"""Whether ``value`` is a row-lazy table's per-row step count :math:`k_v` (``m_phi_sparse_rows``): shape ``(V,)``,
+    the parameter's dtype, on ``device``, finite non-negative integers no larger than the optimizer step clock."""
+    return (isinstance(value, torch.Tensor)
+            and value.device == device
+            and value.dtype == parameter.dtype
+            and value.layout == torch.strided
+            and value.shape == parameter.shape[:1]
+            and bool(torch.isfinite(value).all())
+            and bool((value >= 0).all())
+            and bool((value == value.round()).all())
+            and bool((value <= maximum_slot_step).all()))
+
+
 def _validate_optimizer_state(
     saved_state: object,
     optimizer:   torch.optim.Optimizer,
@@ -1419,8 +1438,14 @@ def _validate_optimizer_state(
             expected_keys = {"step", "exp_avg", "exp_avg_sq"}
             if bool(group.get("amsgrad", False)):
                 expected_keys.add("max_exp_avg_sq")
-            if keys != expected_keys:
+            # m_phi_sparse_rows: the row-lazy table also carries its per-row counts (absent in a dense checkpoint,
+            # which the row-lazy optimizer resumes at k_v = step).
+            row_lazy = bool(group.get("sparse_rows", False))
+            if keys != expected_keys and not (row_lazy and keys == expected_keys | {"row_step"}):
                 raise RuntimeError("checkpoint optimizer_state has an invalid AdamW slot schema")
+            if "row_step" in keys and not _row_step_valid(state["row_step"], parameter, torch.device("cpu"),
+                                                          maximum_slot_step):
+                raise RuntimeError("checkpoint optimizer_state row_step is incompatible with its parameter")
             step = state["step"]
             valid_step = (
                 isinstance(step, torch.Tensor)
@@ -1673,8 +1698,12 @@ def _validate_realized_optimizer_state(
         expected_keys = {"step", "exp_avg", "exp_avg_sq"}
         if bool(group.get("amsgrad", False)):
             expected_keys.add("max_exp_avg_sq")
-        if keys != expected_keys:
+        row_lazy = bool(group.get("sparse_rows", False))
+        if keys != expected_keys and not (row_lazy and keys == expected_keys | {"row_step"}):
             raise RuntimeError("realized optimizer has an invalid AdamW slot schema")
+        if "row_step" in keys and not _row_step_valid(state["row_step"], parameter, parameter.device,
+                                                      maximum_slot_step):
+            raise RuntimeError("realized optimizer row_step is incompatible with its parameter")
         step = state["step"]
         expected_step_device = (
             parameter.device

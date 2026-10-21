@@ -571,6 +571,22 @@ falls from about $4\times10^{-2}$ at $\|\varphi\|_F=0.05$ to $7\times10^{-3}$ at
 $\|\varphi\|_F=1.7$ ($d=6$), and a larger $R$ changes nothing there. The optimizer reports
 the halvings as `phi_group_backtracks_mean` and `phi_group_backtracks_max` on both retractions.
 
+Two opt-in optimizer toggles address the rare-row mechanisms of the 2026-10-20 audit; both
+default to the dense AdamW behavior. `m_phi_sparse_rows=True` (only with
+`m_phi_update_mode="adamw"`) steps `phi_embed` with row-lazy AdamW (`vfe3/sparse_row_optim.py`):
+a row that is neither among the step's input tokens nor carries a nonzero gradient takes no
+moment update, no step and no decoupled decay, and a stepped row's bias correction uses its own
+step count $k_v$, which the optimizer state checkpoints as `row_step`. Under dense AdamW a row
+revisited after a long gap moves about $\min(\sqrt T, 31.6)\,\mathrm{lr}$ per coordinate whatever
+its gradient; the row-lazy step moves a first touch by $\mathrm{lr}$. The moment tables stay
+dense, so the step does not save memory. `m_decode_update_mode="fisher"` (prior-bank decode with
+`untie_decode_bank=True`) replaces AdamW on `decode_mu_embed` and `decode_sigma_log_embed` with
+the natural-gradient step of the Gaussian Fisher metric $\operatorname{diag}(1/t_v, 1/2)$
+weighted by the step's target counts, $(m_v, l_v) \mathrel{-}= \eta\,(N/\max(c_v,1))\,(t_v\odot
+\nabla_m, 2\nabla_l)$, bounded per row in Fisher norm and never clipped; it shares
+`m_table_fisher_lr` and `m_table_fisher_trust_radius` with the encoder table step
+(`vfe3/table_optim.py`), and the decode AdamW rates only schedule it and set its decay.
+
 Under `m_phi_update_mode="pullback_group"` with `m_phi_group_retraction="group_log"`, a row
 whose blocks lie inside the principal strip (margin 0.25) and satisfy
 $\max_h\kappa_2(U_h)\le10^3$ takes the closed-form direction $\xi=U^{-1}\bar G$, and

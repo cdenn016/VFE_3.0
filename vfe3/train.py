@@ -56,6 +56,7 @@ from vfe3.gauge_optim import (
 from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments
 from vfe3.table_optim import (TABLE_FISHER_DIAGNOSTIC_KEYS, TableFisherAdamW, TableFisherGaugeManifoldAdamW,
                               TableFisherStatistics)
+from vfe3.sparse_row_optim import RowLazyAdamW, RowLazyTableFisherAdamW
 from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
@@ -270,6 +271,8 @@ def build_optimizer(
             "role": "phi",
         }
         phi_group.update(phi_group_metadata)
+        if cfg.m_phi_sparse_rows:                               # row-lazy AdamW (vfe3.sparse_row_optim)
+            phi_group["sparse_rows"] = True
     # sigma_weight_decay (default None = inherit the global weight_decay, the long-standing
     # behavior): a dedicated AdamW decay for the log-variance tables. The global decay pulls
     # log sigma toward 0 (sigma toward 1) -- an unintended lognormal prior fighting the configured
@@ -294,6 +297,8 @@ def build_optimizer(
     # m_table_update_mode='fisher' marks the type-prior tables for the natural-gradient step of
     # vfe3.table_optim; their AdamW rates then only schedule that step and set its decoupled decay.
     table_fisher = cfg.m_table_update_mode == "fisher"
+    # m_decode_update_mode='fisher' marks the untied decode bank for the same module's decode step.
+    decode_fisher = cfg.m_decode_update_mode == "fisher"
     groups = []
     if pb.mu_embed is not None:
         groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd,
@@ -316,8 +321,10 @@ def build_optimizer(
         # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
         # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
         # the tables they were cloned from unless their decoder rate overrides the fallback.
-        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **decode_mu_wd})
-        groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd})
+        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **decode_mu_wd,
+                       **({"table_fisher": "decode_mu"} if decode_fisher else {})})
+        groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd,
+                       **({"table_fisher": "decode_sigma"} if decode_fisher else {})})
     if pb.output_proj_weight is not None:                       # decode_mode='linear'
         groups.append({"params": [pb.output_proj_weight], "lr": decode_mu_lr, "role": "mu", **decode_mu_wd})
     if pb.output_proj_bias is not None:                         # decode_mode='linear': learned log-unigram prior
@@ -436,16 +443,19 @@ def build_optimizer(
         )
 
     table_kwargs = {}
-    if table_fisher:
+    if table_fisher or decode_fisher:
         # gaussian_frame_diagonal: the metric of p_v in mu_v is U_v^-T diag(1/s_v) U_v^-1, so the step reads the layer-0
         # frames of the step's types; on identity frames it is the diagonal metric and the diagonal step is exact.
+        # The decode bank's metric reads no frame.
         from vfe3.model.frame_actions import frames_identity_reason
         frame_builder = (model.token_type_frames
-                         if pb.frame_diagonal and frames_identity_reason(cfg, pb.phi_embed.shape[-1]) is None
+                         if table_fisher and pb.frame_diagonal
+                         and frames_identity_reason(cfg, pb.phi_embed.shape[-1]) is None
                          else None)
         table_kwargs = dict(statistics=TableFisherStatistics(pb, frame_builder=frame_builder),
                             table_fisher_lr=cfg.m_table_fisher_lr,
                             table_fisher_trust_radius=cfg.m_table_fisher_trust_radius)
+    table_fisher = table_fisher or decode_fisher                # either bank selects the table Fisher optimizer
     if phi_update_policy.requires_manifold_optimizer:
         # Stored phi factors use one mixed optimizer; every other group remains standard AdamW.
         #
@@ -488,6 +498,13 @@ def build_optimizer(
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
     use_fused = next(model.parameters()).is_cuda
+    if cfg.m_phi_sparse_rows:
+        # Row-lazy phi_embed (validated adamw-only): the occurrence mask reads the step's tokens from the statistics
+        # train_step fills; the base AdamW (fused on CUDA) never sees the frame table's gradient.
+        if table_fisher:
+            return RowLazyTableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
+        return RowLazyAdamW(groups, statistics=TableFisherStatistics(pb), weight_decay=cfg.weight_decay,
+                            fused=use_fused)
     if table_fisher:
         return TableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
     return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused)
@@ -1250,10 +1267,11 @@ def train_step(
         _fisher_provider = getattr(optimizer, "phi_statistics_provider", None)
         if _fisher_provider is not None:
             _fisher_provider.set_batch(tokens, _scored_det)
-        # m_table_update_mode='fisher': the table step's counts n_v and denominator N.
+        # m_table_update_mode='fisher': the table step's counts n_v and denominator N; m_decode_update_mode='fisher':
+        # the target counts c_v; m_phi_sparse_rows: the occurrence mask of the frame rows.
         _table_provider = getattr(optimizer, "table_statistics_provider", None)
         if _table_provider is not None:
-            _table_provider.set_batch(tokens, _scored_det)
+            _table_provider.set_batch(tokens, _scored_det, targets=targets)
         if status_out is not None:
             # References (no copy, no host sync) to the gradients that reach the step: the table Fisher step
             # and the manifold phi step set .grad = None inside step(), so a post-step reader of .grad (the spike
@@ -7258,6 +7276,9 @@ def _fmt_decode_lrs(cfg: VFE3Config) -> str:
         return f"mu={mu_lr}  sigma=inactive"
     if not cfg.untie_decode_bank:
         return f"mu={cfg.m_p_mu_lr} (shared)  sigma={cfg.m_p_sigma_lr} (shared)"
+    if getattr(cfg, "m_decode_update_mode", "adamw") == "fisher":
+        return (f"decode=fisher eta={cfg.m_table_fisher_lr} r={cfg.m_table_fisher_trust_radius} "
+                f"(schedule/decay rates mu={mu_lr} sigma={sigma_lr})")
     return f"mu={mu_lr}  sigma={sigma_lr}"
 
 
