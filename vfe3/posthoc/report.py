@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from vfe3.cpu_linalg import with_batched_cpu_lu_guard
 from vfe3.posthoc import evaluate as ev
 from vfe3.posthoc import streams as st
 
@@ -656,6 +657,7 @@ def _indices(split: str, dataset: Any, options: PosthocOptions) -> np.ndarray:
     return st.evenly_spaced(len(dataset), options.max_windows)
 
 
+@with_batched_cpu_lu_guard
 def run_posthoc(
     run_dir: "str | Path",
 

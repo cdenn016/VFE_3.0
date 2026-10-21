@@ -87,6 +87,11 @@ def fully_gauge_covariant_overrides(
         if get("decode_mode") == "diagonal_chunked":
             wanted["decode_mode"] = "full_chunked"
         wanted["decode_second_order"] = False
+    elif get("family") == "gaussian_frame_diagonal" and get("decode_mode") != "linear":
+        # A tied decode bank pairs the encoder's local-frame mean with the reference variance c_v, which the frame
+        # change moves by about 3e-2 in the logits; the untied bank's own tables are both reference coordinates
+        # (audit 2026-10-20 item 59).
+        wanted["untie_decode_bank"] = True
     if get("encode_mode") == "per_token_additive":
         wanted["encode_mode"] = "per_token"
     if get("m_phi_update_mode") in ("pullback_group", "fisher_group"):

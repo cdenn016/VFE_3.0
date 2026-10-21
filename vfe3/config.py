@@ -1535,6 +1535,13 @@ class VFE3Config:
                                       "diagonal KL decoder reads diag Sigma_i in local or c_i in reference coordinates)")
             if self.decode_second_order:
                 frame_problems.append("decode_second_order=True (its trace term reads a local diagonal covariance)")
+            # A tied decode bank returns the encode tables, whose mean the encoder reads in local coordinates, so the
+            # decoder would score against N(mu_embed[v], diag c_v), a local-frame mean paired with a reference-frame
+            # variance, and the gauge switch would certify it (audit 2026-10-20 item 59).
+            if self.decode_mode != "linear" and not self.untie_decode_bank:
+                frame_problems.append(f"untie_decode_bank=False with decode_mode={self.decode_mode!r} (the tied bank "
+                                      "pairs the encoder's local-frame mean with the reference variance c_v; requires "
+                                      "untie_decode_bank=True)")
             # The table Fisher step preconditions mu_v by the metric U_v^-T diag(1/s_v) U_v^-1 of the type's layer-0
             # frame U_v (vfe3.table_optim). A positional frame makes U_i depend on the position, so the exact metric
             # would be the occurrence average of U_i^-T diag(1/s_v) U_i^-1, which the step does not implement.
@@ -2635,10 +2642,13 @@ class VFE3Config:
             mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"
-                and self.family == "gaussian_diagonal" and self.projected_factorization == "gram"):
+                and self.family in ("gaussian_diagonal", "gaussian_frame_diagonal")
+                and self.projected_factorization == "gram"):
+            # gaussian_frame_diagonal reaches the fused route too: its reference variances c_i are read through the
+            # identity frame (audit 2026-10-20 item 45).
             mark(("relational_diag_moments_kernel",),
                  "only read by the diagonal comparison route (comparison_invariant Gaussian-KL kernel router on "
-                 "gaussian_diagonal under projected_factorization='gram')")
+                 "gaussian_diagonal or gaussian_frame_diagonal under projected_factorization='gram')")
         if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
                 and self.relational_routing == "noisy_key"):
             mark(("kappa_beta",), "relational_routing='noisy_key' routes at temperature exactly 1: the learned key "

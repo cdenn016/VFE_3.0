@@ -21,11 +21,10 @@ from vfe3.process_utils import run_process_tree
 
 
 FAST_WORKERS = 12
-SLOW_WORKERS = 3
-RUN_LANES = ("fast", "slow")
+# The former slow lane was removed (audit 2026-10-20 item 22): no test carried the slow marker, so it never ran one.
+RUN_LANES = ("fast",)
 LANE_TIMEOUT_SECONDS = {
     "fast": 2 * 60 * 60,
-    "slow": 8 * 60 * 60,
 }
 
 CPU_ENVIRONMENT = {
@@ -117,7 +116,6 @@ def preflight_cpu_lane_workers(logical_cpu_count: int | None) -> None:
     """Validate every configured CPU lane against one topology snapshot."""
     for lane, configured_workers in (
         ("fast", FAST_WORKERS),
-        ("slow", SLOW_WORKERS),
     ):
         try:
             resolve_cpu_workers(configured_workers, logical_cpu_count)
@@ -139,18 +137,7 @@ def build_cpu_lane_command(
             "--dist",
             "loadscope",
             "-m",
-            "not slow and not cuda and not external",
-        ]
-    elif lane == "slow":
-        workers = resolve_cpu_workers(SLOW_WORKERS, logical_cpu_count)
-        lane_arguments = [
-            "--runslow",
-            "-n",
-            str(workers),
-            "--dist",
-            "loadgroup",
-            "-m",
-            "slow and not cuda and not external",
+            "not cuda and not external",
         ]
     else:
         raise ValueError(f"unknown CPU test lane {lane!r}")
@@ -199,10 +186,6 @@ def run_lane(
             print(f"{lane}: pytest subprocess failed: {exc}", file=sys.stderr)
             return 1
 
-        if lane == "slow" and completed.returncode == 5:
-            # pytest exit 5: no test carries the slow marker, so the lane has nothing to run.
-            print(f"{lane}: no tests selected")
-            return 0
         try:
             counts = read_junit_counts(junit_path)
         except (OSError, ElementTree.ParseError, ValueError) as exc:

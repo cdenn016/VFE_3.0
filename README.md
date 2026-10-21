@@ -143,7 +143,9 @@ coupling, a `none` or `layernorm` block norm with a `coordinate` block MLP (loca
 push $U_i\operatorname{diag}(c_i)U_i^\top$ and read back $\operatorname{diag}(U_i^{-1}SU_i^{-\top})$;
 reference coordinates push $\operatorname{diag}(c_i)$ and keep the diagonal), the `linear` or
 `diagonal_chunked` decoders (the latter reads $(\xi_i, c_i)$ in reference coordinates, or
-$\operatorname{diag}\Sigma_i$ in local ones), and the table Fisher step only with `pos_phi="none"`.
+$\operatorname{diag}\Sigma_i$ in local ones, and needs `untie_decode_bank=True`, since a tied bank
+would pair the encoder's local-frame mean with the reference variance $c_v$; audit 2026-10-20 item
+59), and the table Fisher step only with `pos_phi="none"`.
 That step preconditions the mean row by the metric $U_v^{-\top}\operatorname{diag}(1/s_v)U_v^{-1}$ of
 the type's layer-0 frame, the diagonal step in $\xi_v = U_v^{-1}\mu_v$; a positional frame would
 make the metric an average over occurrences, which the step does not form.
@@ -1023,6 +1025,11 @@ for dictionaries passed to launchers or serialized-config loaders, and monkeypat
 the launcher dictionary inside the test instead of asserting live experiment settings.
 When adding a config field, add an explicit test baseline value in `tests/profiles.py`;
 the schema coverage check in `tests/test_config_isolation.py` identifies omissions.
+A test that needs CUDA must be registered in `CUDA_TESTS` (or, for one parametrization,
+`CUDA_PARAM_TESTS`) of `tests/pytest_policy.py`, which marks it `cuda` for
+`check_gpu_tests.py`; outside the CUDA lane an unregistered test that skips for want of
+CUDA fails. `check_gpu_tests.py` keeps each run's JUnit report, with the recorded parity
+errors and kernel timings, under `.verification/gpu_tests/`.
 
 ## Outputs and diagnostics
 
@@ -1039,7 +1046,7 @@ When a [`RunArtifacts`](vfe3/run_artifacts.py) instance is supplied, a run direc
 | `final_validation.json` | Validation metrics at the final training step. |
 | `test_results.json` | Held-out test evaluation of the final training weights, with the evaluated step recorded. |
 | `provenance.json` | Git, environment, and dataset provenance. |
-| `summary.json` | Headline end-of-run values and timing. |
+| `summary.json` | Headline end-of-run values and timing, and the kernels that ran (`decode_ce_kernel`, `diag_moments_kernel` with its call counts). |
 | `pure_path_report.json` | Configuration audit attempted during every finalization; write failures are logged and skipped. |
 | `research.json` and figure files | Optional research probes and diagnostic or publication-oriented plots. |
 

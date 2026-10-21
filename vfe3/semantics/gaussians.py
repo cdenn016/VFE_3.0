@@ -586,10 +586,10 @@ def _table_geometry(mu_d0: np.ndarray, lv: np.ndarray) -> Dict[str, Any]:
 
 def _variance_sorted_neighbors(ctx: AnalysisContext, ids: np.ndarray, row_of: Dict[int, int],
                                mu: np.ndarray, lv: np.ndarray, mu_d0: np.ndarray,
-                               logdet: np.ndarray) -> List[Dict[str, Any]]:
+                               logdet: np.ndarray, *, kl_neighbors: bool = True) -> List[Dict[str, Any]]:
     r"""Top cosine neighbors (centered, D0 units) of each probe, re-sorted by log det Sigma.
 
-    Also lists the nearest rows by :math:`\mathrm{KL}(\pi_{probe}\,\|\,\pi_x)`.
+    Also lists the nearest rows by :math:`\mathrm{KL}(\pi_{probe}\,\|\,\pi_x)` unless ``kl_neighbors`` is False.
     """
     probes = [int(t) for t in ctx.probe_ids if int(t) in row_of]
     if not probes:
@@ -598,11 +598,14 @@ def _variance_sorted_neighbors(ctx: AnalysisContext, ids: np.ndarray, row_of: Di
     Xn = _centered_unit(mu_d0)                                  # (n, K)
     S = Xn[rows_p] @ Xn.T                                       # (P, n) cosines
     S[np.arange(rows_p.size), rows_p] = -np.inf
-    KL = kl_one_vs_all(mu[rows_p], lv[rows_p], mu, lv)          # (P, n)
-    KL[np.arange(rows_p.size), rows_p] = np.inf
     z = (logdet - logdet.mean()) / (logdet.std() if logdet.std() > 0 else 1.0)
     k = min(_N_NEIGHBORS, ids.size - 1)
-    k_kl = min(_N_KL_NEIGHBORS, ids.size - 1)
+    k_kl = min(_N_KL_NEIGHBORS, ids.size - 1) if kl_neighbors else 0
+    if kl_neighbors:
+        KL = kl_one_vs_all(mu[rows_p], lv[rows_p], mu, lv)      # (P, n)
+        KL[np.arange(rows_p.size), rows_p] = np.inf
+    else:
+        KL = np.zeros((rows_p.size, ids.size))
     out = []
     for i, t in enumerate(probes):
         top = np.argpartition(-S[i], k - 1)[:k]
@@ -814,6 +817,7 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
                   *, bank: str, failed: List[Dict[str, str]],
                   notes: List[str],
                   logdet_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                  divergences_reason: Optional[str] = None,
                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     r"""Items 1-6 of the Sigma section for one bank. Returns (metrics, arrays for figures).
 
@@ -822,7 +826,9 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     ``logdet_fn`` gives (n,) :math:`\log\det\Sigma_v` for a covariance that is not diagonal (the
     per-head ``block_cholesky`` blocks); None takes the row sum of ``lv_fn``. The frequency,
     entailment and similarity bootstraps each draw from their own stream
-    ``[ctx.seed, _SIGMA_STREAM, _BANK_STREAM[bank], _STEP_STREAM[step]]``.
+    ``[ctx.seed, _SIGMA_STREAM, _BANK_STREAM[bank], _STEP_STREAM[step]]``. ``divergences_reason`` marks the
+    divergence items (the KL neighbors, the KL-asymmetry entailment and the Gaussian similarity scorers) not
+    applicable with that reason, for tables whose mean and variance are not one Gaussian's moments in one chart.
     """
     def rng(step_name: str) -> np.random.Generator:
         return np.random.default_rng(
@@ -869,11 +875,17 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
         "semantic fields", lambda: _fields(ctx, row_of, logdet, log_count), (dict(_FAILED_STEP), {}))
     metrics["neighbors"] = step(
         "variance-sorted neighbors",
-        lambda: _variance_sorted_neighbors(ctx, ids, row_of, mu, lv, mu_d0, logdet), [])
-    metrics["entailment"] = step(
-        "entailment", lambda: _entailment(ctx, row_of, mu, lv, logdet, rng("entailment")), dict(_FAILED_STEP))
-    metrics["similarity"] = step(
-        "similarity", lambda: _similarity(ctx, row_of, mu, mu_d0, lv_d0, rng("similarity")), dict(_FAILED_STEP))
+        lambda: _variance_sorted_neighbors(ctx, ids, row_of, mu, lv, mu_d0, logdet,
+                                           kl_neighbors=divergences_reason is None), [])
+    if divergences_reason is not None:
+        not_applicable = {"status": "not_applicable", "reason": divergences_reason}
+        metrics["entailment"], metrics["similarity"] = dict(not_applicable), dict(not_applicable)
+    else:
+        metrics["entailment"] = step(
+            "entailment", lambda: _entailment(ctx, row_of, mu, lv, logdet, rng("entailment")), dict(_FAILED_STEP))
+        metrics["similarity"] = step(
+            "similarity", lambda: _similarity(ctx, row_of, mu, mu_d0, lv_d0, rng("similarity")),
+            dict(_FAILED_STEP))
     metrics["table_geometry"] = step(
         "table geometry", lambda: _table_geometry(mu_d0, lv), dict(_FAILED_STEP))
     arrays = {"lv": lv, "logdet": logdet, "log_count": log_count, "binned": binned,
@@ -1301,6 +1313,8 @@ def _bank_outputs(run: Any, ctx: AnalysisContext, result: SectionResult, m: Dict
         emit_figure("gaussian_similarity", lambda: _plot_similarity(
             ctx, sim, f"{bank_label}: Gaussian similarity scorers", f"{prefix}gaussian_similarity"))
         emit_table("gaussian_similarity", lambda: _similarity_table(sim))
+    elif sim.get("status") == "not_applicable":
+        result.notes.append(f"{bank_label}: Gaussian similarity scorers not applicable ({sim.get('reason')})")
     elif sim.get("status") != "failed":
         result.notes.append(f"{bank_label}: no similarity benchmark with >= {_MIN_PAIRS} resolved pairs")
 
@@ -1418,8 +1432,24 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     elif run.decode_kind not in GAUSSIAN_BANK_DECODE_KINDS:
         result.notes.append(f"decode kind {run.decode_kind!r}: no decode-bank covariance analysis")
 
+    reference = bool(getattr(run, "reference_variances", False))
+    divergences_reason = None
+    if reference:                                # audit 2026-10-20 item 26
+        divergences_reason = ("gaussian_frame_diagonal stores the reference variances c_v with Sigma_v = U_v diag(c_v) "
+                              "U_v^T: the table pairs the local mean mu_v with c_v, which are not one Gaussian's "
+                              "moments in one chart, and two types have different frames")
+        metrics["prior_covariance"] = {
+            "table": "frame_diagonal (reference variances c_v)",
+            "log_det": "exact: sum_k log c_vk + 2 tr X_v",
+            "divergences": f"not applicable ({divergences_reason})"}
+        result.notes.append("family='gaussian_frame_diagonal': the per-coordinate log-variances, tr and their "
+                            "dispersion describe the reference variances c_v, not diag Σ_v; log det Σ_v = "
+                            "Σ_k log c_vk + 2 tr X_v is exact; the KL neighbors, the KL-asymmetry entailment and "
+                            f"the Gaussian similarity scorers are not applicable: {divergences_reason}")
     m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, bank="Prior bank",
-                           failed=failed, notes=result.notes, logdet_fn=run.log_det if blocks else None)
+                           failed=failed, notes=result.notes,
+                           logdet_fn=run.log_det if (blocks or reference) else None,
+                           divergences_reason=divergences_reason)
     metrics["banks"]["prior"] = m
     disp = m["dispersion"]
     result.notes.append(f"CV(tr Σ) = {disp['cv_trace']:.3f} is computed in the trained coordinates "
