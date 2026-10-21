@@ -70,6 +70,7 @@ from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artif
 #                                                      lazily (function-local), so there is no cycle
 from vfe3.runtime import disable_fill_uninitialized_memory, seed_everything
 from vfe3.timing import TrainingTimer
+from vfe3.weight_ema import WeightEMA
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
     nonfinite_tangent_elements,
@@ -5538,6 +5539,8 @@ def _train_loop(
     # (step, metrics, parameter/buffer versions) of the latest eval, handed to terminal_callback (audit 2026-10-12 #12).
     last_eval_record: Optional[Tuple[int, Dict[str, Any], tuple]] = None
     optimizer = build_optimizer(model, cfg)
+    # Opt-in weight EMA (weight_ema_decay; audit 2026-10-20 item 8): None when off, so the loop below is unchanged.
+    weight_ema = WeightEMA.from_config(model, cfg)
     # Warmup/cosine multiplier, floored per group so each group's ABSOLUTE LR never decays below
     # cfg.min_lr_frac * base -- see _floor_lr_lambdas. With cfg.min_lr_frac=0
     # this is exactly the pure half-cosine-to-zero (the theoretically pure path). base_lrs are the
@@ -5638,7 +5641,8 @@ def _train_loop(
                                      data_state=resume_data_state,
                                      expected_data_identity=loader_data_identity,
                                      expected_selection_data_identity=selection_data_identity,
-                                     expected_steps_per_epoch=steps_per_epoch)
+                                     expected_steps_per_epoch=steps_per_epoch,
+                                     weight_ema=weight_ema)
         if not resume_data_state:
             raise RuntimeError(
                 "exact data resume requires checkpoint data_state; this checkpoint predates "
@@ -5756,6 +5760,10 @@ def _train_loop(
     elif start_step > 0 and artifacts is not None:
         logger.info(" resume: the checkpoint carries no divergence-monitor state; spike detection restarts "
                     "and waits %d finite steps", DIVERGENCE_EMA_WARMUP)
+    if weight_ema is not None and start_step >= weight_ema.start_step and not weight_ema.active:
+        logger.warning(" resume: the checkpoint at step %d carries no weight EMA although the EMA starts at step %d; "
+                       "it starts at the next accepted update", start_step, weight_ema.start_step)
+    last_ema_val: Optional[Dict[str, Any]] = None             # the EMA weights' validation of the current eval
     completed_steps = int(n_steps)
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
@@ -6018,6 +6026,7 @@ def _train_loop(
             _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state", exc, logger)
             artifacts.numerics_counters_state = None
         artifacts.wall_clock_state = _elapsed_wall_clock()
+        artifacts.weight_ema_state = weight_ema.state_dict() if weight_ema is not None else None
         artifacts.divergence_state = _divergence_checkpoint_record(
             divergence, interval_ends=interval_ends, skipped_steps=skipped_steps,
             consecutive_skips=consecutive_skips, last_group_norms=last_group_norms,
@@ -6356,6 +6365,10 @@ def _train_loop(
                 _emit_warning(logger, warning_sink, "failed_step_skip", message, exception=type(exc).__name__,
                               detail=str(exc), notes=[str(note) for note in getattr(exc, "__notes__", ())],
                               batch=batch_path, count=failed_step_skips)
+            if weight_ema is not None:
+                # After the step returned and before the post-step phase, so a post-step emergency checkpoint
+                # carries the shadow of this step; a rejected update leaves it unchanged (audit 2026-10-20 item 8).
+                weight_ema.observe(step + 1, bool(step_status.get("did_step", False)))
             crash_state["phase"] = "post_step"
             losses.append(step_loss)
             recent_losses.append(float(step_loss))
@@ -6531,6 +6544,22 @@ def _train_loop(
                 eval_cpu_rng = torch.get_rng_state().clone()
                 crash_state["eval_rng"] = eval_cpu_rng
                 peak_memory.begin_other()
+                last_ema_val = None
+                if weight_ema is not None and weight_ema.active:
+                    # The EMA weights first, so the raw evaluation below and every record keyed on parameter
+                    # versions (the terminal-validation signature, last_eval_record) read the restored raw weights.
+                    _t0 = time.perf_counter()
+                    try:
+                        with weight_ema.applied():
+                            last_ema_val = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
+                    except Exception as exc:
+                        if max_failed_skips is None or isinstance(exc, torch.OutOfMemoryError):
+                            raise
+                        _record_diagnostic_failure(diagnostics_failures, "evaluation_weight_ema", exc, logger)
+                    if last_ema_val is not None:
+                        logger.info(" Validation @ step %d at the EMA weights (%d updates since step %s): CE %.4f | "
+                                    "Val PPL %.1f (%.1f s)", step + 1, weight_ema.updates, weight_ema.initialized_step,
+                                    last_ema_val["ce"], last_ema_val["ppl"], time.perf_counter() - _t0)
                 if (_final_validation_out is not None and terminal_callback is None
                         and step + 1 == n_steps):
                     terminal_validation_signature = _terminal_validation_signature(model, val_loader)
@@ -6760,6 +6789,11 @@ def _train_loop(
                     "val_expected_targets": (last_val["expected_targets"] if do_eval else float("nan")),
                     "val_scored_targets": (last_val["scored_targets"] if do_eval else float("nan")),
                     "val_excluded_targets": (last_val["excluded_targets"] if do_eval else float("nan")),
+                    # Opt-in weight EMA: the EMA weights' validation on an eval row after the start, NaN otherwise.
+                    **({"val_ema_ce": (last_ema_val["ce"] if do_eval and last_ema_val is not None else float("nan")),
+                        "val_ema_ppl": (last_ema_val["ppl"] if do_eval and last_ema_val is not None
+                                        else float("nan")),
+                        "weight_ema_updates": weight_ema.updates} if weight_ema is not None else {}),
                     "attn_entropy":       d["attn_entropy"],
                     "self_coupling":      d["self_coupling"],     # alpha-regularized F self-term alpha_i D + R(alpha_i)
                     "self_divergence":    d["self_divergence"],   # raw D(q_i||p_i) drift, unweighted by alpha_i and without R(alpha_i)
@@ -7068,6 +7102,9 @@ def _train_loop(
     # already ended its interval, so the monitor is saved as it stands.
     if artifacts is not None:
         artifacts.wall_clock_state = _elapsed_wall_clock()
+        artifacts.weight_ema_state = weight_ema.state_dict() if weight_ema is not None else None
+        # The EMA object itself, for finalize_run's validation and test at the EMA weights (None when off).
+        artifacts.weight_ema = weight_ema
         artifacts.divergence_state = _divergence_checkpoint_record(
             divergence, interval_ends=False, skipped_steps=skipped_steps,
             consecutive_skips=consecutive_skips, last_group_norms=last_group_norms,

@@ -553,7 +553,12 @@ Four numerical safeguards trade cost for conditioning; each is at its cheapest s
 scorer and of the routed spread's query rows. A larger budget dispatches fewer kernels and holds
 more transient memory; values change only by float32 reduction order, and every loop above
 32 MiB stays checkpointed, so a raised budget changes the tile count and never what autograd
-saves. Its step-time effect on CUDA is not measured.
+saves. A routed-spread tile is sized with every batch axis included, so the budget bounds the
+whole tile rather than one sequence's share. When the routing prior is $-\infty$ above the
+diagonal (every causal prior), the readout sees it from the prior tensor and each spread tile of
+query rows $[i, i+s)$ contracts only the sources $[0, i+s)$, with at least four tiles; the dropped
+terms are $0\cdot x$, so values and gradients are unchanged. Its step-time effect on CUDA is not
+measured.
 
 Under `m_phi_update_mode="pullback_group"`, `m_phi_group_differential_mode` selects how the
 strict Frobenius-pullback direction evaluates the trivialized exponential differentials
@@ -1003,6 +1008,16 @@ The launcher checks CUDA availability, so the wrong interpreter can select CPU.
 | [`ablation.py`](ablation.py) | Named architecture and configuration ablations. |
 | [`scaling.py`](scaling.py) | Independent baseline with width, depth, joint-size, and training-budget grids; see [scaling settings](docs/scaling-settings.md). |
 | [`make_figures.py`](make_figures.py) | Regenerates eligible figures from a saved run. |
+| [`average_checkpoints.py`](average_checkpoints.py) | Scores the uniform average of two or more checkpoints of one run (for example `best_model.pt` and `final_model.pt`) on its validation and test streams under the run's protocol; writes `<run>/averaged_eval.json`. |
+
+Weight averaging during training is opt-in: `weight_ema_decay` (None by default) keeps an
+exponential moving average of the trainable weights from `weight_ema_start_frac` of
+`max_steps`, updated after each accepted update (or every `weight_ema_update_interval`
+accepted updates with the decay of that many steps; `weight_ema_device = "cpu"` holds it in
+host memory). Each evaluation also scores the EMA weights (`val_ema_ce`, `val_ema_ppl` in
+`metrics.csv`), `best_model.pt` stays selected on the raw weights, checkpoints carry the
+average under `weight_ema` so a resume continues it, and finalization records validation
+and test at the EMA weights (`val_ema_*`, `test_ema_*`) beside the raw numbers.
 
 ### Focused validation
 

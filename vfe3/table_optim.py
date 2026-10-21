@@ -229,6 +229,22 @@ def _schedule_factor(group: Dict[str, object]) -> float:
     return 0.0 if initial == 0.0 or lr == 0.0 else lr / initial
 
 
+def _overflow_candidate_rows(
+    tokens: torch.Tensor,                     # (...) the step's input ids in [0, V)
+    V:      int,
+    device: torch.device,
+) -> torch.Tensor:                            # (R,) int64 row ids, R = min(tokens.numel(), V)
+    r"""Rows on which the float64 overflow twin runs: a superset of the active rows :math:`\{v : n_v > 0\}`.
+
+    The step's input ids (with repeats) when there are fewer of them than rows, else every row. Both sizes are known
+    on the host, so the gather needs no device-to-host read (no ``nonzero``); a repeated id recomputes the same row.
+    """
+    ids = tokens.reshape(-1)
+    if ids.numel() >= V:
+        return torch.arange(V, device=device)
+    return ids.to(device=device, dtype=torch.int64)
+
+
 def _robust_table_steps(
     g_mu:         Optional[torch.Tensor],     # (V, K) unscaled mean gradient, or None
     g_l:          Optional[torch.Tensor],     # (V, K) unscaled log-variance gradient, or None
@@ -396,8 +412,14 @@ class _TableFisherMixin:
         # the table). Those rows, and only those (a finite norm_sq keeps every other row bit-identical), take the
         # same trust-region step from the float64 direction, where neither can overflow for float32 gradients.
         overflow = active & ~torch.isfinite(norm_sq)                                                 # (V,)
+        # The float64 twin runs on the candidate rows only (audit 2026-10-20 item 44): an overflowed row is active,
+        # so it is among the step's input ids, a set of host-known size with no host read; each twin output is
+        # row-wise, so a gathered row equals its full-table value bit for bit and duplicates scatter equal values.
+        cand = _overflow_candidate_rows(tokens, V, reference.device)                                 # (R,) row ids
+        cand_overflow = overflow[cand]                                                               # (R,)
         wide_mu, wide_l, wide_sq_mu, wide_sq_l, wide_trust = _robust_table_steps(
-            g_mu, g_l, weight, s, eta, self._table_fisher_trust_radius, active)
+            None if g_mu is None else g_mu[cand], None if g_l is None else g_l[cand], weight[cand], s[cand], eta,
+            self._table_fisher_trust_radius, active[cand])                                           # (R, K), (R,)
         realized_sq = torch.zeros(V, dtype=dtype, device=reference.device)    # (V,) ||scheduled step||^2 / trust^2
         overflow_sq = torch.zeros(V, dtype=torch.float64, device=reference.device)   # (V,) ||scheduled step||^2
         for p, step, group, part, wide, wide_sq in ((mu, step_mu, mu_group, norm_sq_mu, wide_mu, wide_sq_mu),
@@ -414,7 +436,8 @@ class _TableFisherMixin:
             factor = _schedule_factor(group)
             if factor != 0.0:
                 scheduled = torch.where(trust > 0, factor * trust * step, torch.zeros_like(step))   # (V, K)
-                scheduled = torch.where(overflow.unsqueeze(-1), (factor * wide).to(dtype), scheduled)
+                scheduled = scheduled.index_put(
+                    (cand,), torch.where(cand_overflow.unsqueeze(-1), (factor * wide).to(dtype), scheduled[cand]))
                 if frames is not None and p is mu:
                     # Delta mu_v = U_v Delta xi_v on the step's rows (every other row's step is zero).
                     scheduled = scheduled.index_copy(0, rows, frame_matvec(forward, scheduled[rows],
@@ -422,10 +445,11 @@ class _TableFisherMixin:
                 update = scheduled.to(p.dtype)
                 p.add_(update if skip is None else torch.where(skip, torch.zeros_like(update), update))
                 realized_sq = realized_sq + factor ** 2 * torch.where(overflow, torch.zeros_like(part), part)
-                overflow_sq = overflow_sq + factor ** 2 * wide_sq
+                overflow_sq = overflow_sq.index_put((cand,), overflow_sq[cand] + factor ** 2 * wide_sq)
             p.grad = None
         if self._collect_table_diag:
-            accepted = torch.where(overflow, wide_trust.to(dtype), trust.squeeze(-1))                # (V,)
+            accepted = trust.squeeze(-1).index_put(
+                (cand,), torch.where(cand_overflow, wide_trust.to(dtype), trust.squeeze(-1)[cand]))   # (V,)
             n_active = active.sum().to(dtype)
             realized = torch.where(overflow, overflow_sq.sqrt().to(dtype),
                                    accepted * realized_sq.sqrt())                                    # (V,) realized norm

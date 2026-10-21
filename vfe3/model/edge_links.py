@@ -34,7 +34,7 @@ Wilson-type loop prior against the previous layer's links.
 """
 
 import math
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -58,9 +58,13 @@ class EdgeContext(NamedTuple):
 
     Every tensor is at the readout's compute dtype; ``T``, ``R``, ``receive`` and ``F`` come from one
     float64 chart evaluation. ``A`` is ``(..., N, K, r)`` for ``"lowrank"`` and the shared ``(K, r)`` basis
-    for ``"pure_gauge"``. ``Phi[..., i, j]`` is :math:`\Phi_{ij}` for receiver i and sender j; on pairs with
-    no routing weight in any head it is :math:`\varphi_1(0) = I` (``"lowrank"``) or 0 (``"pure_gauge"``),
-    values that every consumer multiplies by :math:`\beta_{ij} = 0`.
+    for ``"pure_gauge"``. Under ``"lowrank"`` ``Phi[..., i, j]`` is :math:`\Phi_{ij}` for receiver i and sender j;
+    on pairs with no routing weight in any head it is :math:`\varphi_1(0) = I`, a value that every consumer
+    multiplies by :math:`\beta_{ij} = 0`. Under ``"pure_gauge"`` the coefficient depends on the sender only,
+    :math:`\Phi_{ij} = \Phi_j` on routed pairs and 0 elsewhere, so ``Phi[..., j]`` holds :math:`\Phi_j` once per
+    sender, ``(..., N, r, r)``, and every consumer contracts it with the routed weights without a per-edge broadcast
+    (audit 2026-10-20 item 51; :func:`_sender_terms`). A per-edge ``(..., N, N, r, r)`` tensor is still
+    accepted in either mode and read edge by edge.
     """
 
     mode:    str
@@ -72,7 +76,7 @@ class EdgeContext(NamedTuple):
     B:       torch.Tensor              # (..., N, K, r) sender factors B_j
     B_ref:   torch.Tensor              # (..., N, K, r) B~_j = T^{-T} B_j; row block h is (B~_j)_h
     p:       torch.Tensor              # (..., N, H, r) p_j^h = (B~_j)_h^T T_h xi_j (unshifted values)
-    Phi:     torch.Tensor              # (..., N, N, r, r) Phi_ij
+    Phi:     torch.Tensor              # (..., N, N, r, r) Phi_ij, or (..., N, r, r) Phi_j per sender (pure_gauge)
     g_phi:   Optional[torch.Tensor]    # (..., N, r, r) phi_1(B_i^T A) of g_i (pure_gauge), else None
     mask:    torch.Tensor              # (..., N, N) bool, routed in some head
 
@@ -127,13 +131,15 @@ def edge_coefficients(
     beta: torch.Tensor,                # (..., H, N, N) routing weights
     mode: str,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    r"""Per-edge :math:`\Phi_{ij}` ``(..., N, N, r, r)``, the outer :math:`\varphi_1(B_i^\top A)` (pure gauge) and the routed mask.
+    r"""The coefficients :math:`\Phi`, the outer :math:`\varphi_1(B_i^\top A)` (pure gauge) and the routed mask.
 
-    ``"lowrank"``: :math:`\Phi_{ij} = \varphi_1(B_j^\top A_i)`, the argument zeroed on pairs whose routing
-    weight vanishes in every head (the future under a causal prior) BEFORE :math:`\varphi_1`, so a large
-    unused argument cannot overflow into :math:`\infty\cdot 0`. ``"pure_gauge"``:
-    :math:`\Phi_{ij} = -\varphi_1(-B_j^\top A)` depends on the sender only (N matrix functions, no per-edge
-    one), broadcast to the edges and zeroed on unrouted pairs; :math:`g_i` uses :math:`\varphi_1(B_i^\top A)`.
+    ``"lowrank"``: per-edge :math:`\Phi_{ij} = \varphi_1(B_j^\top A_i)`, ``(..., N, N, r, r)``, the argument zeroed
+    on pairs whose routing weight vanishes in every head (the future under a causal prior) BEFORE
+    :math:`\varphi_1`, so a large unused argument cannot overflow into :math:`\infty\cdot 0`. ``"pure_gauge"``:
+    :math:`\Phi_j = -\varphi_1(-B_j^\top A)` depends on the sender only (N matrix functions, no per-edge one) and is
+    returned per sender, ``(..., N, r, r)``; the edge coefficient is :math:`\Phi_j` on routed pairs and 0 elsewhere,
+    which the consumers apply through the mask (audit 2026-10-20 item 51). :math:`g_i` uses
+    :math:`\varphi_1(B_i^\top A)`.
     """
     mask = (beta != 0).any(dim=-3)                                                       # (..., N, N)
     if mode == "lowrank":
@@ -141,9 +147,45 @@ def edge_coefficients(
         arg = torch.where(mask[..., None, None], arg, torch.zeros_like(arg))
         return phi1(arg), None, mask
     BA = torch.einsum("...jka,kb->...jab", B, A)                                         # (..., N, r, r) B_j^T A
-    sender = -phi1(-BA)                                                                  # (..., N, r, r)
-    Phi = torch.where(mask[..., None, None], sender.unsqueeze(-4), sender.new_zeros(()))   # (..., N, N, r, r)
-    return Phi, phi1(BA), mask
+    sender = -phi1(-BA)                                                                  # (..., N, r, r) Phi_j
+    return sender, phi1(BA), mask
+
+
+def _per_sender(ctx: EdgeContext) -> bool:
+    r"""Whether ``ctx.Phi`` holds one coefficient per sender, ``(..., N, r, r)`` (pure gauge), not per edge."""
+    return ctx.Phi.dim() == ctx.B.dim()
+
+
+def _sender_terms(
+    ctx:   EdgeContext,
+    *terms: Tuple[torch.Tensor, int],  # (sender-side tensor (..., N, *trailing), number of trailing axes)
+) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+    r"""Sender-side products of per-sender coefficients, prepared for contraction over routed edges (audit 2026-10-20
+    item 51).
+
+    Each term is a product of :math:`\Phi_j` with sender data (:math:`\Phi_jp_j^h`, :math:`\Phi_jP_j^{hg}`, ...).
+    Returns the terms with every sender that has a non-finite entry in any of them replaced by 0, the float routed mask
+    :math:`\mathbb 1[(i, j)\ \text{routed}]` ``(..., N, N)`` and the receivers ``(..., N)`` that route to such a sender.
+    With :math:`\Phi_{ij} = \mathbb 1_{ij}\Phi_j`, a sum :math:`\sum_j\Phi_{ij}w_{ij}` over weights that vanish on
+    unrouted pairs equals :math:`\sum_j\Phi_j(\mathbb 1_{ij}w_{ij})`, so no ``(..., N, N, r, r)`` tensor is formed.
+    Multiplying the weights by the mask keeps the per-edge form's zero derivative on unrouted pairs, and the zeroed
+    senders keep its finiteness: an unrouted sender whose coefficient or product overflowed contributes 0, as the
+    masked per-edge coefficient did, while a receiver that routes to one is set to NaN by the caller (the per-edge form
+    gave a non-finite value in some of its entries).
+    """
+    finite = None
+    for x, trailing in terms:
+        ok = torch.isfinite(x).flatten(x.dim() - trailing).all(dim=-1)                  # (..., N) senders
+        finite = ok if finite is None else finite & ok
+    zeroed = [torch.where(finite.reshape(*finite.shape, *(1,) * trailing), x, x.new_zeros(()))
+              for x, trailing in terms]
+    poisoned = (ctx.mask & ~finite.unsqueeze(-2)).any(dim=-1)                            # (..., N) receivers
+    return zeroed, ctx.mask.to(ctx.Phi.dtype), poisoned
+
+
+def _poison_receivers(x: torch.Tensor, poisoned: torch.Tensor, trailing: int) -> torch.Tensor:
+    r"""``x`` with every entry of a receiver in ``poisoned`` (``(..., N)``) set to NaN; ``trailing`` axes follow N."""
+    return torch.where(poisoned.reshape(*poisoned.shape, *(1,) * trailing), float("nan"), x)
 
 
 def build_edge_context(
@@ -205,10 +247,18 @@ def edge_reference_message(
         c_{ij} = \sum_h\beta_{ij}^h p_j^h,
 
     since :math:`\Pi(\beta_{ij})\xi_j = Ry_{ij}` with :math:`y_{ij} = (\beta_{ij}^hv_j^h)_h`, :math:`FR = O'`,
-    :math:`FA_i = O'TA_i` and :math:`B_j^\top Ry_{ij} = c_{ij}`.
+    :math:`FA_i = O'TA_i` and :math:`B_j^\top Ry_{ij} = c_{ij}`. With per-sender coefficients (pure gauge) the sum is
+    :math:`y_i = \sum_h\sum_j\mathbb 1_{ij}\beta_{ij}^h\,\Phi_jp_j^h`, one contraction over senders with no
+    (..., N, N, r) or (..., N, N, r, r) tensor (:func:`_sender_terms`).
     """
-    c = torch.einsum("...hij,...jhb->...ijb", beta, ctx.p)                               # (..., N, N, r) c_ij
-    y = torch.einsum("...ijab,...ijb->...ia", ctx.Phi, c)                                # (..., N, r) y_i
+    if _per_sender(ctx):
+        u = torch.einsum("...jab,...jhb->...jha", ctx.Phi, ctx.p)                        # (..., N, H, r) Phi_j p_j^h
+        (u,), routed, poisoned = _sender_terms(ctx, (u, 2))
+        y = torch.einsum("...hij,...jha->...ia", beta * routed.unsqueeze(-3), u)         # (..., N, r) y_i
+        y = _poison_receivers(y, poisoned, 1)
+    else:
+        c = torch.einsum("...hij,...jhb->...ijb", beta, ctx.p)                           # (..., N, N, r) c_ij
+        y = torch.einsum("...ijab,...ijb->...ia", ctx.Phi, c)                            # (..., N, r) y_i
     TA = ctx.T @ ctx.A                                                                   # (..., N, K, r) or (K, r)
     inner = z + (TA @ y.unsqueeze(-1)).squeeze(-1)                                       # (..., N, K) z_i + T A_i y_i
     return outer_gauge_vector(ctx, inner @ ctx.receive.transpose(-1, -2))
@@ -242,11 +292,21 @@ def edge_covariance_factors(
 
     The spread terms are covariances over the sender label, so the shifted values may enter the
     :math:`v` slot; :math:`p_j^h` stays unshifted (:func:`build_edge_context`).
+
+    With per-sender coefficients (pure gauge, :math:`\Phi_{ij} = \mathbb 1_{ij}\Phi_j`) every sum over j contracts
+    sender-side products, :math:`\Phi_jP_j^{hg}`, :math:`\Phi_jQ_j^{hg}\Phi_j^\top`, :math:`u_j^h = \Phi_jp_j^h`,
+    :math:`u_j^hv_j^{h\top}` and :math:`u_j^hu_j^{h\top}`, against the masked weights :math:`\mathbb 1_{ij}c_{ij}^{hg}`
+    and :math:`\mathbb 1_{ij}\beta_{ij}^h`, so no (..., N, N, r, r) or (..., N, N, H, r) tensor is formed
+    (audit 2026-10-20 item 51; :func:`_sender_terms`).
     """
     H = beta.shape[-3]
     Bt = _head_rows(ctx.B_ref, H)                                                        # (..., N, H, d, r) (B~_j)_h
     O_heads = receive_heads(ctx, H)                                                      # (H, K, d) O'_g
     P = torch.einsum("...nhsa,...nhgst->...nhgat", Bt, source)                           # (..., N, H, H, r, d) (B~_j)_h^T s_j^{hg}
+    if _per_sender(ctx):
+        Xi, Y = _sender_covariance_factors(ctx, beta, c, P, Bt, values, mean)
+        X_hat = torch.einsum("gks,...ngas->...nka", O_heads, Xi)                         # (..., N, K, r)
+        return ctx.F @ ctx.A, X_hat, Y
     Xi = None
     for h in range(H):
         # sum_j c_ij^{hg} Phi_ij P_j^{hg} for one source head: a (..., G, N, N, r, r) weight at a time.
@@ -265,6 +325,49 @@ def edge_covariance_factors(
     X_hat = torch.einsum("gks,...ngas->...nka", O_heads, Xi)                             # (..., N, K, r)
     A_hat = ctx.F @ ctx.A                                                                # (..., N, K, r) or (K, r)
     return A_hat, X_hat, Y
+
+
+def _sender_covariance_factors(
+    ctx:    EdgeContext,               # per-sender Phi (..., N, r, r)
+    beta:   torch.Tensor,              # (..., H, N, N)
+    c:      torch.Tensor,              # (..., H, H, N, N) c_ij^{hg}
+    P:      torch.Tensor,              # (..., N, H, H, r, d) (B~_j)_h^T s_j^{hg}
+    Bt:     torch.Tensor,              # (..., N, H, d, r) (B~_j)_h
+    values: torch.Tensor,              # (..., N, H, d) shifted values v_j^h
+    mean:   torch.Tensor,              # (..., N, H, d) pooled shifted values z_i^h
+) -> Tuple[torch.Tensor, torch.Tensor]:  # Xi (..., N, H, r, d), Y (..., N, r, r)
+    r""":math:`\Xi_i^g` and :math:`Y_i` of :func:`edge_covariance_factors` for per-sender coefficients.
+
+    .. math::
+        \Xi_i^g = \sum_{h,j}\bar c_{ij}^{hg}\Phi_jP_j^{hg} + \sum_j\bar\beta_{ij}^gu_j^gv_j^{g\top} - q_i^gz_i^{g\top},
+        \qquad
+        Y_i = \sum_{h,g,j}\bar c_{ij}^{hg}\Phi_jQ_j^{hg}\Phi_j^\top + \sum_{h,j}\bar\beta_{ij}^hu_j^hu_j^{h\top}
+          - \sum_hq_i^hq_i^{h\top},
+
+    with :math:`\bar c = \mathbb 1c`, :math:`\bar\beta = \mathbb 1\beta`, :math:`u_j^h = \Phi_jp_j^h`,
+    :math:`q_i^h = \sum_j\bar\beta_{ij}^hu_j^h` and :math:`Q_j^{hg} = P_j^{hg}(\tilde B_j)_g`, the per-edge sums at
+    :math:`\Phi_{ij} = \mathbb 1_{ij}\Phi_j` regrouped by sender. Every contraction runs over (h, j) or j alone.
+    """
+    Phi_hg = ctx.Phi.unsqueeze(-3).unsqueeze(-3)                                         # (..., N, 1, 1, r, r)
+    Q = torch.einsum("...nhgat,...ngtb->...nhgab", P, Bt)                                # (..., N, H, H, r, r)
+    u = torch.einsum("...jab,...jhb->...jha", ctx.Phi, ctx.p)                            # (..., N, H, r) Phi_j p_j^h
+    (PhiP, PhiQPhi, u, uv, uu), routed, poisoned = _sender_terms(
+        ctx,
+        (Phi_hg @ P, 4),                                                                 # (..., N, H, H, r, d)
+        (Phi_hg @ Q @ Phi_hg.transpose(-1, -2), 4),                                      # (..., N, H, H, r, r)
+        (u, 2),
+        (u.unsqueeze(-1) * values.unsqueeze(-2), 3),                                     # (..., N, H, r, d) u v^T
+        (u.unsqueeze(-1) * u.unsqueeze(-2), 3))                                          # (..., N, H, r, r) u u^T
+    c_routed = c * routed.unsqueeze(-3).unsqueeze(-3)                                    # (..., H, H, N, N)
+    beta_routed = beta * routed.unsqueeze(-3)                                            # (..., H, N, N)
+    q = torch.einsum("...hij,...jha->...iha", beta_routed, u)                            # (..., N, H, r) q_i^h
+    Xi = (torch.einsum("...hgij,...jhgat->...igat", c_routed, PhiP)                      # (..., N, H, r, d)
+          + torch.einsum("...hij,...jhas->...ihas", beta_routed, uv)
+          - q.unsqueeze(-1) * mean.unsqueeze(-2))
+    Y = (torch.einsum("...hgij,...jhgab->...iab", c_routed, PhiQPhi)                     # (..., N, r, r)
+         + torch.einsum("...hij,...jhab->...iab", beta_routed, uu)
+         - torch.einsum("...iha,...ihb->...iab", q, q))
+    return _poison_receivers(Xi, poisoned, 3), _poison_receivers(Y, poisoned, 2)
 
 
 def edge_correction_dense(
@@ -290,7 +393,11 @@ def edge_correction_blocks(
 
 
 def edge_self_coefficients(ctx: EdgeContext) -> torch.Tensor:          # (..., N, r, r)
-    r"""The self-edge coefficients :math:`\Phi_{ii}`."""
+    r"""The self-edge coefficients :math:`\Phi_{ii}` (:math:`\Phi_i` where the self-edge is routed, else 0, for
+    per-sender coefficients)."""
+    if _per_sender(ctx):
+        self_routed = torch.diagonal(ctx.mask, dim1=-2, dim2=-1)                         # (..., N)
+        return torch.where(self_routed[..., None, None], ctx.Phi, ctx.Phi.new_zeros(()))
     return torch.diagonal(ctx.Phi, dim1=-4, dim2=-3).movedim(-1, -3)
 
 
@@ -400,6 +507,10 @@ def edge_part_norms(ctx: EdgeContext) -> torch.Tensor:                 # (..., N
     r""":math:`\|A_i\Phi_{ij}B_j^\top\|_F = \operatorname{tr}(A_i^\top A_i\Phi_{ij}B_j^\top B_j\Phi_{ij}^\top)^{1/2}` per edge (r x r Grams)."""
     GA = ctx.A.transpose(-1, -2) @ ctx.A                                                 # (..., N, r, r) or (r, r)
     GB = ctx.B.transpose(-1, -2) @ ctx.B                                                 # (..., N, r, r)
+    if _per_sender(ctx):
+        # Shared A: the norm is the sender's own on routed edges and 0 elsewhere (Phi_ij = 0 there).
+        sender = ((GA @ ctx.Phi) * (ctx.Phi @ GB)).sum(dim=(-1, -2)).clamp_min(0.0).sqrt()   # (..., N)
+        return torch.where(ctx.mask, sender.unsqueeze(-2), sender.new_zeros(()))         # (..., N, N)
     left = (GA.unsqueeze(-3) if GA.dim() > 2 else GA) @ ctx.Phi                          # (..., N, N, r, r) GA_i Phi_ij
     right = ctx.Phi @ GB.unsqueeze(-4)                                                   # Phi_ij GB_j
     return (left * right).sum(dim=(-1, -2)).clamp_min(0.0).sqrt()
