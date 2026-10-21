@@ -59,6 +59,7 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Seque
 import numpy as np
 import torch
 
+from vfe3.cpu_linalg import with_batched_cpu_lu_guard
 from vfe3.semantics.common import (
     GAUSSIAN_BANK_DECODE_KINDS,
     AnalysisContext,
@@ -796,6 +797,7 @@ def _relative(path: Any, root: Path) -> str:
         return path.as_posix()
 
 
+@with_batched_cpu_lu_guard
 def analyze_run(
     run_dir:    "str | Path",
 
