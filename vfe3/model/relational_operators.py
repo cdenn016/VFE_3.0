@@ -658,7 +658,7 @@ class RelationalOperators(nn.Module):
         elbo_diagnostic:       bool  = False,
     ) -> None:
         super().__init__()
-        self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
+        self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1" kernel-router clamp reference
         self.pair_kl_gemm_tol = pair_kl_gemm_tol      # None, or the opt-in pair-KL GEMM fallback tolerance (nats)
         # comparison rope_mode: the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.

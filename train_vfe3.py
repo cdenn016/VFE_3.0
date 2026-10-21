@@ -339,6 +339,7 @@ config = dict(
     sigma_weight_decay               = 0,      
     mu_weight_decay                  = 0,       
     decode_mu_weight_decay           = None,   # decode-side means only (untied decode bank / linear readout); None = mu_weight_decay; try ~1e-3 to bound rare-type rows
+    relational_score_weight_decay    = 0.0,    # float >= 0: decoupled AdamW decay of the query/key comparison maps only (raw_score_q, raw_score_k); 0 = undecayed, as before
 
     #################################
     #   Numerics/Speed
@@ -347,7 +348,7 @@ config = dict(
     kl_max                           = None,          # None (8 * embed_dim) | float > 0 nats (inf disables): safety clamp on every divergence, binding only on blowups
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
-    routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" | "query_shifted" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, or D_ij less its query-only row constant)
+    routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, D_ij less its query constant and the row mean of the key log-volumes (scale-invariant), or the pre-2026-10-21 form without the key term)
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
     relational_tile_mib              = 32,         # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
     relational_diag_moments_kernel   = "torch",    # "torch" | "triton": diagonal comparison route (comparison_invariant) on CUDA: fused Triton diag(G) kernels, no materialized source root

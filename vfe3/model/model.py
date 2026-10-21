@@ -1852,6 +1852,7 @@ class VFEModel(nn.Module):
         layer_index: int,
         score:       torch.Tensor,             # (B, H, N, N) clamped routing cost as captured
         support:     torch.Tensor,             # (B, H, N, N) bool causal support
+        row_shift:   Optional[torch.Tensor] = None,   # (B, H, N) score_row_shift_pre of the shifted references
     ) -> float:
         r"""Per-token label free energy of one layer's kernel router (audit 2026-10-16 F114).
 
@@ -1861,7 +1862,13 @@ class VFEModel(nn.Module):
               + \tau_h\sum_j\beta^h_{ij}\log\frac{\beta^h_{ij}}{\pi^h_{ij}}\Big],
 
         with :math:`D` the clamped cost the router read (``score_energy_pre``; the row gaps under the ``row_min``
-        reference, so there the value omits each row's minimum cost), :math:`\pi = \operatorname{softmax}_j` of the
+        reference, so there the value omits each row's minimum cost). Under ``query_shifted`` and ``query_shifted_v1``
+        the captured cost omits the row constant :math:`s_i` (``score_row_shift_pre``: the query constant
+        :math:`c_i`, plus the key log-volume mean :math:`m_i` under ``query_shifted``), and ``row_shift`` adds it back,
+        :math:`F_i = \sum_h (s^h_i - \tau_h\log\sum_j\pi^h_{ij}e^{-\bar D^h_{ij}/\tau_h})`, the free energy of the
+        absolute cost :math:`\min(D_{ij}, \kappa + s_i)` the router read; without it the column carried the dropped
+        constant, about 383 of 531 nats on the reference run, and was unbounded below (audit 2026-10-20 item 39).
+        :math:`\pi = \operatorname{softmax}_j` of the
         attention log-prior on the causal support :math:`S_i` and :math:`\tau_h` the temperature the router ran at
         (:meth:`RelationalOperators.routing_temperature`: learned under ``learn_attention_temperature``, 1 under
         ``noisy_key``). The minimizer is the model's router :math:`\beta`, and each head's term is :math:`\tau_h`
@@ -1884,6 +1891,8 @@ class VFEModel(nn.Module):
         bias = torch.where(support, bias.expand_as(score), float("-inf"))       # (B, H, N, N)
         logits = torch.log_softmax(bias, dim=-1) - score.double() / tau_h[:, None, None]   # log pi - D / tau_h
         rows = -tau_h[:, None] * torch.logsumexp(logits, dim=-1)               # (B, H, N) -tau_h log Z_i^h
+        if row_shift is not None:
+            rows = rows + row_shift.double().to(device).reshape(rows.shape)     # (B, H, N) back to the absolute cost
         rows = torch.where(support.any(dim=-1), rows, torch.zeros_like(rows))  # empty rows (NaN above) give 0
         return float(rows.sum(dim=1).mean())
 
@@ -1902,8 +1911,8 @@ class VFEModel(nn.Module):
         ``clamped_row_frac`` the share of scored rows whose every entry is capped (the
         ``_capture_numerics_counts`` rule: such a row has zero router gradient and routes by the attention prior
         alone, :math:`\beta_{ij} \propto e^{\log\pi_{ij}}` (uniform over the sources only under a flat prior such as
-        plain causal; by the ALiBi distance profile under ``causal_alibi``), which happens only under the absolute
-        reference); ``self_weight`` the mean :math:`\beta_{ii}` and
+        plain causal; by the ALiBi distance profile under ``causal_alibi``), which happens under the absolute and
+        the shifted references, never under ``row_min``); ``self_weight`` the mean :math:`\beta_{ii}` and
         ``self_argmax_frac`` the share of rows with :math:`\beta_{ii} = \max_{j \in S_i}\beta_{ij}`, both
         over scored rows that admit self (NaN for a head with none, e.g. a ``*_noself`` prior).
 
@@ -2679,7 +2688,8 @@ class VFEModel(nn.Module):
             # The capped share above includes failed (non-finite) costs; this column separates them.
             relational_score_nonfinite_frac=self._nonfinite_frac(cap, score, support, minimal_agent),
             relational_routing_free_energy=(float("nan") if minimal_agent
-                                            else self._routing_free_energy(snapshot, layer_index, score, support)),
+                                            else self._routing_free_energy(snapshot, layer_index, score, support,
+                                                                           cap.get("score_row_shift_pre"))),
         )
         d.update(self._raw_router_cost_statistics(cap, score, beta, support, cap_level))
         if self.cfg.diagnose_canonical_free_energy:

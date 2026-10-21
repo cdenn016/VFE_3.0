@@ -167,6 +167,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'mu_weight_decay': None,
     'decode_mu_weight_decay': None,
     'phi_weight_decay': 0.065,
+    'relational_score_weight_decay': 0.0,
     'eps': 1e-06,
     'kl_max': 100.0,
     'routing_kl_max_reference': 'absolute',
