@@ -129,6 +129,10 @@ config = dict(
     max_failed_step_skips            = None,        # None (a step failing at the strictest precision aborts) | int >= 1 (skip up to N such steps)
     max_consecutive_skips            = None,        # None (never abort on skips) | int >= 1 (abort with crash.json + checkpoint after N rejected updates in a row)
     loss_spike_skip_nats             = None,        # None (off) | float > 0 (reject an update whose loss exceeds the monitor's loss EMA by this many nats)
+    weight_ema_decay                 = None,        # None (off) | float in (0, 1): EMA of the trainable weights, scored at every eval and at the end
+    weight_ema_start_frac            = 0.5,         # float in [0, 1]: the EMA starts at this fraction of max_steps
+    weight_ema_update_interval       = 1,           # int >= 1: accepted updates between EMA updates (decay d^k per update)
+    weight_ema_device                = "same",      # "same" (shadow on the parameters' device) | "cpu" (host memory; pair with interval > 1)
 
     n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations

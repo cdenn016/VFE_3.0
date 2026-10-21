@@ -300,6 +300,10 @@ _REGISTRY: List[MetricColumn] = [
     *_declare("eval", "float", ("val_self_coupling", "val_belief_coupling", "val_attention_entropy",
                                 "val_self_divergence"),
               toggle="diagnose_canonical_free_energy"),
+    # Validation at the opt-in weight-EMA weights (vfe3.weight_ema; audit 2026-10-20 item 8): written only with the
+    # EMA on, NaN on an eval row before its start.
+    *_declare("eval", "float", ("val_ema_ce", "val_ema_ppl"), toggle="weight_ema_decay set"),
+    *_declare("cumulative", "count", ("weight_ema_updates",), toggle="weight_ema_decay set"),
     *_declare("eval", "count", ("cap_active_count", "cap_entry_count",
                                 "factorization_fallback_count", "factorization_count")),
     # Pre-step diagnostics (blank on spike rows).

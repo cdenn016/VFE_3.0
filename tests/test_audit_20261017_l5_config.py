@@ -125,7 +125,9 @@ _TRAIN_LOOP = {"log_interval", "eval_interval", "checkpoint_interval", "max_step
                "grad_accum_steps", "grad_clip_scope", "checkpoint_interval",
                # lane L3 (audit 2026-10-17): output policy and failure handling, inert on a healthy two-step run
                "checkpoint_at_end", "checkpoint_keep_last", "block_variance_at_log", "max_failed_step_skips",
-               "max_consecutive_skips", "loss_spike_skip_nats"}
+               "max_consecutive_skips", "loss_spike_skip_nats",
+               # audit 2026-10-20 item 8: the weight EMA shadows the weights and never feeds back into training
+               "weight_ema_decay"}
 _PRECISION = {"deterministic", "fp32_matmul_precision", "amp_dtype", "decode_av_precision",
               "predictive_covariance_precision", "projected_factorization", "decode_ce_triton", "decode_logits_amp",
               "decode_chunk_size", "relational_tile_mib", "decode_ce_checkpoint", "predictive_covariance_checkpoint",

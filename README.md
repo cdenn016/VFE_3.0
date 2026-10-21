@@ -1003,6 +1003,16 @@ The launcher checks CUDA availability, so the wrong interpreter can select CPU.
 | [`ablation.py`](ablation.py) | Named architecture and configuration ablations. |
 | [`scaling.py`](scaling.py) | Independent baseline with width, depth, joint-size, and training-budget grids; see [scaling settings](docs/scaling-settings.md). |
 | [`make_figures.py`](make_figures.py) | Regenerates eligible figures from a saved run. |
+| [`average_checkpoints.py`](average_checkpoints.py) | Scores the uniform average of two or more checkpoints of one run (for example `best_model.pt` and `final_model.pt`) on its validation and test streams under the run's protocol; writes `<run>/averaged_eval.json`. |
+
+Weight averaging during training is opt-in: `weight_ema_decay` (None by default) keeps an
+exponential moving average of the trainable weights from `weight_ema_start_frac` of
+`max_steps`, updated after each accepted update (or every `weight_ema_update_interval`
+accepted updates with the decay of that many steps; `weight_ema_device = "cpu"` holds it in
+host memory). Each evaluation also scores the EMA weights (`val_ema_ce`, `val_ema_ppl` in
+`metrics.csv`), `best_model.pt` stays selected on the raw weights, checkpoints carry the
+average under `weight_ema` so a resume continues it, and finalization records validation
+and test at the EMA weights (`val_ema_*`, `test_ema_*`) beside the raw numbers.
 
 ### Focused validation
 
