@@ -18,6 +18,8 @@ from vfe3.runtime import ieee_fp32_matmul
 
 # The clamp references whose scorer drops the query-only row constant (routing_kl_max_reference).
 _QUERY_SHIFTED_REFERENCES: Tuple[str, ...] = ("query_shifted", "query_shifted_v1")
+# The routing costs with a closed-form diagonal route for a structurally diagonal P(G) (_diagonal_comparison_route).
+_DIAGONAL_ROUTE_COSTS: Tuple[str, ...] = ("gaussian_kl", "noisy_query", "noisy_key")
 
 
 def _key_log_volume(
@@ -37,12 +39,15 @@ def _key_log_volume(
     :math:`G_j \to c^2G_j`, so :math:`\ell_j \to \ell_j + r\ln c` for every key at once, which is the shift the
     query-shifted cost :math:`D_{ij} - c_i` takes (audit 2026-10-20 item 1). It carries gradient. The dense route
     factors :math:`G_j` once more by Cholesky in the working dtype; a key whose factorization fails gives NaN, which
-    :func:`query_shifted_row_reference` leaves out of the row mean.
+    :func:`query_shifted_row_reference` leaves out of the row mean. On the diagonal route the broadened key law of
+    ``noisy_key`` is :math:`g_j + n_h` coordinatewise (audit 2026-10-20 item 50).
     """
     if routing == "mean_distance":
         shape = G_k.shape[:-1] if diagonal else G_k.shape[:-2]                  # (..., N, H)
         return torch.zeros(shape, dtype=G_k.dtype, device=G_k.device).movedim(-1, -2)
     if diagonal:
+        if key_noise is not None:
+            G_k = G_k + key_noise.to(G_k.dtype)[:, None]                         # (..., N, H, r) g_j + n_h
         return .5 * G_k.log().sum(-1).movedim(-1, -2)                           # (..., H, N)
     if key_noise is not None:
         r = G_k.shape[-1]
@@ -109,13 +114,17 @@ def query_shifted_row_reference(
 
 
 def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: int) -> bool:
-    r"""Whether a rotation-invariant comparison block of rank r scores its Gaussian KL on the diagonal route.
+    r"""Whether a rotation-invariant comparison block of rank r scores its routing cost on the diagonal route.
 
     :math:`P(G)` is structurally diagonal when at most one coordinate of the block stays unrotated
     (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal`). The diagonal route
-    (``diagonal_covariance`` of :func:`vfe3.relational_scoring.projected_gaussian_kl`) also requires the Gaussian-KL
-    cost and conditioning-triggered recovery off (``projected_factorization='gram'``); every other case keeps the
-    dense route with its certificate and recovery (audit 2026-10-10 round 2, item 30). ``pair_kl_gemm_tol`` no longer
+    (``diagonal_covariance`` of :func:`vfe3.relational_scoring.projected_gaussian_kl`) also requires a cost that reads
+    the covariances, the Gaussian KL or one of its noisy forms (``noisy_key``, the Gaussian KL of
+    :math:`g_j + n_h`; ``noisy_query``, the closed form of
+    :func:`vfe3.relational_scoring._projected_diagonal_noisy_query`; audit 2026-10-20 item 50), and
+    conditioning-triggered recovery off (``projected_factorization='gram'``); every other case keeps the
+    dense route with its certificate and recovery (audit 2026-10-10 round 2, item 30). ``mean_distance`` reads no
+    covariance and keeps its route. ``pair_kl_gemm_tol`` no longer
     moves a diagonal :math:`P(G)` onto the dense route: the diagonal route has its own error estimate and
     direct-difference fallback (audit 2026-10-17 item 11).
 
@@ -127,7 +136,7 @@ def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: 
     :func:`vfe3.relational_scoring.source_recovery_elements`. On a diagonal :math:`P(G)` this moved a flagged pair by
     at most about 2e-5 nats against the diagonal route on the audit probe (audit 2026-10-16 F9).
     """
-    return (rope_commutant_is_diagonal(r, n_pairs) and operators.routing == "gaussian_kl"
+    return (rope_commutant_is_diagonal(r, n_pairs) and operators.routing in _DIAGONAL_ROUTE_COSTS
             and not projected_condition_recovery())
 
 
@@ -173,7 +182,7 @@ def relational_score(
     the dropped constant :math:`c_i` (:func:`_query_row_constant`) as a (..., H, N) float64 tensor (audit 2026-10-20
     item 39).
 
-    With ``capture`` on the diagonal route, ``score_term_medians_pre`` records the per-head medians of the four cost
+    With ``capture`` on the diagonal route of the Gaussian KL, ``score_term_medians_pre`` records the per-head medians of the four cost
     terms (:func:`vfe3.relational_scoring.diagonal_kl_term_medians`, a (4, H + 1) float64 tensor, rows query constant,
     key log-determinant, trace, Mahalanobis, columns the heads and then all heads pooled) over the pairs of
     ``term_support`` (every pair when None); the dense
@@ -186,17 +195,23 @@ def relational_score(
     :math:`P(G)`, the covariance the router scores. The scorer takes its Gram route; the source tuples carry the
     rotated maps :math:`R_iS` with ``commutant_pairs``, so a failed (or, under condition recovery, flagged)
     factorization is rebuilt as :math:`P(XX^\top)` from the source (audit 2026-10-10 round 2, item 12). When
-    :math:`P(G)` is structurally diagonal and :func:`_diagonal_comparison_route` admits it (Gaussian-KL routing,
-    ``projected_factorization='gram'``, ``pair_kl_gemm_tol`` None) only diag(G) is formed and the
-    Gaussian KL takes its diagonal route, with no Gram, factorization or source tuple.
+    :math:`P(G)` is structurally diagonal and :func:`_diagonal_comparison_route` admits it (Gaussian-KL,
+    ``noisy_query`` or ``noisy_key`` routing, ``projected_factorization='gram'``) only diag(G) is formed and the
+    cost takes its diagonal route, with no Gram, factorization or source tuple.
     Under ``tie_comparison_maps`` a belief scored against itself is projected once and both roles share it.
 
     Under ``operators.frame_diagonal`` (``gaussian_frame_diagonal``) ``sigma`` and ``source_sigma`` hold the reference
     variances :math:`c_i`, so :math:`S U_i^{-1}\Sigma_iU_i^{-\top}S^\top = S\operatorname{diag}(c_i)S^\top`: the means are
     moved to :math:`\xi_i = U_i^{-1}\mu_i` and every role reads them through the identity frame, the diagonal source
-    root :math:`S\operatorname{diag}(c_i)^{1/2}` included, with no frame product in the covariance.
+    root :math:`S\operatorname{diag}(c_i)^{1/2}` included, with no frame product in the covariance. The moments
+    declare that frame (``identity_frame`` of :func:`vfe3.relational_scoring.projected_moments`), so it is never
+    multiplied, and the diagonal route reads :math:`\operatorname{diag}(S\operatorname{diag}(c_i)S^\top) =
+    (S\circ S)c_i` as one GEMM (audit 2026-10-20 item 46).
     """
-    if getattr(operators, "frame_diagonal", False):
+    # gaussian_frame_diagonal: the moments read the reference variances through the identity frame, which
+    # projected_moments then never multiplies (identity_frame; audit 2026-10-20 item 46).
+    frame_diagonal = bool(getattr(operators, "frame_diagonal", False))
+    if frame_diagonal:
         from vfe3.model.frame_actions import frame_diagonal_reference, frame_matvec
         same = source_mu is mu
         mu, reference_frame = frame_diagonal_reference(mu, frame)                 # (..., N, K) xi, identity frame
@@ -274,7 +289,8 @@ def relational_score(
         n_pairs = rope_rotated_pairs(S_q.shape[-2], operators.comparison_rope_fraction) if invariant else 0
         # A structurally diagonal P(G) needs only diag(G): the moments return it (..., N, H, r) in place of G.
         diagonal = invariant and _diagonal_comparison_route(operators, S_q.shape[-2], n_pairs)
-        moment_options = {"head_dims": head_dims, **({"diagonal_only": True} if diagonal else {})}
+        moment_options = {"head_dims": head_dims, **({"diagonal_only": True} if diagonal else {}),
+                          **({"identity_frame": True} if frame_diagonal else {})}
         if tied:
             a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, **moment_options)  # (..., N, H, d), (..., N, H, d, d)
             a_k, G_k = a_q, G_q
@@ -349,7 +365,8 @@ def relational_score(
                 query_constants.append(_query_row_constant(G_q.detach(), operators.routing, diagonal=diagonal))
         if diagonal:
             run_options["diagonal_covariance"] = True                           # G_q, G_k are (..., N, H, r)
-            if capture is not None:
+            # The term medians decompose the Gaussian KL; the noisy costs record none, as on their dense routes.
+            if capture is not None and operators.routing == "gaussian_kl":
                 run_support = (term_support[..., first_head - H:first_head, :, :]   # this run's heads
                                if term_support is not None and term_support.dim() >= 3
                                and term_support.shape[-3] > 1 else term_support)

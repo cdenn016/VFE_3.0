@@ -281,6 +281,7 @@ def projected_moments(
     *,
     head_dims:      Optional[Tuple[int, ...]] = None,  # caller-declared equal diagonal blocks of a full Sigma
     diagonal_only:  bool = False,                      # return diag(G_i), (..., N, H, r), instead of G_i
+    identity_frame: bool = False,                      # caller-declared: inverse_blocks is the identity, not read
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return a_i = S U_i^{-1} mu_i and G_i = S U_i^{-1} Sigma_i U_i^{-T} S^T.
 
@@ -301,6 +302,19 @@ def projected_moments(
     it (the diagonal route of :func:`projected_gaussian_kl`): from the source root of a diagonal covariance it is
     :math:`\operatorname{diag}(G_i) = \sum_k X_{i,\cdot k}^2`, with no :math:`XX^\top` product, and from a full
     covariance it is the diagonal of the same :math:`G_i`.
+    ``identity_frame=True`` is the caller's declaration that ``inverse_blocks`` is the identity (the reference
+    moments of ``gaussian_frame_diagonal``, read through :func:`vfe3.model.frame_actions.identity_frame`); the frame
+    is then never multiplied. With a diagonal covariance :math:`\sigma_i` the moments are :math:`a_i = S\mu_i` and
+    :math:`G_i = S\operatorname{diag}(\sigma_i)S^\top`, and under ``diagonal_only``
+
+    .. math::
+        \operatorname{diag}(G_i) = (S\circ S)\,\sigma_i,
+
+    one (tokens, K) x (K, R H r) GEMM with no source root, tile loop or checkpoint (:func:`_identity_frame_diagonal`;
+    audit 2026-10-20 item 46). It sums the nonnegative terms :math:`S_{sk}^2\sigma_k` that the source root sums as
+    :math:`(S_{sk}\sigma_k^{1/2})^2`, so it adds no cancellation, and it keeps that route's failure and zero-variance
+    conventions. The fused Triton kernels are not used there: they would multiply a materialized identity block by
+    block, about d times the FLOPs of the GEMM. A full covariance ignores the flag.
     Returns (..., N, H, r) and (..., N, H, r, r) for a single map (the second (..., N, H, r) under ``diagonal_only``).
     """
     if mu_h.ndim < 3 or S.ndim not in (3, 4):
@@ -331,12 +345,16 @@ def projected_moments(
     tokens = mu_h.shape[-3]
     batch = torch.broadcast_shapes(mu_h.shape[:-3], inverse_blocks.shape[:-4])
     roles = S.shape[0] if S.ndim == 4 else 1
+    identity_frame = identity_frame and diagonal
+    global _DIAG_MOMENTS_TORCH_CALLS
+    if diagonal_only and identity_frame:
+        _DIAG_MOMENTS_TORCH_CALLS += 1
+        return _identity_frame_diagonal(mu_h, Sigma_h, S, dtype)
     if diagonal_only and diagonal and _diagonal_moments_triton_active(mu_h, Sigma_h, inverse_blocks, S):
         fused = _fused_diagonal_moments(mu_h, Sigma_h, inverse_blocks, S, dtype, batch)
         if fused is not None:
             return fused
     if diagonal_only and diagonal:
-        global _DIAG_MOMENTS_TORCH_CALLS
         _DIAG_MOMENTS_TORCH_CALLS += 1
     bytes_per_token = math.prod(batch) * roles * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
     # Small projections keep the single contraction. Large projections checkpoint
@@ -352,14 +370,50 @@ def projected_moments(
                      else Sigma_h[..., start:start+step, :, :, :])
             args = (mu_h[..., start:start+step, :, :], sigma, inverse, S)
             if torch.is_grad_enabled() and any(x.requires_grad for x in args):
-                a, G = checkpoint(_projected_moments_tile, *args, head_dims, diagonal_only,
+                a, G = checkpoint(_projected_moments_tile, *args, head_dims, diagonal_only, identity_frame,
                                   use_reentrant=False, preserve_rng_state=False)
             else:
-                a, G = _projected_moments_tile(*args, head_dims, diagonal_only)
+                a, G = _projected_moments_tile(*args, head_dims, diagonal_only, identity_frame)
             means.append(a)
             covariances.append(G)
         return torch.cat(means, dim=-3), torch.cat(covariances, dim=-3 if diagonal_only else -4)
-    return _projected_moments_tile(mu_h, Sigma_h, inverse_blocks, S, head_dims, diagonal_only)
+    return _projected_moments_tile(mu_h, Sigma_h, inverse_blocks, S, head_dims, diagonal_only, identity_frame)
+
+
+def _identity_frame_diagonal(
+    mu_h:    torch.Tensor,  # (..., N, H, K) reference means
+    Sigma_h: torch.Tensor,  # (..., N, H, K) reference variances
+    S:       torch.Tensor,  # (H, r, K) or (R, H, r, K)
+    dtype:   torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""``diagonal_only`` moments of a diagonal covariance read through the identity frame (audit 2026-10-20 item 46).
+
+    .. math::
+        a_i = S\mu_i, \qquad g_i = \operatorname{diag}(S\operatorname{diag}(\sigma_i)S^\top) = (S\circ S)\,\sigma_i,
+
+    each one GEMM over every token, what :func:`_projected_moments_tile` returns for an identity frame up to the
+    summation order. The source route's conventions are kept: a zero variance contributes with zero gradient (its
+    zero-safe root, :func:`_diagonal_root_moments`), and a token with a negative or NaN variance gets NaN in every
+    coordinate, as the plain root gives there, so the scorer's checks see the same failures. Nothing token-sized is
+    saved but the inputs.
+    """
+    with torch.autocast(device_type=mu_h.device.type, enabled=False):
+        maps = (S if S.ndim == 4 else S.unsqueeze(0)).to(dtype)                       # (R, H, r, K)
+        R, H, r, K = maps.shape
+        a = _projected_root_mean(_head_shared(mu_h).to(dtype), None, maps)            # (..., N, R, H, r)
+        sigma = _head_shared(Sigma_h).to(dtype)                                       # (..., N, h, K), h = 1 or H
+        invalid = ((sigma < 0) | sigma.isnan()).any(-1)                               # (..., N, h)
+        # The zero-safe root's convention: no gradient reaches a variance that is exactly zero.
+        variance = torch.where(sigma == 0, 0., sigma)                                 # (..., N, h, K)
+        squares = maps.square()                                                       # (R, H, r, K) S o S
+        if variance.shape[-2] == 1:
+            g = (variance.squeeze(-2) @ squares.flatten(0, 2).transpose(0, 1)).unflatten(-1, (R, H, r))
+        else:
+            g = torch.einsum("Rhrk,...hk->...Rhr", squares, variance)                 # (..., N, R, H, r)
+        g = torch.where(invalid[..., None, :, None], float("nan"), g)                 # (..., N, R, H, r)
+    if S.ndim == 3:
+        return a.squeeze(-3), g.squeeze(-3)                                           # (..., N, H, r)
+    return a.movedim(-3, 0).contiguous(), g.movedim(-3, 0).contiguous()              # (R, ..., N, H, r)
 
 
 def _fused_diagonal_moments(
@@ -415,6 +469,7 @@ def _projected_moments_tile(
     S:              torch.Tensor,
     head_dims:      Optional[Tuple[int, ...]] = None,
     diagonal_only:  bool = False,
+    identity_frame: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Compute a=L mu and G=L Sigma L^T for one token tile.
 
@@ -425,7 +480,8 @@ def _projected_moments_tile(
     :func:`_head_block_covariance`. A diagonal covariance takes the source root
     (:func:`_diagonal_root_moments`). The tile is pinned to IEEE fp32 itself, so a checkpointed
     recompute in backward runs under the same matmul policy as the forward (audit 2026-10-09 #15).
-    ``diagonal_only`` returns diag(G) (see :func:`projected_moments`).
+    ``diagonal_only`` returns diag(G) (see :func:`projected_moments`). ``identity_frame`` (a diagonal covariance
+    only) reads no frame: the source root is :math:`X = S\operatorname{diag}(\sigma)^{1/2}`.
     """
     diagonal = Sigma_h.shape == mu_h.shape
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
@@ -436,7 +492,7 @@ def _projected_moments_tile(
             # (audit 2026-10-10 #28). Role-stacked maps are one (R H, r, K) contraction sharing xi and W.
             maps = (S if S.ndim == 4 else S.unsqueeze(0)).to(dtype)                    # (R, H, r, K)
             a, X = _diagonal_root_moments(_head_shared(mu_h).to(dtype), _head_shared(Sigma_h).to(dtype),
-                                          inverse, maps)                               # (..., N, R, H, r[, K])
+                                          None if identity_frame else inverse, maps)   # (..., N, R, H, r[, K])
             if diagonal_only:
                 g = X.square().sum(-1)                                                  # (..., N, R, H, r) diag(X X^T)
                 if S.ndim == 3:
@@ -485,7 +541,7 @@ def _head_shared(x: torch.Tensor) -> torch.Tensor:  # (..., N, H, K) -> (..., N,
 def _diagonal_root_moments(
     mu:      torch.Tensor,             # (..., N, h, K), h = 1 for a head-shared mean or H
     sigma:   torch.Tensor,             # (..., N, h, K) diagonal variances, h = 1 or H
-    inverse: torch.Tensor,             # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1} blocks
+    inverse: Optional[torch.Tensor],   # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1}; None = I
     S:       torch.Tensor,             # (R, H, r, K) comparison maps, one per role
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # a (..., N, R, H, r), X (..., N, R, H, r, K)
     r"""Projected means and source roots of a diagonal covariance for every role's comparison map.
@@ -505,13 +561,17 @@ def _diagonal_root_moments(
     :math:`1/(2\sqrt{\sigma})` of the plain root is infinite there and its product with the zero cotangent of the
     root would be NaN, while :math:`L\operatorname{diag}(\sigma)L^\top` has a finite derivative. Every other value,
     a negative or NaN variance included, is the plain ``sigma.sqrt()`` bit for bit, so an invalid variance still
-    reaches the scorer's finiteness and positivity checks.
+    reaches the scorer's finiteness and positivity checks. ``inverse=None`` declares the identity frame:
+    :math:`\xi_i = \mu_i` and :math:`X_i = S\operatorname{diag}(\sigma_i)^{1/2}`, with no frame product.
     """
     R, H, r, K = S.shape
     zero = sigma == 0
     root = torch.where(zero, 0., torch.where(zero, 1., sigma).sqrt())              # (..., N, h, K)
     a = _projected_root_mean(mu, inverse, S)                                       # (..., N, R, H, r)
-    if inverse.shape[-2:] == (K, K):
+    if inverse is None:
+        # Identity frame (audit 2026-10-20 item 46): X = S diag(sigma)^{1/2} column-scales the maps.
+        X = S * root[..., None, :, None, :]                                        # (..., N, R, H, r, K)
+    elif inverse.shape[-2:] == (K, K):
         # Dense blocks (..., N, H', K, K): W = U^{-1} diag(sigma)^{1/2} column-scales each block.
         W = inverse * root.unsqueeze(-2)                                           # (..., N, h, K, K)
         X = (_projected_linear_map(S.flatten(0, 1), W).unflatten(-3, (R, H)) if W.shape[-3] == 1
@@ -527,12 +587,15 @@ def _diagonal_root_moments(
 
 def _projected_root_mean(
     mu:      torch.Tensor,             # (..., N, h, K), h = 1 for a head-shared mean or H
-    inverse: torch.Tensor,             # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1} blocks
+    inverse: Optional[torch.Tensor],   # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1}; None = I
     S:       torch.Tensor,             # (R, H, r, K) comparison maps, one per role
 ) -> torch.Tensor:                     # a (..., N, R, H, r)
-    r"""Projected means :math:`a_i = S \xi_i`, :math:`\xi_i = U_i^{-1}\mu_i`, of :func:`_diagonal_root_moments`."""
+    r"""Projected means :math:`a_i = S \xi_i`, :math:`\xi_i = U_i^{-1}\mu_i`, of :func:`_diagonal_root_moments`
+    (:math:`\xi_i = \mu_i` for ``inverse=None``, the identity frame)."""
     R, H, r, K = S.shape
-    if inverse.shape[-2:] == (K, K):
+    if inverse is None:
+        xi = mu                                                                    # (..., N, h, K)
+    elif inverse.shape[-2:] == (K, K):
         xi = (inverse @ mu.unsqueeze(-1)).squeeze(-1)                              # (..., N, h, K)
     else:
         M, d = inverse.shape[-3], inverse.shape[-1]
@@ -1867,6 +1930,7 @@ def projected_noisy_query_cost(
     symmetric_inputs: bool = False,
     commutant_pairs: Optional[int] = None,
     drop_query_constant: bool = False,
+    diagonal_covariance: bool = False,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute D_ij = -log N(a_i; b_j, W_ij) - log det(2 pi G_q,i)/2 with W_ij = G_q,i + G_k,j.
 
@@ -1891,10 +1955,19 @@ def projected_noisy_query_cost(
     ``commutant_pairs`` its declaration that the covariances are RoPE-commutant projections, which recovery
     rebuilds as such. ``drop_query_constant=True`` omits the query-only row constant :math:`-\tfrac12\log\det G_{q,i}`
     (``routing_kl_max_reference='query_shifted'``; the value can then be negative).
+
+    ``diagonal_covariance=True`` declares structurally diagonal covariances passed as their diagonals, shaped like
+    the means (a diagonal RoPE-commutant :math:`P(G)`, :func:`vfe3.gradients.relational._diagonal_comparison_route`):
+    the closed form of :func:`_projected_diagonal_noisy_query`, with no factorization (audit 2026-10-20 item 50).
+    The source tuples and ``commutant_pairs`` are not read there.
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
     r = a_q.shape[-1]
+    if diagonal_covariance:
+        if G_q.shape != a_q.shape or G_k.shape != a_k.shape:
+            raise ValueError("diagonal projected covariances must match their means")
+        return _projected_diagonal_noisy_query(a_q, G_q, a_k, G_k, drop_query_constant=drop_query_constant)
     if G_q.shape != (*a_q.shape, r) or G_k.shape != (*a_k.shape, r):
         raise ValueError("projected covariances must match their means with one additional matrix axis")
     dtype = _compute_dtype(a_q, G_q, a_k, G_k)
@@ -2017,6 +2090,75 @@ def _noisy_query_tile(
     return .5 * (quadratic + logdet_w - logdet_q.unsqueeze(-1)), (info != 0).any()
 
 
+def _projected_diagonal_noisy_query(
+    a_q: torch.Tensor,             # (..., Nq, H, r)
+    g_q: torch.Tensor,             # (..., Nq, H, r) diagonal query covariances
+    a_k: torch.Tensor,             # (..., Nk, H, r)
+    g_k: torch.Tensor,             # (..., Nk, H, r) diagonal key covariances
+
+    *,
+    drop_query_constant: bool = False,
+) -> torch.Tensor:                 # (..., H, Nq, Nk)
+    r"""Diagonal route of :func:`projected_noisy_query_cost` for structurally diagonal comparison covariances.
+
+    With :math:`G_{q,i} = \operatorname{diag}(g_i)`, :math:`G_{k,j} = \operatorname{diag}(g_j)` and
+    :math:`\delta_{ij} = a_i - b_j`, :math:`W_{ij}` is diagonal and
+
+    .. math::
+        D_{ij} = \tfrac12\sum_k\Bigl[\frac{\delta_{ijk}^2}{g_{ik} + g_{jk}} + \log(g_{ik} + g_{jk}) - \log g_{ik}\Bigr],
+
+    the dense cost of the diagonal matrices exactly (audit 2026-10-20 item 50); ``drop_query_constant`` omits the
+    last sum. No pair factorization runs: each query-row tile forms its (..., H, I, Nk, r) pair terms elementwise,
+    tiles bounded by the scorer budget and checkpointed under autograd as in :func:`projected_mean_distance_cost`.
+    The certificate is that of :func:`_projected_diagonal_kl` (finite means, finite positive variances, which make
+    every :math:`W_{ij}` positive definite), raised through :func:`vfe3.contracts.host_check`, so inside
+    :func:`vfe3.contracts.deferred_host_checks` the route reads nothing from the device.
+    """
+    dtype = _compute_dtype(a_q, g_q, a_k, g_k)
+    with torch.autocast(device_type=a_q.device.type, enabled=False):
+        aq, ak = a_q.to(dtype).movedim(-2, -3), a_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
+        gq, gk = g_q.to(dtype).movedim(-2, -3), g_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
+        with torch.no_grad():
+            flags = torch.stack((torch.isfinite(aq).all() & torch.isfinite(ak).all(),
+                                 torch.isfinite(gq).all(), (gq > 0).all(),
+                                 torch.isfinite(gk).all(), (gk > 0).all()))
+        host_check(flags, _diagonal_kl_verdict, detail=lambda: "; ".join((
+            describe_offending_entries(gq, label="query variances"),
+            describe_offending_entries(gk, label="key variances"))))
+        logdet_q = (torch.zeros(gq.shape[:-1], dtype=dtype, device=gq.device) if drop_query_constant
+                    else gq.log().sum(-1))                                      # (..., H, Nq)
+        nq, r = aq.shape[-2], aq.shape[-1]
+        # One query row holds three (..., H, Nk, r) pair tensors (difference, W and the summed terms).
+        batch_heads = math.prod(torch.broadcast_shapes(aq.shape[:-2], ak.shape[:-2]))   # (..., H) slices
+        per_row = max(1, 3 * batch_heads * ak.shape[-2] * r * ak.element_size())
+        step = max(1, min(nq, _PROJECTION_TILE_BYTES // per_row))
+        checkpointed = step < nq or nq * per_row > _CHECKPOINT_BYTES
+        rows = []
+        for i in range(0, nq, step):
+            args = (aq[..., i:i + step, :], ak, gq[..., i:i + step, :], gk, logdet_q[..., i:i + step])
+            if torch.is_grad_enabled() and checkpointed and any(x.requires_grad for x in args):
+                rows.append(checkpoint(_diagonal_noisy_query_tile, *args, use_reentrant=False,
+                                       preserve_rng_state=False))
+            else:
+                rows.append(_diagonal_noisy_query_tile(*args))
+        return rows[0] if len(rows) == 1 else torch.cat(rows, dim=-2)          # (..., H, Nq, Nk)
+
+
+def _diagonal_noisy_query_tile(
+    aq:       torch.Tensor,  # (..., H, I, r) query means
+    ak:       torch.Tensor,  # (..., H, J, r) key means
+    gq:       torch.Tensor,  # (..., H, I, r) query variances
+    gk:       torch.Tensor,  # (..., H, J, r) key variances
+    logdet_q: torch.Tensor,  # (..., H, I) sum_k log g_ik, or 0 when the query constant is dropped
+) -> torch.Tensor:           # (..., H, I, J)
+    r"""One query-row tile of :func:`_projected_diagonal_noisy_query`,
+    :math:`\tfrac12\sum_k[\delta_{ijk}^2/w_{ijk} + \log w_{ijk}] - \tfrac12\log\det G_{q,i}`, :math:`w = g_i + g_j`."""
+    delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)                                  # (..., H, I, J, r)
+    W = gq.unsqueeze(-2) + gk.unsqueeze(-3)                                      # (..., H, I, J, r) diag W_ij
+    terms = delta.square() / W + W.log()                                         # (..., H, I, J, r)
+    return .5 * (terms.sum(-1) - logdet_q.unsqueeze(-1))
+
+
 def projected_noisy_key_cost(
     a_q: torch.Tensor,        # (..., Nq, H, r)
     G_q: torch.Tensor,        # (..., Nq, H, r, r)
@@ -2047,13 +2189,25 @@ def projected_noisy_key_cost(
     Gram route runs, and :math:`G_{k,j} + n_hI \succeq n_hI` needs none). The query keeps its source tuple and
     recovery. ``kl_options`` (``query_row_constant_grad``, ``gemm_expansion_tol``) pass through. ``key_noise`` is
     required, so a caller that does not supply it fails instead of scoring the noise-free Gaussian KL.
+
+    With ``diagonal_covariance=True`` (passed through ``kl_options``) the covariances are the diagonals of
+    structurally diagonal matrices, shaped like the means; the broadened key law is then :math:`g_j + n_h`
+    coordinatewise and the cost takes the diagonal route of :func:`projected_gaussian_kl`
+    (:func:`_projected_diagonal_kl`; audit 2026-10-20 item 50).
     """
     r = a_k.shape[-1]
-    if G_k.shape != (*a_k.shape, r):
-        raise ValueError("projected covariances must match their means with one additional matrix axis")
     if key_noise.shape != (a_k.shape[-2],):
         raise ValueError(f"key_noise must have one entry per head, shape ({a_k.shape[-2]},), "
                          f"got {tuple(key_noise.shape)}")
+    if kl_options.get("diagonal_covariance", False):
+        if G_k.shape != a_k.shape:
+            raise ValueError("diagonal projected covariances must match their means")
+        dtype = _compute_dtype(a_q, G_q, a_k, G_k, key_noise)
+        g_noisy = G_k.to(dtype) + key_noise.to(dtype)[:, None]                  # (..., Nk, H, r) g_j + n_h
+        return projected_gaussian_kl(a_q, G_q, a_k, g_noisy, projection_q=projection_q, projection_k=None,
+                                     symmetric_inputs=symmetric_inputs, commutant_pairs=commutant_pairs, **kl_options)
+    if G_k.shape != (*a_k.shape, r):
+        raise ValueError("projected covariances must match their means with one additional matrix axis")
     dtype = _compute_dtype(a_q, G_q, a_k, G_k, key_noise)
     eye = torch.eye(r, dtype=dtype, device=G_k.device)
     # G_k + n_h I is exactly symmetric when G_k is: the shift touches only the diagonal.
