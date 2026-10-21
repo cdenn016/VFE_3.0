@@ -3513,6 +3513,20 @@ def _calibration_and_strata(
                 "corpus_freq_strata_ce": strata}
 
 
+def _float64_cpu_copy(model: torch.nn.Module) -> torch.nn.Module:
+    r"""``model`` itself when every parameter is a float64 CPU tensor, else a float64 CPU copy with its state.
+
+    The copy is built from ``model.cfg`` under a forked RNG (the caller's random state is untouched) and loads the
+    state dict, so no second device-resident copy of the live model is made.
+    """
+    if all(p.dtype == torch.float64 and p.device.type == "cpu" for p in model.parameters()):
+        return model
+    with torch.random.fork_rng(devices=[]):
+        copy = type(model)(model.cfg)
+    copy.load_state_dict({key: value.detach().cpu() for key, value in model.state_dict().items()})
+    return copy.double()
+
+
 def _fd_gradient_check(
     model:       torch.nn.Module,
     test_loader: Iterable,
@@ -3520,19 +3534,30 @@ def _fd_gradient_check(
 
     *,
     n_coords:    int   = 4,
-    fd_eps:      float = 1e-3,
+    fd_eps:      float = 1e-5,
     record:      Optional[Dict[str, Any]] = None,
 ) -> float:
     r"""Worst relative error between autograd-of-CE and a central finite difference on a few DECODE
     coordinates: ``output_proj_weight`` under linear decode, else the untied decode tables
     ``decode_mu_embed`` / ``decode_sigma_log_embed`` of a prior-bank decode, whose gradient reaches the
-    loss only through the decode, so a healthy model reads ~1e-4 and a broken decode adjoint spikes far
-    above it. A tied prior-bank decode has no decode-only trainable table (``decode_log_scale`` is frozen),
-    so the check returns NaN there. The probed parameter, or the reason for a NaN, is written to ``record``
-    (``fd_gradient_probe``, ``fd_gradient_nan_reason``; audit 2026-10-07, F86). Best-effort on one tiny
-    batch; restores every coord."""
+    loss only through the decode. A tied prior-bank decode has no decode-only trainable table
+    (``decode_log_scale`` is frozen), so the check returns NaN there. The probed parameter, or the reason for a
+    NaN, is written to ``record`` (``fd_gradient_probe``, ``fd_gradient_nan_reason``; audit 2026-10-07, F86).
+    Best-effort on one tiny batch; restores every coord.
+
+    The probe runs on a float64 CPU copy of the model (audit 2026-10-20 item 60): in float32 at a step of 1e-3 the
+    rounding floor of the central difference is of order :math:`u|L|/(h|g|) \approx 0.3` relative for a correct
+    gradient, so it could not separate rounding from an adjoint error. In float64 at :math:`h = 10^{-5}` the
+    truncation error is :math:`O(h^2)` and the rounding floor
+    :math:`\varepsilon_{64}|L|/(h\min_j|g_j|)` is recorded as ``fd_gradient_noise_floor``; a correct adjoint reads
+    about that floor plus about 1e-8, and a broken one far above it. ``fd_gradient_dtype`` and ``fd_gradient_eps``
+    record the arithmetic."""
     if record is None:
         record = {}
+    model = _float64_cpu_copy(model)
+    device = torch.device("cpu")
+    record["fd_gradient_dtype"] = "float64"
+    record["fd_gradient_eps"] = float(fd_eps)
     with _diagnostic_eval_mode(model):
         batch = next(iter(test_loader))
         tok, tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
@@ -3581,6 +3606,9 @@ def _fd_gradient_check(
                     record["fd_gradient_nan_reason"] = "non-finite finite difference or autograd value"
                     return float("nan")
                 worst = max(worst, abs(fd - ana) / max(abs(fd), abs(ana), 1e-8))
+        smallest = min(abs(float(gflat[j])) for j in idx)
+        record["fd_gradient_noise_floor"] = (torch.finfo(torch.float64).eps * abs(float(loss)) / (fd_eps * smallest)
+                                             if smallest > 0 else float("inf"))
         model.zero_grad(set_to_none=True)
         return worst
 
