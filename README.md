@@ -940,6 +940,32 @@ vocabulary readout can dominate parameter and memory cost.
 Setting `MIN_COUNT` in `build_wikitext103_word_cache.py` and rebuilding applies a frequency
 cutoff that trades vocabulary size against OOV.
 
+The GPT-2 BPE cache that every reported `wikitext-103` run reads
+(`wikitext-103_{train,validation,test}_tiktoken_tokens.pt`, dated 2026-05-02; validation
+245,021 tokens, SHA-256 `b88ffdc3...`, test 280,542 tokens) has no builder in this repository and
+no provenance manifest, so the loader records it as `tokenizer_provenance_status =
+"filename_inferred_unverified"`. Its sidecar records only token and source-character counts. Its
+recipe was reconstructed on 2026-10-21 by decoding it and comparing with the pinned Hugging Face
+`Salesforce/wikitext` `wikitext-103-v1` parquet (revision `6231e49f`), and is: take the split's
+rows in stored order, drop the empty rows, join the remaining rows (each of which ends in its own
+newline) with `"\n\n"`, replace the markers `" @-@ "`, `" @,@ "` and `" @.@ "` by `"-"`, `","` and
+`"."`, and encode with tiktoken's `gpt2` encoding, with no `<|endoftext|>` between rows or
+articles. The text contains no `<unk>`, so its source is the raw text (`wikitext-103-raw-v1`) rather
+than the `<unk>`-masked `wikitext-103-v1` it was compared with; the raw parquet is not in the local
+cache and was not downloaded, so the source was not confirmed byte for byte. Under this recipe every
+compared line without `<unk>` matches except 3 of 7,382 validation lines, 0 of 8,672 test lines and 5
+of the first 60,339 training lines, where a row-final comma marker keeps a trailing space or a
+similar whitespace detail differs. The other spacing of the tokenized text (spaces around ordinary
+punctuation) is kept. Per-token perplexities on this stream are therefore not comparable with
+standard raw-v1 or v1 numbers: removing the markers also removes about 1.7 GPT-2 tokens per marker
+that the standard streams score (audit 2026-10-20 item 30). Word-normalized figures
+(`vfe3/posthoc/calibration.py`) are the comparable quantity. A later source-bound GPT-2 cache of
+`wikitext-103-v1` with upstream and tokenizer manifests sits in
+`~/.cache/tokenized_cache/wikitext-103-v1_hf-6231e49_tiktoken-gpt2_source-bound-v2/`; the loader
+does not read it. `vfe3.data.datasets.publish_cache_provenance(dataset, split)` writes the
+tokenizer-provenance manifest for an existing cache without rebuilding it, which binds the payload
+digest and tokenizer but not this text recipe.
+
 ### Click-to-run workflow
 
 Entrypoints do not parse command-line configuration. Edit the configuration dictionary
