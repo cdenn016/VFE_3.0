@@ -1,0 +1,65 @@
+{
+  "scope": "Fixed tiny CPU float64 examples, K <= 2 and M <= 3. No training or GPU evidence.",
+  "torch_version": "2.10.0.dev20251210+cu128",
+  "threads": 1,
+  "cuda_visible": false,
+  "independent_exact_errors": {
+    "mean": 8.326672684688674e-17,
+    "covariance": 2.220446049250313e-16,
+    "labels": 1.1102230246251565e-16,
+    "log_evidence": 0.0
+  },
+  "posterior_response_finite_difference_error": 8.749556634768396e-12,
+  "evidence_score_finite_difference_error": 1.7300424981492313e-11,
+  "diagonal_projection_error": 2.220446049250313e-16,
+  "discarded_off_diagonal_covariance": -0.274517473164194,
+  "cavi": [
+    {
+      "sweeps": 1,
+      "elbo": -4.171782719468174,
+      "gap": 0.8003280067935385,
+      "label_staleness_max": 0.016234709686571314
+    },
+    {
+      "sweeps": 2,
+      "elbo": -4.169554181570459,
+      "gap": 0.7980994688958232,
+      "label_staleness_max": 0.02226323156666643
+    },
+    {
+      "sweeps": 4,
+      "elbo": -4.162348585077506,
+      "gap": 0.7908938724028705,
+      "label_staleness_max": 0.03895058231757231
+    },
+    {
+      "sweeps": 8,
+      "elbo": -4.108689762106614,
+      "gap": 0.7372350494319786,
+      "label_staleness_max": 0.06623779630109383
+    }
+  ],
+  "symmetric_example": {
+    "input_mean": 0.0,
+    "input_variance": 1.0,
+    "template_means": [
+      -3.0,
+      3.0
+    ],
+    "template_variances": [
+      0.25,
+      0.25
+    ],
+    "exact_weights": [
+      0.5,
+      0.5
+    ],
+    "exact_output_mean": 0.0,
+    "exact_output_variance": 5.960000000000002,
+    "factorized_exact_output_gap_nats": 27.102745803244325,
+    "mean_field_output_mean": 0.0,
+    "mean_field_output_variance": 0.2,
+    "mean_field_gap_nats": 14.4
+  },
+  "all_checks_passed": true
+}
