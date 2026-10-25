@@ -53,11 +53,13 @@ class Stats:
     yp: Tensor         # (R, V, d)  sum over y_{t-1} = v of E[z_{t-1}]
     yz: Tensor         # (R, V, d)  sum over y_{t-1} = v of E[z_t]
     cnt: Tensor        # (R, V)     frequency of y_{t-1} = v
+    node_uu: Tensor    # (R, V-1)   E[u^2] per node visit (the residual utility variance of parameter expansion)
 
     @staticmethod
     def zeros(R: int, d: int, V: int, device: torch.device | str = "cpu") -> "Stats":
         z = lambda *s: torch.zeros(R, *s, dtype=torch.float64, device=device)   # noqa: E731
-        return Stats(z(V - 1, d + 1, d + 1), z(V - 1, d + 1), z(d, d), z(d, d), z(d, d), z(V, d), z(V, d), z(V))
+        return Stats(z(V - 1, d + 1, d + 1), z(V - 1, d + 1), z(d, d), z(d, d), z(d, d), z(V, d), z(V, d), z(V),
+                     z(V - 1))
 
     def scaled(self, c: float) -> "Stats":
         return Stats(*(getattr(self, f) * c for f in self.__dataclass_fields__))
@@ -101,6 +103,8 @@ class SensorCollector:
         self.st.node_zz.view(R * nodes, d + 1, d + 1).index_add_(0, idx, blk.reshape(R * B, d + 1, d + 1))
         uz = torch.cat([Euz, Eu.unsqueeze(-1)], -1).reshape(R * B, d + 1)
         self.st.node_uz.view(R * nodes, d + 1).index_add_(0, idx, uz)
+        Eu2 = s2 * (1.0 - lam * (lam + kappa)) + Eu ** 2               # E[u^2] at the node (R, B)
+        self.st.node_uu.view(R * nodes).index_add_(0, idx, Eu2.reshape(-1))
 
 
 class CavitySensorCollector:
@@ -201,8 +205,16 @@ def residual_covariance(Szz: Tensor, Szx: Tensor, Sxx: Tensor, W: Tensor) -> Ten
     return Szz - WSxz - WSxz.transpose(-1, -2) + W @ Sxx @ W.transpose(-1, -2)
 
 
-def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transition: bool = True) -> Params:
-    r"""Ridge least-squares solves for every node and for :math:`[G\ E^\top]`; Q from the residual moments."""
+def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transition: bool = True,
+           expand_sensor: bool = False) -> Params:
+    r"""Ridge least-squares solves for every node and for :math:`[G\ E^\top]`; Q from the residual moments.
+
+    ``expand_sensor`` applies parameter-expanded EM to each probit node (Liu, Rubin and Wu 1998). The expanded
+    model lets the utility have a free variance, :math:`u_n\sim\mathcal N(\tilde a_n^\top\tilde z,\sigma_n^2)`,
+    which leaves the branch law unchanged up to the scale of :math:`\tilde a_n`. Its M-step is the same least
+    squares for :math:`\tilde a_n` plus :math:`\sigma_n^2=E[(u-\tilde a_n^\top\tilde z)^2]` per visit, and the
+    reduction to the unit-variance model is :math:`\tilde a_n\leftarrow\tilde a_n/\sigma_n`. Nodes without
+    visits keep :math:`\sigma_n=1`."""
     d, V, R = prm.d, prm.E.shape[1], prm.R
     dev = prm.G.device
     eye1 = torch.eye(d + 1, dtype=torch.float64, device=dev)
@@ -210,6 +222,12 @@ def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transitio
     # LU solve with a transposed right-hand side fails inside MKL's DLASWP on CPU at d+V = 264).
     Ln = torch.linalg.cholesky(st.node_zz + ridge * eye1)
     ab = torch.cholesky_solve(st.node_uz.unsqueeze(-1).contiguous(), Ln).squeeze(-1)   # (R, V-1, d+1)
+    if expand_sensor:
+        visits = st.node_zz[..., d, d]                                 # (R, V-1) visit frequency
+        resid = (st.node_uu - 2.0 * (ab * st.node_uz).sum(-1)
+                 + torch.einsum("rni,rnij,rnj->rn", ab, st.node_zz, ab))
+        sigma2 = torch.where(visits > 1e-12, resid / visits.clamp_min(1e-12), torch.ones_like(visits))
+        ab = ab / sigma2.clamp_min(1e-6).sqrt().unsqueeze(-1)
     new = prm.clone()
     new.A, new.b = ab[..., :d].contiguous(), ab[..., d].contiguous()
     if not learn_transition:
@@ -231,12 +249,18 @@ def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transitio
 def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, window: int = 1,
                 blind: bool = False, ridge: float = 1e-6, q_floor: float = 1e-4,
                 gamma_exponent: float = 0.6, gamma_floor: float = 0.0, reset_every: Optional[int] = None,
-                sensor_stats: str = "sequential", log: Optional[Logger] = None) -> Params:
+                sensor_stats: str = "sequential", expand_sensor: bool = False, overrelax: float = 1.0,
+                log: Optional[Logger] = None) -> Params:
     r"""Stepwise variational EM over token streams (B, L), for all runs of ``prm0`` at once. ``blind`` uses the
     forecast in place of the assimilated state in the transition statistics (the target-blind control;
     requires window = 1). The averaging step is :math:`\max((k+1)^{-\alpha},\gamma_{\min})` with
     :math:`\alpha` = ``gamma_exponent``, :math:`\gamma_{\min}` = ``gamma_floor``, and k counted from the
-    last restart when ``reset_every`` is set."""
+    last restart when ``reset_every`` is set. ``expand_sensor`` uses the parameter-expanded probit M-step of
+    :func:`m_step`. ``overrelax`` :math:`\omega\in(0,2)` replaces each M-step result :math:`\theta_{\rm EM}` by
+    :math:`\theta+\omega(\theta_{\rm EM}-\theta)` for G, E, A, b and Q (Q's eigenvalues then floored at
+    ``q_floor``); :math:`\omega=1` is plain EM and :math:`\omega>1` overrelaxes (Salakhutdinov and Roweis 2003)."""
+    if not 0.0 < overrelax < 2.0:
+        raise ValueError("overrelax must lie in (0, 2)")
     if not 0.0 < gamma_exponent <= 1.0 or not 0.0 <= gamma_floor <= 1.0:
         raise ValueError("gamma_exponent must lie in (0, 1] and gamma_floor in [0, 1]")
     if reset_every is not None and reset_every < 1:
@@ -280,7 +304,15 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
             k_eff = k % reset_every if reset_every else k
             gamma = max((k_eff + 1) ** -gamma_exponent, gamma_floor)
             running = st if running is None or gamma >= 1.0 else running.blend(st, gamma)
-            prm = m_step(running, prm, ridge, q_floor)
+            new = m_step(running, prm, ridge, q_floor, expand_sensor=expand_sensor)
+            if overrelax != 1.0:
+                for f in ("G", "E", "A", "b", "Q"):
+                    old = getattr(prm, f)
+                    setattr(new, f, old + overrelax * (getattr(new, f) - old))
+                Q = 0.5 * (new.Q + new.Q.transpose(-1, -2))
+                evals, evecs = torch.linalg.eigh(Q)
+                new.Q = (evecs * evals.clamp_min(q_floor).unsqueeze(-2)) @ evecs.transpose(-1, -2)
+            prm = new
             k += 1
             if log is not None and (k % 20 == 0 or c0 + chunk >= Ltot):
                 log({"arm": "local", "chunk": k, "train_bits": (nll / ntok / math.log(2)).tolist(),
