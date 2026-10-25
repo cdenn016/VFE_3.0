@@ -21,7 +21,7 @@ from pathlib import Path
 
 CONFIG = {
     
-    "stage":            "X",                    # "timing" | "A" | "B" | "S" (scaling) | "W" (warm start) | "X" (acceleration)
+    "stage":            "C",                    # "timing" | "A" | "B" | "S" (scaling) | "W" (warm start) | "X" (acceleration) | "C" (exp links)
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
@@ -87,6 +87,15 @@ CONFIG = {
     "X_passes":         1,
     "X_arms":           ["local_w16", "local_w16_or15", "local_w16_or18", "local_w16_px", "local_w16_px_or15"],
 
+    # stage C (group-valued links on the stage B data; results_C.jsonl). The transition is G = exp(L): the local
+    # arm updates L by the natural-gradient step D exp_L[dL] = link_step (G_EM - G) (equations (4)-(5) of the
+    # October 20 local-learning note) and backpropagation learns L through matrix_exp. The matrix-chart arms rerun
+    # under the same code as the reference. One pass from the stage B initialization (G = 0.5 I, L = log(0.5) I),
+    # three stacked seeds, scored at the end with the particle-filter gap, as in stage B.
+    "C_dims":           [32],
+    "C_arms":           ["local_w16", "local_w16_exp", "backprop", "backprop_exp"],
+    "link_step":        1.0,                    # natural-gradient step on L, in (0, 1]
+
     # stage B (WikiText-103 bytes)
     "B_dims":           [8, 16, 32],
     "B_seeds":          [0, 1, 2],
@@ -137,13 +146,16 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
     record stores it, so a completed run is reused only under the same settings."""
     c = CONFIG
     chunk = c["chunk"] if chunk is None else chunk
-    if arm == "backprop":
-        return {"rule": "backprop", "chunk": chunk, "lr": c["backprop_lr"]}
+    if arm in ("backprop", "backprop_exp"):
+        out = {"rule": "backprop", "chunk": chunk, "lr": c["backprop_lr"]}
+        return {**out, "link_chart": "exp"} if arm == "backprop_exp" else out
     base, _, name = arm.partition("@")
-    sensor_stats, expand_sensor, overrelax = "sequential", False, 1.0
-    while True:                                 # suffixes, in any order: _cav, _px, _orNN
+    sensor_stats, expand_sensor, overrelax, link_chart = "sequential", False, 1.0, "matrix"
+    while True:                                 # suffixes, in any order: _cav, _px, _orNN, _exp
         head, _, tail = base.rpartition("_")
-        if tail == "cav":                       # node statistics at the EP cavity of the token's posterior
+        if tail == "exp":                       # group-valued link G = exp(L), natural-gradient step on L
+            link_chart = "exp"
+        elif tail == "cav":                     # node statistics at the EP cavity of the token's posterior
             sensor_stats = "cavity"
         elif tail == "px":                      # parameter-expanded probit M-step
             expand_sensor = True
@@ -164,10 +176,12 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
         window, blind = int(base[7:]), False
     else:
         raise ValueError(arm)
-    return {"rule": "local", "chunk": chunk, "window": window, "blind": blind, "ridge": c["ridge"],
-            "q_floor": c["q_floor"], "gamma_exponent": sched["alpha"], "gamma_floor": sched["floor"],
-            "reset_every": reset, "sensor_stats": sensor_stats, "expand_sensor": expand_sensor,
-            "overrelax": overrelax}
+    out = {"rule": "local", "chunk": chunk, "window": window, "blind": blind, "ridge": c["ridge"],
+           "q_floor": c["q_floor"], "gamma_exponent": sched["alpha"], "gamma_floor": sched["floor"],
+           "reset_every": reset, "sensor_stats": sensor_stats, "expand_sensor": expand_sensor,
+           "overrelax": overrelax}
+    # The chart keys appear only off the default, so earlier records keep their stored settings.
+    return {**out, "link_chart": "exp", "link_step": c["link_step"]} if link_chart == "exp" else out
 
 
 def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
@@ -496,7 +510,7 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
         train = as_streams(xtrain, c["streams"]).to(DEVICE)
         val = val_cpu.to(DEVICE)
         pf = as_streams(xval[:c["pf_streams"] * c["pf_len"]], c["pf_streams"]).to(DEVICE)
-        for order in (1, 2, 3):
+        for order in ((1, 2, 3) if stage == "B" else ()):    # stage C reuses stage B's n-gram references
             key = (f"{order}-gram", 0, 0)
             ident = identity({"rule": "ngram", "order": order, "k_grid": c["ngram_k_grid"]}, proto)
             if not pending(done, key[0], 0, [0], ident):
@@ -505,9 +519,9 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
             (nll, n), k = best
             append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k,
                           "identity": ident})
-        dims, seeds = c["B_dims"], c["B_seeds"]
+        dims, seeds = (c["C_dims"] if stage == "C" else c["B_dims"]), c["B_seeds"]
     for d in dims:
-        for arm in (c["A_arms"] if stage == "A" else c["arms"]):
+        for arm in {"A": c["A_arms"], "C": c.get("C_arms", [])}.get(stage, c["arms"]):
             ident = identity(arm_settings(arm), proto)
             todo = pending(done, arm, d, seeds, ident)
             if not todo:

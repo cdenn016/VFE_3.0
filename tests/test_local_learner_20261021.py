@@ -327,3 +327,54 @@ def test_parameter_expanded_and_overrelaxed_m_steps(setup):
     assert torch.linalg.eigvalsh(stacked.Q).min() >= 1e-4 - 1e-12
     with pytest.raises(ValueError):
         train_local(start, streams, tree, chunk=8, overrelax=2.0)
+
+
+def test_exponential_link_chart(setup):
+    r"""Dexp's matrix matches finite differences of matrix_exp; spd_logm inverts exp on SPD input and refuses
+    other input; the natural-gradient link step solves Dexp_L[dL] = step (G_EM - G) and lowers the profiled
+    transition energy for a small step; stacked exp-chart runs of both rules equal separate ones."""
+    from vfe3.local_learner.learners import dexp_matrix, exp_link_transition, spd_logm
+    tree, prm = setup
+    g = torch.Generator().manual_seed(24)
+    L = 0.3 * torch.randn(2, d, d, generator=g)
+    E = torch.randn(d, d, generator=g)
+    M = dexp_matrix(L)
+    h = 1e-6
+    for r in range(2):
+        fd = (torch.linalg.matrix_exp(L[r] + h * E) - torch.linalg.matrix_exp(L[r] - h * E)) / (2 * h)
+        assert torch.allclose((M[r] @ E.reshape(-1)).reshape(d, d), fd, atol=1e-8)
+    X = torch.randn(d, d, generator=g)
+    S = X @ X.T + 0.5 * torch.eye(d)
+    assert torch.allclose(torch.linalg.matrix_exp(spd_logm(S[None]))[0], S, atol=1e-10)
+    with pytest.raises(ValueError):
+        spd_logm(torch.tensor([[[1.0, 0.5], [0.0, 1.0]]]))
+    streams = sample_sequences(prm, tree, 64, 40, seed=25)
+    start = init_params(d, tree.V, seed=26)
+    st = _one_chunk_stats(tree, start, streams, blind=False)
+    L0 = spd_logm(start.G)
+
+    def profiled_energy(G: torch.Tensor) -> float:
+        E_star = (st.yz[0] - st.yp[0] @ G.T) / (st.cnt[0] + 1e-6).unsqueeze(-1)
+        W = torch.cat([G, E_star.T], 1)
+        Sxx = torch.zeros(d + tree.V, d + tree.V)
+        Sxx[:d, :d], Sxx[:d, d:], Sxx[d:, :d], Sxx[d:, d:] = st.pp[0], st.yp[0].T, st.yp[0], torch.diag(st.cnt[0])
+        Szx = torch.cat([st.zp[0], st.yz[0].T], 1)
+        return float(0.5 * torch.trace(W @ Sxx @ W.T) - torch.trace(W @ Szx.T))
+
+    L1, G1, _, Q1 = exp_link_transition(st, start, L0, 1e-6, 1e-4, 1.0)
+    full = m_step(st, start, 1e-6, 1e-4)
+    dG = full.G - start.G
+    assert torch.allclose((dexp_matrix(L0)[0] @ (L1 - L0)[0].reshape(-1)).reshape(d, d), dG[0], atol=1e-9)
+    assert torch.allclose(G1, torch.linalg.matrix_exp(L1), atol=1e-12)
+    assert torch.linalg.eigvalsh(Q1).min() >= 1e-4 - 1e-12
+    _, G_small, _, _ = exp_link_transition(st, start, L0, 1e-6, 1e-4, 0.05)
+    assert profiled_energy(G_small[0]) < profiled_energy(start.G[0])
+    for train in (lambda p: train_local(p, streams, tree, chunk=8, window=4, link_chart="exp"),
+                  lambda p: train_backprop(p, streams, tree, chunk=8, lr=1e-2, link_chart="exp")):
+        stacked = train(init_runs(d, tree.V, [3, 4]))
+        for r, sd in enumerate([3, 4]):
+            alone = train(init_params(d, tree.V, sd))
+            for f in ("G", "E", "Q", "A", "b"):
+                assert torch.allclose(getattr(stacked.run(r), f), getattr(alone, f), atol=1e-9), f
+    with pytest.raises(ValueError):
+        train_local(start, streams, tree, chunk=8, link_chart="exp", overrelax=1.5)
