@@ -123,7 +123,7 @@ block_glmc or an equal-block so_n or su_n tower, any tying), edge links off, a b
 covariance is read through its head-block projection (`posterior` needs
 `block_mlp_inference="mean_field"`), no CG coupling, and the `linear`,
 `diagonal_chunked` or `full_chunked` decoders (the diagonal decoder reads
-$\operatorname{diag}\Sigma_i$, exact up to a per-position constant). With identity frames
+$\mathrm{diag}\Sigma_i$, exact up to a per-position constant). With identity frames
 (`gauge_transport="off"`), `prior_covariance_table="block_cholesky"` replaces the diagonal
 variance table by per-type head blocks $C_{vh}=L_{vh}L_{vh}^\top$ (log-diagonal Cholesky,
 `sigma_chol_embed`), so that `mu_embed` and the blocks hold $(\xi_v, C_v)$ and the model
@@ -131,22 +131,22 @@ represents what the learned-frame reference arm represents without a frame table
 needs a full-layout family and an untied decode bank (or the linear decoder).
 
 `family="gaussian_frame_diagonal"` keeps the covariance diagonal in reference coordinates,
-$\Sigma_i=U_i\operatorname{diag}(c_i)U_i^\top$, and stores the reference variances $c_i$ in the
+$\Sigma_i=U_i\mathrm{diag}(c_i)U_i^\top$, and stores the reference variances $c_i$ in the
 $(\ldots, K)$ layout. The passive action leaves $c_i$ fixed, so the family is closed under every
-structure group, and the moment-matched update returns $c_i^+=\operatorname{diag}C_i^{\mathrm{att}}$
-plus the floor in reference coordinates ($f c_{p,i}$, $f\,\mathrm{mean}(c_i)$, or their elementwise
+structure group, and the moment-matched update returns $c_i^+=\mathrm{diag}C_i^{\mathrm{att}}$
+plus the floor in reference coordinates ($f c_{p,i}$, $f \mathrm{mean}(c_i)$, or their elementwise
 maximum), a frame-independent projection whose reference trace does not grow with the frame
 condition number (audit 2026-10-17 item 3). The router and the update read $(U_i^{-1}\mu_i, c_i)$,
-which makes the comparison covariance $S\operatorname{diag}(c_i)S^\top$ with no frame product. It
+which makes the comparison covariance $S\mathrm{diag}(c_i)S^\top$ with no frame product. It
 is defined on the kernel predictive readout with edge links off, no frame-space RoPE, no CG
 coupling, a `none` or `layernorm` block norm with a `coordinate` block MLP (local coordinates
-push $U_i\operatorname{diag}(c_i)U_i^\top$ and read back $\operatorname{diag}(U_i^{-1}SU_i^{-\top})$;
-reference coordinates push $\operatorname{diag}(c_i)$ and keep the diagonal), the `linear` or
+push $U_i\mathrm{diag}(c_i)U_i^\top$ and read back $\mathrm{diag}(U_i^{-1}SU_i^{-\top})$;
+reference coordinates push $\mathrm{diag}(c_i)$ and keep the diagonal), the `linear` or
 `diagonal_chunked` decoders (the latter reads $(\xi_i, c_i)$ in reference coordinates, or
-$\operatorname{diag}\Sigma_i$ in local ones, and needs `untie_decode_bank=True`, since a tied bank
+$\mathrm{diag}\Sigma_i$ in local ones, and needs `untie_decode_bank=True`, since a tied bank
 would pair the encoder's local-frame mean with the reference variance $c_v$; audit 2026-10-20 item
 59), and the table Fisher step only with `pos_phi="none"`.
-That step preconditions the mean row by the metric $U_v^{-\top}\operatorname{diag}(1/s_v)U_v^{-1}$ of
+That step preconditions the mean row by the metric $U_v^{-\top}\mathrm{diag}(1/s_v)U_v^{-1}$ of
 the type's layer-0 frame, the diagonal step in $\xi_v = U_v^{-1}\mu_v$; a positional frame would
 make the metric an average over occurrences, which the step does not form.
 
@@ -532,7 +532,7 @@ the validator for the complete admission rules.
 | `block_mlp_mode="prototype_agents"` | Replaces the feed-forward block MLP by the minimal-agent model on $M$ = `block_mlp_expansion`·$K$ template agents. `block_mlp_inference` selects `"mean_field"` (KL-label responsibilities and a power posterior, `block_mlp_cavi_steps` sweeps) or `"exact"` (the mixture posterior); `block_mlp_covariance="posterior"` returns the template posterior covariance; `block_mlp_em_weight>0` adds an EM M-step term on the templates; `block_mlp_template_init` is `"absolute"` or `"working_variance"`. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `rope_mode="none"` or comparison-space RoPE (`"comparison"` or `"comparison_invariant"`). |
-| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. `"query_shifted"` clamps $D_{ij}-c_i-m_i$ from above only, where $c_i$ is the query-only row constant of the cost ($-(r+\log\det G_i)/2$ for the Gaussian KL, $-\log\det G_i/2$ for `noisy_query`, $0$ for `mean_distance`) and $m_i$ is the mean of the key log-volumes $\ell_j=\tfrac12\log\det G_j$ over the row's admissible keys. Both are row constants, so $eta$ equals the absolute route's wherever nothing is capped, and the shifted costs can be negative. The tested quantity is invariant under a joint rescaling of a head's comparison maps, which leaves the KL unchanged, so map growth along that flat direction can no longer push a head onto the cap (audit 2026-10-20 item 1). `"query_shifted_v1"` is the earlier form without $m_i$, which kept the key log-determinant in the clamped cost; configurations saved with `"query_shifted"` before the change reload as `"query_shifted_v1"`. `relational_score_weight_decay` (default 0) is an opt-in decoupled decay on $S_Q,S_K$. |
+| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j:\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. `"query_shifted"` clamps $D_{ij}-c_i-m_i$ from above only, where $c_i$ is the query-only row constant of the cost ($-(r+\log\det G_i)/2$ for the Gaussian KL, $-\log\det G_i/2$ for `noisy_query`, $0$ for `mean_distance`) and $m_i$ is the mean of the key log-volumes $\ell_j=\tfrac12\log\det G_j$ over the row's admissible keys. Both are row constants, so $eta$ equals the absolute route's wherever nothing is capped, and the shifted costs can be negative. The tested quantity is invariant under a joint rescaling of a head's comparison maps, which leaves the KL unchanged, so map growth along that flat direction can no longer push a head onto the cap (audit 2026-10-20 item 1). `"query_shifted_v1"` is the earlier form without $m_i$, which kept the key log-determinant in the clamped cost; configurations saved with `"query_shifted"` before the change reload as `"query_shifted_v1"`. `relational_score_weight_decay` (default 0) is an opt-in decoupled decay on $S_Q,S_K$. |
 | `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(3\tanh(\delta_{\ell,h}/3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. The offset $3\tanh(\delta/3)$ equals $\delta$ to first order and stays inside $(-3,3)$ with nonzero gradient everywhere; it replaced a hard clamp of $\delta$ to $[-3,3]$ whose gradient vanished outside the window, so a saved nonzero offset reloads at a different temperature than under the clamp. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays at the attention prior $\pi$ (uniform under a causal mask). Not with `predictive_readout="minimal_agent"`. |
 | `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
 
@@ -587,12 +587,12 @@ default to the dense AdamW behavior. `m_phi_sparse_rows=True` (only with
 a row that is neither among the step's input tokens nor carries a nonzero gradient takes no
 moment update, no step and no decoupled decay, and a stepped row's bias correction uses its own
 step count $k_v$, which the optimizer state checkpoints as `row_step`. Under dense AdamW a row
-revisited after a long gap moves about $\min(\sqrt T, 31.6)\,\mathrm{lr}$ per coordinate whatever
+revisited after a long gap moves about $\min(\sqrt T, 31.6) \mathrm{lr}$ per coordinate whatever
 its gradient; the row-lazy step moves a first touch by $\mathrm{lr}$. The moment tables stay
 dense, so the step does not save memory. `m_decode_update_mode="fisher"` (prior-bank decode with
 `untie_decode_bank=True`) replaces AdamW on `decode_mu_embed` and `decode_sigma_log_embed` with
-the natural-gradient step of the Gaussian Fisher metric $\operatorname{diag}(1/t_v, 1/2)$
-weighted by the step's target counts, $(m_v, l_v) \mathrel{-}= \eta\,(N/\max(c_v,1))\,(t_v\odot
+the natural-gradient step of the Gaussian Fisher metric $\mathrm{diag}(1/t_v, 1/2)$
+weighted by the step's target counts, $(m_v, l_v) \mathrel{-}= \eta (N/\max(c_v,1)) (t_v\odot
 \nabla_m, 2\nabla_l)$, bounded per row in Fisher norm and never clipped; it shares
 `m_table_fisher_lr` and `m_table_fisher_trust_radius` with the encoder table step
 (`vfe3/table_optim.py`), and the decode AdamW rates only schedule it and set its decay.
@@ -637,7 +637,7 @@ families differ. A genuinely full covariance requires `gaussian_full` together w
 `attention_mode="projected_gradient"`. Of the two LayerNorm pushforwards, `"pushforward"` is the
 delta method at the norm's scale $s$, capped at the sphere bound where $\Sigma/s^2$ is large, so
 there it keeps the delta method's near rank-one radial shape; `"pushforward_moment"` evaluates the
-same expression at the effective scale $s_{\mathrm{eff}}^2=s^2+\operatorname{tr}(\Pi\Sigma\Pi)/K$ with a
+same expression at the effective scale $s_{\mathrm{eff}}^2=s^2+\mathrm{tr}(\Pi\Sigma\Pi)/K$ with a
 span floor, a moment estimate of the LayerNorm output at every $\Sigma/s^2$ (within 4% per
 coordinate of Monte Carlo at $K=128$). Both are read only under `norm_type_block="layernorm"`.
 `VFE3Config.inactive_fields()`
