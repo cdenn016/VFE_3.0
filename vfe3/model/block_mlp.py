@@ -2040,6 +2040,7 @@ class CueResultMemoryBlockMLP(nn.Module):
         self.regression_rank = regression_rank
         self.result_noise_ratio = float(result_noise_ratio)
         self.tile_bytes = CUE_RESULT_TILE_BYTES                                    # chunk budget (not state)
+        self.fused_kernel = False                                                  # block_memory_triton (not state)
         bound_in = embed_dim ** -0.5
         self.nu = nn.Parameter(torch.empty(M, K).uniform_(-bound_in, bound_in))                     # (M, K)
         self.log_lambda = nn.Parameter(torch.full((M, K), math.log(float(template_init_variance))))  # (M, K)
@@ -2094,10 +2095,13 @@ class CueResultMemoryBlockMLP(nn.Module):
         r"""The exact result posterior at the working belief: dense
         (:func:`vfe3.model.cue_result_memory.cue_result_exact_posterior`) or, for (..., K) variances, diagonal
         (:func:`vfe3.model.cue_result_memory.cue_result_diagonal_posterior`)."""
-        kernel = cue_result_diagonal_posterior if sigma.dim() == mu.dim() else cue_result_exact_posterior
-        return kernel(mu, sigma, self.nu, self.omega, self.log_lambda, self.log_result_noise,
-                      self.log_pi if log_prior is None else log_prior, tile_bytes=self.tile_bytes,
-                      **self._regression())
+        prior = self.log_pi if log_prior is None else log_prior
+        if sigma.dim() == mu.dim():
+            return cue_result_diagonal_posterior(mu, sigma, self.nu, self.omega, self.log_lambda,
+                                                 self.log_result_noise, prior, tile_bytes=self.tile_bytes,
+                                                 fused=self.fused_kernel, **self._regression())
+        return cue_result_exact_posterior(mu, sigma, self.nu, self.omega, self.log_lambda, self.log_result_noise,
+                                          prior, tile_bytes=self.tile_bytes, **self._regression())
 
     @torch.no_grad()
     def calibrate_templates(

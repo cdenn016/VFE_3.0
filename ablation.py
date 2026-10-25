@@ -432,6 +432,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
     block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     block_memory_tile_mib            = 1024,           # cue_result_memory only: int >= 1 (MiB), one exact-posterior tile; same result at every budget, larger = fewer kernels and more transient memory (32 = CPU-safe default)
+    block_memory_triton              = False,          # True | False: cue_result_memory on gaussian_frame_diagonal, rank 1..4: fused Triton kernels on CUDA (CPU runs torch either way)
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 
