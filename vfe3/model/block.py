@@ -413,7 +413,7 @@ def _reference_coordinate_block(
     a pushed :math:`C_i'` returns as its diagonal, the family's M-projection in reference coordinates, which the
     passive action leaves fixed. The mean still moves through :math:`U_i`.
     """
-    from vfe3.model.block_mlp import (GaussianTemplateBlockMLP, PrototypeAgentBlockMLP,
+    from vfe3.model.block_mlp import (CueResultMemoryBlockMLP, GaussianTemplateBlockMLP, PrototypeAgentBlockMLP,
                                       block_norm_covariance_pushforward, block_norm_linearization,
                                       block_norm_radial_term, block_norm_trace_cap)
     from vfe3.model.frame_actions import (frame_matvec, identity_frame, local_covariance, reference_covariance,
@@ -428,7 +428,9 @@ def _reference_coordinate_block(
     # The frame of the covariance actions: U_i, or the identity when the family stores reference variances.
     cov_frame = identity_frame(frame) if frame_diagonal else frame
     template = isinstance(block_mlp, GaussianTemplateBlockMLP)
-    prototype = isinstance(block_mlp, PrototypeAgentBlockMLP)
+    # prototype_agents and cue_result_memory read the whole reference covariance C_i; under 'posterior' (the only
+    # contract of cue_result_memory) their C^+ returns as U C^+ U^T.
+    prototype = isinstance(block_mlp, (PrototypeAgentBlockMLP, CueResultMemoryBlockMLP))
     delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
     push = push_norm and block_norm is not None and not delta_full
     sigma = out.sigma

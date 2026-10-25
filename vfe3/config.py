@@ -758,19 +758,23 @@ class VFE3Config:
 
     use_block_mlp:                    bool            = True         # residual feed-forward unit after each block
 
-    # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" | "prototype_agents"
+    # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" | "prototype_agents" | "cue_result_memory"
     #   coordinate         standard MLP on the mean coordinates
     #   gauge_gate         gauge-equivariant gate built from Mahalanobis invariants
     #   canonical_frame    ordinary MLP in the realized frame-fixed coordinates
     #   gaussian_template  softmax over template KLs (covariance kept)
     #   prototype_agents   minimal agent model with M = block_mlp_expansion * K template agents
+    #   cue_result_memory  exact conditioning of M components with a cue law and a linear-Gaussian result law
+    #                      (vfe3.model.cue_result_memory). only: projected_predictive, block_coordinates "reference",
+    #                      family "gaussian_full", block_mlp_inference "exact", block_mlp_covariance "posterior",
+    #                      block_mlp_dropout 0, block_mlp_em_weight 0
     block_mlp_mode:                   str             = "coordinate"
 
     # "passthrough" | "delta_full" | "posterior"
     #   passthrough  covariance untouched (every mode)
     #   delta_full   J Sigma J^T + block_mlp_covariance_floor * Sigma (coordinate, gauge_gate, canonical_frame);
     #                its diagonal on gaussian_diagonal (coordinate, canonical_frame)
-    #   posterior    the template posterior covariance (prototype_agents)
+    #   posterior    the template posterior covariance (prototype_agents; the only contract of cue_result_memory)
     block_mlp_covariance:             str             = "passthrough"
    
     # "gelu" | "silu" | "relu"
@@ -801,6 +805,11 @@ class VFE3Config:
     #                     lambda_0 = c (1 - p)/p with c the mean working variance there and p the target pull
     block_mlp_template_init:          str             = "absolute"
     block_mlp_template_init_pull:     float           = 0.09         # working_variance only: initial pull p in (0, 1)
+
+    # cue_result_memory only. Regression F_a = I + D_a (None: dense D_a, M K^2 parameters per layer) or
+    # F_a = I + U_a V_a^T with U_a, V_a of rank r in [1, K] (2 M K r parameters per layer).
+    block_memory_regression_rank:     Optional[int]   = None
+    block_memory_result_noise_ratio:  float           = 0.01         # cue_result_memory only: initial Q_a / L_a > 0
 
     ##################################################
     #   15. E-step (belief updates)
@@ -2128,6 +2137,41 @@ class VFE3Config:
                 f"got {self.block_mlp_template_init_variance!r}"
             )
         _require(self.block_mlp_template_init, ("absolute", "working_variance"), "block_mlp_template_init")
+        # cue_result_memory knobs (validated in every mode; inactive_fields reports them off that mode).
+        rank = self.block_memory_regression_rank
+        if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int)
+                                 or not 1 <= rank <= self.embed_dim):
+            raise ValueError(f"block_memory_regression_rank must be None or an int in [1, embed_dim={self.embed_dim}], "
+                             f"got {rank!r}")
+        if (isinstance(self.block_memory_result_noise_ratio, bool)
+                or not isinstance(self.block_memory_result_noise_ratio, Real)
+                or not math.isfinite(float(self.block_memory_result_noise_ratio))
+                or float(self.block_memory_result_noise_ratio) <= 0.0):
+            raise ValueError("block_memory_result_noise_ratio must be a finite real value > 0, "
+                             f"got {self.block_memory_result_noise_ratio!r}")
+        if self.use_block_mlp and self.block_mlp_mode == "cue_result_memory":
+            memory_problems = []
+            if self.attention_mode != "projected_predictive":
+                memory_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+            if self.block_coordinates != "reference":
+                memory_problems.append(f"block_coordinates={self.block_coordinates!r} (requires 'reference': the "
+                                       "components live in reference coordinates and read the invariant C_i)")
+            if self.family != "gaussian_full":
+                memory_problems.append(f"family={self.family!r} (requires 'gaussian_full': the block reads and "
+                                       "returns a dense covariance)")
+            if self.block_mlp_inference != "exact":
+                memory_problems.append(f"block_mlp_inference={self.block_mlp_inference!r} (requires 'exact')")
+            if self.block_mlp_covariance != "posterior":
+                memory_problems.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires 'posterior')")
+            if float(self.block_mlp_dropout) != 0.0:
+                memory_problems.append(f"block_mlp_dropout={self.block_mlp_dropout!r} (requires 0: the output is a "
+                                       "posterior)")
+            if float(self.block_mlp_em_weight) != 0.0:
+                memory_problems.append(f"block_mlp_em_weight={self.block_mlp_em_weight!r} (requires 0: no cue/result "
+                                       "EM objective is implemented)")
+            if memory_problems:
+                raise ValueError("block_mlp_mode='cue_result_memory' is defined only on the exact reference route; "
+                                 "got " + "; ".join(memory_problems))
         if (isinstance(self.block_mlp_template_init_pull, bool)
                 or not isinstance(self.block_mlp_template_init_pull, Real)
                 or not 0.0 < float(self.block_mlp_template_init_pull) < 1.0):
@@ -2156,7 +2200,7 @@ class VFE3Config:
             if self.use_cg_coupling:
                 incompatible.append("use_cg_coupling=True (acts in local coordinates before the norm)")
             if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template",
-                                                                  "prototype_agents"):
+                                                                  "prototype_agents", "cue_result_memory"):
                 incompatible.append(
                     f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate', 'gaussian_template' or "
                     "'prototype_agents'; canonical_frame is already conjugated and gauge_gate is already "
@@ -2652,13 +2696,26 @@ class VFE3Config:
         elif self.block_mlp_mode == "gaussian_template":
             mark(("block_mlp_activation", *norm_floor),
                  "gaussian_template gates by softmax over template KLs and keeps covariance")
-        elif self.block_mlp_mode == "prototype_agents":
+        elif self.block_mlp_mode in ("prototype_agents", "cue_result_memory"):
             mark(("block_mlp_activation", *norm_floor),
-                 "prototype_agents has no hidden activation, and its posterior covariance is exact, "
+                 f"{self.block_mlp_mode} has no hidden activation, and its posterior covariance is exact, "
                  "with no floor")
         elif self.block_mlp_covariance != "delta_full":
             mark(norm_floor, "only read by block_mlp_covariance='delta_full' or a block_norm_covariance pushforward")
-        if not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
+        memory = self.use_block_mlp and self.block_mlp_mode == "cue_result_memory"
+        if not memory:
+            mark(("block_memory_regression_rank", "block_memory_result_noise_ratio"),
+                 "only read by block_mlp_mode='cue_result_memory' with use_block_mlp=True")
+        if memory:
+            # Exact inference is required and validated; the cue bank's initialization knobs are read.
+            mark(("block_mlp_inference", "block_mlp_cavi_steps", "block_mlp_em_weight"),
+                 "cue_result_memory runs exact inference only and has no EM term")
+            if self.block_mlp_template_init == "working_variance":
+                mark(("block_mlp_template_init_variance",),
+                     "block_mlp_template_init='working_variance' sets lambda_0 from the measured working variance")
+            else:
+                mark(("block_mlp_template_init_pull",), "only read by block_mlp_template_init='working_variance'")
+        elif not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
             mark(("block_mlp_inference", "block_mlp_template_init_variance", "block_mlp_template_init",
                   "block_mlp_template_init_pull", "block_mlp_cavi_steps", "block_mlp_em_weight"),
                  "only read by block_mlp_mode='prototype_agents' with use_block_mlp=True")
