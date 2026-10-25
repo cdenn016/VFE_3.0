@@ -440,18 +440,18 @@ def _require_identity_sha256(value: object, field: str) -> str:
     return value
 
 
-_DECLARATIVE_DRIVER_NAME = re.compile(r"^(?:config|fully_gauge_covariant|[A-Z][A-Z0-9_]*)$")
+_DECLARATIVE_DRIVER_NAME = re.compile(r"^(?:config|fully_gauge_covariant|principled_exact_route|[A-Z][A-Z0-9_]*)$")
 
 
 def _is_declarative_driver_statement(statement: ast.stmt) -> bool:
     r"""Whether a top-level driver statement only assigns click-to-run settings.
 
     The launchers keep their live settings in a top-level ``config`` dictionary, the lowercase launcher
-    toggle ``fully_gauge_covariant`` (``train_vfe3.py``, ``ablation.py``), and public UPPER_CASE names
+    toggles ``fully_gauge_covariant`` and ``principled_exact_route`` (``train_vfe3.py``, ``ablation.py``), and public UPPER_CASE names
     (``CONFIG``, ``SWEEPS``, ``DATA_SEED``, ``RUN_DIR`` ...), including ``config[...] = ...`` item
     assignments. Those values are bound by the run's own config fingerprint and contracts, not by the
     executable-code identity, so editing them (for example adding ``resume_from``) is not code drift. The
-    toggle acts through the gauge overrides it writes into the config, which the fingerprint binds, and a
+    toggles act through the overrides they write into the config, which the fingerprint binds, and a
     refusal gate that computes nothing; ``ablation.py``'s runner hash lists it as declarative too (audit
     2026-10-16 F78).
     """
