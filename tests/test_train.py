@@ -858,7 +858,8 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
                             "val_expected_targets", "val_scored_targets", "val_excluded_targets",
                             "best_val_ppl", "best_step", "final_train_loss", "n_params",
                             "terminal_checkpoint", "save_model_artifacts",
-                            "skipped_steps", "accepted_update_frac"}
+                            "skipped_steps", "accepted_update_frac",
+                            "terminal_selection_published", "unpublished_terminal_val_ppl"}
     # After the terminal maybe_save_best the primary equals the selected finite best (no earlier best).
     assert mapping["primary_val_ppl"] == mapping["best_val_ppl"] == mapping["final_val_ppl"]
     assert Path(mapping["terminal_checkpoint"]).exists()
