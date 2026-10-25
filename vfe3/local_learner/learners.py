@@ -14,7 +14,9 @@ and :math:`(a_n,b_n)` is the ridge least-squares solve from their running averag
 :math:`[G\ E^\top]` is the ridge regression of :math:`z_t` on :math:`x_t=[z_{t-1};\mathrm{onehot}(y_{t-1})]`
 from Rauch-Tung-Striebel smoothed pair moments over blocks of ``window`` steps, and Q is the expected
 residual covariance. Averages follow :math:`s\leftarrow(1-\gamma_k)s+\gamma_k\hat s`,
-:math:`\gamma_k=(k+1)^{-0.6}` (Cappe and Moulines 2009). No derivative of the filter is taken.
+:math:`\gamma_k=\max((k+1)^{-\alpha},\gamma_{\min})` (Cappe and Moulines 2009; default
+:math:`\alpha=0.6`, :math:`\gamma_{\min}=0`), with k optionally restarted every ``reset_every`` updates
+(:math:`\gamma=1` then replaces the averages). No derivative of the filter is taken.
 
 Backprop arm. Adam on the forecast NLL of the same filter, autograd through it, truncated at ``chunk``.
 
@@ -159,10 +161,17 @@ def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transitio
 
 def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, window: int = 1,
                 blind: bool = False, ridge: float = 1e-6, q_floor: float = 1e-4,
+                gamma_exponent: float = 0.6, gamma_floor: float = 0.0, reset_every: Optional[int] = None,
                 log: Optional[Logger] = None) -> Params:
     r"""Stepwise variational EM over token streams (B, L), for all runs of ``prm0`` at once. ``blind`` uses the
     forecast in place of the assimilated state in the transition statistics (the target-blind control;
-    requires window = 1)."""
+    requires window = 1). The averaging step is :math:`\max((k+1)^{-\alpha},\gamma_{\min})` with
+    :math:`\alpha` = ``gamma_exponent``, :math:`\gamma_{\min}` = ``gamma_floor``, and k counted from the
+    last restart when ``reset_every`` is set."""
+    if not 0.0 < gamma_exponent <= 1.0 or not 0.0 <= gamma_floor <= 1.0:
+        raise ValueError("gamma_exponent must lie in (0, 1] and gamma_floor in [0, 1]")
+    if reset_every is not None and reset_every < 1:
+        raise ValueError("reset_every must be a positive number of updates")
     if blind and window != 1:
         raise ValueError("the target-blind control is defined for window = 1")
     if chunk % window:
@@ -194,8 +203,9 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
                     m_block, P_block = m, P                     # the state the next forecast is built from
                     mf, Pf, mm_l, Pm_l, yp_l = [], [], [], [], []
             st = st.scaled(1.0 / (B * len(steps)))
-            gamma = (k + 1) ** -0.6
-            running = st if running is None else running.blend(st, gamma)
+            k_eff = k % reset_every if reset_every else k
+            gamma = max((k_eff + 1) ** -gamma_exponent, gamma_floor)
+            running = st if running is None or gamma >= 1.0 else running.blend(st, gamma)
             prm = m_step(running, prm, ridge, q_floor)
             k += 1
             if log is not None and (k % 20 == 0 or c0 + chunk >= Ltot):

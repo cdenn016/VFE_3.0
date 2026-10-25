@@ -219,3 +219,21 @@ def test_cuda_filter_and_learners_match_cpu(setup):
     assert torch.allclose(nll_cpu, nll_gpu, rtol=1e-10)
     pf, _ = particle_filter_nll(prm.to("cuda"), streams.to("cuda"), gpu_tree, 256, seed=0)
     assert torch.isfinite(pf).all()
+
+
+def test_gamma_schedule_options(setup):
+    r"""Restarting every update and a unit floor both reduce stepwise EM to per-chunk batch EM, and the
+    explicit default schedule reproduces the default call."""
+    tree, prm = setup
+    streams = sample_sequences(prm, tree, 16, 33, seed=17)
+    start = init_params(d, tree.V, seed=18)
+    reset1 = train_local(start, streams, tree, chunk=8, reset_every=1)
+    floor1 = train_local(start, streams, tree, chunk=8, gamma_floor=1.0)
+    default = train_local(start, streams, tree, chunk=8)
+    explicit = train_local(start, streams, tree, chunk=8, gamma_exponent=0.6, gamma_floor=0.0, reset_every=None)
+    for f in ("G", "E", "Q", "A", "b"):
+        assert torch.allclose(getattr(reset1, f), getattr(floor1, f), atol=1e-12)
+        assert torch.equal(getattr(default, f), getattr(explicit, f))
+    assert float((reset1.G - default.G).abs().max()) > 1e-6
+    with pytest.raises(ValueError):
+        train_local(start, streams, tree, chunk=8, gamma_exponent=0.0)
