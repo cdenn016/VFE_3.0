@@ -350,15 +350,23 @@ _MINIMAL_AGENT_COVARIANCE_RECOMPUTED = (
     "moves an ill-conditioned frame producer call to float64)")
 
 
+def _covariance_failure_rows(
+    sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
+    diagonal: bool,
+) -> torch.Tensor:            # (..., N) bool on sigma's device, no host sync
+    r"""Per receiver: a nonpositive or non-finite variance (diagonal) or a failed Cholesky factorization."""
+    with torch.no_grad():
+        if diagonal:
+            return ~(torch.isfinite(sigma) & (sigma > 0)).all(dim=-1)
+        return torch.linalg.cholesky_ex(sigma.detach())[1] != 0
+
+
 def _covariance_failure(
     sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
     diagonal: bool,
 ) -> torch.Tensor:            # () bool on sigma's device, no host sync
     r"""Whether some variance is nonpositive or non-finite (diagonal) or some matrix fails a Cholesky factorization."""
-    with torch.no_grad():
-        if diagonal:
-            return ~(torch.isfinite(sigma) & (sigma > 0)).all()
-        return (torch.linalg.cholesky_ex(sigma.detach())[1] != 0).any()
+    return _covariance_failure_rows(sigma, diagonal).any()
 
 
 def _covariance_positive(
@@ -375,6 +383,32 @@ def _receiver_mask(
 ) -> torch.Tensor:            # (..., N, 1) or (..., N, 1, 1): broadcasts against the covariance layout
     r"""``bad`` shaped to select whole receivers of a diagonal (..., N, K) or full (..., N, K, K) covariance."""
     return bad[..., None] if diagonal else bad[..., None, None]
+
+
+def _localized_receivers(
+    rows: torch.Tensor,       # (..., N) bool, the receivers a raised status flag localizes to
+) -> torch.Tensor:            # (..., N) bool
+    r"""``rows``, or every receiver when a raised status flag localizes to none (device-side, no host sync)."""
+    return torch.where(rows.any(), rows, torch.ones_like(rows))
+
+
+def _escalated_write_back(
+    narrow: torch.Tensor,     # (..., N, K) or (..., N, K, K) float32 output of the first attempt
+    wide:   torch.Tensor,     # the same layout, its float64 recompute
+    mask:   torch.Tensor,     # broadcasts against both: the receivers that take the recompute
+) -> torch.Tensor:            # narrow's dtype
+    r"""The float64 recompute at the masked receivers and the float32 attempt elsewhere, in value.
+
+    The unmasked values are the float32 attempt's bit for bit (a straight-through term
+    :math:`w - \operatorname{sg}(w) = 0` is added only when the recompute carries a graph), and the gradient
+    is the recompute's at every receiver, as when the whole call was replaced: backward never runs
+    through the float32 attempt, whose failed factorizations may hold non-finite intermediates.
+    """
+    wide = wide.to(narrow.dtype)
+    kept = narrow.detach()
+    if wide.requires_grad:
+        kept = kept + (wide - wide.detach())
+    return torch.where(mask, wide, kept)
 
 
 def _per_block_bmm(
@@ -1394,9 +1428,14 @@ class RelationalOperators(nn.Module):
         :mod:`vfe3.model.minimal_agent`), or, with ``return_covariance``, a floored output that fails the covariance
         screen (a nonpositive or non-finite variance, or a failed Cholesky factorization of a full covariance;
         checked on the device before the ceiling, audit 2026-10-16 F8) is recomputed whole in float64 from the local
-        beliefs, frame and prior, and its outputs and capture are cast back to the input dtypes. The output is a Kalman
+        beliefs, frame and prior, and its capture is cast back to the input dtypes. Only the receivers the flags reach
+        (``flagged_receivers`` of the readout, and the receivers that fail the screen) take the float64 outputs, cast
+        back; every other receiver keeps its float32 output bit for bit, so under a causal prior a flag raised at a
+        later token never changes an earlier output (audit 2026-10-25 F20, the analog of the kernel route's F41
+        write-back). The output is a Kalman
         downdate computed by cancellation, so in float32 it can lose positivity with every factorization healthy. The
-        float32 attempt is discarded, so backward never runs through its failed factorizations. A factorization or
+        gradient of every receiver is taken from the float64 recompute (:func:`_escalated_write_back`), so backward
+        never runs through the float32 attempt's failed factorizations. A factorization or
         certificate recompute counts every query and key entry of the call (:math:`2BNH`) as recovered in the
         source-recovery counter that the training loop reads (``relational_covariance_repair_count``); an output-screen
         recompute counts the call's :math:`BN` tokens in ``covariance_escalation_elements``, as the kernel route does.
@@ -1422,7 +1461,7 @@ class RelationalOperators(nn.Module):
                   and self.minimal_agent_inference == "mean_field" and projected_condition_recovery() else None)
         floor = (self.floor_term(floor_anchor, sigma, frame, diagonal=sigma.dim() == mu.dim())
                  if return_covariance else None)
-        mu_plus, sigma_plus, record, status = self._minimal_agent_call(
+        mu_plus, sigma_plus, record, status, receivers = self._minimal_agent_call(
             mu, sigma, frame, log_prior, return_covariance, capture is not None, floor)
         # The one host read of a healthy call; it also resolves raise-only checks queued by
         # vfe3.contracts.deferred_host_checks (earlier frame certificates and prototype-agent checks) first.
@@ -1434,7 +1473,7 @@ class RelationalOperators(nn.Module):
             # float64 beliefs make the body compute in float64; it casts the frame factors itself, so the float32
             # frame is passed unchanged (a float64 CanonicalFrameContext would re-validate a float32 inverse pair
             # against the float64 residual tolerance).
-            mu_plus, sigma_plus, record, status = self._minimal_agent_call(
+            mu_wide, sigma_wide, record, status, _ = self._minimal_agent_call(
                 mu.double(), sigma.double(), frame, None if log_prior is None else log_prior.double(),
                 return_covariance, capture is not None, None if floor is None else floor.double())
             failed_wide, _, covariance_failed_wide = host_read(status)
@@ -1443,8 +1482,17 @@ class RelationalOperators(nn.Module):
                                  + "; the float32 call failed first and was recomputed in float64")
             if covariance_failed_wide:
                 raise ValueError(_MINIMAL_AGENT_COVARIANCE_FAILURE + _MINIMAL_AGENT_COVARIANCE_RECOMPUTED)
-            mu_plus = mu_plus.to(mu.dtype)
-            sigma_plus = None if sigma_plus is None else sigma_plus.to(sigma.dtype)
+            # Only the receivers a raised flag reaches take the recompute (audit 2026-10-25 F20).
+            readout_rows, covariance_rows = receivers.unbind(0)                    # (..., N) each
+            affected = torch.zeros_like(readout_rows)
+            if failed or ill_conditioned:
+                affected = affected | _localized_receivers(readout_rows)
+            if covariance_failed:
+                affected = affected | _localized_receivers(covariance_rows)
+            mu_plus = _escalated_write_back(mu_plus, mu_wide, affected[..., None])
+            if sigma_plus is not None:
+                sigma_plus = _escalated_write_back(sigma_plus, sigma_wide,
+                                                   _receiver_mask(affected, diagonal=sigma.dim() == mu.dim()))
             record = {key: (value.to(mu.dtype) if torch.is_tensor(value) and value.is_floating_point() else value)
                       for key, value in record.items()}
             if failed or ill_conditioned:
@@ -1468,7 +1516,7 @@ class RelationalOperators(nn.Module):
     def _minimal_agent_call(
         self,
         *args: object,                              # the arguments of _minimal_agent_body
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor, torch.Tensor]:
         r""":meth:`_minimal_agent_body`, as one non-reentrant checkpoint under ``predictive_covariance_checkpoint``."""
         if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
             return checkpoint(self._minimal_agent_body, *args, use_reentrant=False, preserve_rng_state=False)
@@ -1483,12 +1531,13 @@ class RelationalOperators(nn.Module):
         return_covariance: bool,
         diagnostics:       bool,
         floor:             Optional[torch.Tensor],  # sigma's layout: f Sigma_p (return_covariance only)
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor, torch.Tensor]:
         r"""Body of :meth:`minimal_agent_update`: autocast off, IEEE fp32 GEMMs, float64 under an escalated frame.
 
-        Returns the local outputs, the capture record and the status ``(failed, ill_conditioned, covariance_failed)``
+        Returns the local outputs, the capture record, the status ``(failed, ill_conditioned, covariance_failed)``
         ``(3,)`` bool, unchecked (the caller makes the host check): the readout's factorization and certificate flags
-        and the device-side screen of the floored covariance (False without ``return_covariance``)."""
+        and the device-side screen of the floored covariance (False without ``return_covariance``), and their
+        receivers ``(2, ..., N)`` bool: the readout's ``flagged_receivers`` and the receivers failing the screen."""
         H = len(self.irrep_dims)
         S, T, log_noise = self.raw_score_q, self.T, self.channel_log_noise
         dtype = _compute_dtype(mu, sigma, S, T, log_noise, frame.forward)
@@ -1511,7 +1560,7 @@ class RelationalOperators(nn.Module):
             forward = frame.forward.to(dtype)
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None
-            covariance_failed = torch.zeros((), dtype=torch.bool, device=mu.device)
+            covariance_rows = torch.zeros(mu_plus.shape[:-1], dtype=torch.bool, device=mu.device)   # (..., N)
             if return_covariance:
                 # A float64 recompute of a float32 call keeps the float32 frame pair, an inverse pair only to about
                 # eps_32 kappa(U_i), so its first term is U_i C_i U_i^T rebuilt from the C_i the gains used (audit
@@ -1521,7 +1570,7 @@ class RelationalOperators(nn.Module):
                 sigma_plus = minimal_agent.local_posterior_covariance(
                     sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype),
                     result.spread_gains, result.label_spread, reference=C if coarse_pair else None)
-                covariance_failed = _covariance_failure(sigma_plus, diagonal=sigma.dim() == mu.dim())   # () bool
+                covariance_rows = _covariance_failure_rows(sigma_plus, diagonal=sigma.dim() == mu.dim())   # (..., N)
         record: dict = {}
         if diagnostics:
             with torch.no_grad():
@@ -1553,8 +1602,12 @@ class RelationalOperators(nn.Module):
                         (result.adf_evidence - result.elbo).nanmean(), result.evidence.mean(),
                         result.is_evidence.nanmean(), (result.is_evidence - result.elbo).nanmean(),
                         result.is_ess.nanmean())))                                          # () float64 each
-        status = torch.stack((result.failed, result.ill_conditioned, covariance_failed))      # (3,) bool
-        return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
+        status = torch.stack((result.failed, result.ill_conditioned, covariance_rows.any()))   # (3,) bool
+        rows_shape = torch.broadcast_shapes(result.flagged_receivers.shape, covariance_rows.shape)
+        receivers = torch.stack((result.flagged_receivers.expand(rows_shape),
+                                 covariance_rows.expand(rows_shape)))                  # (2, ..., N) bool
+        return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status,
+                receivers)
 
     def _receive_runs(
         self,

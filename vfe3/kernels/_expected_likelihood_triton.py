@@ -120,7 +120,9 @@ def el_fwd_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, CE, S, V,
         logit = tl.where(mv_ok[None, :], logit, float("-inf"))
         lt += tl.sum(tl.where(offs_v[None, :] == t[:, None], logit, 0.0), 1)
         m_new = tl.maximum(m, tl.max(logit, 1))
-        l = l * tl.exp(m - m_new) + tl.sum(tl.exp(logit - m_new[:, None]), 1)
+        # An all -inf prefix contributes 0, not NaN (-inf - -inf), as in the KL decode kernel (audit 2026-10-25 F22).
+        m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
+        l = l * tl.exp(m - m_ref) + tl.sum(tl.exp(logit - m_ref[:, None]), 1)
         m = m_new
     log_l = tl.log(l)
     tl.store(M + offs_i, m, mask=mi)

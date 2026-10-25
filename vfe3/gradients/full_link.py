@@ -599,7 +599,12 @@ def full_link_cost(
         linear = (mean * eta).sum(-1)
         if sigma.ndim == mu.ndim:
             trace = (Lambda.diagonal(dim1=-2, dim2=-1) * covariance).sum(-1)
-            logdet = covariance.log().sum(-1)
+            if c.ndim == mu.ndim:                                        # per-coordinate weights c_ik
+                # Weight each log variance before the coordinate sum, as full_link_cost_parts does
+                # (audit 2026-10-25 F18): sum_k c_ik log s_ik, not c_ik * sum_k log s_ik.
+                logdet, c = (c * covariance.log()).sum(-1), 1.0
+            else:
+                logdet = covariance.log().sum(-1)
         else:
             trace = (Lambda * covariance.transpose(-1, -2)).sum(dim=(-2, -1))
             factor = torch.linalg.cholesky(covariance)
