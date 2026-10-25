@@ -246,11 +246,67 @@ def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transitio
     return new
 
 
+def spd_logm(G: Tensor) -> Tensor:
+    r"""Principal logarithm of a symmetric positive-definite matrix batch (the starting point of the exponential
+    link chart; the stage B initialization :math:`G=0.5I` qualifies). Raises on any other input."""
+    sym = 0.5 * (G + G.transpose(-1, -2))
+    evals, evecs = torch.linalg.eigh(sym)
+    if float((G - sym).abs().max()) > 1e-12 or float(evals.min()) <= 0.0:
+        raise ValueError("the exponential link chart starts from a symmetric positive-definite G")
+    return (evecs * evals.log().unsqueeze(-2)) @ evecs.transpose(-1, -2)
+
+
+def dexp_matrix(L: Tensor) -> Tensor:
+    r"""Matrix of the Frechet derivative :math:`D\exp_L[E]=\int_0^1e^{sL}Ee^{(1-s)L}\,ds` on row-major vec,
+    from the upper-right block of :math:`\exp\begin{pmatrix}L&E\\0&L\end{pmatrix}` for each basis matrix E
+    (Higham 2008, Sec. 3.2). L (..., d, d) -> (..., d^2, d^2) with column k = vec(Dexp_L[E_k])."""
+    *lead, d, _ = L.shape
+    n = d * d
+    basis = torch.eye(n, dtype=L.dtype, device=L.device).reshape(n, d, d)
+    X = torch.zeros(*lead, n, 2 * d, 2 * d, dtype=L.dtype, device=L.device)
+    X[..., :d, :d] = L.unsqueeze(-3)
+    X[..., d:, d:] = L.unsqueeze(-3)
+    X[..., :d, d:] = basis
+    D = torch.linalg.matrix_exp(X)[..., :d, d:]                         # (..., n, d, d)
+    return D.reshape(*lead, n, n).transpose(-1, -2)
+
+
+def exp_link_transition(st: Stats, prm: Params, L: Tensor, ridge: float, q_floor: float,
+                        step: float) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    r"""Natural-gradient update of the exponential link :math:`G=e^L` at held statistics, then E and Q in
+    closed form at the new G.
+
+    Profiling E out of the expected transition energy leaves a quadratic in G whose Gauss-Newton (Fisher) metric
+    is :math:`Q^{-1}\otimes\tilde S`. Pulled back through exp (the metric after equation (5) of the October 20
+    local-learning note), the natural-gradient direction in L solves :math:`D\exp_L[\delta L]=G_{\rm EM}-G`,
+    where :math:`G_{\rm EM}` is the unconstrained regression optimum; ``step`` scales it (1 = full step, exact to
+    first order). Returns (L, G, E, Q)."""
+    d, V, R = prm.d, prm.E.shape[1], prm.R
+    dev = prm.G.device
+    Sxx = torch.zeros(R, d + V, d + V, dtype=torch.float64, device=dev)
+    Sxx[:, :d, :d], Sxx[:, :d, d:], Sxx[:, d:, :d] = st.pp, st.yp.transpose(-1, -2), st.yp
+    Sxx[:, d:, d:] = torch.diag_embed(st.cnt)
+    Szx = torch.cat([st.zp, st.yz.transpose(-1, -2)], -1)               # (R, d, d+V)
+    Lx = torch.linalg.cholesky(Sxx + ridge * torch.eye(d + V, dtype=torch.float64, device=dev))
+    W = torch.cholesky_solve(Szx.transpose(-1, -2).contiguous(), Lx).transpose(-1, -2)
+    dG = W[..., :d] - prm.G                                             # (R, d, d)
+    dL = torch.linalg.solve(dexp_matrix(L), (step * dG).reshape(R, d * d, 1)).reshape(R, d, d)
+    L_new = L + dL
+    G_new = torch.linalg.matrix_exp(L_new)
+    E_new = (st.yz - st.yp @ G_new.transpose(-1, -2)) / (st.cnt + ridge).unsqueeze(-1)   # (R, V, d) at G_new
+    W_new = torch.cat([G_new, E_new.transpose(-1, -2)], -1)
+    Q = residual_covariance(st.zz, Szx, Sxx, W_new)
+    Q = 0.5 * (Q + Q.transpose(-1, -2))
+    evals, evecs = torch.linalg.eigh(Q)
+    Q = (evecs * evals.clamp_min(q_floor).unsqueeze(-2)) @ evecs.transpose(-1, -2)
+    return L_new, G_new, E_new.contiguous(), Q
+
+
 def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, window: int = 1,
                 blind: bool = False, ridge: float = 1e-6, q_floor: float = 1e-4,
                 gamma_exponent: float = 0.6, gamma_floor: float = 0.0, reset_every: Optional[int] = None,
                 sensor_stats: str = "sequential", expand_sensor: bool = False, overrelax: float = 1.0,
-                log: Optional[Logger] = None) -> Params:
+                link_chart: str = "matrix", link_step: float = 1.0, log: Optional[Logger] = None) -> Params:
     r"""Stepwise variational EM over token streams (B, L), for all runs of ``prm0`` at once. ``blind`` uses the
     forecast in place of the assimilated state in the transition statistics (the target-blind control;
     requires window = 1). The averaging step is :math:`\max((k+1)^{-\alpha},\gamma_{\min})` with
@@ -258,9 +314,15 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
     last restart when ``reset_every`` is set. ``expand_sensor`` uses the parameter-expanded probit M-step of
     :func:`m_step`. ``overrelax`` :math:`\omega\in(0,2)` replaces each M-step result :math:`\theta_{\rm EM}` by
     :math:`\theta+\omega(\theta_{\rm EM}-\theta)` for G, E, A, b and Q (Q's eigenvalues then floored at
-    ``q_floor``); :math:`\omega=1` is plain EM and :math:`\omega>1` overrelaxes (Salakhutdinov and Roweis 2003)."""
+    ``q_floor``); :math:`\omega=1` is plain EM and :math:`\omega>1` overrelaxes (Salakhutdinov and Roweis 2003).
+    ``link_chart="exp"`` keeps the transition as :math:`G=e^L` and updates L by the natural-gradient step of
+    :func:`exp_link_transition` (scaled by ``link_step``), starting from the principal log of ``prm0.G``."""
     if not 0.0 < overrelax < 2.0:
         raise ValueError("overrelax must lie in (0, 2)")
+    if link_chart not in ("matrix", "exp"):
+        raise ValueError(f"link_chart must be 'matrix' or 'exp', got {link_chart!r}")
+    if link_chart == "exp" and (overrelax != 1.0 or blind or not 0.0 < link_step <= 1.0):
+        raise ValueError("the exponential link chart takes 0 < link_step <= 1, no overrelaxation, no blind arm")
     if not 0.0 < gamma_exponent <= 1.0 or not 0.0 <= gamma_floor <= 1.0:
         raise ValueError("gamma_exponent must lie in (0, 1] and gamma_floor in [0, 1]")
     if reset_every is not None and reset_every < 1:
@@ -275,6 +337,7 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
     d, V, R = prm.d, prm.E.shape[1], prm.R
     B, Ltot = streams.shape
     with torch.no_grad():
+        L = spd_logm(prm.G) if link_chart == "exp" else None
         m, P = start_state(streams[:, 0], prm, tree)
         running: Optional[Stats] = None
         dev = prm.G.device
@@ -304,7 +367,10 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
             k_eff = k % reset_every if reset_every else k
             gamma = max((k_eff + 1) ** -gamma_exponent, gamma_floor)
             running = st if running is None or gamma >= 1.0 else running.blend(st, gamma)
-            new = m_step(running, prm, ridge, q_floor, expand_sensor=expand_sensor)
+            new = m_step(running, prm, ridge, q_floor, learn_transition=link_chart == "matrix",
+                         expand_sensor=expand_sensor)
+            if link_chart == "exp":
+                L, new.G, new.E, new.Q = exp_link_transition(running, prm, L, ridge, q_floor, link_step)
             if overrelax != 1.0:
                 for f in ("G", "E", "A", "b", "Q"):
                     old = getattr(prm, f)
@@ -322,13 +388,17 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
 
 
 def train_backprop(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, lr: float = 3e-3,
-                   clip: float = 1.0, log: Optional[Logger] = None) -> Params:
+                   clip: float = 1.0, link_chart: str = "matrix", log: Optional[Logger] = None) -> Params:
     r"""Adam on the filter's forecast NLL, backpropagated through the filter (truncated at ``chunk``), for all
-    runs at once: the loss is the sum of the runs' mean NLLs and each run's gradient is clipped separately."""
+    runs at once: the loss is the sum of the runs' mean NLLs and each run's gradient is clipped separately.
+    ``link_chart="exp"`` learns the transition as :math:`G=e^L` with L the leaf (autograd through matrix_exp),
+    starting from the principal log of ``prm0.G``."""
+    if link_chart not in ("matrix", "exp"):
+        raise ValueError(f"link_chart must be 'matrix' or 'exp', got {link_chart!r}")
     d, R = prm0.d, prm0.R
     dev = prm0.G.device
     eye = torch.eye(d, dtype=torch.float64, device=dev)
-    G = prm0.G.clone().requires_grad_(True)
+    G = (spd_logm(prm0.G) if link_chart == "exp" else prm0.G.clone()).requires_grad_(True)   # L for the exp chart
     E = prm0.E.clone().requires_grad_(True)
     Lq = torch.linalg.cholesky(prm0.Q - 1e-4 * eye).requires_grad_(True)
     A = prm0.A.clone().requires_grad_(True)
@@ -338,7 +408,8 @@ def train_backprop(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: in
 
     def current() -> Params:
         Lt = torch.tril(Lq)
-        return Params(G=G, E=E, Q=Lt @ Lt.transpose(-1, -2) + 1e-4 * eye, A=A, b=b)
+        Gm = torch.linalg.matrix_exp(G) if link_chart == "exp" else G
+        return Params(G=Gm, E=E, Q=Lt @ Lt.transpose(-1, -2) + 1e-4 * eye, A=A, b=b)
 
     B, Ltot = streams.shape
     with torch.no_grad():
