@@ -271,8 +271,8 @@ def dexp_matrix(L: Tensor) -> Tensor:
     return D.reshape(*lead, n, n).transpose(-1, -2)
 
 
-def exp_link_transition(st: Stats, prm: Params, L: Tensor, ridge: float, q_floor: float,
-                        step: float) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def exp_link_transition(st: Stats, prm: Params, L: Tensor, ridge: float, q_floor: float, step: float,
+                        trust: float = 1.0, halvings: int = 10) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     r"""Natural-gradient update of the exponential link :math:`G=e^L` at held statistics, then E and Q in
     closed form at the new G.
 
@@ -280,7 +280,11 @@ def exp_link_transition(st: Stats, prm: Params, L: Tensor, ridge: float, q_floor
     is :math:`Q^{-1}\otimes\tilde S`. Pulled back through exp (the metric after equation (5) of the October 20
     local-learning note), the natural-gradient direction in L solves :math:`D\exp_L[\delta L]=G_{\rm EM}-G`,
     where :math:`G_{\rm EM}` is the unconstrained regression optimum; ``step`` scales it (1 = full step, exact to
-    first order). Returns (L, G, E, Q)."""
+    first order). The step is exact only to first order, so a far-off :math:`G_{\rm EM}` can make
+    :math:`e^{L+\delta L}` overshoot: the step is capped at Frobenius norm ``trust`` and then halved, per run, up to
+    ``halvings`` times until the profiled energy :math:`\tfrac12\operatorname{tr}(Q^{-1}R(G))` (R the expected
+    residual covariance with E refit at G, Q the current noise) is finite and lower than at the current G; a run
+    with no such step keeps its L. Returns (L, G, E, Q)."""
     d, V, R = prm.d, prm.E.shape[1], prm.R
     dev = prm.G.device
     Sxx = torch.zeros(R, d + V, d + V, dtype=torch.float64, device=dev)
@@ -290,12 +294,34 @@ def exp_link_transition(st: Stats, prm: Params, L: Tensor, ridge: float, q_floor
     Lx = torch.linalg.cholesky(Sxx + ridge * torch.eye(d + V, dtype=torch.float64, device=dev))
     W = torch.cholesky_solve(Szx.transpose(-1, -2).contiguous(), Lx).transpose(-1, -2)
     dG = W[..., :d] - prm.G                                             # (R, d, d)
-    dL = torch.linalg.solve(dexp_matrix(L), (step * dG).reshape(R, d * d, 1)).reshape(R, d, d)
-    L_new = L + dL
+    # Householder QR, not LU: the batched LU solve has failed inside MKL's pivoting (DLASWP) on CPU here, as it did
+    # for the transition solve before that switched to Cholesky; Dexp_L is not symmetric, so QR is used instead.
+    Qm, Rm = torch.linalg.qr(dexp_matrix(L).contiguous())
+    rhs = Qm.transpose(-1, -2) @ (step * dG).reshape(R, d * d, 1)
+    dL = torch.linalg.solve_triangular(Rm, rhs, upper=True).reshape(R, d, d)
+    dL = torch.nan_to_num(dL, nan=0.0, posinf=0.0, neginf=0.0)          # a singular Dexp yields no step
+    norm = torch.linalg.matrix_norm(dL).clamp_min(1e-300)
+    dL = dL * (trust / norm).clamp(max=1.0)[:, None, None]
+    Qinv = torch.linalg.inv(prm.Q)
+
+    def profiled(G: Tensor) -> tuple[Tensor, Tensor, Tensor]:          # G (..., R, d, d)
+        E = (st.yz - st.yp @ G.transpose(-1, -2)) / (st.cnt + ridge).unsqueeze(-1)       # (..., R, V, d)
+        Wg = torch.cat([G, E.transpose(-1, -2)], -1)
+        Rc = residual_covariance(st.zz, Szx, Sxx, Wg)
+        return 0.5 * (Qinv * Rc).sum((-1, -2)), E, Rc
+
+    h0, _, _ = profiled(prm.G)                                          # (R,)
+    scales = 0.5 ** torch.arange(halvings + 1, dtype=torch.float64, device=dev)          # (S,)
+    L_try = L + scales[:, None, None, None] * dL                        # (S, R, d, d)
+    G_try = torch.linalg.matrix_exp(L_try)
+    h_try, _, _ = profiled(G_try)                                       # (S, R)
+    ok = torch.isfinite(h_try) & (h_try < h0) & torch.isfinite(G_try).all(-1).all(-1)
+    first = torch.where(ok.any(0), ok.float().argmax(0), torch.full_like(h0, halvings + 1, dtype=torch.long))
+    take = (first <= halvings)                                          # (R,) runs with an accepted step
+    idx = first.clamp(max=halvings)
+    L_new = torch.where(take[:, None, None], L_try[idx, torch.arange(R, device=dev)], L)
     G_new = torch.linalg.matrix_exp(L_new)
-    E_new = (st.yz - st.yp @ G_new.transpose(-1, -2)) / (st.cnt + ridge).unsqueeze(-1)   # (R, V, d) at G_new
-    W_new = torch.cat([G_new, E_new.transpose(-1, -2)], -1)
-    Q = residual_covariance(st.zz, Szx, Sxx, W_new)
+    _, E_new, Q = profiled(G_new)
     Q = 0.5 * (Q + Q.transpose(-1, -2))
     evals, evecs = torch.linalg.eigh(Q)
     Q = (evecs * evals.clamp_min(q_floor).unsqueeze(-2)) @ evecs.transpose(-1, -2)
@@ -306,7 +332,8 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
                 blind: bool = False, ridge: float = 1e-6, q_floor: float = 1e-4,
                 gamma_exponent: float = 0.6, gamma_floor: float = 0.0, reset_every: Optional[int] = None,
                 sensor_stats: str = "sequential", expand_sensor: bool = False, overrelax: float = 1.0,
-                link_chart: str = "matrix", link_step: float = 1.0, log: Optional[Logger] = None) -> Params:
+                link_chart: str = "matrix", link_step: float = 1.0, log: Optional[Logger] = None,
+                log_every: int = 20) -> Params:
     r"""Stepwise variational EM over token streams (B, L), for all runs of ``prm0`` at once. ``blind`` uses the
     forecast in place of the assimilated state in the transition statistics (the target-blind control;
     requires window = 1). The averaging step is :math:`\max((k+1)^{-\alpha},\gamma_{\min})` with
@@ -380,7 +407,7 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
                 new.Q = (evecs * evals.clamp_min(q_floor).unsqueeze(-2)) @ evecs.transpose(-1, -2)
             prm = new
             k += 1
-            if log is not None and (k % 20 == 0 or c0 + chunk >= Ltot):
+            if log is not None and (k % log_every == 0 or c0 + chunk >= Ltot):
                 log({"arm": "local", "chunk": k, "train_bits": (nll / ntok / math.log(2)).tolist(),
                      "G_spectral": torch.linalg.matrix_norm(prm.G, 2).tolist(), "sec": time.perf_counter() - t0})
                 nll, ntok = torch.zeros_like(nll), 0
@@ -388,7 +415,8 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
 
 
 def train_backprop(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, lr: float = 3e-3,
-                   clip: float = 1.0, link_chart: str = "matrix", log: Optional[Logger] = None) -> Params:
+                   clip: float = 1.0, link_chart: str = "matrix", log: Optional[Logger] = None,
+                   log_every: int = 20) -> Params:
     r"""Adam on the filter's forecast NLL, backpropagated through the filter (truncated at ``chunk``), for all
     runs at once: the loss is the sum of the runs' mean NLLs and each run's gradient is clipped separately.
     ``link_chart="exp"`` learns the transition as :math:`G=e^L` with L the leaf (autograd through matrix_exp),
@@ -437,7 +465,7 @@ def train_backprop(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: in
         nll += loss.detach()
         ntok += n
         k += 1
-        if log is not None and (k % 20 == 0 or c0 + chunk >= Ltot):
+        if log is not None and (k % log_every == 0 or c0 + chunk >= Ltot):
             log({"arm": "backprop", "chunk": k, "train_bits": (nll / ntok / math.log(2)).tolist(),
                  "G_spectral": torch.linalg.matrix_norm(G.detach(), 2).tolist(), "sec": time.perf_counter() - t0})
             nll, ntok = torch.zeros_like(nll), 0
