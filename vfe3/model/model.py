@@ -398,6 +398,9 @@ class VFEModel(nn.Module):
             decode_coordinates=cfg.decode_coordinates,
             prior_covariance_table=cfg.prior_covariance_table,
         )
+        # Type-level frame dropout (training forwards only; read by the per_token encoder).
+        self.prior_bank.phi_type_dropout = float(cfg.phi_type_dropout)
+        self.prior_bank.phi_type_dropout_freq_scale = cfg.phi_type_dropout_freq_scale
         if cfg.decode_logits_amp and cfg.decode_mode == "linear" and cfg.amp_dtype is not None:
             self.prior_bank.decode_logits_amp_dtype = (
                 torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16)
