@@ -17,13 +17,23 @@ from pathlib import Path
 
 CONFIG = {
     
-    "stage":            "A",                    # "timing" | "A" | "B"
+    "stage":            "B",                    # "timing" | "A" | "B"
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
     "chunk":            16,                     # M-step / truncated-BPTT length (smoothing windows must divide it)
     "streams":          512,                    # parallel training streams (512 * 16 = 8192 tokens per update)
-    "arms":             ["local_w1", "local_w4", "local_w16", "blind", "backprop"],   # local_w<window> | blind | backprop
+    "arms":             ["local_w1", "local_w4", "local_w16", "blind", "backprop"],   # stage B: local_w<window>[@schedule] | blind | backprop
+    "A_arms":           ["local_w1", "local_w4", "local_w16", "blind", "backprop",      # stage A arms (the schedule comparison)
+                         "local_w16@a03", "local_w16@floor05", "local_w16@floor20", "local_w16@reset"],
+    "local_schedule":   "floor20",                 # schedule of local arms without "@": a key of local_schedules
+    # Stepwise-EM averaging gamma_k = max((k+1)^-alpha, floor), k restarted every reset updates ("pass" = one
+    # pass over the stage A training set; None = never). rm06 is the original Cappe-Moulines schedule.
+    "local_schedules":  {"rm06":    {"alpha": 0.6, "floor": 0.0,  "reset": None},
+                         "a03":     {"alpha": 0.3, "floor": 0.0,  "reset": None},     # forgets faster
+                         "floor05": {"alpha": 0.6, "floor": 0.05, "reset": None},     # memory of about 20 updates
+                         "floor20": {"alpha": 0.6, "floor": 0.2,  "reset": None},     # memory of about 5 updates
+                         "reset":   {"alpha": 0.6, "floor": 0.0,  "reset": "pass"}},  # averages restart each pass
     "backprop_lr":      1e-2,                   # chosen on stage A only
     "ridge":            1e-6,
     "q_floor":          1e-4,
@@ -84,12 +94,19 @@ def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log
     c = CONFIG
     if arm == "backprop":
         return train_backprop(prm0, train, tree, chunk=c["chunk"], lr=c["backprop_lr"], log=log)
-    if arm == "blind":
-        return train_local(prm0, train, tree, chunk=c["chunk"], window=1, blind=True,
-                           ridge=c["ridge"], q_floor=c["q_floor"], log=log)
-    if arm.startswith("local_w"):
-        return train_local(prm0, train, tree, chunk=c["chunk"], window=int(arm[7:]),
-                           ridge=c["ridge"], q_floor=c["q_floor"], log=log)
+    base, _, name = arm.partition("@")
+    sched = c["local_schedules"][name or c["local_schedule"]]
+    reset = sched["reset"]
+    if reset == "pass":
+        if c["stage"] != "A":
+            raise ValueError("the 'pass' reset needs repeated passes (stage A)")
+        reset = max(1, c["A_train_len"] // c["chunk"])
+    kw = dict(chunk=c["chunk"], ridge=c["ridge"], q_floor=c["q_floor"], gamma_exponent=sched["alpha"],
+              gamma_floor=sched["floor"], reset_every=reset, log=log)
+    if base == "blind":
+        return train_local(prm0, train, tree, window=1, blind=True, **kw)
+    if base.startswith("local_w"):
+        return train_local(prm0, train, tree, window=int(base[7:]), **kw)
     raise ValueError(arm)
 
 
@@ -173,7 +190,7 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
             append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k})
         dims, seeds = c["B_dims"], c["B_seeds"]
     for d in dims:
-        for arm in c["arms"]:
+        for arm in (c["A_arms"] if stage == "A" else c["arms"]):
             todo = [s for s in seeds if (arm, d, s) not in done]
             if not todo:
                 continue
