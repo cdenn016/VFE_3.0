@@ -770,7 +770,8 @@ class VFE3Config:
     #   prototype_agents   minimal agent model with M = block_mlp_expansion * K template agents
     #   cue_result_memory  exact conditioning of M components with a cue law and a linear-Gaussian result law
     #                      (vfe3.model.cue_result_memory). only: projected_predictive, block_coordinates "reference",
-    #                      family "gaussian_full", block_mlp_inference "exact", block_mlp_covariance "posterior",
+    #                      family "gaussian_full" (dense C) or "gaussian_frame_diagonal" (reference variances,
+    #                      elementwise), block_mlp_inference "exact", block_mlp_covariance "posterior",
     #                      block_mlp_dropout 0, block_mlp_em_weight 0
     block_mlp_mode:                   str             = "coordinate"
 
@@ -1573,7 +1574,7 @@ class VFE3Config:
             if self.norm_type_block not in ("none", "layernorm"):
                 frame_problems.append(f"norm_type_block={self.norm_type_block!r} (requires 'none' or 'layernorm': the "
                                       "Mahalanobis norm inverts the local covariance blocks)")
-            if self.use_block_mlp and self.block_mlp_mode != "coordinate":
+            if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "cue_result_memory"):
                 frame_problems.append(f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate': the other block "
                                       "MLPs read a local or template covariance this family does not store)")
             if self.decode_mode not in ("linear", "diagonal_chunked"):
@@ -2162,9 +2163,10 @@ class VFE3Config:
             if self.block_coordinates != "reference":
                 memory_problems.append(f"block_coordinates={self.block_coordinates!r} (requires 'reference': the "
                                        "components live in reference coordinates and read the invariant C_i)")
-            if self.family != "gaussian_full":
-                memory_problems.append(f"family={self.family!r} (requires 'gaussian_full': the block reads and "
-                                       "returns a dense covariance)")
+            if self.family not in ("gaussian_full", "gaussian_frame_diagonal"):
+                memory_problems.append(f"family={self.family!r} (requires 'gaussian_full', whose dense reference "
+                                       "covariance the block reads, or 'gaussian_frame_diagonal', whose reference "
+                                       "variances it reads)")
             if self.block_mlp_inference != "exact":
                 memory_problems.append(f"block_mlp_inference={self.block_mlp_inference!r} (requires 'exact')")
             if self.block_mlp_covariance != "posterior":

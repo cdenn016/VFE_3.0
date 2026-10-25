@@ -22,7 +22,8 @@ from vfe3.model.prototype_agents import (
     prototype_mean_field_posterior,
     template_kl_logits,
 )
-from vfe3.model.cue_result_memory import CUE_RESULT_TILE_BYTES, CueResultPosterior, cue_result_exact_posterior
+from vfe3.model.cue_result_memory import (CUE_RESULT_TILE_BYTES, CueResultPosterior, cue_result_diagonal_posterior,
+                                          cue_result_exact_posterior)
 from vfe3.numerics import validated_cholesky_solve
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -1955,9 +1956,13 @@ class CueResultMemoryBlockMLP(nn.Module):
     (its whitened Jacobian is positive definite). Read as a transition, a component is one regime of a switching
     linear-Gaussian step with Bayesian regime selection, collapsed to one Gaussian.
 
-    Scope (enforced by :class:`vfe3.config.VFE3Config`): reference coordinates on ``gaussian_full``, so the block reads the
-    dense invariant :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` and its covariance returns as :math:`U_iC_i^+U_i^\top`;
-    exact inference only, covariance contract ``'posterior'`` only, no dropout and no EM term.
+    Scope (enforced by :class:`vfe3.config.VFE3Config`): reference coordinates on ``gaussian_full``, where the block reads
+    the dense invariant :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` and its covariance returns as :math:`U_iC_i^+U_i^\top`, or on
+    ``gaussian_frame_diagonal``, where it reads the stored reference variances :math:`c_i` and returns the exact diagonal
+    of the result covariance in the reference chart (:func:`vfe3.model.cue_result_memory.cue_result_diagonal_posterior`,
+    elementwise, :math:`O(MKr^2)` per token with a rank-:math:`r` regression); exact inference only, covariance contract
+    ``'posterior'`` only, no dropout and no EM term. The layout follows the covariance it receives: (..., K, K) dense,
+    (..., K) diagonal.
 
     Parameters, in registration order: ``nu``, ``log_lambda`` (M, K), ``log_pi`` (M,), ``omega``, ``log_result_noise``
     (M, K), then ``regression_offset`` (M, K, K) when ``regression_rank`` is None, or ``regression_left`` and
@@ -2028,17 +2033,20 @@ class CueResultMemoryBlockMLP(nn.Module):
     def posterior(
         self,
         mu:    torch.Tensor,                          # (..., K) record values (reference working means)
-        sigma: torch.Tensor,                          # (..., K, K) dense record covariance
+        sigma: torch.Tensor,                          # (..., K, K) dense record covariance, or (..., K) variances
     ) -> CueResultPosterior:
-        r"""The exact result posterior at the working belief (:func:`vfe3.model.cue_result_memory.cue_result_exact_posterior`)."""
-        return cue_result_exact_posterior(mu, sigma, self.nu, self.omega, self.log_lambda, self.log_result_noise,
-                                          self.log_pi, tile_bytes=self.tile_bytes, **self._regression())
+        r"""The exact result posterior at the working belief: dense
+        (:func:`vfe3.model.cue_result_memory.cue_result_exact_posterior`) or, for (..., K) variances, diagonal
+        (:func:`vfe3.model.cue_result_memory.cue_result_diagonal_posterior`)."""
+        kernel = cue_result_diagonal_posterior if sigma.dim() == mu.dim() else cue_result_exact_posterior
+        return kernel(mu, sigma, self.nu, self.omega, self.log_lambda, self.log_result_noise,
+                      self.log_pi, tile_bytes=self.tile_bytes, **self._regression())
 
     @torch.no_grad()
     def calibrate_templates(
         self,
         mu:        torch.Tensor,                      # (..., K) working means this block receives
-        sigma:     torch.Tensor,                      # (..., K, K) dense working covariance
+        sigma:     torch.Tensor,                      # (..., K, K) dense working covariance or (..., K) variances
         *,
         pull:      float,                             # target initial pull p in (0, 1)
         generator: torch.Generator,                   # CPU generator for the template draw
@@ -2047,7 +2055,7 @@ class CueResultMemoryBlockMLP(nn.Module):
         (same draw), then :math:`\omega = \nu` and :math:`Q_a = \rho L_a`, so the calibrated block still starts at
         :math:`F_a = I` with the result centered on the cue."""
         K = self.nu.shape[-1]
-        diag = sigma.diagonal(dim1=-2, dim2=-1)
+        diag = sigma if sigma.dim() == mu.dim() else sigma.diagonal(dim1=-2, dim2=-1)
         c_bar = float(diag.double().mean())
         lam0 = c_bar * (1.0 - pull) / pull
         rows = mu.reshape(-1, K)
@@ -2074,9 +2082,9 @@ class CueResultMemoryBlockMLP(nn.Module):
         _reject_hidden_bias(hidden_bias, "the cue_result_memory block conditions on components and has no fc1 hidden layer")
         if em_rows is not None:
             raise ValueError("cue_result_memory has no EM objective (block_mlp_em_weight must be 0)")
-        if sigma.dim() != mu.dim() + 1:
-            raise ValueError("cue_result_memory reads a dense (..., K, K) covariance (reference coordinates on "
-                             f"gaussian_full); got sigma {tuple(sigma.shape)} for mu {tuple(mu.shape)}")
+        if sigma.dim() not in (mu.dim(), mu.dim() + 1):
+            raise ValueError("cue_result_memory reads a dense (..., K, K) covariance (gaussian_full) or (..., K) reference "
+                             f"variances (gaussian_frame_diagonal); got sigma {tuple(sigma.shape)} for mu {tuple(mu.shape)}")
         result = self.posterior(mu, sigma)
         return BlockMLPMomentResult(result.mean.to(mu.dtype), result.covariance.to(sigma.dtype), None)
 

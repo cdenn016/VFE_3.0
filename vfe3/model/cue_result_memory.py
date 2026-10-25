@@ -39,6 +39,22 @@ difference of two large matrices. Components are processed in chunks bounded by 
 merged by the law of total covariance with log-sum-exp weights, so no (tokens, M, K, K) tensor is retained beyond one
 chunk. A factor that fails reads NaN. Autocast is disabled, GEMMs run in IEEE fp32, and the compute dtype is float64
 when an input is float64 and float32 otherwise.
+
+Diagonal record. :func:`cue_result_diagonal_posterior` is the same exact posterior for a diagonal record covariance
+:math:`C = \operatorname{diag}c` (the reference variances of ``gaussian_frame_diagonal``). Then :math:`W_a` is diagonal,
+:math:`m_{X,a} - \nu_a = \lambda_a/(\lambda_a + c)\odot(\xi - \nu_a)` and
+:math:`P_{X,a} = \operatorname{diag}(\lambda_ac/(\lambda_a + c))` elementwise, and with :math:`F_a = I + U_aV_a^\top`
+
+.. math::
+    \operatorname{diag}(F_aP_{X,a}F_a^\top)_k = p_k + 2p_k\sum_rU_{kr}V_{kr} + \sum_{r,s}U_{kr}U_{ks}(V_a^\top P_{X,a}V_a)_{rs},
+
+so a (token, component) pair costs :math:`O(Kr^2)`, or :math:`O(K^2)` for a dense :math:`F_a`, where
+:math:`\operatorname{diag}(FPF^\top)_k = \sum_lF_{kl}^2p_l`. It returns the result mean and the exact diagonal of the
+result mixture's covariance, :math:`\sum_aw_a[\operatorname{diag}P_{Y,a} + (m_{Y,a} - \bar m)^{\odot2}]`: the M-projection of
+the exact result law onto Gaussians with diagonal covariance in the reference chart. The off-diagonal covariance, within
+a component (from :math:`F_a`) and between components, is discarded by that projection, not approximated. Rows and
+components are tiled by ``tile_bytes``; with gradients on and more than one tile, each tile runs under a non-reentrant
+checkpoint and is recomputed in backward.
 """
 
 from __future__ import annotations
@@ -47,6 +63,7 @@ import math
 from typing import NamedTuple, Optional, Tuple
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -57,7 +74,7 @@ class CueResultPosterior(NamedTuple):
     """Moments of the exact result marginal, the component log weights and the record log evidence."""
 
     mean:         torch.Tensor                  # (..., K) result mean sum_a w_a m_{Y,a}
-    covariance:   torch.Tensor                  # (..., K, K) result covariance with the between-component spread
+    covariance:   torch.Tensor                  # (..., K, K), or (..., K) variances on a diagonal record; with the spread
     log_weights:  torch.Tensor                  # (..., M) log w_a
     log_evidence: torch.Tensor                  # (...) log p(xi | C)
 
@@ -77,9 +94,14 @@ def _check_inputs(
     regression_offset: Optional[torch.Tensor],
     regression_left: Optional[torch.Tensor],
     regression_right: Optional[torch.Tensor],
+    diagonal: bool = False,
 ) -> None:
     K = xi.shape[-1]
-    if C.dim() != xi.dim() + 1 or C.shape[-2:] != (K, K) or C.shape[:-2] != xi.shape[:-1]:
+    if diagonal:
+        if C.shape != xi.shape:
+            raise ValueError(f"the diagonal cue/result memory needs record variances (..., K) matching xi "
+                             f"{tuple(xi.shape)}, got {tuple(C.shape)}")
+    elif C.dim() != xi.dim() + 1 or C.shape[-2:] != (K, K) or C.shape[:-2] != xi.shape[:-1]:
         raise ValueError(f"cue/result memory needs a dense record covariance (..., K, K) matching xi {tuple(xi.shape)}, "
                          f"got {tuple(C.shape)}")
     M = nu.shape[0]
@@ -232,4 +254,124 @@ def cue_result_exact_posterior(
         log_weights = torch.cat(log_ws, dim=-1) - log_evidence.unsqueeze(-1)             # (T, M) normalized
         cov = 0.5 * (cov + cov.transpose(-2, -1))
     return CueResultPosterior(mean.reshape(*batch, K), cov.reshape(*batch, K, K),
+                              log_weights.reshape(*batch, M), log_evidence.reshape(batch))
+
+
+@ieee_fp32_matmul()
+def _diagonal_tile(
+    xi:         torch.Tensor,                   # (r, K)
+    c:          torch.Tensor,                   # (r, K) record variances
+    nu:         torch.Tensor,                   # (m, K)
+    omega:      torch.Tensor,                   # (m, K)
+    lam:        torch.Tensor,                   # (m, K) cue variances
+    q:          torch.Tensor,                   # (m, K) result noise variances
+    log_pi_hat: torch.Tensor,                   # (m,) normalized log prior
+    offset:     Optional[torch.Tensor],         # (m, K, K) D_a
+    left:       Optional[torch.Tensor],         # (m, K, rank) U_a
+    right:      Optional[torch.Tensor],         # (m, K, rank) V_a
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""One (rows x components) tile, elementwise: log weights (r, m), the tile's log mass (r,), and its normalized
+    result mean and variances (r, K)."""
+    K = xi.shape[-1]
+    W = c.unsqueeze(-2) + lam                                                            # (r, m, K) diag(L_a + C)
+    delta = xi.unsqueeze(-2) - nu                                                        # (r, m, K) xi - nu_a
+    log_w = log_pi_hat - 0.5 * ((delta.square() / W).sum(-1) + W.log().sum(-1) + K * math.log(2.0 * math.pi))
+    gain = lam / W                                                                       # (r, m, K) L W^-1
+    g = gain * delta                                                                     # (r, m, K) m_X - nu
+    p = gain * c.unsqueeze(-2)                                                           # (r, m, K) diag P_X = L C / W
+    if offset is not None:
+        F = offset + torch.eye(K, dtype=offset.dtype, device=offset.device)              # (m, K, K) I + D_a
+        m_Y = omega + torch.einsum("akl,ial->iak", F, g)
+        v_Y = q + torch.einsum("akl,ial->iak", F.square(), p)                            # sum_l F_kl^2 p_l
+    else:
+        t = torch.einsum("iak,akr->iar", g, right)                                       # (r, m, rank) V^T g
+        m_Y = omega + g + torch.einsum("iar,akr->iak", t, left)
+        cross = 2.0 * p * (left * right).sum(-1)                                         # 2 p_k sum_r U_kr V_kr
+        G = torch.einsum("akr,iak,aks->iars", right, p, right)                           # (r, m, rank, rank) V^T P V
+        quad = torch.einsum("akr,iars,aks->iak", left, G, left)                          # diag U G U^T
+        v_Y = q + p + cross + quad
+    log_mass = torch.logsumexp(log_w, dim=-1)                                            # (r,)
+    w = torch.exp(log_w - log_mass.unsqueeze(-1))                                        # (r, m)
+    mean = (w.unsqueeze(-1) * m_Y).sum(-2)                                               # (r, K)
+    var = (w.unsqueeze(-1) * (v_Y + (m_Y - mean.unsqueeze(-2)).square())).sum(-2)       # (r, K)
+    return log_w, log_mass, mean, var
+
+
+def _merge_diagonal(
+    log_mass_a: torch.Tensor, mean_a: torch.Tensor, var_a: torch.Tensor,
+    log_mass_b: torch.Tensor, mean_b: torch.Tensor, var_b: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Law of total variance for two normalized mixtures with log masses, coordinatewise: a positive sum."""
+    log_mass = torch.logaddexp(log_mass_a, log_mass_b)
+    alpha = torch.exp(log_mass_a - log_mass).unsqueeze(-1)                               # (r, 1)
+    beta = torch.exp(log_mass_b - log_mass).unsqueeze(-1)
+    return (log_mass, alpha * mean_a + beta * mean_b,
+            alpha * var_a + beta * var_b + alpha * beta * (mean_a - mean_b).square())
+
+
+@ieee_fp32_matmul()
+def cue_result_diagonal_posterior(
+    xi:                torch.Tensor,            # (..., K) record value (reference working mean)
+    c:                 torch.Tensor,            # (..., K) record variances (reference, diagonal)
+    nu:                torch.Tensor,            # (M, K) cue means
+    omega:             torch.Tensor,            # (M, K) result means
+    log_lambda:        torch.Tensor,            # (M, K) cue log variances
+    log_result_noise:  torch.Tensor,            # (M, K) result-noise log variances
+    log_pi:            torch.Tensor,            # (M,) unnormalized log prior weights
+    *,
+    regression_offset: Optional[torch.Tensor] = None,   # (M, K, K) D_a, F_a = I + D_a
+    regression_left:   Optional[torch.Tensor] = None,   # (M, K, r) U_a
+    regression_right:  Optional[torch.Tensor] = None,   # (M, K, r) V_a, F_a = I + U_a V_a^T
+    tile_bytes:        int = CUE_RESULT_TILE_BYTES,
+) -> CueResultPosterior:
+    r"""The exact result posterior for a diagonal record covariance, with the diagonal M-projection of its covariance
+    (module docstring, Diagonal record): ``covariance`` holds the (..., K) result variances."""
+    _check_inputs(xi, c, nu, omega, log_lambda, log_result_noise, log_pi,
+                  regression_offset, regression_left, regression_right, diagonal=True)
+    if tile_bytes < 1:
+        raise ValueError(f"tile_bytes must be a positive byte count, got {tile_bytes!r}")
+    batch, K, M = xi.shape[:-1], xi.shape[-1], nu.shape[0]
+    rows = math.prod(batch)
+    reg = (regression_offset, regression_left, regression_right)
+    dtype = _compute_dtype(xi, c, nu, omega, log_lambda, log_result_noise, log_pi,
+                           *(t for t in reg if t is not None))
+    with torch.autocast(device_type=xi.device.type, enabled=False):
+        cast = lambda t: None if t is None else t.to(dtype)                              # noqa: E731
+        x, cv = xi.to(dtype).reshape(rows, K), c.to(dtype).reshape(rows, K)
+        nu_c, omega_c = cast(nu), cast(omega)
+        lam, q = log_lambda.to(dtype).exp(), log_result_noise.to(dtype).exp()
+        log_pi_hat = torch.log_softmax(log_pi.to(dtype), dim=-1)
+        offset, left, right = (cast(t) for t in reg)
+        rank = 0 if left is None else left.shape[-1]
+        # About eight (r, m, K) tensors per tile, plus (r, m, K, K)-sized work for a dense F or (r, m, rank^2).
+        per_pair = K * (8 + (K if offset is not None else 0)) + rank * rank
+        pairs = max(1, int(tile_bytes) // ((torch.finfo(dtype).bits // 8) * per_pair))
+        m_step = min(M, pairs)
+        r_step = max(1, min(rows, pairs // m_step))
+        tiled = rows > r_step or M > m_step
+        grad = torch.is_grad_enabled()
+        log_w_rows, mean_rows, var_rows, mass_rows = [], [], [], []
+        for i in range(0, rows, r_step):
+            running = None
+            chunks = []
+            for j in range(0, M, m_step):
+                sl = slice(j, j + m_step)
+                args = (x[i:i + r_step], cv[i:i + r_step], nu_c[sl], omega_c[sl], lam[sl], q[sl], log_pi_hat[sl],
+                        None if offset is None else offset[sl], None if left is None else left[sl],
+                        None if right is None else right[sl])
+                if tiled and grad and any(t is not None and t.requires_grad for t in args):
+                    log_w, log_mass, mean, var = checkpoint(_diagonal_tile, *args, use_reentrant=False,
+                                                            preserve_rng_state=False)
+                else:
+                    log_w, log_mass, mean, var = _diagonal_tile(*args)
+                chunks.append(log_w)
+                running = (log_mass, mean, var) if running is None else _merge_diagonal(*running, log_mass, mean, var)
+            mass_rows.append(running[0])
+            mean_rows.append(running[1])
+            var_rows.append(running[2])
+            log_w_rows.append(torch.cat(chunks, dim=-1))
+        log_evidence = torch.cat(mass_rows)                                              # (R,)
+        mean, var = torch.cat(mean_rows), torch.cat(var_rows)                            # (R, K)
+        log_weights = torch.cat(log_w_rows) - log_evidence.unsqueeze(-1)                 # (R, M)
+    return CueResultPosterior(mean.reshape(*batch, K), var.reshape(*batch, K),
                               log_weights.reshape(*batch, M), log_evidence.reshape(batch))
