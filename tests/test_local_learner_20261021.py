@@ -289,3 +289,41 @@ def test_cavity_statistics(setup):
         alone = train_local(init_params(d, tree.V, sd), streams, tree, chunk=8, window=4, sensor_stats="cavity")
         assert torch.allclose(stacked.run(r).A, alone.A, atol=1e-9)
     assert torch.isfinite(stacked.G).all()
+
+
+def test_parameter_expanded_and_overrelaxed_m_steps(setup):
+    r"""The expanded probit M-step rescales each node's least-squares solution by its residual utility standard
+    deviation (checked on complete-data statistics); overrelax = 1 reproduces plain EM; stacked runs with both
+    options equal separate runs; the options validate their ranges."""
+    tree, prm = setup
+    g = torch.Generator().manual_seed(21)
+    z = torch.randn(4000, d, generator=g)
+    a_true, b_true = torch.tensor([0.8, -0.5, 0.3]), 0.2
+    u = z @ a_true + b_true + 1.7 * torch.randn(4000, generator=g)        # complete data, residual sd 1.7
+    zt = torch.cat([z, torch.ones(4000, 1)], 1)
+    st = Stats.zeros(1, d, tree.V)
+    st.node_zz[0, 0] = zt.T @ zt / 4000
+    st.node_uz[0, 0] = (u[:, None] * zt).mean(0)
+    st.node_uu[0, 0] = (u ** 2).mean()
+    st.node_zz[0, 1:] = torch.eye(d + 1)                                   # other nodes: arbitrary SPD, unit stats
+    plain = m_step(st, prm, 1e-12, 1e-4, learn_transition=False)
+    px = m_step(st, prm, 1e-12, 1e-4, learn_transition=False, expand_sensor=True)
+    ab = torch.cat([plain.A[0, 0], plain.b[0, :1]])
+    sd = (u - zt @ ab).pow(2).mean().sqrt()
+    assert abs(float(sd) - 1.7) < 0.1
+    assert torch.allclose(torch.cat([px.A[0, 0], px.b[0, :1]]), ab / sd, atol=1e-9)
+    streams = sample_sequences(prm, tree, 16, 25, seed=22)
+    start = init_params(d, tree.V, seed=23)
+    base = train_local(start, streams, tree, chunk=8, window=4)
+    unit = train_local(start, streams, tree, chunk=8, window=4, overrelax=1.0)
+    for f in ("G", "E", "Q", "A", "b"):
+        assert torch.equal(getattr(base, f), getattr(unit, f))
+    kw = dict(chunk=8, window=4, expand_sensor=True, overrelax=1.5)
+    stacked = train_local(init_runs(d, tree.V, [3, 4]), streams, tree, **kw)
+    for r, sd_seed in enumerate([3, 4]):
+        alone = train_local(init_params(d, tree.V, sd_seed), streams, tree, **kw)
+        for f in ("G", "E", "Q", "A", "b"):
+            assert torch.allclose(getattr(stacked.run(r), f), getattr(alone, f), atol=1e-9), f
+    assert torch.linalg.eigvalsh(stacked.Q).min() >= 1e-4 - 1e-12
+    with pytest.raises(ValueError):
+        train_local(start, streams, tree, chunk=8, overrelax=2.0)
