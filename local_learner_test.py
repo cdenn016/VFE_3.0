@@ -19,7 +19,7 @@ from pathlib import Path
 
 CONFIG = {
     
-    "stage":            "W",                    # "timing" | "A" | "B" | "S" (scaling) | "W" (warm start, passes)
+    "stage":            "X",                    # "timing" | "A" | "B" | "S" (scaling) | "W" (warm start) | "X" (acceleration)
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
@@ -76,6 +76,15 @@ CONFIG = {
     "W_passes":         3,
     "W_points":         5,                      # scoring points per pass
 
+    # stage X (accelerated local learners on the stage B data; results_X.jsonl). Each arm trains X_passes passes
+    # from the stage B initialization at d = X_d, scored at W_points evenly spaced points per pass, as in stage W.
+    # Arm suffixes: _px = parameter-expanded probit M-step (each node also fits its utility variance, then
+    # rescales), _orNN = overrelaxed M-step with omega = NN/10 (or15 = 1.5). Backpropagation's one-pass score at
+    # d = 32 is in results_W.jsonl (3.270 bits per byte).
+    "X_d":              32,
+    "X_passes":         1,
+    "X_arms":           ["local_w16", "local_w16_or15", "local_w16_or18", "local_w16_px", "local_w16_px_or15"],
+
     # stage B (WikiText-103 bytes)
     "B_dims":           [8, 16, 32],
     "B_seeds":          [0, 1, 2],
@@ -129,9 +138,18 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
     if arm == "backprop":
         return {"rule": "backprop", "chunk": chunk, "lr": c["backprop_lr"]}
     base, _, name = arm.partition("@")
-    sensor_stats = "sequential"
-    if base.endswith("_cav"):                   # node statistics at the EP cavity of the token's posterior
-        base, sensor_stats = base[:-4], "cavity"
+    sensor_stats, expand_sensor, overrelax = "sequential", False, 1.0
+    while True:                                 # suffixes, in any order: _cav, _px, _orNN
+        head, _, tail = base.rpartition("_")
+        if tail == "cav":                       # node statistics at the EP cavity of the token's posterior
+            sensor_stats = "cavity"
+        elif tail == "px":                      # parameter-expanded probit M-step
+            expand_sensor = True
+        elif tail.startswith("or") and tail[2:].isdigit():
+            overrelax = int(tail[2:]) / 10      # overrelaxed M-step, omega = NN/10
+        else:
+            break
+        base = head
     sched = c["local_schedules"][name or c["local_schedule"]]
     reset = sched["reset"]
     if reset == "pass":
@@ -146,7 +164,8 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
         raise ValueError(arm)
     return {"rule": "local", "chunk": chunk, "window": window, "blind": blind, "ridge": c["ridge"],
             "q_floor": c["q_floor"], "gamma_exponent": sched["alpha"], "gamma_floor": sched["floor"],
-            "reset_every": reset, "sensor_stats": sensor_stats}
+            "reset_every": reset, "sensor_stats": sensor_stats, "expand_sensor": expand_sensor,
+            "overrelax": overrelax}
 
 
 def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
@@ -350,6 +369,47 @@ def run_warm(tree: TreeSensor) -> None:
     score(f"backprop_{c['W_passes']}pass", bp_multi, per_pass * c["W_passes"], time.perf_counter() - t0)
 
 
+def run_accel(tree: TreeSensor) -> None:
+    r"""Stage X: each arm of ``X_arms`` trains ``X_passes`` passes from the stage B initialization at d = ``X_d``,
+    three stacked seeds, scored at ``W_points`` points per pass. An arm whose final point is already recorded
+    under the same identity is skipped; a recorded final point under a different identity raises."""
+    c = CONFIG
+    out = Path(c["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "results_X.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    recorded = {(r["run"], r["d"], r["seed"], r["updates_done"]): r for r in rows}
+    d, seeds, P = c["X_d"], c["B_seeds"], c["W_points"]
+    xtrain = load_bytes("train", c["B_train_bytes"])
+    xval = load_bytes("validation", c["B_val_bytes"])
+    train = as_streams(xtrain, c["streams"]).to(DEVICE)
+    val = as_streams(xval, c["B_val_streams"]).to(DEVICE)
+    L = train.shape[1]
+    cuts = [round(i * (L - 1) / P) for i in range(P + 1)]
+    final = sum(-(-(cuts[i + 1] - cuts[i]) // c["chunk"]) for i in range(P)) * c["X_passes"]
+    proto = {**protocol("B"), "stage": "X", "X_passes": c["X_passes"], "W_points": P}
+    for arm in c["X_arms"]:
+        ident = identity(arm_settings(arm), proto)
+        last = [recorded.get((arm, d, s, final)) for s in seeds]
+        if all(r is not None for r in last):
+            if any(r.get("identity") != ident for r in last):
+                raise RuntimeError(f"stage X results for {arm!r} were made under different settings; set a new "
+                                   f"out_dir or remove those records to rerun")
+            continue
+        prm, updates, t0 = init_runs(d, tree.V, seeds, DEVICE), 0, time.perf_counter()
+        for _ in range(c["X_passes"]):
+            for i in range(P):
+                prm = train_arm(arm, prm, train[:, cuts[i]:cuts[i + 1] + 1], tree, None)
+                sync()
+                updates += -(-(cuts[i + 1] - cuts[i]) // c["chunk"])
+                nll, n = evaluate_filter(prm, val, tree)
+                spectral = torch.linalg.matrix_norm(prm.G, 2).tolist()
+                for r, seed in enumerate(seeds):
+                    append(path, {"stage": "X", "run": arm, "d": d, "seed": seed, "updates_done": updates,
+                                  "val_bits": float(nll[r]) / n / LN2, "train_sec": time.perf_counter() - t0,
+                                  "stacked_runs": len(seeds), "G_spectral": spectral[r], "identity": ident})
+
+
 def run_stage(stage: str, tree: TreeSensor) -> None:
     c = CONFIG
     out = Path(c["out_dir"])
@@ -436,6 +496,8 @@ def main() -> None:
         run_scaling(tree)
     elif CONFIG["stage"] == "W":
         run_warm(tree)
+    elif CONFIG["stage"] == "X":
+        run_accel(tree)
     else:
         run_stage(CONFIG["stage"], tree)
 
