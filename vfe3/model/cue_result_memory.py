@@ -326,9 +326,12 @@ def cue_result_diagonal_posterior(
     regression_left:   Optional[torch.Tensor] = None,   # (M, K, r) U_a
     regression_right:  Optional[torch.Tensor] = None,   # (M, K, r) V_a, F_a = I + U_a V_a^T
     tile_bytes:        int = CUE_RESULT_TILE_BYTES,
+    fused:             bool = False,            # the fused Triton route on CUDA tensors (vfe3.kernels.cue_result)
 ) -> CueResultPosterior:
     r"""The exact result posterior for a diagonal record covariance, with the diagonal M-projection of its covariance
-    (module docstring, Diagonal record): ``covariance`` holds the (..., K) result variances."""
+    (module docstring, Diagonal record): ``covariance`` holds the (..., K) result variances. With ``fused`` and a
+    low-rank regression of rank at most :data:`vfe3.kernels.cue_result.MAX_RANK`, CUDA tensors run the same posterior
+    in fused Triton kernels (``tile_bytes`` then bounds their per-row planes); everything else runs the torch tiles."""
     _check_inputs(xi, c, nu, omega, log_lambda, log_result_noise, log_pi,
                   regression_offset, regression_left, regression_right, diagonal=True)
     if tile_bytes < 1:
@@ -338,6 +341,22 @@ def cue_result_diagonal_posterior(
     reg = (regression_offset, regression_left, regression_right)
     dtype = _compute_dtype(xi, c, nu, omega, log_lambda, log_result_noise, log_pi,
                            *(t for t in reg if t is not None))
+    if fused and regression_left is not None:
+        from vfe3.kernels import cue_result as fused_kernels
+        if regression_left.shape[-1] <= fused_kernels.MAX_RANK and fused_kernels.fused_route_active(xi):
+            rank = regression_left.shape[-1]
+            planes = 2 * (2 * fused_kernels._rank_pad(rank) + 2 * fused_kernels._rank_pad(rank) ** 2) + 2
+            row_chunk = max(1, int(tile_bytes) // ((torch.finfo(dtype).bits // 8) * planes * M))
+            with torch.autocast(device_type=xi.device.type, enabled=False):
+                log_pi_hat = torch.log_softmax(log_pi.to(dtype), dim=-1)
+                if log_pi_hat.dim() > 1:
+                    log_pi_hat = log_pi_hat.reshape(rows, M)                             # (R, M) per token
+                mean, var, log_weights, log_evidence = fused_kernels.cue_result_diagonal_lowrank_fused(
+                    xi.to(dtype).reshape(rows, K), c.to(dtype).reshape(rows, K), nu.to(dtype), omega.to(dtype),
+                    log_lambda.to(dtype).exp(), log_result_noise.to(dtype).exp(), log_pi_hat,
+                    regression_left.to(dtype), regression_right.to(dtype), row_chunk=row_chunk)
+            return CueResultPosterior(mean.reshape(*batch, K), var.reshape(*batch, K),
+                                      log_weights.reshape(*batch, M), log_evidence.reshape(batch))
     with torch.autocast(device_type=xi.device.type, enabled=False):
         cast = lambda t: None if t is None else t.to(dtype)                              # noqa: E731
         x, cv = xi.to(dtype).reshape(rows, K), c.to(dtype).reshape(rows, K)

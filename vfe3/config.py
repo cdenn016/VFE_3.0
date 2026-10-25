@@ -845,6 +845,11 @@ class VFE3Config:
     # introduction value; on a large GPU about 1024 removes the launch-bound regime (32 MiB at K=192, M=1536, rank 2
     # leaves 3 tokens per tile, about 2,700 tiles per layer for 32 x 256 tokens).
     block_memory_tile_mib:            int             = 32
+    # True | False. cue_result_memory on gaussian_frame_diagonal with a low-rank regression (rank 1..4) only: run the
+    # exact posterior and its backward in fused Triton kernels on CUDA tensors (vfe3.kernels.cue_result), never forming
+    # the (tokens, M, K) workspace; CPU tensors run the torch tiles either way. Same formulas, rounding-level
+    # differences. Needs triton (triton-windows on Windows).
+    block_memory_triton:              bool            = False
 
     ##################################################
     #   15. E-step (belief updates)
@@ -2224,6 +2229,15 @@ class VFE3Config:
             if float(self.block_mlp_em_weight) != 0.0:
                 memory_problems.append(f"block_mlp_em_weight={self.block_mlp_em_weight!r} (requires 0: no cue/result "
                                        "EM objective is implemented)")
+            if self.block_memory_triton:
+                from vfe3.kernels.cue_result import MAX_RANK
+                if self.family != "gaussian_frame_diagonal":
+                    memory_problems.append(f"block_memory_triton=True with family={self.family!r} (the fused kernels "
+                                           "take diagonal records: requires 'gaussian_frame_diagonal')")
+                if self.block_memory_regression_rank is None or self.block_memory_regression_rank > MAX_RANK:
+                    memory_problems.append(f"block_memory_triton=True with block_memory_regression_rank="
+                                           f"{self.block_memory_regression_rank!r} (the fused kernels take a low-rank "
+                                           f"regression of rank 1..{MAX_RANK})")
             if memory_problems:
                 raise ValueError("block_mlp_mode='cue_result_memory' is defined only on the exact reference route; "
                                  "got " + "; ".join(memory_problems))
@@ -2762,7 +2776,8 @@ class VFE3Config:
         memory = self.use_block_mlp and self.block_mlp_mode == "cue_result_memory"
         if not memory:
             mark(("block_memory_regression_rank", "block_memory_result_noise_ratio", "block_memory_regime_transition",
-                  "block_memory_regime_beta", "block_memory_regime_stay", "block_memory_tile_mib"),
+                  "block_memory_regime_beta", "block_memory_regime_stay", "block_memory_tile_mib",
+                  "block_memory_triton"),
                  "only read by block_mlp_mode='cue_result_memory' with use_block_mlp=True")
         elif self.block_memory_regime_transition == "off":
             mark(("block_memory_regime_beta", "block_memory_regime_stay"),

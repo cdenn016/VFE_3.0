@@ -212,6 +212,7 @@ INTRODUCED_AFTER_CAA0114: Mapping[str, Any] = {
     'block_memory_regime_beta':              1.0,             # regime belief through depth (2026-10-25)
     'block_memory_regime_stay':              0.9,             # regime belief through depth (2026-10-25)
     'block_memory_tile_mib':                 32,              # cue_result_memory tile budget (2026-10-25)
+    'block_memory_triton':                   False,           # fused cue/result Triton route (2026-10-25)
 }
 
 FIELD_INTRODUCTION_VALUES: Mapping[str, Any] = {**SNAPSHOT_CAA0114, **INTRODUCED_AFTER_CAA0114}

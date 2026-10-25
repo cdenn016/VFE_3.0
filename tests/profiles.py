@@ -143,6 +143,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'block_memory_regime_beta': 1.0,
     'block_memory_regime_stay': 0.9,
     'block_memory_tile_mib': 32,
+    'block_memory_triton': False,
     'block_mlp_dropout': 0.0,
     'm_block_mlp_lr': None,
     'per_type_hidden_bias': False,
