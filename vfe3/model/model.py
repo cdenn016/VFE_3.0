@@ -442,6 +442,7 @@ class VFEModel(nn.Module):
             )
             if isinstance(mlp, CueResultMemoryBlockMLP):
                 mlp.tile_bytes = cfg.block_memory_tile_mib * 1024 ** 2         # exact-posterior tile budget (not state)
+                mlp.fused_kernel = cfg.block_memory_triton                     # fused Triton route on CUDA (not state)
             return mlp
 
         if not cfg.use_block_mlp:
