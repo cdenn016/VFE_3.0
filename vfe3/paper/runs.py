@@ -826,12 +826,16 @@ def latest_training_checkpoint(run: RunRecord) -> Optional[Path]:
 
 
 def _parameter_cfg_like(run: RunRecord) -> SimpleNamespace:
-    r"""The config fields the parameter breakdown reads (family, vocabulary, decode, frozen tables)."""
+    r"""The config fields the parameter breakdown reads (family, vocabulary, decode, frozen tables, tied bank)."""
     return SimpleNamespace(
         model_family=run.value("model_family", "vfe") or "vfe",
         vocab_size=run.value("vocab_size"),
         decode_mode=run.value("decode_mode"),
         gauge_transport=run.value("gauge_transport", "on"),
+        # A block MLP shared across layers has one state-dict alias per layer, counted once
+        # (vfe3.run_resources.tied_block_mlp_aliases); both keys are absent (False) on runs before the toggle.
+        use_block_mlp=run.value("use_block_mlp", False),
+        block_mlp_tie_layers=run.value("block_mlp_tie_layers", False),
         # Historical key: absent on runs after its 2026-10-02 retirement, which froze the temperature.
         decode_temperature_learned=run.value("decode_temperature_learned", False),
     )

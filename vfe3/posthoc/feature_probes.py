@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -140,7 +140,12 @@ def prototype_probe(
     r"""Template usage, top-1 token codebook and exact-versus-mean-field gap of every ``prototype_agents`` layer.
 
     The gap reruns the block in the other inference mode, so it is limited to the first ``gap_tokens`` tokens (the
-    exact path on a block or dense layout is an extreme opt-in cost)."""
+    exact path on a block or dense layout is an extreme opt-in cost).
+
+    A bank shared across layers (``block_mlp_tie_layers=True``) is one object listed at every layer. It gets one
+    recording wrapper, and each forward pass calls it once per layer in layer order (:mod:`vfe3.model.stack`),
+    so its ``k``-th call of a pass is attributed to the ``k``-th layer that holds it; the wrapper is removed once.
+    """
     blocks = getattr(model, "block_mlps", None)
     targets = ([(index, mlp) for index, mlp in enumerate(blocks) if isinstance(mlp, PrototypeAgentBlockMLP)]
                if blocks is not None else [])
@@ -148,11 +153,23 @@ def prototype_probe(
         return None
     current: Dict[str, Optional[torch.Tensor]] = {"ids": None}
     stats: Dict[int, Dict[str, Any]] = {}
-
+    # Distinct bank objects, each with the layers that call it in order (one layer each when untied).
+    banks: Dict[int, Tuple[PrototypeAgentBlockMLP, List[int]]] = {}
     for layer, mlp in targets:
+        banks.setdefault(id(mlp), (mlp, []))[1].append(layer)
+    calls: Dict[int, int] = {key: 0 for key in banks}                 # calls of each bank in the current pass
+
+    for key, (mlp, layers) in banks.items():
         original = mlp.forward_moments
 
-        def recording(mu, sigma, *args, _layer=layer, _mlp=mlp, _original=original, **kwargs):
+        def recording(mu, sigma, *args, _key=key, _layers=tuple(layers), _mlp=mlp, _original=original, **kwargs):
+            call = calls[_key]
+            if call >= len(_layers):
+                raise RuntimeError(
+                    f"prototype_probe: the block MLP of layers {list(_layers)} was called {call + 1} times in one "
+                    "forward pass; its calls cannot be attributed to layers")
+            calls[_key] = call + 1
+            _layer = _layers[call]
             result = _original(mu, sigma, *args, **kwargs)
             weights, _ = _mlp.weights_and_gain(mu, sigma)                       # (B, N, M)
             M = weights.shape[-1]
@@ -204,12 +221,14 @@ def prototype_probe(
     try:
         for ids in token_batches:
             current["ids"] = ids
+            for key in calls:
+                calls[key] = 0
             model.forward_beliefs(ids.to(device))
     finally:
         current["ids"] = None
         for module, was_training in modes:
             module.training = was_training
-        for _, mlp in targets:
+        for mlp, _ in banks.values():                                    # one wrapper per distinct bank
             del mlp.forward_moments
     out: Dict[str, Any] = {"configured_inference": targets[0][1].inference, "layers": []}
     for layer, mlp in targets:

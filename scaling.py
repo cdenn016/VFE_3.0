@@ -662,6 +662,8 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
             regression_rank=getattr(cfg, "block_memory_regression_rank", None),    # cue_result_memory only
             regime_transition=getattr(cfg, "block_memory_regime_transition", "off"),   # cue_result_memory only
         )
+    if getattr(cfg, "per_type_hidden_bias", False):
+        n += V * n_gen                                       # per_type_hidden_bias (V, n_gen), split over layers
     if cfg.layernorm_affine and cfg.norm_type_block == "layernorm":
         n += 2 * K
     n += int(cfg.n_layers) * 4 * K * K                       # full-width Q/K/T/O maps
@@ -1421,7 +1423,7 @@ def run_cell(
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(device)
     actual_n = int(sum(p.numel() for p in model.parameters()))
-    gap = "" if actual_n == pred_n else f"  (predicted {pred_n:,}; +{actual_n - pred_n:,} small modules)"
+    gap = "" if actual_n == pred_n else f"  (predicted {pred_n:,}; {actual_n - pred_n:+,} outside the estimate)"
     print(f"    {label} s{seed} | K={cfg.embed_dim} h={cfg.n_heads} {cfg.gauge_group} "
           f"n_gen={n_gen} | N={actual_n:,}{gap} | steps={cfg.max_steps}")
 
