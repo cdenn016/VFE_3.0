@@ -378,3 +378,33 @@ def test_exponential_link_chart(setup):
                 assert torch.allclose(getattr(stacked.run(r), f), getattr(alone, f), atol=1e-9), f
     with pytest.raises(ValueError):
         train_local(start, streams, tree, chunk=8, link_chart="exp", overrelax=1.5)
+
+
+def test_exponential_link_step_is_guarded(setup):
+    r"""Far from the regression optimum (statistics from a strongly rotating chain against G = 0.5 I) the guarded
+    exp-chart step stays finite, respects the trust radius, and does not raise the profiled energy."""
+    from vfe3.local_learner.learners import exp_link_transition, residual_covariance, spd_logm
+    tree, prm = setup
+    far = prm.clone()
+    th = 2.5
+    rot = torch.eye(d)
+    rot[:2, :2] = torch.tensor([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    far.G = 0.95 * rot[None]
+    streams = sample_sequences(far, tree, 64, 40, seed=27)
+    start = init_params(d, tree.V, seed=28)
+    st = _one_chunk_stats(tree, start, streams, blind=False)
+    L0 = spd_logm(start.G)
+    L1, G1, E1, Q1 = exp_link_transition(st, start, L0, 1e-6, 1e-4, 1.0, trust=0.5)
+    assert all(torch.isfinite(x).all() for x in (L1, G1, E1, Q1))
+    assert float(torch.linalg.matrix_norm(L1 - L0).max()) <= 0.5 + 1e-12
+    Sxx = torch.zeros(1, d + tree.V, d + tree.V)
+    Sxx[:, :d, :d], Sxx[:, :d, d:], Sxx[:, d:, :d] = st.pp, st.yp.transpose(-1, -2), st.yp
+    Sxx[:, d:, d:] = torch.diag_embed(st.cnt)
+    Szx = torch.cat([st.zp, st.yz.transpose(-1, -2)], -1)
+
+    def h(G):
+        E = (st.yz - st.yp @ G.transpose(-1, -2)) / (st.cnt + 1e-6).unsqueeze(-1)
+        Rc = residual_covariance(st.zz, Szx, Sxx, torch.cat([G, E.transpose(-1, -2)], -1))
+        return float(0.5 * (torch.linalg.inv(start.Q) * Rc).sum())
+
+    assert h(G1) <= h(start.G) + 1e-12

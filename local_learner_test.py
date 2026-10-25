@@ -24,6 +24,7 @@ CONFIG = {
     "stage":            "C",                    # "timing" | "A" | "B" | "S" (scaling) | "W" (warm start) | "X" (acceleration) | "C" (exp links)
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
+    "log_every":        100,                    # console progress line every N updates per training call (0 = off)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
     "chunk":            16,                     # M-step / truncated-BPTT length (smoothing windows must divide it)
     "streams":          512,                    # parallel training streams (512 * 16 = 8192 tokens per update)
@@ -186,9 +187,20 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
 
 def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
     kw = arm_settings(arm, chunk)
-    if kw.pop("rule") == "backprop":
-        return train_backprop(prm0, train, tree, log=log, **kw)
-    return train_local(prm0, train, tree, log=log, **kw)
+    every = CONFIG.get("log_every", 0)
+
+    def progress(row: dict) -> None:                   # keeps the caller's history and prints a progress line
+        if log is not None:
+            log(row)
+        if every:
+            bits = row["train_bits"]
+            print(f"  [{arm} d={prm0.d} x{prm0.R}] update {row['chunk']:5d}: train {sum(bits) / len(bits):.4f} "
+                  f"bits/byte, max |G| {max(row['G_spectral']):.3f}, {row['sec']:.0f} s", flush=True)
+
+    sink = progress if (log is not None or every) else None
+    rule = kw.pop("rule")
+    trainer = train_backprop if rule == "backprop" else train_local
+    return trainer(prm0, train, tree, log=sink, log_every=every or 20, **kw)
 
 
 def protocol(stage: str, streams: int | None = None) -> dict:
