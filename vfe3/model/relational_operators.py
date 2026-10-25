@@ -946,8 +946,9 @@ class RelationalOperators(nn.Module):
             frame_problems = []
             if block_covariance:
                 frame_problems.append("block_covariance=False (one covariance family per operator)")
-            if readout_mode != "predictive_content" or minimal:
-                frame_problems.append("the kernel predictive readout (predictive_content, predictive_readout='kernel')")
+            if readout_mode != "predictive_content":
+                frame_problems.append("the predictive readout (predictive_content, predictive_readout 'kernel' or "
+                                      "'minimal_agent')")
             if content_link_edges != "off":
                 frame_problems.append("content_link_edges='off'")
             if frame_problems:
@@ -1407,6 +1408,13 @@ class RelationalOperators(nn.Module):
         """
         if self.predictive_readout != "minimal_agent":
             raise ValueError("minimal_agent_update needs predictive_readout='minimal_agent'")
+        local_mu, local_frame = mu, frame
+        if self.frame_diagonal:
+            # gaussian_frame_diagonal: sigma holds c_i, so C_i = diag(c_i) in reference coordinates. The readout runs on
+            # (xi, diag c) through the identity frame (the layout every consumer reads), returns xi^+ and diag(C^+), the
+            # family's M-projection of the posterior in the reference chart, and the floor in reference coordinates; the
+            # mean returns to local coordinates through U_i below.
+            mu, frame = frame_diagonal_reference(mu, frame)                           # (..., N, K) xi, identity frame
         dtype = _compute_dtype(mu, sigma, self.raw_score_q, self.T, self.channel_log_noise, frame.forward)
         # A float32 mean-field KL may refactor its factors in float64 under the certificate and count them; an
         # escalated call then adds only the rest of its entries below, so no entry is counted twice.
@@ -1447,9 +1455,12 @@ class RelationalOperators(nn.Module):
                 _count_source_recovery(entries)
             if covariance_failed:
                 _count_covariance_escalation(math.prod(mu.shape[:-1]), mu.device)   # the call's B N tokens
+        if self.frame_diagonal:
+            mu_plus = frame_matvec(local_frame.forward.to(mu_plus.dtype), mu_plus,
+                                   local_frame.block_diagonal)                             # mu^+ = U_i xi^+
         if capture is not None:
             capture.update(record)
-            capture["relational_mean_displacement_norm"] = (mu_plus - mu).norm().detach()
+            capture["relational_mean_displacement_norm"] = (mu_plus - local_mu).norm().detach()
         if sigma_plus is not None:
             sigma_plus = self.ceiling_term(sigma_plus, floor_anchor, diagonal=sigma.dim() == mu.dim())
         return mu_plus, sigma_plus

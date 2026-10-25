@@ -119,6 +119,10 @@ def vfe_stack(
                        else (relational_operators,))
     link_state = ({} if any(getattr(operator, "content_link_loop_weight", 0.0) > 0.0
                             for operator in layer_operators) else None)
+    # Regime belief of a tied cue/result memory (block_memory_regime_transition != 'off'): layer l+1's block reads
+    # layer l's component log weights ("previous") and writes its own ("current"), promoted after the block.
+    regime_state = ({} if (block_mlps is not None and cfg.use_block_mlp and cfg.block_mlp_mode == "cue_result_memory"
+                           and cfg.block_memory_regime_transition != "off") else None)
     for layer_index in range(cfg.n_layers):
         if diagnostic_capture is not None:
             diagnostic_capture["layer_priors"].append((mu_p, sigma_p))
@@ -134,6 +138,8 @@ def vfe_stack(
         block_extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
         if link_state is not None:
             block_extra["link_state"] = link_state
+        if regime_state is not None:
+            block_extra["regime_state"] = regime_state
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, cg_coupling=cg_coupling,
                            block_mlp=(block_mlps[layer_index] if block_mlps is not None else None),
@@ -153,6 +159,8 @@ def vfe_stack(
                            **block_extra)
         if link_state is not None:
             link_state["previous"] = link_state.pop("current", None)
+        if regime_state is not None:
+            regime_state["previous"] = regime_state.pop("current", None)
         if diagnostic_capture is not None:
             if relational_capture is not None:
                 # The shared capture is overwritten by the next block. Preserve each

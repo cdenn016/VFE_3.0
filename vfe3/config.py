@@ -816,6 +816,16 @@ class VFE3Config:
     block_memory_regression_rank:     Optional[int]   = None
     block_memory_result_noise_ratio:  float           = 0.01         # cue_result_memory only: initial Q_a / L_a > 0
 
+    # "off" | "sticky" | "learned"
+    # cue_result_memory with block_mlp_tie_layers only: carry the component (regime) posterior through depth as a
+    # hidden-Markov state. Layer l+1's per-token prior is pi_b (w^l T)_b^beta (a Dirichlet record of w^l T).
+    #   off      every layer uses the shared prior pi
+    #   sticky   T = s I + (1 - s) 1 pi^T, one learned stay probability s
+    #   learned  T = row-softmax of an (M, M) logit table, initialized at s I + (1 - s)/M
+    block_memory_regime_transition:   str             = "off"
+    block_memory_regime_beta:         float           = 1.0          # trust beta >= 0 in the carried belief (0 = shared prior)
+    block_memory_regime_stay:         float           = 0.9          # initial stay probability s in (0, 1)
+
     ##################################################
     #   15. E-step (belief updates)
     ##################################################
@@ -1559,9 +1569,9 @@ class VFE3Config:
             if self.attention_mode != "projected_predictive":
                 frame_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive': the "
                                       "gradient receiver's Fisher steps and retraction act on a local covariance)")
-            if self.predictive_readout != "kernel":
-                frame_problems.append(f"predictive_readout={self.predictive_readout!r} (requires 'kernel': the minimal "
-                                      "agent's conditioning reads a local diagonal covariance)")
+            # Both predictive readouts read (xi, diag c) through the identity frame: the kernel's routing and
+            # moment-matched update, and the minimal agent's exact conditioning (whose diag(C^+) is the family's
+            # reference M-projection).
             if self.content_link_edges != "off":
                 frame_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off': the edge "
                                       "links' latent receivers read the local covariance)")
@@ -2156,8 +2166,19 @@ class VFE3Config:
                 or float(self.block_memory_result_noise_ratio) <= 0.0):
             raise ValueError("block_memory_result_noise_ratio must be a finite real value > 0, "
                              f"got {self.block_memory_result_noise_ratio!r}")
+        _require(self.block_memory_regime_transition, ("off", "sticky", "learned"), "block_memory_regime_transition")
+        if (isinstance(self.block_memory_regime_beta, bool) or not isinstance(self.block_memory_regime_beta, Real)
+                or not math.isfinite(float(self.block_memory_regime_beta)) or float(self.block_memory_regime_beta) < 0.0):
+            raise ValueError(f"block_memory_regime_beta must be a finite real value >= 0, got {self.block_memory_regime_beta!r}")
+        if (isinstance(self.block_memory_regime_stay, bool) or not isinstance(self.block_memory_regime_stay, Real)
+                or not 0.0 < float(self.block_memory_regime_stay) < 1.0):
+            raise ValueError(f"block_memory_regime_stay must be a real value in (0, 1), got {self.block_memory_regime_stay!r}")
         if self.use_block_mlp and self.block_mlp_mode == "cue_result_memory":
             memory_problems = []
+            if self.block_memory_regime_transition != "off" and not self.block_mlp_tie_layers:
+                memory_problems.append("block_memory_regime_transition="
+                                       f"{self.block_memory_regime_transition!r} with block_mlp_tie_layers=False "
+                                       "(requires tied banks: untied layers give the labels no common meaning)")
             if self.attention_mode != "projected_predictive":
                 memory_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
             if self.block_coordinates != "reference":
@@ -2714,8 +2735,12 @@ class VFE3Config:
             mark(norm_floor, "only read by block_mlp_covariance='delta_full' or a block_norm_covariance pushforward")
         memory = self.use_block_mlp and self.block_mlp_mode == "cue_result_memory"
         if not memory:
-            mark(("block_memory_regression_rank", "block_memory_result_noise_ratio"),
+            mark(("block_memory_regression_rank", "block_memory_result_noise_ratio", "block_memory_regime_transition",
+                  "block_memory_regime_beta", "block_memory_regime_stay"),
                  "only read by block_mlp_mode='cue_result_memory' with use_block_mlp=True")
+        elif self.block_memory_regime_transition == "off":
+            mark(("block_memory_regime_beta", "block_memory_regime_stay"),
+                 "only read by block_memory_regime_transition 'sticky' or 'learned'")
         if memory:
             # Exact inference is required and validated; the cue bank's initialization knobs are read.
             mark(("block_mlp_inference", "block_mlp_cavi_steps", "block_mlp_em_weight"),

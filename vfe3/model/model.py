@@ -435,6 +435,9 @@ class VFEModel(nn.Module):
                 cavi_steps=cfg.block_mlp_cavi_steps,                  # prototype_agents mean field only
                 regression_rank=cfg.block_memory_regression_rank,     # cue_result_memory only
                 result_noise_ratio=cfg.block_memory_result_noise_ratio,   # cue_result_memory only
+                regime_transition=cfg.block_memory_regime_transition,     # cue_result_memory only
+                regime_beta=cfg.block_memory_regime_beta,
+                regime_stay=cfg.block_memory_regime_stay,
             )
 
         if not cfg.use_block_mlp:
@@ -480,6 +483,7 @@ class VFEModel(nn.Module):
                 covariance_layout=_get_family(cfg.family).cov_kind,     # 'full' also for the dense head-block storage
                 regression_rank=cfg.block_memory_regression_rank,       # cue_result_memory parameter count only
                 tied_layers=cfg.block_mlp_tie_layers,                   # one shared module: parameters counted once
+                regime_transition=cfg.block_memory_regime_transition,   # cue_result_memory transition parameters
             )
         )
         # Under a comparison rope_mode no frame carries R_i: the MLP and the values both read U_i.

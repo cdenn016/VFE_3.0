@@ -208,6 +208,9 @@ INTRODUCED_AFTER_CAA0114: Mapping[str, Any] = {
     'block_memory_regression_rank':          None,            # cue_result_memory (2026-10-24)
     'block_memory_result_noise_ratio':       0.01,            # cue_result_memory (2026-10-24)
     'block_mlp_tie_layers':                  False,           # tied block MLP across depth (2026-10-25)
+    'block_memory_regime_transition':        'off',           # regime belief through depth (2026-10-25)
+    'block_memory_regime_beta':              1.0,             # regime belief through depth (2026-10-25)
+    'block_memory_regime_stay':              0.9,             # regime belief through depth (2026-10-25)
 }
 
 FIELD_INTRODUCTION_VALUES: Mapping[str, Any] = {**SNAPSHOT_CAA0114, **INTRODUCED_AFTER_CAA0114}

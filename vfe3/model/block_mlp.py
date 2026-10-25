@@ -1943,6 +1943,9 @@ class PrototypeAgentBlockMLP(nn.Module):
         }
 
 
+REGIME_TRANSITIONS: Tuple[str, ...] = ("off", "sticky", "learned")
+
+
 class CueResultMemoryBlockMLP(nn.Module):
     r"""Block as exact conditioning of a cue/result component model (``block_mlp_mode='cue_result_memory'``).
 
@@ -1972,6 +1975,24 @@ class CueResultMemoryBlockMLP(nn.Module):
     :math:`0.01/\sqrt K`, so :math:`F_a = I` with nonzero initial gradients for both factors. ``log_lambda``, ``log_pi``
     and ``log_result_noise`` train without weight decay (:func:`vfe3.train.build_optimizer`); decay on the regression
     parameters pulls :math:`F_a` toward the identity.
+
+    Regime belief through depth (``regime_transition`` 'sticky' or 'learned'; tied banks only). With the previous
+    layer's component posterior :math:`w^\ell_i` handed in through ``regime_state['previous']``, layer :math:`\ell+1` uses
+    the per-token prior
+
+    .. math::
+        \hat\pi^{\ell+1}_{ib} \propto \hat\pi_b\bigl(\textstyle\sum_aw^\ell_{ia}T_{ab}\bigr)^\beta,
+
+    the posterior of the reference prior :math:`\hat\pi` after a Dirichlet record of the predicted regime law
+    :math:`\tilde s = w^\ell T`: a record :math:`o\sim\operatorname{Dir}(\alpha\mathbf 1 + \beta e_b)` has a normalizer independent of
+    :math:`b`, so its likelihood at :math:`o = \tilde s` is :math:`\propto\tilde s_b^\beta`. :math:`\beta` (``regime_beta``) is the declared
+    trust in the carried belief; :math:`\beta = 0` recovers the shared prior. The record is the network's own earlier
+    belief, so it is not independent of the current cue record; :math:`\beta < 1` tempers that reuse but is not derived to
+    correct it. 'sticky' is :math:`T = sI + (1 - s)\mathbf 1\hat\pi^\top` with a learned stay probability
+    :math:`s = \sigma(\texttt{regime\_stay\_logit})`, initialized at ``regime_stay``, and needs no :math:`M\times M` tensor; 'learned'
+    is a row-softmax :math:`T = \operatorname{softmax}(\texttt{regime\_transition\_logits})` initialized at
+    :math:`sI + (1 - s)\mathbf 1\mathbf 1^\top/M`. Both train without weight decay. The layer writes its posterior log weights to
+    ``regime_state['current']``; the stack promotes them. Layer 0 (no ``'previous'``) uses :math:`\hat\pi`.
     """
 
     covariance_contract = "posterior"
@@ -1987,10 +2008,21 @@ class CueResultMemoryBlockMLP(nn.Module):
         template_init_variance: float = 10.0,
         regression_rank: Optional[int] = None,
         result_noise_ratio: float = 0.01,
+        regime_transition: str = "off",
+        regime_beta: float = 1.0,
+        regime_stay: float = 0.9,
     ) -> None:
         super().__init__()
         if covariance_contract != "posterior":
             raise ValueError(f"cue_result_memory supports only covariance_contract='posterior', got {covariance_contract!r}")
+        if regime_transition not in REGIME_TRANSITIONS:
+            raise ValueError(f"regime_transition must be one of {REGIME_TRANSITIONS}, got {regime_transition!r}")
+        if (isinstance(regime_beta, bool) or not isinstance(regime_beta, (int, float))
+                or not math.isfinite(float(regime_beta)) or float(regime_beta) < 0.0):
+            raise ValueError(f"regime_beta must be a finite real value >= 0, got {regime_beta!r}")
+        if (isinstance(regime_stay, bool) or not isinstance(regime_stay, (int, float))
+                or not 0.0 < float(regime_stay) < 1.0):
+            raise ValueError(f"regime_stay must be a real value in (0, 1), got {regime_stay!r}")
         if inference != "exact":
             raise ValueError(f"cue_result_memory supports only inference='exact', got {inference!r}")
         if float(dropout) != 0.0:
@@ -2020,10 +2052,33 @@ class CueResultMemoryBlockMLP(nn.Module):
             self.regression_left = nn.Parameter(torch.zeros(M, K, regression_rank))                 # (M, K, r) U_a
             self.regression_right = nn.Parameter(
                 torch.randn(M, K, regression_rank) * (0.01 / math.sqrt(K)))                         # (M, K, r) V_a
+        self.regime_transition = regime_transition
+        self.regime_beta = float(regime_beta)
+        s = float(regime_stay)
+        if regime_transition == "sticky":
+            self.regime_stay_logit = nn.Parameter(torch.tensor(math.log(s / (1.0 - s))))           # () logit of s
+        elif regime_transition == "learned":
+            target = torch.full((M, M), (1.0 - s) / M) + s * torch.eye(M)                          # sI + (1-s)/M
+            self.regime_transition_logits = nn.Parameter(target.log())                              # (M, M) rows -> T
 
     def undecayed_parameters(self) -> Tuple[nn.Parameter, ...]:
-        r"""Log variances and log weights: decay would pull them toward 1 and uniform, a prior, not a penalty."""
-        return (self.log_lambda, self.log_pi, self.log_result_noise)
+        r"""Log variances, log weights and regime-transition logits: decay would pull them toward 1, uniform or a
+        stay probability of 1/2, a prior, not a penalty."""
+        regime = ((self.regime_stay_logit,) if self.regime_transition == "sticky"
+                  else (self.regime_transition_logits,) if self.regime_transition == "learned" else ())
+        return (self.log_lambda, self.log_pi, self.log_result_noise, *regime)
+
+    def regime_log_prior(self, previous: torch.Tensor) -> torch.Tensor:          # (..., M) log w^l -> (..., M)
+        r""":math:`\log\hat\pi_b + \beta\log(w^\ell T)_b`, the next layer's unnormalized per-token log prior."""
+        log_pi_hat = torch.log_softmax(self.log_pi, dim=-1)                        # (M,)
+        w = previous.exp()                                                         # (..., M) w^l
+        if self.regime_transition == "sticky":
+            s = torch.sigmoid(self.regime_stay_logit)
+            predicted = s * w + (1.0 - s) * log_pi_hat.exp()                       # w (sI + (1-s) 1 pi^T)
+        else:
+            T = torch.softmax(self.regime_transition_logits, dim=-1)               # (M, M) row-stochastic
+            predicted = w @ T.to(w.dtype)
+        return log_pi_hat.to(predicted.dtype) + self.regime_beta * predicted.clamp_min(torch.finfo(predicted.dtype).tiny).log()
 
     def _regression(self) -> Dict[str, torch.Tensor]:
         if self.regression_rank is None:
@@ -2034,13 +2089,15 @@ class CueResultMemoryBlockMLP(nn.Module):
         self,
         mu:    torch.Tensor,                          # (..., K) record values (reference working means)
         sigma: torch.Tensor,                          # (..., K, K) dense record covariance, or (..., K) variances
+        log_prior: Optional[torch.Tensor] = None,     # (..., M) per-token log prior (None: the shared log_pi)
     ) -> CueResultPosterior:
         r"""The exact result posterior at the working belief: dense
         (:func:`vfe3.model.cue_result_memory.cue_result_exact_posterior`) or, for (..., K) variances, diagonal
         (:func:`vfe3.model.cue_result_memory.cue_result_diagonal_posterior`)."""
         kernel = cue_result_diagonal_posterior if sigma.dim() == mu.dim() else cue_result_exact_posterior
         return kernel(mu, sigma, self.nu, self.omega, self.log_lambda, self.log_result_noise,
-                      self.log_pi, tile_bytes=self.tile_bytes, **self._regression())
+                      self.log_pi if log_prior is None else log_prior, tile_bytes=self.tile_bytes,
+                      **self._regression())
 
     @torch.no_grad()
     def calibrate_templates(
@@ -2076,8 +2133,10 @@ class CueResultMemoryBlockMLP(nn.Module):
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,
         em_rows: Optional[list[torch.Tensor]] = None,
+        regime_state: Optional[dict] = None,          # regime_transition != 'off': {'previous': (..., M) log w^l}
     ) -> BlockMLPMomentResult:
-        r""":math:`(\xi, C) \mapsto` the result posterior moments :math:`(\bar m_Y, \bar P_Y)`."""
+        r""":math:`(\xi, C) \mapsto` the result posterior moments :math:`(\bar m_Y, \bar P_Y)`; with ``regime_state`` the
+        prior is carried from ``regime_state['previous']`` and this layer's log weights go to ``regime_state['current']``."""
         del frame_context
         _reject_hidden_bias(hidden_bias, "the cue_result_memory block conditions on components and has no fc1 hidden layer")
         if em_rows is not None:
@@ -2085,7 +2144,14 @@ class CueResultMemoryBlockMLP(nn.Module):
         if sigma.dim() not in (mu.dim(), mu.dim() + 1):
             raise ValueError("cue_result_memory reads a dense (..., K, K) covariance (gaussian_full) or (..., K) reference "
                              f"variances (gaussian_frame_diagonal); got sigma {tuple(sigma.shape)} for mu {tuple(mu.shape)}")
-        result = self.posterior(mu, sigma)
+        log_prior = None
+        if regime_state is not None and self.regime_transition != "off":
+            previous = regime_state.get("previous")
+            if previous is not None:
+                log_prior = self.regime_log_prior(previous)
+        result = self.posterior(mu, sigma, log_prior)
+        if regime_state is not None and self.regime_transition != "off":
+            regime_state["current"] = result.log_weights
         return BlockMLPMomentResult(result.mean.to(mu.dtype), result.covariance.to(sigma.dtype), None)
 
     def forward(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -2122,7 +2188,7 @@ class BlockMLPRegistration:
     factory_options: frozenset[str] = frozenset()
     # (width, expansion, regression_rank) -> per-layer count, for modes whose count depends on the regression rank
     # (cue_result_memory); takes precedence over parameter_count_per_layer.
-    rank_parameter_count_per_layer: Optional[Callable[[int, int, Optional[int]], int]] = None
+    rank_parameter_count_per_layer: Optional[Callable[[int, int, Optional[int], str], int]] = None
 
     def parameter_count(
         self,
@@ -2132,10 +2198,12 @@ class BlockMLPRegistration:
         expansion: int,
         n_layers: int = 1,
         regression_rank: Optional[int] = None,
+        regime_transition: str = "off",
     ) -> int:
         width = self.width(embed_dim, irrep_dims)
         if self.rank_parameter_count_per_layer is not None:
-            return int(n_layers) * self.rank_parameter_count_per_layer(width, expansion, regression_rank)
+            return int(n_layers) * self.rank_parameter_count_per_layer(width, expansion, regression_rank,
+                                                                       regime_transition)
         if self.parameter_count_per_layer is not None:
             return int(n_layers) * self.parameter_count_per_layer(width, expansion)
         per_layer = 2 * expansion * width * width + (expansion + 1) * width
@@ -2211,10 +2279,12 @@ def _cue_result_memory_factory(**kwargs) -> nn.Module:
     return CueResultMemoryBlockMLP(**kwargs)
 
 
-def _cue_result_parameter_count(width: int, expansion: int, regression_rank: Optional[int]) -> int:
+def _cue_result_parameter_count(width: int, expansion: int, regression_rank: Optional[int],
+                                regime_transition: str = "off") -> int:
     M = expansion * width
     regression = M * width * width if regression_rank is None else 2 * M * width * int(regression_rank)
-    return 4 * M * width + M + regression          # nu, log_lambda, omega, log_result_noise; log_pi; F_a
+    regime = {"off": 0, "sticky": 1, "learned": M * M}[regime_transition]
+    return 4 * M * width + M + regression + regime  # nu, log_lambda, omega, log_result_noise; log_pi; F_a; T
 
 
 def _coordinate_report_label(covariance: str) -> str:
@@ -2319,7 +2389,8 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         extra_flops_per_layer=lambda _embed_dim, _irrep_dims: 0.0,
         report_label=lambda _covariance: "cue_result_memory_posterior_covariance_nonintertwiner",
         matmul_flops_per_layer=lambda width, expansion: (25.0 / 3.0) * expansion * width ** 4,
-        factory_options=frozenset({"inference", "template_init_variance", "regression_rank", "result_noise_ratio"}),
+        factory_options=frozenset({"inference", "template_init_variance", "regression_rank", "result_noise_ratio",
+                                   "regime_transition", "regime_beta", "regime_stay"}),
         rank_parameter_count_per_layer=_cue_result_parameter_count,
     ),
 })
@@ -2349,6 +2420,7 @@ def block_mlp_build_metadata(
     covariance_layout: str = "full",
     regression_rank: Optional[int] = None,
     tied_layers: bool = False,
+    regime_transition: str = "off",
 ) -> BlockMLPBuildMetadata:
     r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs,
     ``regression_rank`` the cue_result_memory parameter count (other modes ignore it), and ``tied_layers`` (one
@@ -2363,6 +2435,7 @@ def block_mlp_build_metadata(
         expansion=expansion,
         n_layers=1 if tied_layers else n_layers,
         regression_rank=regression_rank,
+        regime_transition=regime_transition,
     )
     realized_flops_per_token = registration.flops_per_token(
         embed_dim=embed_dim,
@@ -2411,14 +2484,18 @@ def build_block_mlp(
     cavi_steps: int = 1,
     regression_rank: Optional[int] = None,
     result_noise_ratio: float = 0.01,
+    regime_transition: str = "off",
+    regime_beta: float = 1.0,
+    regime_stay: float = 0.9,
 ) -> nn.Module:
-    r"""Build one block MLP; ``inference``, ``template_init_variance``, ``cavi_steps``, ``regression_rank`` and
-    ``result_noise_ratio`` reach only the modes that read them."""
+    r"""Build one block MLP; ``inference``, ``template_init_variance``, ``cavi_steps`` and the cue/result options
+    (``regression_rank``, ``result_noise_ratio``, ``regime_*``) reach only the modes that read them."""
     registration = get_block_mlp_registration(mode)
     if covariance_contract not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
     options = {"inference": inference, "template_init_variance": template_init_variance, "cavi_steps": cavi_steps,
-               "regression_rank": regression_rank, "result_noise_ratio": result_noise_ratio}
+               "regression_rank": regression_rank, "result_noise_ratio": result_noise_ratio,
+               "regime_transition": regime_transition, "regime_beta": regime_beta, "regime_stay": regime_stay}
     return registration.factory(
         embed_dim=embed_dim,
         irrep_dims=irrep_dims,
