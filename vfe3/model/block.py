@@ -79,6 +79,7 @@ def vfe_block(
     relational_capture: Optional[dict] = None,
     hidden_bias:     Optional[torch.Tensor]                  = None,      # (B, N, w) per-type hidden bias (None -> off)
     link_state:      Optional[dict]                          = None,      # content_link_loop_weight > 0: cross-layer link state
+    regime_state:    Optional[dict]                          = None,      # cue/result regime belief carried through depth
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -154,7 +155,7 @@ def vfe_block(
             norm_covariance=norm_covariance if push_norm else "pushforward",
             trace_cap=cfg.block_norm_trace_cap,
             cap_moment_fallback=cfg.block_norm_cap_moment_fallback,
-            frame_diagonal=frame_diagonal)
+            frame_diagonal=frame_diagonal, regime_state=regime_state)
     # gaussian_frame_diagonal in local coordinates: a covariance pushforward (the LayerNorm's or a delta_full MLP's)
     # acts on the local Sigma_i = U_i diag(c_i) U_i^T, and its result S is read back as the family's M-projection
     # c_i' = diag(U_i^{-1} S U_i^{-T}); a passthrough covariance keeps c_i exactly (_frame_diagonal_local_block).
@@ -374,6 +375,7 @@ def _reference_coordinate_block(
     trace_cap:   bool = True,                              # block_norm_trace_cap
     cap_moment_fallback: bool = False,                     # block_norm_cap_moment_fallback
     frame_diagonal: bool = False,                          # gaussian_frame_diagonal: out.sigma holds c_i
+    regime_state: Optional[dict] = None,                   # cue/result regime belief carried through depth
 ) -> BeliefState:
     r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
 
@@ -468,6 +470,8 @@ def _reference_coordinate_block(
                              input_radial=radial, input_cap=cap)
             if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
                 extra["em_rows"] = capture["block_mlp_em_rows"]      # the templates read (xi, diag C)
+            if regime_state is not None:
+                extra["regime_state"] = regime_state
             with context:
                 result = block_mlp.forward_moments(xi, c, **extra)
             xi = result.mu                                                   # passthrough: covariance kept

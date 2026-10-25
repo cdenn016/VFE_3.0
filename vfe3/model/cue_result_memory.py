@@ -108,8 +108,8 @@ def _check_inputs(
     for name, t in (("nu", nu), ("omega", omega), ("log_lambda", log_lambda), ("log_result_noise", log_result_noise)):
         if t.shape != (M, K):
             raise ValueError(f"{name} must have shape ({M}, {K}), got {tuple(t.shape)}")
-    if log_pi.shape != (M,):
-        raise ValueError(f"log_pi must have shape ({M},), got {tuple(log_pi.shape)}")
+    if log_pi.shape != (M,) and log_pi.shape != (*xi.shape[:-1], M):
+        raise ValueError(f"log_pi must have shape ({M},) or, per token, {(*xi.shape[:-1], M)}; got {tuple(log_pi.shape)}")
     dense = regression_offset is not None
     low_rank = regression_left is not None or regression_right is not None
     if dense == low_rank:
@@ -160,7 +160,7 @@ def _chunk_moments(
     omega: torch.Tensor,                        # (m, K)
     lam: torch.Tensor,                          # (m, K) cue variances
     q: torch.Tensor,                            # (m, K) result noise variances
-    log_pi_hat: torch.Tensor,                   # (m,) normalized log prior
+    log_pi_hat: torch.Tensor,                   # (m,) or (T, m) normalized log prior
     offset: Optional[torch.Tensor],
     left: Optional[torch.Tensor],
     right: Optional[torch.Tensor],
@@ -213,7 +213,7 @@ def cue_result_exact_posterior(
     omega:             torch.Tensor,            # (M, K) result means
     log_lambda:        torch.Tensor,            # (M, K) cue log variances
     log_result_noise:  torch.Tensor,            # (M, K) result-noise log variances
-    log_pi:            torch.Tensor,            # (M,) unnormalized log prior weights
+    log_pi:            torch.Tensor,            # (M,) or (..., M) per token: unnormalized log prior weights
     *,
     regression_offset: Optional[torch.Tensor] = None,   # (M, K, K) D_a, F_a = I + D_a
     regression_left:   Optional[torch.Tensor] = None,   # (M, K, r) U_a
@@ -221,7 +221,8 @@ def cue_result_exact_posterior(
     tile_bytes:        int = CUE_RESULT_TILE_BYTES,
 ) -> CueResultPosterior:
     r"""The moments of :math:`p(Y\mid O=\xi, C)` for the model in the module docstring, with the component log
-    weights and :math:`\log p(\xi\mid C) = \log\sum_a\hat\pi_a\mathcal N(\xi;\nu_a, L_a + C)`."""
+    weights and :math:`\log p(\xi\mid C) = \log\sum_a\hat\pi_a\mathcal N(\xi;\nu_a, L_a + C)`. A ``log_pi`` of
+    shape (..., M) gives every token its own prior :math:`\hat\pi_i = \operatorname{softmax}(\log\pi_i)`."""
     _check_inputs(xi, C, nu, omega, log_lambda, log_result_noise, log_pi,
                   regression_offset, regression_left, regression_right)
     batch, K, M = xi.shape[:-1], xi.shape[-1], nu.shape[0]
@@ -236,6 +237,8 @@ def cue_result_exact_posterior(
         nu_c, omega_c = cast(nu), cast(omega)
         lam, q = log_lambda.to(dtype).exp(), log_result_noise.to(dtype).exp()
         log_pi_hat = torch.log_softmax(log_pi.to(dtype), dim=-1)
+        if log_pi_hat.dim() > 1:
+            log_pi_hat = log_pi_hat.reshape(-1, M)                                       # (T, M) per token
         offset, left, right = (cast(t) for t in reg)
         T = xi_f.shape[0]
         per_component = max(1, T) * K * K * torch.finfo(dtype).bits // 8 * 6             # ~6 (T, K, K) tensors live
@@ -245,7 +248,7 @@ def cue_result_exact_posterior(
         for start in range(0, M, chunk):
             sl = slice(start, min(M, start + chunk))
             log_w, log_mass, mean, cov = _chunk_moments(
-                xi_f, C_f, nu_c[sl], omega_c[sl], lam[sl], q[sl], log_pi_hat[sl],
+                xi_f, C_f, nu_c[sl], omega_c[sl], lam[sl], q[sl], log_pi_hat[..., sl],
                 None if offset is None else offset[sl], None if left is None else left[sl],
                 None if right is None else right[sl])
             log_ws.append(log_w)
@@ -265,7 +268,7 @@ def _diagonal_tile(
     omega:      torch.Tensor,                   # (m, K)
     lam:        torch.Tensor,                   # (m, K) cue variances
     q:          torch.Tensor,                   # (m, K) result noise variances
-    log_pi_hat: torch.Tensor,                   # (m,) normalized log prior
+    log_pi_hat: torch.Tensor,                   # (m,) or (r, m) normalized log prior
     offset:     Optional[torch.Tensor],         # (m, K, K) D_a
     left:       Optional[torch.Tensor],         # (m, K, rank) U_a
     right:      Optional[torch.Tensor],         # (m, K, rank) V_a
@@ -317,7 +320,7 @@ def cue_result_diagonal_posterior(
     omega:             torch.Tensor,            # (M, K) result means
     log_lambda:        torch.Tensor,            # (M, K) cue log variances
     log_result_noise:  torch.Tensor,            # (M, K) result-noise log variances
-    log_pi:            torch.Tensor,            # (M,) unnormalized log prior weights
+    log_pi:            torch.Tensor,            # (M,) or (..., M) per token: unnormalized log prior weights
     *,
     regression_offset: Optional[torch.Tensor] = None,   # (M, K, K) D_a, F_a = I + D_a
     regression_left:   Optional[torch.Tensor] = None,   # (M, K, r) U_a
@@ -341,6 +344,9 @@ def cue_result_diagonal_posterior(
         nu_c, omega_c = cast(nu), cast(omega)
         lam, q = log_lambda.to(dtype).exp(), log_result_noise.to(dtype).exp()
         log_pi_hat = torch.log_softmax(log_pi.to(dtype), dim=-1)
+        per_token = log_pi_hat.dim() > 1
+        if per_token:
+            log_pi_hat = log_pi_hat.reshape(rows, M)                                     # (R, M) per token
         offset, left, right = (cast(t) for t in reg)
         rank = 0 if left is None else left.shape[-1]
         # About eight (r, m, K) tensors per tile, plus (r, m, K, K)-sized work for a dense F or (r, m, rank^2).
@@ -356,7 +362,8 @@ def cue_result_diagonal_posterior(
             chunks = []
             for j in range(0, M, m_step):
                 sl = slice(j, j + m_step)
-                args = (x[i:i + r_step], cv[i:i + r_step], nu_c[sl], omega_c[sl], lam[sl], q[sl], log_pi_hat[sl],
+                prior = log_pi_hat[i:i + r_step, sl] if per_token else log_pi_hat[sl]
+                args = (x[i:i + r_step], cv[i:i + r_step], nu_c[sl], omega_c[sl], lam[sl], q[sl], prior,
                         None if offset is None else offset[sl], None if left is None else left[sl],
                         None if right is None else right[sl])
                 if tiled and grad and any(t is not None and t.requires_grad for t in args):

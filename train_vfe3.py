@@ -104,6 +104,16 @@ RUN_ROOT = "vfe3_runs"
 # in the run's config.md. False: the config exactly as written.
 fully_gauge_covariant = False
 
+# True: run the principled exact route (vfe3.exact_route). At launch the keys the route fixes are overridden: exact
+# minimal-agent attention with its posterior covariance; the exact cue/result memory in reference coordinates with no
+# block norm, one bank tied across depth and the regime belief carried through it ('sticky' unless 'learned' is
+# chosen); the covariant diagonal family gaussian_frame_diagonal with the diagonal_chunked decoder at decode_tau=1 and
+# an untied bank; and everything fully_gauge_covariant overrides on top of that. The run is refused unless every
+# requirement holds. The memory's regression rank and result noise, the regime beta and stay, routing prior, floors,
+# learning rates, shape and numerics are not touched. The overrides are logged and listed in config.md.
+# Implies fully_gauge_covariant. False: the config exactly as written.
+principled_exact_route = False
+
 config = dict(
        
     #################################
@@ -201,8 +211,11 @@ config = dict(
     block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
     block_mlp_em_weight              = 0.0,            # prototype_agents only: EM M-step term on the templates (nu, lambda, pi); 0 = off
-    block_memory_regression_rank     = None,           # cue_result_memory only: None (dense F_a = I + D_a) | int r in [1, K] (F_a = I + U_a V_a^T)
+    block_memory_regression_rank     = 2,              # cue_result_memory only: None (dense F_a = I + D_a; M K^2 per bank, ~10x slower) | int r in [1, K] (F_a = I + U_a V_a^T; 2 is the smallest rank that rotates or reverses a plane)
     block_memory_result_noise_ratio  = 0.01,           # cue_result_memory only: initial result noise Q_a / L_a > 0
+    block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
+    block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
+    block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 
@@ -571,12 +584,23 @@ def _run_once(
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
     overrides = {}
-    if fully_gauge_covariant:
+    if principled_exact_route:
+        from vfe3.exact_route import (describe_principled_exact_route_overrides, principled_exact_route_failures,
+                                      principled_exact_route_overrides)
+        overrides = principled_exact_route_overrides(config)
+    elif fully_gauge_covariant:
         from vfe3.gauge_covariant import (describe_fully_gauge_covariant_overrides, fully_gauge_covariant_overrides,
                                           gauge_covariance_failures)
         overrides = fully_gauge_covariant_overrides(config)
     cfg = VFE3Config(**{**config, **overrides, "seed": seed})   # the run's seed, from SEEDS
-    if fully_gauge_covariant:
+    if principled_exact_route:
+        failures = principled_exact_route_failures(cfg)
+        if failures:
+            raise ValueError(f"principled_exact_route=True left these requirements unmet: {failures}")
+        logger.info("principled_exact_route=True: overriding %s",
+                    describe_principled_exact_route_overrides(config, overrides)
+                    or "nothing (the config is already on the exact route)")
+    elif fully_gauge_covariant:
         failures = gauge_covariance_failures(cfg)
         if failures:
             raise ValueError(f"fully_gauge_covariant=True left these gauge flags false: {failures}")
@@ -622,8 +646,9 @@ def _run_once(
             from vfe3.config_markdown import write_config_markdown
             write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
                                   header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg),
-                                          "fully_gauge_covariant": fully_gauge_covariant,
-                                          "fully_gauge_covariant overrides": overrides})
+                                          "principled_exact_route": principled_exact_route,
+                                          "fully_gauge_covariant": fully_gauge_covariant or principled_exact_route,
+                                          "launch overrides": overrides})
         except Exception as exc:
             logger.warning("config.md was not written (%s: %s); the run continues", type(exc).__name__, exc)
         logger.info("Saving run artifacts to %s", run_dir)

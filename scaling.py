@@ -660,6 +660,7 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
             expansion=int(cfg.block_mlp_expansion),
             n_layers=1 if getattr(cfg, "block_mlp_tie_layers", False) else int(cfg.n_layers),   # tied: counted once
             regression_rank=getattr(cfg, "block_memory_regression_rank", None),    # cue_result_memory only
+            regime_transition=getattr(cfg, "block_memory_regime_transition", "off"),   # cue_result_memory only
         )
     if cfg.layernorm_affine and cfg.norm_type_block == "layernorm":
         n += 2 * K

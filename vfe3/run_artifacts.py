@@ -3973,6 +3973,7 @@ def _cost_model_fields(
                                else "diagonal"),                                   # head blocks: dense storage
             regression_rank=getattr(cfg, "block_memory_regression_rank", None),    # cue_result_memory only
             tied_layers=bool(getattr(cfg, "block_mlp_tie_layers", False)),         # shared module counted once
+            regime_transition=getattr(cfg, "block_memory_regime_transition", "off"),   # cue_result_memory only
         )
     )
     block_mlp_active = block_mlp_build.enabled
