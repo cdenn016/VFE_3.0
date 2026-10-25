@@ -2679,6 +2679,7 @@ def load_checkpoint(
     expected_selection_data_identity: Optional[Mapping[str, object]] = None,
     expected_steps_per_epoch: Optional[int]                  = None,
     weight_ema:           Optional[Any]                      = None,
+    divergence_state:     Optional[Dict[str, object]]        = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -2710,6 +2711,10 @@ def load_checkpoint(
     it before any mutable state is restored and then loaded, so a resumed run continues the shadow; a bundle without
     the key (older, or written with the EMA off) leaves it unstarted, and a record with no ``weight_ema`` to receive
     it is dropped with a warning. The retired ``"ema_state"`` key is still refused.
+    When a mutable ``divergence_state`` mapping is supplied, it is cleared and filled with the bundle's validated
+    divergence-monitor record (loss EMA and warmup, skip counters and failed-step budget), independently of
+    ``artifacts``, so an output-disabled resume continues the same update-acceptance policy (audit 2026-10-25 F06);
+    it stays empty for an older bundle without the record or a malformed one.
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -2983,6 +2988,13 @@ def load_checkpoint(
             if saved_data_state.get("window_offset") is not None:
                 data_state["window_offset"] = _require_nonnegative_int(
                     saved_data_state["window_offset"], "window_offset")
+    # Divergence-monitor state (None for an older checkpoint or a malformed record). It controls which updates
+    # train() accepts, so it is returned whether or not output persistence is enabled (audit 2026-10-25 F06).
+    saved_divergence_state = _checkpoint_divergence_state(ckpt.get("divergence_monitor"))
+    if divergence_state is not None:
+        divergence_state.clear()
+        if saved_divergence_state is not None:
+            divergence_state.update(saved_divergence_state)
     if artifacts is not None:
         # Cumulative S1 panel D frame-projection counts (None for an older checkpoint); train()
         # continues counting from them so a resumed run's columns stay cumulative since step 0.
@@ -2992,8 +3004,8 @@ def load_checkpoint(
         artifacts.resumed_wall_clock_s = (
             float(saved_wall_clock) if isinstance(saved_wall_clock, (int, float))
             and not isinstance(saved_wall_clock, bool) and math.isfinite(saved_wall_clock) else None)
-        # Divergence-monitor state (None for an older checkpoint or a malformed record); train() continues it.
-        artifacts.resumed_divergence_state = _checkpoint_divergence_state(ckpt.get("divergence_monitor"))
+        # Kept on the artifacts for library callers; train() reads the artifact-independent divergence_state.
+        artifacts.resumed_divergence_state = saved_divergence_state
         resolved_checkpoint = checkpoint_path.resolve()
         artifacts.resume_source = {
             # <run_dir>/checkpoints/step_<N>.pt; None for a checkpoint kept outside a run directory.
@@ -5147,8 +5159,11 @@ def finalize_validation_run(
 
     Returns the ablation merge mapping with both ``final_val_bits_per_token`` and nullable
     ``final_val_bpc`` alongside the validation/selection/checkpoint fields.
-    ``primary_val_ppl`` is the minimum of the finite run-wide best and the final validation PPL (or the
-    final value when no earlier best exists); after ``maybe_save_best`` it equals the selected finite best.
+    ``primary_val_ppl`` is the selected finite best after ``maybe_save_best``, so it always describes the
+    published ``best_val_ppl``/``best_step``/``best_model.pt``. When the terminal PPL improves on an earlier best
+    but its publication is blocked (a persistent Windows lock), the earlier selection is retained and stays
+    primary; ``terminal_selection_published`` is then False and ``unpublished_terminal_val_ppl`` records the better
+    terminal score, whose weights remain only in the terminal checkpoint (audit 2026-10-25 F07).
     """
     from vfe3.train import (                                     # local import avoids an import cycle
         _loader_data_identity,
@@ -5230,12 +5245,11 @@ def finalize_validation_run(
                 field: float("nan")
                 for field in established_fields
             } | terminal_validation_fields
-        # Run-wide best BEFORE the terminal save: primary is the better of the finite periodic best and
-        # the final validation, so after maybe_save_best it equals the selected finite best.
+        # Run-wide best BEFORE the terminal save, to detect a terminal improvement whose publication fails.
         prior_best = artifacts.best_val_ppl
         if not reuse_loop_validation:
             artifacts.log_metrics(terminal_row)
-        artifacts.maybe_save_best(completed_step, model, final_ppl)
+        terminal_published = artifacts.maybe_save_best(completed_step, model, final_ppl)
         # After the terminal save the selection is live and MUST be reachable: maybe_save_best either
         # atomically replaced any stale file with the terminal weights (a recomputed cell) or left an
         # already-reachable earlier best (guarded above). Fail closed before publishing the success
@@ -5243,8 +5257,24 @@ def finalize_validation_run(
         if (not math.isfinite(float(artifacts.best_val_ppl))
                 or (artifacts.save_model_artifacts and not artifacts.best_path.is_file())):
             raise RuntimeError("finite best-model metadata has no reachable weights")
-        primary_val_ppl = (min(prior_best, final_ppl) if math.isfinite(prior_best) else final_ppl)
+        # Primary is the selected score itself, never a score whose weights were not published: on a blocked
+        # publication of an improving terminal score the retained earlier selection stays primary and the
+        # terminal score is recorded as unpublished (audit 2026-10-25 F07).
+        primary_val_ppl = float(artifacts.best_val_ppl)
         best_val_ppl = (artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None)
+        terminal_improved = bool(final_ppl < prior_best)
+        terminal_selection_published = bool(not terminal_improved or terminal_published)
+        unpublished_terminal_val_ppl = (None if terminal_selection_published else final_ppl)
+        if not terminal_selection_published:
+            logger.warning(
+                "terminal validation PPL %.4f improves on the selected best %.4f (step %s), but its "
+                "best_model.pt publication failed; the earlier selection stays primary and the terminal "
+                "weights remain only in the terminal checkpoint",
+                final_ppl, primary_val_ppl, artifacts.best_step)
+        selection_fields = {
+            "terminal_selection_published": terminal_selection_published,
+            "unpublished_terminal_val_ppl": unpublished_terminal_val_ppl,
+        }
 
         artifacts.save_json("validation_results.json", {
             "selection_split": "validation",
@@ -5259,6 +5289,7 @@ def finalize_validation_run(
             "primary_val_ppl": float(primary_val_ppl),
             "best_val_ppl":    best_val_ppl,
             "best_step":       artifacts.best_step,
+            **selection_fields,
         })
 
         # Reproducibility provenance -- VALIDATION ONLY (test_loader=None): the ablation finalizer must
@@ -5325,6 +5356,7 @@ def finalize_validation_run(
         "val_excluded_targets": target_counts["excluded_targets"],
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
+        **selection_fields,
         "n_steps":             completed_step,
         # Realized-update counts and training-time diagnostic failures, as finalize_run publishes them
         # (train() sets both before the terminal callback; audit 2026-10-12 round 2, item 7).
@@ -5357,6 +5389,7 @@ def finalize_validation_run(
         "val_excluded_targets": target_counts["excluded_targets"],
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
+        **selection_fields,
         "final_train_loss":    final_train_loss,
         "n_params":            n_params,
         "terminal_checkpoint": terminal_checkpoint,
