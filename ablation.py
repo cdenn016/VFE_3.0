@@ -230,9 +230,10 @@ def _git_code_identity() -> Dict[str, object]:
 # DATA_SEED (EXP-1 variance floor), mirroring train_vfe3.DATA_SEED: when set to an int, the TRAIN
 # loader's shuffle order is fixed to this seed via an explicit generator, INDEPENDENT of the
 # per-cell model seed. None gives each cell its own order: the train generator is re-pinned to the
-# cell's cfg.seed in run_single, as train_vfe3 does. Keep this EQUAL to train_vfe3.DATA_SEED so the
-# two entry points train on the same batch order and reproduce each other under an identical config.
-DATA_SEED: Optional[int] = 3
+# cell's cfg.seed in run_single, as train_vfe3 does. The frame-capacity comparison uses None to pair
+# model and data-order seeds across arms while varying both across replicates. To reproduce a single
+# train_vfe3 run instead, match its DATA_SEED explicitly.
+DATA_SEED: Optional[int] = None
 
 # =============================================================================
 # CLICK-TO-RUN KNOBS  -- edit, then run.
@@ -248,7 +249,7 @@ CONFIG: Dict[str, Any] = {
     # One sweep name, or None -> every sweep in SWEEP_ORDER.
     # New attention suite: "new_attention_features" (3 arms x NEW_ATTENTION_SEEDS).
     # Smaller subset: "relational_features".
-    "sweep":       None,   #"new_attention_features" 3-arms; "relational_features" is the same subset
+    "sweep":       "frame_capacity",   # three arms x three paired model/data seeds; None uses SWEEP_ORDER
 
 
     # 'auto' picks CUDA when present (the RTX 5090), else CPU.
@@ -262,7 +263,7 @@ CONFIG: Dict[str, Any] = {
     "max_tokens":  None, #11684031,
 
     # Override every run's cosine horizon (None = use BASELINE_CONFIG['max_steps']).
-    "max_steps":   6000,
+    "max_steps":   None,
 
     # Optional absolute stopping step, capped at max_steps; None runs the full horizon.
     # Example: max_steps=15000, stop_after_steps=5000 keeps the 15000-step cosine.
@@ -345,13 +346,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     batch_size                       = 64,
     max_steps                        = 15000,
      
-    min_lr_frac                      = 0.01,        # float in [0, 1]: LR floor as a fraction of each group's base LR (0 = decay to 0)
-   
-    
+       
     n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
 
-    warmup_steps                     = 100,         # int >= 0: linear warmup steps before the cosine decay
+    warmup_steps                     = 250,         # int >= 0: linear warmup steps before the cosine decay
     #################################
     #         Misc/Logging
     #################################
@@ -359,6 +358,14 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     log_interval                     = 375001,       # console log every N steps (0 = off)
     eval_interval                    = 300000,      # periodic validation every N steps (0 = off)
     checkpoint_interval              = 150000,     # save a resumable checkpoint every N steps (0 = off)   
+    
+    checkpoint_keep_last             = 1,        # None (keep every checkpoint) | int >= 1 (keep the newest N)
+    checkpoint_at_end                = True,     # True | False (also save a resumable checkpoint after the last step)
+    block_variance_at_log            = True,     # True | False (also write diagnostics/block_variance.csv at log steps)
+       
+    loss_spike_skip_nats             = None,        # None (off) | float > 0 (reject an update whose loss exceeds the monitor's loss EMA by this many nats)
+    
+    kl_max                           = 128,
     
     #################################
     #           Modes               #
@@ -371,7 +378,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1        
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-    predictive_covariance            = 'moment_matched',        # "passthrough" 
+    predictive_covariance            = 'passthrough',        # "passthrough" 
                                                                 # "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) 
                                                                  # "spread_corrected" (minimal_agent mean_field: plus the label spread)
             
@@ -379,7 +386,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: kernel readout, temperature 1)
     relational_receiver_measurement  = "inverse",    # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
-    relational_receiver_update       = "closed_form",           # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step-projected_gradient only)
+    relational_receiver_update       = "closed_form",     # closed_form_profiled      # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step-projected_gradient only)
        
     predictive_readout               = "kernel",         # "kernel" | "minimal_agent" (projected_predictive only)
     minimal_agent_inference          = "mean_field",            # "exact" | "mean_field" (minimal_agent only)
@@ -399,35 +406,37 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
     decode_second_order              = False,         # linear decode, diagonal family, local coords: train on CE(mu) + 1/2 tr(Sigma Cov_p(w)); pushes Sigma to its floor, ablation arm first
     
-    attention_residual               = False,      #ignored with minimal_agent
+    attention_residual               = True,      #ignored with minimal_agent
     #################################
     #     Optional Block MLP        #
     #################################
     
     use_block_mlp                    = True,
+    block_mlp_tie_layers             = False,          # True | False: one block MLP shared by every layer (depth as time; labels persist across layers)
     per_type_hidden_bias             = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
      
     block_mlp_activation             = "gelu",         # "gelu" | "silu" | "relu" (not read by gaussian_template / prototype_agents)   
-    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
-    block_mlp_covariance             = "passthrough",   # "passthrough" | "posterior" (prototype_agents) | "delta_full" (block norm "none"/"layernorm", no post-norm)  | gaussian_template: "passthrough" only
+    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "cue_result_memory" (exact reference route; gaussian_full dense or gaussian_frame_diagonal elementwise) | "canonical_frame" | "gaussian_template" | "gauge_gate"
+    block_mlp_covariance             = "passthrough",   # "passthrough" | "posterior" (prototype_agents; required by cue_result_memory) | "delta_full" (block norm "none"/"layernorm", no post-norm)  | gaussian_template: "passthrough" only
     
       
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
     block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
+    block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
+    
     block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
     block_mlp_em_weight              = 0.0,            # prototype_agents only: EM M-step term on the templates (nu, lambda, pi); 0 = off
+    block_memory_regression_rank     = 2,              # cue_result_memory only: None (dense F_a = I + D_a; M K^2 per bank, ~10x slower) | int r in [1, K] (F_a = I + U_a V_a^T; 2 is the smallest rank that rotates or reverses a plane)
+    block_memory_result_noise_ratio  = 0.01,           # cue_result_memory only: initial result noise Q_a / L_a > 0
+    
+    block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
+    block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 
     block_mlp_template_init_pull     = 0.09,            # working_variance only: initial pull p in (0, 1)
     block_mlp_dropout                = 0.00,
     block_mlp_covariance_floor       = 1e-4,            # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
-    block_mlp_tie_layers             = False,          # True | False: one block MLP shared by every layer (depth as time; labels persist across layers)
-    block_memory_regression_rank     = 2,              # cue_result_memory only: None (dense F_a = I + D_a; M K^2 per bank, ~10x slower) | int r in [1, K] (F_a = I + U_a V_a^T)
-    block_memory_result_noise_ratio  = 0.01,           # cue_result_memory only: initial result noise Q_a / L_a > 0
-    block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
-    block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
-    block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     
   
     #################################
@@ -448,10 +457,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
        
     mu_init_std                      = 0.065,     # std of the random mean table mu_embed
     sigma_init                       = 15,         # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                        = 0.035,      # std
+    phi_scale                        = 0.001,      # std 0.001
     pos_phi_scale                    = 0.02,      # learned-table init scale AND frozen per-position step
     
-    decode_tau                       = 0.1,       # tau =1 principled bayes 0.01 works well for some reason
+    decode_tau                       = 0.1,       # tau =1 principled bayes 0.1 works well for some reason
     unigram_kappa                    = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
     decode_chunk_size                = 8192,
    
@@ -533,7 +542,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_phi_fisher_completion          = "rotation",  # fisher_group only: "rotation" (lambda on every rotation) | "stabilizer" (lambda on the belief's stabilizer only: the belief-Fisher natural gradient on the visible subspace; not with pos_phi="learned")
 
     m_table_update_mode              = "fisher",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
-    m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
+   
     m_table_fisher_trust_radius      = 0.5,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step to second order; decay outside)
     m_decode_update_mode             = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on the untied decode bank at m_table_fisher_lr / m_table_fisher_trust_radius; untie_decode_bank=True, prior-bank decode)
 
@@ -542,33 +551,34 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Learning Rates
     #################################
 
-    m_p_mu_lr                        = 0.005,     #0.025
+    m_p_mu_lr                        = 0.02,     #0.025
     m_p_sigma_lr                     = 0.001,       
-    m_phi_lr                         = 0.001,     #0.003
+    m_phi_lr                         = 0.002,     #0.003
     
+    m_table_fisher_lr                = 0.125,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
     
     #################################
     #      Other M-Step LR's
     #################################
+           
+    m_decode_mu_lr                   = 0.005,       
+    m_decode_sigma_lr                = 0.001,       
       
-    m_pos_phi_lr                     = 0.003,      #0.0025?
-     
-    m_decode_mu_lr                   = 0.005,       # 0.025?
-    m_decode_sigma_lr                = 0.001,       # 0.001
+    m_relational_score_lr            = 0.0075,        
+    m_relational_content_lr          = 0.001,      
       
-    m_relational_score_lr            = 0.01,        # 0.005 0.01
-    m_relational_content_lr          = 0.0025,      # 0.005   0.0025
-      
-    m_block_mlp_lr                   = 0.005,      #0.0075?
-    m_layernorm_lr                   = 0.005,      # 0.005
+    m_block_mlp_lr                   = 0.0025,      
+    m_layernorm_lr                   = 0.003,      
     
     m_per_type_hidden_bias_lr        = 0.0025,    
+    m_pos_phi_lr                     = 0.003,  
     
     #################################
     #        Weight Decays
     #################################
-    weight_decay                     = 0.01,
-    phi_weight_decay                 = 0.1,    
+    
+    weight_decay                     = 0.06,
+    phi_weight_decay                 = 0.2,    
     sigma_weight_decay               = 0,      
     mu_weight_decay                  = 0,       
 
@@ -639,59 +649,57 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 SWEEP_ORDER: List[str] = [
 
    
-   "m_phi_lr",
-   "m_p_mu_lr",  
-    "m_p_sigma_lr",
+   # "m_phi_lr",
+  # "m_p_mu_lr",  
+    #"m_p_sigma_lr",
        
-   "m_table_fisher_lr",
-    "m_decode_sigma_lr", 
-    "m_decode_mu_lr",
-   #"relational_key_noise",
-   #"m_table_fisher_trust_radius", 
+  # "m_table_fisher_lr",
    
+  #  "m_decode_sigma_lr", 
+  #  "m_decode_mu_lr",
    
     
-   "m_relational_score_lr", 
-   "m_relational_content_lr",
-    
-   
-    "m_block_mlp_lr",
-   
     "weight_decay",  
-   "phi_weight_decay",
+  # "m_relational_score_lr", 
+  # "m_relational_content_lr",
+   
+   # "m_layernorm_lr",
+   # "phi_weight_decay",
+ # "relational_score_weight_decay",
+  # "decode_mu_weight_decay", 
+  
   #  "mu_weight_decay",
   # "sigma_weight_decay",
-   #"decode_mu_weight_decay", 
-    
   
-    "decode_tau",
-   "m_layernorm_lr",
-    
-   
-    
-  "block_mlp_expansion",
-   
-   
-  
-  
-   
-   
-   #"unigram_kappa", 
-   
-   "phi_scale",   
-     "mu_init_std",
-    "sigma_init",
-  
-   # "m_relational_lr_tied",
-   
-  
-   
-   
+  # "block_mlp_expansion",
      
+      
+    # "phi_scale",   
+      
+   #  "mu_init_std",
+   # "sigma_init",
   
+  #  "decode_tau",
+   
     
+  #  "m_block_mlp_lr",
+   
+    
+ 
+ # "unigram_kappa", 
+   
+ # "warmup_steps", 
+ 
+   
+  
+   
+    
+ 
+  
+    #"relational_key_noise",
+   #"m_table_fisher_trust_radius",  
    # "predictive_covariance_floor",
-#"m_pos_phi_lr",
+   #"m_pos_phi_lr",
   
   # "block_mlp_em_weight",
    #"block_mlp_cavi_steps",
@@ -701,7 +709,7 @@ SWEEP_ORDER: List[str] = [
  #  "block_mlp_covariance_floor",
   #"minimal_agent_channel_noise",
   # "relational_key_noise",
-  # 
+   
   # "relational_receiver_noise",
   # "relational_receiver_damping",
    
@@ -714,55 +722,85 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
 
     
-
+#################################
+#         Main M-step
+#        Learning Rates
+#################################
     
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
         "param": "m_p_mu_lr", 
-        "values": [0.001, 0.005, 0.01],
+        "values": [0.01, 0.02, 0.025, 0.03],
         "scale": "linear",
         "requires": {"m_table_update_mode": "adamw"},   # under "fisher" the table steps at m_table_fisher_lr
     },
-    
-   "m_phi_lr": {
-        "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr",
-        "values": [0.0005, 0.00075, 0.00085, 0.001, 0.0025, 0.0035],
-        "scale": "linear",
-    },
-
    
-   "m_p_sigma_lr": {
+    "m_phi_lr": {
+            "description": "M-step LR for the gauge-frame parameters (phi)",
+            "param": "m_phi_lr",
+            "values": [0.0009, 0.001, 0.00125, 0.002, 0.003],
+            "scale": "linear",
+        },
+    
+    
+    "m_p_sigma_lr": {
        "description": "M-step LR for the prior-bank variances",
        "param": "m_p_sigma_lr", 
-       "values": [0.0005, 0.001, 0.005],
+       "values": [0.00025, 0.0005, 0.001, 0.0025],
        "scale": "linear",
        "requires": {"m_table_update_mode": "adamw"},   # under "fisher" the table steps at m_table_fisher_lr
    },
-
+    
+    
    "m_table_fisher_lr": {
        "description": "natural-gradient step size eta of the prior-bank tables (m_table_update_mode='fisher')",
        "param": "m_table_fisher_lr",
-       "values": [0.05, 0.1, 0.3,  0.5],
+       "values": [0.085, 0.1, 0.125, 0.15, 0.2 ],
        "scale": "log",
        "requires": {"m_table_update_mode": "fisher"},
    },
    
    
+   "m_relational_score_lr": {
+       "description": "M-step LR for independent relational Q/K score maps (0 freezes)",
+       "param": "m_relational_score_lr",
+       "values": [0.0025, 0.005, 0.0075, 0.01],
+       "scale": "linear",
+       "requires": {
+           "attention_mode": "projected_predictive",
+       },
+   },
+
+   "m_relational_content_lr": {
+       "description": "M-step LR for learned relational T/O content maps (0 freezes)",
+       "param": "m_relational_content_lr",
+       "values": [0.0005, 0.00075, 0.001, 0.0025],
+       "scale": "linear",
+       "requires": {
+           "attention_mode": "projected_predictive",
+       },
+   },
+   
   
+    
+#################################
+#         Other M-step
+#        Learning Rates
+################################# 
+   
 
    "m_decode_mu_lr": {
        "description": "M-step LR for untied decoder means or linear projection",
        "param": "m_decode_mu_lr",
-       "values": [0.0025, 0.005, 0.0075, 0.01],
+       "values": [0.0035, 0.005, 0.0065],
        "scale": "linear",
    },
    
    "m_decode_sigma_lr": {
        "description": "M-step LR for untied decoder log variances",
        "param": "m_decode_sigma_lr",
-       "values": [0.0005, 0.001, 0.002, 0.003, 0.004],
+       "values": [0.00085, 0.001, 0.0015],
        "scale": "linear",
        
    },
@@ -782,7 +820,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "M-step LR for the LayerNorm affine gamma/beta (the 0.009 arm is the "
                        "inherited m_p_mu_lr baseline)",
         "param": "m_layernorm_lr",
-        "values": [0, 0.0025, 0.005, 0.0075, 0.01],
+        "values": [0.001, 0.003],
         "scale": "linear",
         "requires": {"layernorm_affine": True, "norm_type_block": "layernorm"},
     },
@@ -791,38 +829,242 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    "m_block_mlp_lr": {
        "description": "M-step LR for the block MLP parameters",
        "param": "m_block_mlp_lr",
-       "values": [0.0025, 0.005, 0.0075, 0.01, 0.025, 0.05],  
+       "values": [0.002, 0.0025, 0.003],  
        "scale": "log",
        "requires": {"use_block_mlp": True},
    },
    
-   
-   
-   
-   
-   
-   
+
     
+   
+#################################
+#        Weight Decays
+#        
+#################################  
     
+  
     
-    "m_relational_score_lr": {
-        "description": "M-step LR for independent relational Q/K score maps (0 freezes)",
-        "param": "m_relational_score_lr",
-        "values": [0.005, 0.0075, 0.01, 0.02],
+    "weight_decay": {
+        "description": "AdamW weight decay",
+        "param": "weight_decay", 
+        "values": [0.075, 0.1],  
         "scale": "linear",
-        "requires": {
-            "attention_mode": "projected_predictive",
-        },
     },
 
-    "m_relational_content_lr": {
-        "description": "M-step LR for learned relational T/O content maps (0 freezes)",
-        "param": "m_relational_content_lr",
-        "values": [0.00075, 0.001,0.0025, 0.005],
+    "phi_weight_decay":{
+        "description": "weight decay on phi",
+        "param": "phi_weight_decay",  
+        "values": [0.025, 0.05, 0.1, 0.2, 0.3],  
         "scale": "linear",
-        "requires": {
-            "attention_mode": "projected_predictive",
         },
+
+
+    "mu_weight_decay": {
+        "description": "AdamW weight decay",
+        "param": "mu_weight_decay",  
+        "values": [0, 0.001, 0.005, 0.01, 0.025],  
+        "scale": "linear",
+    }, 
+    
+    
+    "sigma_weight_decay": {  
+        "description": "AdamW weight decay on the log-variance (sigma) tables",
+        "param": "sigma_weight_decay",  
+        "values": [0, 0.001, 0.005, 0.01, 0.025],  
+        "scale": "linear",
+    },
+    
+    "decode_mu_weight_decay": {  
+        "description": "AdamW weight decay on the decoder",
+        "param": "decode_mu_weight_decay",  
+        "values": [0, 0.001, 0.005, 0.01, 0.05, 0.1],  
+        "scale": "linear",
+    },
+    
+    "relational_score_weight_decay": {  
+        "description": "AdamW weight decay on the scores",
+        "param": "relational_score_weight_decay",  
+        "values": [0, 0.05, 0.1],  
+        "scale": "linear",
+    },
+    
+    
+#################################
+#        Initializations
+#        
+#################################    
+    
+    
+    "mu_init_std": {
+        "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
+        "param": "mu_init_std", 
+        "values": [0.001, 0.005, 0.01, 0.025, 0.05, 0.1],
+        "scale": "log",
+    },
+    
+    
+    "phi_scale": {
+        "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
+        "param": "phi_scale", 
+        "values": [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1],
+        "scale": "log",
+    },
+    
+    "sigma_init": {
+        "description": "constant initial coordinate variance of the prior table (>0)",
+        "param": "sigma_init", 
+        "values": [0.5, 1, 5, 10, 15],
+    },
+    
+    "pos_phi_scale": {
+        "description": "learned pos_phi table init scale",
+        "param": "pos_phi_scale", 
+        "values": [0.005, 0.01,  0.02, 0.04],
+        "scale": "log",
+        "requires": {"pos_phi": "learned"},
+    },    
+  
+
+     
+    
+#################################
+#        Temperatures
+#       
+#################################    
+    
+   
+    "decode_tau": {
+        "description": "KL-to-prior decode temperature",
+        "param": "decode_tau", "values": [0.005, 0.01, 0.05, 0.2, 0.5, 1],
+        "scale": "log",
+        
+    },
+    
+
+    "unigram_kappa": {
+       "description": "decode unigram prior temperature.",
+       "param": "unigram_kappa", "values": [0.25, 0.5, 1],
+    },
+      
+    
+    
+    "kappa_beta": {
+       "description": "attention temperature tau = kappa * sqrt(d_head)",
+       "param": "kappa_beta", "range": [0.25, 3, 0.25],
+    },
+    
+    
+    
+    
+    "rope_base": {
+        "description": "rope_base",
+        "param": "rope_base", 
+        "values": [50, 100, 500, 1000, 10000],
+        "scale": "log",
+    },    
+
+
+
+
+#################################
+#        Other Parameters
+#        
+#################################
+
+     "mstep_self_coupling_weight": {
+         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
+         "param": "mstep_self_coupling_weight", 
+         "log_range": [0.0001, 2, 20],
+         "scale": "log",
+     },
+
+
+     "lambda_beta": {
+         "description": "belief-coupling block weight (1.0 = pure F)",
+         "param": "lambda_beta", "range": [0.0, 5, 0.05],
+         # projected_predictive weights no coupling block in training; projected_gradient (kernel readout) does
+         "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel",
+                      "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
+     },
+
+
+
+
+      "rope_fraction": {
+         "description": "p-RoPE fraction of each head's planes rotated (fastest first); under comparison_invariant "
+                       "the unrotated coordinates keep their full comparison covariance",
+         "param": "rope_fraction",
+         "values": [0.4, 0.6, 0.8, 1.0],
+         "requires": {"rope_mode": "comparison_invariant", "predictive_readout": "kernel"},
+     },
+
+    
+    
+     "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
+         "description": "LR warmup steps before cosine decay",
+         "param": "warmup_steps", "values": [200, 250, 300],
+     },
+    
+    
+  
+    
+    
+    "block_mlp_expansion": {
+        "description": "block MLP hidden-width multiplier",
+        "param": "block_mlp_expansion",
+        "values": [6, 8, 10, 12, 16],
+        "requires": {"use_block_mlp": True},
+    },
+    
+    
+    "relational_key_noise": {
+        "description": "noisy_key routing: initial per-head key noise n_h (learned; temperature 1)",
+        "param": "relational_key_noise",
+        "values": [0.5, 1.0, 3.0, 10.0],
+        "scale": "log",
+        "requires": {"attention_mode": "projected_predictive", "predictive_readout": "kernel",
+                     "relational_routing": "noisy_key", "learn_attention_temperature": False},
+    },    
+    
+    
+    
+#################################
+#            Misc
+#        Less Important
+#################################  
+    
+    "e_q_mu_lr": {
+       "description": "E-step natural-gradient step size for mu_q",
+       "param": "e_q_mu_lr",
+       "range": [0.8, 1.1, 0.1],
+       "scale": "linear",
+       "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                   "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},   
+    },
+  
+    "e_q_sigma_lr": {
+       "description": "E-step retraction step size for sigma_q",
+       "param": "e_q_sigma_lr", "range": [0.0000, 0.1, 0.005],
+       "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                    "skip_belief_sigma_update": False, "lambda_alpha_mode": "state_dependent",
+                    "rope_mode": "frame"},
+    },
+    
+    
+
+    "block_mlp_activation": {
+        "description": "block MLP pointwise activation",
+        "param": "block_mlp_activation",
+        "values": ["gelu", "silu", "relu"],
+        "requires": {"use_block_mlp": True},
+    },
+
+    "block_mlp_dropout": {
+        "description": "block MLP residual-branch dropout probability",
+        "param": "block_mlp_dropout",
+        "log_range": [0.0001, 0.2, 20],
+        "scale": "log",
+        "requires": {"use_block_mlp": True},
     },
 
 
@@ -846,175 +1088,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "scale": "linear",
         
         },
-    
-
-
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    "weight_decay": {
-        "description": "AdamW weight decay",
-        "param": "weight_decay", 
-        "values": [0, 0.001, 0.005, 0.01, 0.025],  
-        "scale": "linear",
-    },
-
-    "phi_weight_decay":{
-        "description": "weight decay on phi",
-        "param": "phi_weight_decay",  
-        "values": [0, 0.005, 0.01, 0.05, 0.1, 0.2],  
-        "scale": "linear",
-        },
-
-
-    "mu_weight_decay": {
-        "description": "AdamW weight decay",
-        "param": "mu_weight_decay",  
-        "values": [0, 0.001, 0.005, 0.01, 0.025],  
-        "scale": "linear",
-    }, 
-    
-    
-    "sigma_weight_decay": {  
-        "description": "AdamW weight decay on the log-variance (sigma) tables",
-        "param": "sigma_weight_decay",  
-        "values": [0, 0.001, 0.005, 0.01, 0.025],  
-        "scale": "linear",
-    },
-    
-    "decode_mu_weight_decay": {  
-        "description": "AdamW weight decay on the decoder",
-        "param": "decode_mu_weight_decay",  
-        "values": [0, 0.001, 0.005, 0.01],  
-        "scale": "linear",
-    },
-    
-    
-    
-    
-    
-    
-    
-    
-    # === belief-table init scales (PriorBank) ===============================
-    "mu_init_std": {
-        "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", 
-        "log_range": [0.001, 1, 10],
-        "scale": "log",
-    },
-    
-    "sigma_init": {
-        "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", 
-        "values": [0.25, 0.75, 1, 5, 10, 15],
-    },
-    
-    "phi_scale": {
-        "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", 
-        "log_range": [0.001, 1, 10],
-        "scale": "log",
-    },
-    
-    
-    "pos_phi_scale": {
-        "description": "learned pos_phi table init scale",
-        "param": "pos_phi_scale", 
-        "values": [0.005, 0.01,  0.02, 0.04],
-        "scale": "log",
-        "requires": {"pos_phi": "learned"},
-    },    
-    
-    
-    "rope_base": {
-        "description": "rope_base",
-        "param": "rope_base", 
-        "values": [25, 75, 100, 150, 250, 1000],
-        "scale": "log",
-        "requires": {"rope_mode": "comparison"},
-    },    
-
-    "rope_fraction": {
-        "description": "p-RoPE fraction of each head's planes rotated (fastest first); under comparison_invariant "
-                       "the unrotated coordinates keep their full comparison covariance",
-        "param": "rope_fraction",
-        "values": [0.4, 0.6, 0.8, 1.0],
-        "requires": {"rope_mode": "comparison_invariant", "predictive_readout": "kernel"},
-    },
-
-    
-    
-    
-    
-    
-    
-    
-    "block_mlp_expansion": {
-        "description": "block MLP hidden-width multiplier",
-        "param": "block_mlp_expansion",
-        "values": [6, 8, 10, 12],
-        "requires": {"use_block_mlp": True},
-    },
-
-    "block_mlp_activation": {
-        "description": "block MLP pointwise activation",
-        "param": "block_mlp_activation",
-        "values": ["gelu", "silu", "relu"],
-        "requires": {"use_block_mlp": True},
-    },
-
-    "block_mlp_dropout": {
-        "description": "block MLP residual-branch dropout probability",
-        "param": "block_mlp_dropout",
-        "log_range": [0.0001, 0.2, 20],
-        "scale": "log",
-        "requires": {"use_block_mlp": True},
-    },
 
    
-     "mstep_self_coupling_weight": {
-         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-         "param": "mstep_self_coupling_weight", 
-         "log_range": [0.0001, 2, 20],
-         "scale": "log",
-     },
-
-
-    "lambda_beta": {
-        "description": "belief-coupling block weight (1.0 = pure F)",
-        "param": "lambda_beta", "range": [0.0, 5, 0.05],
-        # projected_predictive weights no coupling block in training; projected_gradient (kernel readout) does
-        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel",
-                     "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
-    },
+    
+   
     
     
-    "kappa_beta": {
-       "description": "attention temperature tau = kappa * sqrt(d_head)",
-       "param": "kappa_beta", "range": [0.25, 3, 0.25],
-    },
-    
-    "decode_tau": {
-        "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.01, 0.05, 0.25, 0.5, 1],
-        "scale": "log",
-        
-    },
-    
-
-    "unigram_kappa": {
-       "description": "decode unigram prior temperature.",
-       "param": "unigram_kappa", "values": [0.1, 0.25, 0.5, 0.75, 1],
-    },
-      
     
     "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
         "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
@@ -1030,17 +1109,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
-        "description": "LR warmup steps before cosine decay",
-        "param": "warmup_steps", "values": [50, 150, 200, 1500],
-    },
-    
-    
-   "min_lr_frac": {  
-       "description": "min_lr_frac ",
-       "param": "min_lr_frac", "values": [0.0, 0.001, 0.01, 0.1],
-       
-   },
+   
     
    
     
@@ -1051,22 +1120,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
    
    
-   "e_q_mu_lr": {
-      "description": "E-step natural-gradient step size for mu_q",
-      "param": "e_q_mu_lr",
-      "range": [0.8, 1.1, 0.1],
-      "scale": "linear",
-      "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
-                   "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},   
-   },
-  
-   "e_q_sigma_lr": {
-      "description": "E-step retraction step size for sigma_q",
-      "param": "e_q_sigma_lr", "range": [0.0000, 0.1, 0.005],
-      "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
-                   "skip_belief_sigma_update": False, "lambda_alpha_mode": "state_dependent",
-                   "rope_mode": "frame"},
-   },
+
   
 
     
@@ -1216,14 +1270,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
 
 
-    "relational_key_noise": {
-        "description": "noisy_key routing: initial per-head key noise n_h (learned; temperature 1)",
-        "param": "relational_key_noise",
-        "values": [0.5, 1.0, 3.0, 10.0],
-        "scale": "log",
-        "requires": {"attention_mode": "projected_predictive", "predictive_readout": "kernel",
-                     "relational_routing": "noisy_key", "learn_attention_temperature": False},
-    },
+
 
     
 
@@ -1287,6 +1334,43 @@ SWEEPS["new_attention_features"] = {
     "seeds": NEW_ATTENTION_SEEDS,
     "schedule_seed": 20260913,
     "configs": [arm for arms in _ATTENTION_ARMS.values() for arm in arms],
+}
+
+
+# Frame-capacity control: the bias arm restores the V * n_gen trainable parameters removed with
+# the token-frame table. All arms keep the same position signal (comparison-space RoPE + ALiBi,
+# no positional frames) and the residual that carries the current token through every layer.
+# The shared BASELINE_CONFIG / CONFIG budget applies to every arm: currently 15000 steps of
+# batch 64 x context 128, with no early stop. This matches training tokens, not wall time.
+# DATA_SEED=None pairs (model seed, data seed) as (6, 6), (23, 23), (54, 54); the separate schedule
+# seed randomizes arm order within each seed block without consuming the training RNG.
+# Keep fully_gauge_covariant and principled_exact_route off for this coordinate-MLP comparison.
+SWEEPS["frame_capacity"] = {
+    "description": "Learned frames versus identity frames, with and without matched per-type MLP capacity",
+    "requires": {
+        "attention_mode": "projected_predictive",
+        "predictive_readout": "kernel",              # the attention residual is active on this route
+        "encode_mode": "per_token",
+        "attention_residual": True,
+        "pos_phi": "none",
+        "rope_mode": "comparison_invariant",        # changes comparisons only; identity transport stays identity
+        "beta_attention_prior": "causal_alibi",
+        "use_block_mlp": True,
+        "block_mlp_mode": "coordinate",
+        "block_mlp_covariance": "passthrough",
+        "gauge_transport": "on",
+        "per_type_hidden_bias": False,
+        "m_phi_update_mode": "adamw",               # both trainable tables use AdamW and phi_weight_decay
+        "m_per_type_hidden_bias_lr": None,           # inherit declared m_phi_lr before gauge-off coercion
+    },
+    "seeds": [6, 23, 54],
+    "schedule_seed": 20261025,
+    "include_baseline": False,                       # exactly three arms; no fourth generic baseline
+    "configs": [
+        {"label": "learned_frames"},                 # reference for paired across-seed differences
+        {"label": "identity_frames", "gauge_transport": "off"},
+        {"label": "identity_frames_type_bias", "gauge_transport": "off", "per_type_hidden_bias": True},
+    ],
 }
 
 

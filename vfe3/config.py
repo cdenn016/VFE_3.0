@@ -184,7 +184,7 @@ class VFE3Config:
     max_steps:                        int             = 15000        # cosine-schedule horizon
     warmup_steps:                     int             = 100
    
-    min_lr_frac:                      float           = 0.01         # LR floor as a fraction of each group's base LR (0 = decay to 0)
+    min_lr_frac:                      float           = 0.00         # LR floor as a fraction of each group's base LR (0 = decay to 0)
     
     grad_accum_steps:                 int             = 1            # microbatches per optimizer step (1 = no accumulation)
     
@@ -195,19 +195,23 @@ class VFE3Config:
     #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
     #   group  one set per optimizer group, so one exploding group cannot set the coefficient of the others
     grad_clip_scope:                  str             = "role"
+    
     # Failed-step recovery (audit 2026-10-17 item 16). None keeps the historical abort: a step whose strictest
     # precision rung raises before any optimizer update ends the run. N >= 1: up to N such steps over the run are
     # skipped instead (gradients zeroed, no optimizer or scheduler step, the batch saved under
     # diagnostics/failed_steps/, counted in metrics.csv failed_step_skips), and a failed evaluation reports NaN
     # validation with no best-model update; the (N+1)-th failure aborts as before.
     max_failed_step_skips:            Optional[int]   = None
+   
     # Abort after this many consecutive rejected updates of any kind (non-finite, failed, loss spike) through the
     # crash path (diagnostics/crash.json and a resumable checkpoint). None = never abort on consecutive skips.
     max_consecutive_skips:            Optional[int]   = None
+    
     # Reject the update of a step whose training loss exceeds the divergence monitor's loss EMA by more than this
     # many nats (after its 50-step warmup; audit 2026-10-17 item 17), read from the host loss the step already
     # transfers. Rejections are counted in metrics.csv loss_spike_rejected_updates. None = off.
     loss_spike_skip_nats:             Optional[float] = None
+    
     # Opt-in weight EMA (audit 2026-10-20 item 8). With a decay d in (0, 1), a shadow copy of every trainable floating
     # parameter starts at the first accepted update at or after step ceil(weight_ema_start_frac * max_steps) and then
     # follows theta_bar <- d^k theta_bar + (1 - d^k) theta every k = weight_ema_update_interval accepted updates
@@ -217,6 +221,7 @@ class VFE3Config:
     weight_ema_decay:                 Optional[float] = None
     weight_ema_start_frac:            float           = 0.5          # in [0, 1]: start step as a fraction of max_steps
     weight_ema_update_interval:       int             = 1            # k >= 1 accepted updates between shadow updates
+    
     # "same" | "cpu"
     #   same  the shadow lives on the parameters' device (one parameter copy of memory there)
     #   cpu   the shadow lives in host memory; each shadow update copies the parameters to the host (use k > 1)
@@ -233,6 +238,7 @@ class VFE3Config:
     log_interval:                     int             = 100          # console log every N steps (0 = off)
     eval_interval:                    int             = 1500         # validation every N steps (0 = off)
     checkpoint_interval:              int             = 15000        # resumable checkpoint every N steps (0 = off)
+    
     checkpoint_keep_last:             Optional[int]   = None         # keep the newest N step checkpoints; None = keep all
     checkpoint_at_end:                bool            = False        # also write a resumable checkpoint after the last step
     block_variance_at_log:            bool            = False        # also write diagnostics/block_variance.csv at log steps
@@ -342,6 +348,7 @@ class VFE3Config:
     decode_coordinates:               str             = "local"
 
     decode_unigram_prior:             bool            = True         # add unigram_kappa * log pi_v (corpus unigram) to the logits
+    
     # decode_mode="linear" only: train on the second-order (delta-method) expected log-loss
     # E_q[-log p_y] ~ CE(mu) + 1/2 tr(Sigma Cov_p(w)) instead of the plug-in CE(mu), at one extra (V, 2K)
     # GEMM per vocab chunk. Training mode only; evaluation keeps the plug-in predictive CE. Requires
@@ -610,17 +617,20 @@ class VFE3Config:
     # output is not positive definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in covariance_escalation_elements;
     # one host read per layer call. A float64 failure raises.
     predictive_covariance_fp64_escalation: bool       = False
+   
     # "fp32" | "fp64"
     # moment_matched, kernel readout only: compute precision of the covariance update.
     #   fp32  the beliefs' precision
     #   fp64  the whole update (C_i, pooling, sandwich, floor, ceiling) in float64 from float32 beliefs, cast back:
     #         removes the kappa(U)^2 rounding the sign-only escalation misses (audit 2026-10-16 F7); costly
     predictive_covariance_precision:  str             = "fp32"
+    
     # moment_matched, kernel readout only (audit 2026-10-17 item 12): add the routed spread after the sandwich as the
     # nonnegative sum of squares sum_h sum_j beta_ij^h (U_i O'_h (v_j^h - m_i^h))^2 (outer products on full layouts)
     # instead of through the head-pair pooled covariance, where diag(U C^att U^T) cancels it; equal in exact
     # arithmetic, about N K^2 multiply-adds per token. Not with content_link_edges.
     predictive_covariance_spread_squares: bool        = False
+    
     # moment_matched, kernel readout only (audit 2026-10-17 item 19): form the head-pair source and pooled
     # covariances for h <= g only and double the off-diagonal pairs (diag(U Y U^T) = diag(U Y^T U^T)); equal up to
     # rounding, about H(H-1)/2 fewer pair contractions. Blockwise route (block frames, equal heads), not with
@@ -681,6 +691,7 @@ class VFE3Config:
     #                         receiver (not per_coord)
     #   euler                 explicit Fisher step with e_q_mu_lr / e_q_sigma_lr and the trust regions
     relational_receiver_update:       str             = "closed_form"
+    
     # closed_form(_profiled) only: rho in (0, 1]; rho = 1 takes the full step. Under closed_form that is the
     # minimizer with alpha frozen at the current iterate, one MM step, so extra E-steps keep moving the belief;
     # under closed_form_profiled it is the profiled fixed point, which extra E-steps leave unchanged.
@@ -702,6 +713,7 @@ class VFE3Config:
     lambda_beta:                      float                 = 1.0          # weight of the whole belief-coupling block (1 = pure F)
     
     mstep_self_coupling_weight:       float                 = 0.0          # M-step sum_i alpha_i D(q_i* || p_i); 0 = off
+    
     # None | float > 0 (inf allowed): the divergence clamp of the M-step self-coupling term D(q_i* || p_i); None uses
     # kl_max, the router's clamp, under which the term saturates (zero gradient) in the collapse regime (audit
     # 2026-10-17 item 33)
@@ -731,10 +743,12 @@ class VFE3Config:
     #                of the LayerNorm output at every Sigma/s^2, where 'pushforward' (the delta method at s, capped at
     #                the sphere bound) keeps the delta method's radial shape (audit 2026-10-16 F3, F2)
     block_norm_covariance:            str             = "pushforward"
+    
     # Scale the LayerNorm covariance pushforward (both pushforward modes, and the delta_full composite's norm stage)
     # by min(1, K max(gamma^2) / tr) at the sphere bound (audit 2026-10-12 item 1). False skips the cap: the
     # uncapped delta method, which can exceed the bound by orders of magnitude once Sigma is large against s^2.
     block_norm_trace_cap:             bool            = True
+    
     # block_norm_covariance='pushforward' with the trace cap only (audit 2026-10-17 item 8): on the tokens where the
     # cap binds return the moment estimate of 'pushforward_moment' instead of the capped delta method, whose shape
     # is off by up to about 10^3 per coordinate on anisotropic input. False keeps the capped delta method everywhere.
@@ -757,6 +771,7 @@ class VFE3Config:
     ##################################################
 
     use_block_mlp:                    bool            = True         # residual feed-forward unit after each block
+    
     # One block MLP shared by every layer (every block_mlp_mode): depth then applies one set of dynamics, and the
     # template or component labels of prototype_agents / cue_result_memory keep their meaning from layer to layer.
     # The state dict keeps the per-layer keys block_mlps.<layer>.* as aliases of one tensor.
@@ -1006,6 +1021,7 @@ class VFE3Config:
     ##################################################
 
     eps:                              float           = 1e-6
+    
     # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
     # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
     kl_max:                           Optional[float] = None
@@ -1033,6 +1049,7 @@ class VFE3Config:
     # diagonal comparison route keeps its closed form with its own O(N r) estimate and one host read per layer
     # (audit 2026-10-17 item 11).
     pair_kl_gemm_tol:                 Optional[float] = None
+    
     # int >= 1. Byte budget, in MiB, of one tile of the relational scorer (projected moments, source-root factor,
     # GEMM-fallback direct pair tiles, mean-distance rows) and of the routed spread's query-row tiles. Larger tiles
     # dispatch fewer kernels, until one tile holds the whole loop, and hold more transient memory; values change only
@@ -1040,6 +1057,7 @@ class VFE3Config:
     # 32 * (relational_tile_mib // 32) tokens (audit 2026-10-17 item 6). Keep 32 until a CUDA A/B confirms a gain
     # (audit 2026-10-16 F26).
     relational_tile_mib:              int             = 32
+    
     # "torch" | "triton". Kernel of the diagonal comparison route's projected moments (rope_mode="comparison_invariant"
     # with a diagonal P(G), gaussian_diagonal family, gaussian_kl, noisy_query or noisy_key kernel router): "triton"
     # computes diag(G) = sum_k X^2,
@@ -1049,6 +1067,7 @@ class VFE3Config:
     # variances or frames, frame blocks wider than 64), always run the torch route. gaussian_frame_diagonal reads its
     # reference variances through the identity frame, diag(G) = (S o S) c, one torch GEMM (audit 2026-10-20 item 46).
     relational_diag_moments_kernel:   str             = "torch"
+    
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
 

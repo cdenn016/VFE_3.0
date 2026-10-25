@@ -112,7 +112,7 @@ fully_gauge_covariant = False
 # requirement holds. The memory's regression rank and result noise, the regime beta and stay, routing prior, floors,
 # learning rates, shape and numerics are not touched. The overrides are logged and listed in config.md.
 # Implies fully_gauge_covariant. False: the config exactly as written.
-principled_exact_route = False
+principled_exact_route = True
 
 config = dict(
        
@@ -122,22 +122,19 @@ config = dict(
    
     vocab_size                       = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / word 267735)
                                                                   
-    embed_dim                        = 128,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                          = 4,                   # = number of irrep blocks (alibi priors require this)
+    embed_dim                        = 32,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                          = 2,                   # = number of irrep blocks (alibi priors require this)
     
-    max_seq_len                      = 128,                 # N, context length
-    eval_stride                      = 32,
+    max_seq_len                      = 64,                 # N, context length
+    eval_stride                      = 16,
     
-    batch_size                       = 64,
-    max_steps                        = 15000,
-     
-    min_lr_frac                      = 0.01,        # float in [0, 1]: LR floor as a fraction of each group's base LR (0 = decay to 0)
-   
+    batch_size                       = 32,
+    max_steps                        = 60000,
     
     n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
 
-    warmup_steps                     = 100,         # int >= 0: linear warmup steps before the cosine decay
+    warmup_steps                     = 250,         # int >= 0: linear warmup steps before the cosine decay
     
     #################################
     #         Misc/Logging
@@ -147,13 +144,14 @@ config = dict(
     eval_interval                    = 3000,      # periodic validation every N steps (0 = off)
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off) 
    
-    checkpoint_keep_last             = 1,      # None (keep every checkpoint) | int >= 1 (keep the newest N)
+    checkpoint_keep_last             = 1,        # None (keep every checkpoint) | int >= 1 (keep the newest N)
     checkpoint_at_end                = True,     # True | False (also save a resumable checkpoint after the last step)
     block_variance_at_log            = True,     # True | False (also write diagnostics/block_variance.csv at log steps)
        
     loss_spike_skip_nats             = None,        # None (off) | float > 0 (reject an update whose loss exceeds the monitor's loss EMA by this many nats)
     
     kl_max                           = 128,
+    
     #################################
     #           Modes               #
     #################################
@@ -165,7 +163,7 @@ config = dict(
     
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1        
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-    predictive_covariance            = 'moment_matched',        # "passthrough"  #TODO passthrough 
+    predictive_covariance            = 'passthrough',        # "passthrough" 
                                                                 # "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) 
                                                                  # "spread_corrected" (minimal_agent mean_field: plus the label spread)
             
@@ -173,7 +171,7 @@ config = dict(
     
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: kernel readout, temperature 1)
     relational_receiver_measurement  = "inverse",    # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
-    relational_receiver_update       = "closed_form",           # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step-projected_gradient only)
+    relational_receiver_update       = "closed_form",     # closed_form_profiled      # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step-projected_gradient only)
        
     predictive_readout               = "kernel",         # "kernel" | "minimal_agent" (projected_predictive only)
     minimal_agent_inference          = "mean_field",            # "exact" | "mean_field" (minimal_agent only)
@@ -193,7 +191,7 @@ config = dict(
     tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
     decode_second_order              = False,         # linear decode, diagonal family, local coords: train on CE(mu) + 1/2 tr(Sigma Cov_p(w)); pushes Sigma to its floor, ablation arm first
     
-    attention_residual               = False,      #ignored with minimal_agent
+    attention_residual               = True,      #ignored with minimal_agent
     #################################
     #     Optional Block MLP        #
     #################################
@@ -209,11 +207,13 @@ config = dict(
       
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
     block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
+    block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
+    
     block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
     block_mlp_em_weight              = 0.0,            # prototype_agents only: EM M-step term on the templates (nu, lambda, pi); 0 = off
     block_memory_regression_rank     = 2,              # cue_result_memory only: None (dense F_a = I + D_a; M K^2 per bank, ~10x slower) | int r in [1, K] (F_a = I + U_a V_a^T; 2 is the smallest rank that rotates or reverses a plane)
     block_memory_result_noise_ratio  = 0.01,           # cue_result_memory only: initial result noise Q_a / L_a > 0
-    block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
+    
     block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
     block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     
@@ -242,10 +242,10 @@ config = dict(
        
     mu_init_std                      = 0.065,     # std of the random mean table mu_embed
     sigma_init                       = 15,         # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                        = 0.035,      # std
+    phi_scale                        = 0.001,      # std 0.001
     pos_phi_scale                    = 0.02,      # learned-table init scale AND frozen per-position step
     
-    decode_tau                       = 0.1,       # tau =1 principled bayes 0.01 works well for some reason
+    decode_tau                       = 0.1,       # tau =1 principled bayes 0.1 works well for some reason
     unigram_kappa                    = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
     decode_chunk_size                = 8192,
    
@@ -327,7 +327,7 @@ config = dict(
     m_phi_fisher_completion          = "rotation",  # fisher_group only: "rotation" (lambda on every rotation) | "stabilizer" (lambda on the belief's stabilizer only: the belief-Fisher natural gradient on the visible subspace; not with pos_phi="learned")
 
     m_table_update_mode              = "fisher",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
-    m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
+   
     m_table_fisher_trust_radius      = 0.5,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step to second order; decay outside)
     m_decode_update_mode             = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on the untied decode bank at m_table_fisher_lr / m_table_fisher_trust_radius; untie_decode_bank=True, prior-bank decode)
 
@@ -336,33 +336,34 @@ config = dict(
     #        Learning Rates
     #################################
 
-    m_p_mu_lr                        = 0.005,     #0.025
+    m_p_mu_lr                        = 0.02,     #0.025
     m_p_sigma_lr                     = 0.001,       
-    m_phi_lr                         = 0.00075,     #0.003
+    m_phi_lr                         = 0.002,     #0.003
     
+    m_table_fisher_lr                = 0.125,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
     
     #################################
     #      Other M-Step LR's
     #################################
+           
+    m_decode_mu_lr                   = 0.005,       
+    m_decode_sigma_lr                = 0.001,       
       
-    m_pos_phi_lr                     = 0.003,      #0.0025?
-     
-    m_decode_mu_lr                   = 0.005,       # 0.025?
-    m_decode_sigma_lr                = 0.001,       # 0.001
+    m_relational_score_lr            = 0.0075,        
+    m_relational_content_lr          = 0.001,      
       
-    m_relational_score_lr            = 0.01,        # 0.005 0.01
-    m_relational_content_lr          = 0.0025,      # 0.005   0.0025
-      
-    m_block_mlp_lr                   = 0.005,      #0.0075?
-    m_layernorm_lr                   = 0.005,      # 0.005
+    m_block_mlp_lr                   = 0.0025,      
+    m_layernorm_lr                   = 0.003,      
     
     m_per_type_hidden_bias_lr        = 0.0025,    
+    m_pos_phi_lr                     = 0.003,  
     
     #################################
     #        Weight Decays
     #################################
-    weight_decay                     = 0.01,
-    phi_weight_decay                 = 0.1,    
+    
+    weight_decay                     = 0.06,
+    phi_weight_decay                 = 0.2,    
     sigma_weight_decay               = 0,      
     mu_weight_decay                  = 0,       
 
