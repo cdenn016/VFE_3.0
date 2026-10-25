@@ -12,6 +12,9 @@ Forward. ``cr_fwd_weights_kernel`` writes the unnormalized log weights :math:`\e
 :math:`\bar v_{ik} = \sum_a w_{ia}[v^Y_{iak} + (m^Y_{iak} - \bar m_{ik})^2]` by a weighted Chan merge over component
 tiles, so the variance is a sum of non-negative terms with no cancellation.
 
+The log weights are formed relative to the row maximum, :math:`(\ell_{ia} - s_i) - \log l_i`, never by subtracting
+the absolute log evidence (audit 2026-10-25 F01).
+
 Backward, for incoming :math:`\bar g^m, \bar g^v` (rows, K), :math:`\bar g^{\log w}` (rows, M) and
 :math:`\bar g^{\log Z}` (rows,): with :math:`\bar m = w(\bar g^m + 2\bar g^v(m^Y - \bar m_{ik}))` and
 :math:`\bar v = w\bar g^v` per element,
@@ -26,8 +29,11 @@ Backward, for incoming :math:`\bar g^m, \bar g^v` (rows, K), :math:`\bar g^{\log
     \bar\ell_{ia} = w_{ia}\Big(\bar w_{ia} - \sum_b w_{ib}\bar w_{ib}\Big) + \bar g^{\log w}_{ia}
                     - w_{ia}\sum_b\bar g^{\log w}_{ib} + w_{ia}\bar g^{\log Z}_i,
 
-which is also :math:`\partial L/\partial\log\hat\pi_{ia}`. Per element, :math:`\bar g = \bar m + \sum_r\bar t_rV_r`,
-:math:`\bar p = \bar v(1 + 2\sum_rU_rV_r) + \sum_{rs}\bar G_{rs}V_rV_s`,
+which is also :math:`\partial L/\partial\log\hat\pi_{ia}`. With :math:`a = \sum_rU_rV_r` and the indicator
+:math:`\iota = [\sum_{rs}U_rG_{rs}U_s - pa^2 \ge 0]` of the unclamped remainder of
+:math:`v^Y = p(1 + a)^2 + \max(\sum_{rs}U_rG_{rs}U_s - pa^2, 0) + q` (``_cue_result_triton.py``), and
+:math:`\bar G_{ia,rs} = \sum_k\iota\,\bar v\,U_{akr}U_{aks}`, per element :math:`\bar g = \bar m + \sum_r\bar t_rV_r`,
+:math:`\bar p = \bar v((1 + a)^2 - \iota a^2) + \sum_{rs}\bar G_{rs}V_rV_s`,
 :math:`\bar\delta = \bar g\,\mathrm{gain} - \bar\ell\,\delta/W`,
 :math:`\overline{\mathrm{gain}} = \bar g\,\delta + \bar p\,c`,
 :math:`\bar W = -\overline{\mathrm{gain}}\,\lambda/W^2 - \tfrac12\bar\ell(1/W - \delta^2/W^2)`, and
@@ -37,8 +43,8 @@ which is also :math:`\partial L/\partial\log\hat\pi_{ia}`. Per element, :math:`\
     \bar\nu = -\sum_i\bar\delta,\quad \bar\lambda = \sum_i(\overline{\mathrm{gain}}/W + \bar W),\quad
     \bar\omega = \sum_i\bar m,\quad \bar q = \sum_i\bar v,
 
-    \bar U_r = \sum_i\Big[\bar m\,t_r + \bar v\Big(2pV_r + 2\sum_sG_{rs}U_s\Big)\Big],\quad
-    \bar V_r = \sum_i\Big[g\,\bar t_r + 2p\Big(\bar vU_r + \sum_s\bar G_{rs}V_s\Big)\Big]
+    \bar U_r = \sum_i\Big[\bar m\,t_r + \bar v\Big(2p(1 + a - \iota a)V_r + 2\iota\sum_sG_{rs}U_s\Big)\Big],\quad
+    \bar V_r = \sum_i\Big[g\,\bar t_r + 2p\Big(\bar v(1 + a - \iota a)U_r + \sum_s\bar G_{rs}V_s\Big)\Big]
 
 (``cr_bwd_rows_kernel`` owns :math:`\bar\xi, \bar c`; ``cr_bwd_cols_kernel`` owns the parameter sums, one partial per
 row split, summed in torch). Rows are processed in chunks of ``row_chunk`` so the planes stay bounded. The kernels use
@@ -129,9 +135,13 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                     xs, cs, nu, lam, V, lps, logw, T, G, Rc, M, K, M if per_token else 0, half_k_log2pi,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
-                lse = torch.logsumexp(logw, dim=-1)                              # (Rc,)
-                logwn[r0:r1] = logw - lse.unsqueeze(-1)
-                log_ev[r0:r1] = lse
+                # Shift and scaled mass kept apart: subtracting the absolute log evidence rounds its log l increment
+                # away at large log densities (audit 2026-10-25 F01).
+                shift = logw.amax(dim=-1)
+                shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
+                log_l = torch.log(torch.exp(logw - shift.unsqueeze(-1)).sum(-1))            # (Rc,)
+                logwn[r0:r1] = (logw - shift.unsqueeze(-1)) - log_l.unsqueeze(-1)
+                log_ev[r0:r1] = shift + log_l
                 f = cfg["fwd_moments"]
                 tk.cr_fwd_moments_kernel[(Rc, _cdiv(K, f["BK"]))](
                     xs, cs, nu, lam, omega, q, U, V, logwn[r0:r1], T, G, mean[r0:r1], var[r0:r1], Rc, M, K,
