@@ -132,6 +132,18 @@ def accumulate_transition(st: Stats, G: Tensor, m_prev: Tensor, P_prev: Tensor, 
         ms, Ps = ms_p, Ps_p
 
 
+def residual_covariance(Szz: Tensor, Szx: Tensor, Sxx: Tensor, W: Tensor) -> Tensor:
+    r"""Expected residual covariance of the regression z ~ W x at a given W,
+
+    .. math:: E[(z - Wx)(z - Wx)^\top] = S_{zz} - W S_{xz} - S_{zx} W^\top + W S_{xx} W^\top,
+
+    with :math:`S_{xz} = S_{zx}^\top`. The shortcut :math:`S_{zz} - W S_{zx}^\top` holds only at the
+    unregularized solve; at the ridge solve :math:`W = S_{zx}(S_{xx} + \rho I)^{-1}` it exceeds this by
+    :math:`\rho W W^\top`. Shapes: Szz (..., d, d), Szx (..., d, n), Sxx (..., n, n), W (..., d, n)."""
+    WSxz = W @ Szx.transpose(-1, -2)                                   # (..., d, d)
+    return Szz - WSxz - WSxz.transpose(-1, -2) + W @ Sxx @ W.transpose(-1, -2)
+
+
 def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transition: bool = True) -> Params:
     r"""Ridge least-squares solves for every node and for :math:`[G\ E^\top]`; Q from the residual moments."""
     d, V, R = prm.d, prm.E.shape[1], prm.R
@@ -152,7 +164,7 @@ def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transitio
     Lx = torch.linalg.cholesky(Sxx + ridge * torch.eye(d + V, dtype=torch.float64, device=dev))
     W = torch.cholesky_solve(Szx.transpose(-1, -2).contiguous(), Lx).transpose(-1, -2)   # (R, d, d+V)
     new.G, new.E = W[..., :d].contiguous(), W[..., d:].transpose(-1, -2).contiguous()
-    Q = st.zz - W @ Szx.transpose(-1, -2)
+    Q = residual_covariance(st.zz, Szx, Sxx, W)
     Q = 0.5 * (Q + Q.transpose(-1, -2))
     evals, evecs = torch.linalg.eigh(Q)
     new.Q = (evecs * evals.clamp_min(q_floor).unsqueeze(-2)) @ evecs.transpose(-1, -2)
