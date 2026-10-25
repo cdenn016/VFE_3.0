@@ -3,7 +3,9 @@ r"""Click-to-run local-learner test (design: docs/research/2026-10-21-local-lear
 Edit CONFIG and run. Stage "timing" measures one chunk per arm; "A" is the synthetic identifiability check;
 "B" is WikiText-103 bytes. Results append to ``<out_dir>/results_<stage>.jsonl``; each record stores its effective
 arm settings, data protocol and source hash, and a completed run is skipped on relaunch only when these match the
-current ones (a mismatch stops with the differing fields; records without them are reused with a warning). The
+current ones (a mismatch stops with the differing fields; records without them are reused with a warning). Stage W
+records carry the same identity (both arms, its pass and point counts, its data protocol, and a source hash that
+includes its runner) and the stage is skipped once its final row exists for every seed. The
 seeds of one (arm, d) train as one stacked batch, so each kernel launch serves all of them; stacked runs never
 exchange information. With ``device = "cuda"`` run it under the CUDA interpreter (``$CUDA_PYTHON``,
 ``C:/anaconda/python.exe``); the n-gram references and synthetic sampling stay on the CPU.
@@ -169,16 +171,17 @@ def protocol(stage: str, streams: int | None = None) -> dict:
             "B_val_bytes": c["B_val_bytes"], "B_val_streams": c["B_val_streams"]}
 
 
-def source_identity() -> str:
+def source_identity(extra: tuple = ()) -> str:
     r"""SHA-256 of the local-learner package source and of this script's training, scoring and data-loading
-    functions (line endings normalized), so a result is not reused across a change of the code that made it."""
+    functions (line endings normalized), so a result is not reused across a change of the code that made it.
+    ``extra`` adds stage-specific functions (stage W adds its runner, which holds its training and scoring loop)."""
     import hashlib
     import inspect
     import vfe3.local_learner as pkg
     h = hashlib.sha256()
     for f in sorted(Path(pkg.__file__).parent.glob("*.py")):
         h.update(f.name.encode() + b"\0" + f.read_bytes().replace(b"\r\n", b"\n") + b"\0")
-    for fn in (arm_settings, train_arm, protocol, scores, load_bytes, as_streams):
+    for fn in (arm_settings, train_arm, protocol, scores, load_bytes, as_streams, *extra):
         h.update(inspect.getsource(fn).replace("\r\n", "\n").encode() + b"\0")
     return h.hexdigest()
 
@@ -233,6 +236,49 @@ def pending(done: dict, arm: str, d: int, seeds: list[int], ident: dict) -> list
         print(f"warning: reusing results for arm {arm!r}, d={d}, seeds {legacy} that predate stored settings; "
               f"their settings cannot be checked against CONFIG", flush=True)
     return todo
+
+
+def warm_identity() -> dict:
+    r"""Identity of a stage W record: the local and backpropagation arm settings, the pass and scoring-point counts,
+    the data protocol stage W reads (training streams and the stage B byte budgets), and the source including
+    :func:`run_warm`. The dimension and seed are the record's key, as in the other stages."""
+    c = CONFIG
+    arms = {"local_arm": c["W_local_arm"], "local": arm_settings(c["W_local_arm"]), "backprop": arm_settings("backprop"),
+            "W_passes": c["W_passes"], "W_points": c["W_points"]}
+    proto = {"stage": "W", "data": "wikitext-103 bytes", "streams": c["streams"], "B_train_bytes": c["B_train_bytes"],
+             "B_val_bytes": c["B_val_bytes"], "B_val_streams": c["B_val_streams"]}
+    return json.loads(json.dumps({"arm_settings": arms, "protocol": proto,
+                                  "source": source_identity(extra=(run_warm,))}))
+
+
+def warm_done(path: Path) -> dict:
+    r"""Stage W records keyed by (run, d, seed, updates_done); a later record of the same key replaces an earlier one."""
+    if not path.exists():
+        return {}
+    return {(r["run"], r["d"], r["seed"], r["updates_done"]): r
+            for r in map(json.loads, path.read_text().splitlines()) if "run" in r}
+
+
+def warm_pending(done: dict, d: int, seeds: list[int], ident: dict) -> bool:
+    r"""Whether stage W must run at dimension d for these seeds. Records of (d, seed) made under a different
+    identity raise, as :func:`pending` does; records without an identity cannot be checked and are reported. The
+    stage is complete, and skipped, when its final row (the multi-pass backpropagation score) exists for every seed.
+    Stage W trains all of its runs in one sequence, so an incomplete stage reruns whole; rows already present are
+    not written twice."""
+    rows = [r for (_, rd, rs, _), r in done.items() if rd == d and rs in seeds]
+    clash = sorted({f"run {r['run']!r} seed {r['seed']}: {', '.join(_differences(r['identity'], ident))}"
+                    for r in rows if "identity" in r and r["identity"] != ident})
+    if clash:
+        raise RuntimeError(f"completed stage W results for d={d} were made under different settings "
+                           f"({'; '.join(clash[:5])}{'; ...' if len(clash) > 5 else ''}). Set a new out_dir or remove "
+                           "those records to rerun.")
+    legacy = sorted({r["seed"] for r in rows if "identity" not in r})
+    if legacy:
+        print(f"warning: reusing stage W results for d={d}, seeds {legacy} that predate stored settings; their "
+              "settings cannot be checked against CONFIG", flush=True)
+    final = f"backprop_{CONFIG['W_passes']}pass"
+    finished = {rs for (run, rd, rs, _) in done if run == final and rd == d}
+    return not set(seeds) <= finished
 
 
 def append(path: Path, row: dict) -> None:
@@ -302,10 +348,12 @@ def run_warm(tree: TreeSensor) -> None:
     out = Path(c["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     path = out / "results_W.jsonl"
-    done = set()
-    if path.exists():
-        done = {(r["run"], r["d"], r["seed"], r["updates_done"]) for r in map(json.loads, path.read_text().splitlines())}
+    done = warm_done(path)
     d, seeds, local_arm, P = c["W_d"], c["B_seeds"], c["W_local_arm"], c["W_points"]
+    ident = warm_identity()
+    if not warm_pending(done, d, seeds, ident):
+        print(f"stage W at d={d} is complete in {path}; nothing to run", flush=True)
+        return
     xtrain = load_bytes("train", c["B_train_bytes"])
     xval = load_bytes("validation", c["B_val_bytes"])
     train = as_streams(xtrain, c["streams"]).to(DEVICE)
@@ -321,7 +369,7 @@ def run_warm(tree: TreeSensor) -> None:
                 append(path, {"stage": "W", "run": run, "d": d, "seed": seed, "updates_done": updates,
                               "val_bits": float(nll[r]) / n / LN2, "train_sec": sec, "stacked_runs": len(seeds),
                               "local_arm": local_arm, "local_schedule": c["local_schedule"],
-                              "backprop_lr": c["backprop_lr"]})
+                              "backprop_lr": c["backprop_lr"], "identity": ident})
 
     def train_passes(run: str, arm: str, prm: Params, passes: int, start_updates: int = 0) -> Params:
         t0, updates = time.perf_counter(), start_updates
