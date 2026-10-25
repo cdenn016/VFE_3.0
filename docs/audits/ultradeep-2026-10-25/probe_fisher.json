@@ -1,0 +1,58 @@
+[
+  {
+    "mean_scale": 0.0,
+    "spectrum_min": [
+      2.0
+    ],
+    "spectrum_max": [
+      2.0
+    ],
+    "updated_parameter": [
+      [
+        -0.005000000000000009,
+        0.0,
+        0.0,
+        -0.005000000000000009
+      ]
+    ]
+  },
+  {
+    "mean_scale": 1e-06,
+    "spectrum_min": [
+      5.000444502911705e-13
+    ],
+    "spectrum_max": [
+      2.000000000001
+    ],
+    "updated_parameter": [
+      [
+        -0.004999999999997508,
+        0.0,
+        0.0,
+        -0.005000000000000009
+      ]
+    ]
+  },
+  {
+    "mean_scale": 1e-08,
+    "spectrum_min": [
+      0.0
+    ],
+    "spectrum_max": [
+      2.0
+    ],
+    "error": "FloatingPointError",
+    "message": "pullback group direction returned a nonfinite certificate"
+  },
+  {
+    "mean_scale": 1e-09,
+    "spectrum_min": [
+      0.0
+    ],
+    "spectrum_max": [
+      2.0
+    ],
+    "error": "FloatingPointError",
+    "message": "pullback group direction returned a nonfinite certificate"
+  }
+]

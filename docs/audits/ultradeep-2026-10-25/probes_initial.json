@@ -1,0 +1,151 @@
+{
+  "cue_lowrank_cancellation": {
+    "expected_noise": [
+      [
+        1.3887943746404563e-11
+      ]
+    ],
+    "lowrank": [
+      [
+        0.0
+      ]
+    ],
+    "dense_regression": [
+      [
+        1.3887943746404563e-11
+      ]
+    ],
+    "dense_record": [
+      [
+        [
+          1.3887943746404563e-11
+        ]
+      ]
+    ]
+  },
+  "cue_large_logmass": [
+    {
+      "dtype": "torch.float32",
+      "dense": false,
+      "mean": [
+        [
+          10000.0
+        ]
+      ],
+      "covariance": [
+        [
+          50000004.0
+        ]
+      ],
+      "weight_sum": [
+        2.0
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "dense": true,
+      "mean": [
+        [
+          10000.0
+        ]
+      ],
+      "covariance": [
+        [
+          [
+            50000004.0
+          ]
+        ]
+      ],
+      "weight_sum": [
+        2.0
+      ]
+    },
+    {
+      "dtype": "torch.float64",
+      "dense": false,
+      "mean": [
+        [
+          5000.000009103181
+        ]
+      ],
+      "covariance": [
+        [
+          1.500000002813822
+        ]
+      ],
+      "weight_sum": [
+        1.000000001820636
+      ]
+    },
+    {
+      "dtype": "torch.float64",
+      "dense": true,
+      "mean": [
+        [
+          5000.00000910318
+        ]
+      ],
+      "covariance": [
+        [
+          [
+            1.500000002813822
+          ]
+        ]
+      ],
+      "weight_sum": [
+        1.000000001820636
+      ]
+    }
+  ],
+  "cue_dense_budget": {
+    "requested_bytes": 96,
+    "calls": [
+      {
+        "tokens": 8,
+        "components": 1,
+        "estimated_tile_bytes": 768
+      },
+      {
+        "tokens": 8,
+        "components": 1,
+        "estimated_tile_bytes": 768
+      },
+      {
+        "tokens": 8,
+        "components": 1,
+        "estimated_tile_bytes": 768
+      }
+    ]
+  },
+  "cg_train_eval": {
+    "grad_enabled_covariance_diagonal": [
+      1.5,
+      1.5,
+      1.5,
+      1.5
+    ],
+    "no_grad_covariance_diagonal": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "max_difference": 0.5
+  },
+  "local_ridge_noise": {
+    "fitted_G": 0.49999999999999994,
+    "computed_Q": 1.5,
+    "expected_residual_Q": 1.25,
+    "conditional_noise_energy_before": 0.6115717756571049,
+    "conditional_noise_energy_after": 0.6193992207207488
+  },
+  "test_collection_default_dtype": {
+    "before_import": "torch.float32",
+    "after_import": "torch.float64"
+  },
+  "environment": {
+    "torch": "2.10.0.dev20251210+cu128",
+    "threads": 1,
+    "device": "cpu"
+  }
+}

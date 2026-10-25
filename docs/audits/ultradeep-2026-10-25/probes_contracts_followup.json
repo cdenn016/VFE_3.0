@@ -1,0 +1,68 @@
+{
+  "loss_modes": {
+    "no_grad_[1, 1, 2]": {
+      "status": "completed",
+      "value": null
+    },
+    "no_grad_[1, 2, 3]": {
+      "status": "completed",
+      "value": null
+    },
+    "inference_[1, 1, 2]": {
+      "status": "error",
+      "type": "RuntimeError",
+      "message": "Inference tensors do not track version counter.",
+      "trace": [
+        "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\geometry\\transport.py\", line 1589, in build_factored_transport",
+        "    stacked = _stacked_compact_exp_pairs(",
+        "              ^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+        "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\geometry\\transport.py\", line 1476, in _stacked_compact_exp_pairs",
+        "    left_pair = _compact_pair_from_exp(",
+        "                ^^^^^^^^^^^^^^^^^^^^^^^",
+        "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\geometry\\transport.py\", line 1403, in _compact_pair_from_exp",
+        "    mark_gathered_frame_pair(exp_pos, exp_neg, unique_pos, unique_neg)",
+        "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\contracts.py\", line 193, in mark_gathered_frame_pair",
+        "    record = (unique_forward, unique_inverse, forward._version, inverse._version)",
+        "                                              ^^^^^^^^^^^^^^^^",
+        "RuntimeError: Inference tensors do not track version counter."
+      ]
+    },
+    "inference_[1, 2, 3]": {
+      "status": "completed",
+      "value": null
+    }
+  },
+  "rope_model_transition": {
+    "status": "completed",
+    "value": null
+  },
+  "parameter_counts": {
+    "status": "completed",
+    "value": {
+      "counts": [
+        {
+          "tied": false,
+          "named_total": 1086,
+          "state_total": 1086,
+          "named_bank": 792,
+          "state_bank": 792,
+          "bank_numel": 264,
+          "buffers": {
+            "prior_bank.unigram_log_prior": 7
+          }
+        },
+        {
+          "tied": true,
+          "named_total": 558,
+          "state_total": 1086,
+          "named_bank": 264,
+          "state_bank": 792,
+          "bank_numel": 264,
+          "buffers": {
+            "prior_bank.unigram_log_prior": 7
+          }
+        }
+      ]
+    }
+  }
+}

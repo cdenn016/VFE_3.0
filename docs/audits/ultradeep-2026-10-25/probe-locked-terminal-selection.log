@@ -1,0 +1,8 @@
+best_model.pt publish at step 2 blocked (simulated ordinary Windows reader lock); the previous best is kept
+{
+  "primary_val_ppl": 18.0,
+  "best_val_ppl": 20.0,
+  "best_step": 1,
+  "summary_written": true,
+  "artifacts": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\locked-selection-probe-i_95q8rh"
+}

@@ -1,0 +1,91 @@
+{
+  "model_modes": {
+    "no_grad_[1, 1, 2]": {
+      "status": "completed",
+      "value": null
+    },
+    "no_grad_[1, 2, 3]": {
+      "status": "completed",
+      "value": null
+    },
+    "inference_[1, 1, 2]": {
+      "status": "completed",
+      "value": null
+    },
+    "inference_[1, 2, 3]": {
+      "status": "completed",
+      "value": null
+    }
+  },
+  "temperature_cache": {
+    "status": "error",
+    "type": "RuntimeError",
+    "message": "Inference tensors cannot be saved for backward. Please do not use Tensors created in inference mode in computation tracked by autograd. To work around this, you can make a clone to get a normal tensor and use it in autograd, or use `torch.no_grad()` instead of `torch.inference_mode()`.",
+    "trace": [
+      "Traceback (most recent call last):",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probes_contracts_artifacts.py\", line 27, in attempt",
+      "    value = action()",
+      "            ^^^^^^^^",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probes_contracts_artifacts.py\", line 46, in temperature_transition",
+      "    attention_tau(torch.ones(2, requires_grad=True), [1, 3]).sum().backward()",
+      "    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\free_energy.py\", line 90, in attention_tau",
+      "    return kappa * sqrt_d",
+      "           ~~~~~~^~~~~~~~",
+      "RuntimeError: Inference tensors cannot be saved for backward. Please do not use Tensors created in inference mode in computation tracked by autograd. To work around this, you can make a clone to get a normal tensor and use it in autograd, or use `torch.no_grad()` instead of `torch.inference_mode()`."
+    ]
+  },
+  "rope_cache": {
+    "status": "error",
+    "type": "RuntimeError",
+    "message": "Inference tensors cannot be saved for backward. Please do not use Tensors created in inference mode in computation tracked by autograd. To work around this, you can make a clone to get a normal tensor and use it in autograd, or use `torch.no_grad()` instead of `torch.inference_mode()`.",
+    "trace": [
+      "Traceback (most recent call last):",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probes_contracts_artifacts.py\", line 27, in attempt",
+      "    value = action()",
+      "            ^^^^^^^^",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probes_contracts_artifacts.py\", line 56, in rope_transition",
+      "    (cached @ torch.ones_like(cached, requires_grad=True)).sum().backward()",
+      "     ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~",
+      "RuntimeError: Inference tensors cannot be saved for backward. Please do not use Tensors created in inference mode in computation tracked by autograd. To work around this, you can make a clone to get a normal tensor and use it in autograd, or use `torch.no_grad()` instead of `torch.inference_mode()`."
+    ]
+  },
+  "parameter_counts": {
+    "status": "error",
+    "type": "ValueError",
+    "message": "predictive_readout='minimal_agent' is unsupported here: attention_mode='projected_gradient' (requires 'projected_predictive': the projected_gradient receiver reads the content maps O)",
+    "trace": [
+      "    value = action()",
+      "            ^^^^^^^^",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probes_contracts_artifacts.py\", line 62, in parameter_counts",
+      "    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, n_layers=3, max_seq_len=3,",
+      "          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\tests\\profiles.py\", line 220, in test_config",
+      "    return VFE3Config(**config_values(**overrides))",
+      "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+      "  File \"<string>\", line 195, in __init__",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\config.py\", line 1955, in __post_init__",
+      "    raise ValueError(\"predictive_readout='minimal_agent' is unsupported here: \" + \"; \".join(agent_problems))",
+      "ValueError: predictive_readout='minimal_agent' is unsupported here: attention_mode='projected_gradient' (requires 'projected_predictive': the projected_gradient receiver reads the content maps O)"
+    ]
+  },
+  "tied_prototype_probe": {
+    "status": "error",
+    "type": "AttributeError",
+    "message": "'PrototypeAgentBlockMLP' object has no attribute 'forward_moments'",
+    "trace": [
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probes_contracts_artifacts.py\", line 87, in tied_prototype_probe",
+      "    return prototype_probe(model, [], torch.device(\"cpu\"), gap_tokens=0)",
+      "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+      "  File \"C:\\anaconda\\Lib\\site-packages\\torch\\utils\\_contextlib.py\", line 124, in decorate_context",
+      "    return func(*args, **kwargs)",
+      "           ^^^^^^^^^^^^^^^^^^^^^",
+      "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\posthoc\\feature_probes.py\", line 213, in prototype_probe",
+      "    del mlp.forward_moments",
+      "        ^^^^^^^^^^^^^^^^^^^",
+      "  File \"C:\\anaconda\\Lib\\site-packages\\torch\\nn\\modules\\module.py\", line 2083, in __delattr__",
+      "    super().__delattr__(name)",
+      "AttributeError: 'PrototypeAgentBlockMLP' object has no attribute 'forward_moments'"
+    ]
+  }
+}
