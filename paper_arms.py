@@ -162,8 +162,19 @@ ROOT = Path(__file__).resolve().parent
 
 CONFIG: Dict[str, Any] = {
     "bases":             ["k128_glk_mlp_1ep"],  # keys of BASES
-    "arms":              "TIER_A",        # None: every row of ARMS in table order; a list of labels;
-                                           # "TIER_A" / "TIER_B" (the confound controls), "TIER_AB" (both),
+    "arms":              [                # None: every row of ARMS in table order; a list of labels;
+        # TIER_A, then the two TIER_B arms the 2026-10-25 frame_capacity ablation sweep did not train
+        # (it trained the evaluated, identity-frame and capacity-control arms at this base and these seeds).
+        "Per-type read table, ALiBi (as run)",
+        "Per-type table of the frame table's size",
+        "Per-type read table, ALiBi, realization optimizer",
+        "Per-type read-and-write table, ALiBi",
+        "Per-type read table, ALiBi, shared post-norm",
+        "Matched context-processing parameters",
+        "Matched total parameters",
+        "Frames frozen at their random initialization",
+        "Covariance-blind routing (mean distance)",
+    ],                                     # "TIER_A" / "TIER_B" (the confound controls), "TIER_AB" (both),
                                            # or "REST" (every row in neither tier, e.g. at one seed)
     "budget":            "base_protocol",  # key of BUDGETS
     "seeds":             [(6, 3), (23, 23), (54, 54)],   # (seed, data_seed); (6, 3) is the 25.12, 36.41, 32.65 and 34.48 runs'
@@ -179,15 +190,19 @@ CONFIG: Dict[str, Any] = {
 # Archived runs live under D:/DATA_KEEP/<date>_experiments/ (paths checked 2026-10-17); a base whose
 # directory is gone is reported unavailable by main(), which plans the other selected bases.
 BASES: Dict[str, str] = {
+    
     # K=192, 8 layers, 6 heads, diagonal family with GL(K) frames, ALiBi prior with comparison-invariant RoPE,
     # chunked diagonal decoder, attention residual, coordinate block MLP, no stored-covariance decay,
     # 120,000 steps (25.12 test PPL; best run as of 2026-10-25).
     "k192_glk_mlp": "D:/DATA_KEEP/25.12_wikitext-103_K192_block_glk_mlp_s6",
+    
     # The 25.12 configuration at K=128 (four heads) for one epoch: 15,000 steps, eval every 3,000 (33.57 test PPL).
     "k128_glk_mlp_1ep": "vfe3_runs/33.57_wikitext-103_K128_block_glk_mlp_s6",
+    
     # K=128 exponential chart, 4 layers, ALiBi prior without RoPE, chunked diagonal decoder, no attention
     # residual, row_min clamp, per-epoch window offsets (36.41 test PPL).
     "k128_alibi": "vfe3_runs/36.41_wikitext-103_K128_alibi-exp-chunk",
+    
     # K=128 exponential chart, 6 layers, RoPE, chunked diagonal decoder, no attention residual,
     # 120,000 steps (32.65 test PPL).
     "k128_diag_chunked": "D:/DATA_KEEP/10-10-2026_experiments/32.65_wikitext-103_K128_diag-chunked_exp",
