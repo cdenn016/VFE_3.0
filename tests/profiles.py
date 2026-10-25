@@ -138,6 +138,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'block_mlp_template_init_pull': 0.09,
     'block_memory_regression_rank': None,
     'block_memory_result_noise_ratio': 0.01,
+    'block_mlp_tie_layers': False,
     'block_mlp_dropout': 0.0,
     'm_block_mlp_lr': None,
     'per_type_hidden_bias': False,

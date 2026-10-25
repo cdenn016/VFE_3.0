@@ -3972,6 +3972,7 @@ def _cost_model_fields(
             covariance_layout=("full" if getattr(cfg, "family", None) in ("gaussian_full", "gaussian_block")
                                else "diagonal"),                                   # head blocks: dense storage
             regression_rank=getattr(cfg, "block_memory_regression_rank", None),    # cue_result_memory only
+            tied_layers=bool(getattr(cfg, "block_mlp_tie_layers", False)),         # shared module counted once
         )
     )
     block_mlp_active = block_mlp_build.enabled

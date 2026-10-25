@@ -416,28 +416,34 @@ class VFEModel(nn.Module):
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
-        # One untied selected residual transform per block. The disabled path adds no module,
-        # parameter, or state-dict key; coordinate + passthrough retains the historical topology.
-        self.block_mlps = (
-            nn.ModuleList([
-                build_block_mlp(
-                    cfg.block_mlp_mode,
-                    embed_dim=cfg.embed_dim,
-                    irrep_dims=self.group.irrep_dims,
-                    expansion=cfg.block_mlp_expansion,
-                    covariance_floor=cfg.block_mlp_covariance_floor,
-                    activation=cfg.block_mlp_activation,
-                    dropout=cfg.block_mlp_dropout,
-                    covariance_contract=cfg.block_mlp_covariance,
-                    inference=cfg.block_mlp_inference,                    # read by prototype_agents only
-                    template_init_variance=cfg.block_mlp_template_init_variance,
-                    cavi_steps=cfg.block_mlp_cavi_steps,                  # prototype_agents mean field only
-                    regression_rank=cfg.block_memory_regression_rank,     # cue_result_memory only
-                    result_noise_ratio=cfg.block_memory_result_noise_ratio,   # cue_result_memory only
-                )
-                for _ in range(cfg.n_layers)
-            ]) if cfg.use_block_mlp else None
-        )
+        # One selected residual transform per block. The disabled path adds no module, parameter, or
+        # state-dict key; coordinate + passthrough retains the historical topology. Under block_mlp_tie_layers one
+        # module serves every layer: the list holds the same object n_layers times, so the state dict keeps the
+        # per-layer keys block_mlps.<layer>.* (aliases of one tensor) and parameters() yields it once.
+        def _new_block_mlp() -> nn.Module:
+            return build_block_mlp(
+                cfg.block_mlp_mode,
+                embed_dim=cfg.embed_dim,
+                irrep_dims=self.group.irrep_dims,
+                expansion=cfg.block_mlp_expansion,
+                covariance_floor=cfg.block_mlp_covariance_floor,
+                activation=cfg.block_mlp_activation,
+                dropout=cfg.block_mlp_dropout,
+                covariance_contract=cfg.block_mlp_covariance,
+                inference=cfg.block_mlp_inference,                    # read by prototype_agents only
+                template_init_variance=cfg.block_mlp_template_init_variance,
+                cavi_steps=cfg.block_mlp_cavi_steps,                  # prototype_agents mean field only
+                regression_rank=cfg.block_memory_regression_rank,     # cue_result_memory only
+                result_noise_ratio=cfg.block_memory_result_noise_ratio,   # cue_result_memory only
+            )
+
+        if not cfg.use_block_mlp:
+            self.block_mlps = None
+        elif cfg.block_mlp_tie_layers:
+            shared = _new_block_mlp()
+            self.block_mlps = nn.ModuleList([shared] * cfg.n_layers)
+        else:
+            self.block_mlps = nn.ModuleList([_new_block_mlp() for _ in range(cfg.n_layers)])
         # Per-type hidden bias (default off: no parameter, no state-dict key, no RNG draw). A (V, n_gen)
         # table E, zero-initialized so step 0 equals the model without it, split over the layers into
         # widths w_l; layer l adds E[x_i, slice_l] to the first w_l hidden pre-activation units of its
@@ -473,6 +479,7 @@ class VFEModel(nn.Module):
                 n_layers=cfg.n_layers,
                 covariance_layout=_get_family(cfg.family).cov_kind,     # 'full' also for the dense head-block storage
                 regression_rank=cfg.block_memory_regression_rank,       # cue_result_memory parameter count only
+                tied_layers=cfg.block_mlp_tie_layers,                   # one shared module: parameters counted once
             )
         )
         # Under a comparison rope_mode no frame carries R_i: the MLP and the values both read U_i.
@@ -614,6 +621,19 @@ class VFEModel(nn.Module):
                     "checkpoint was trained in a different so_n irrep basis than this build's "
                     "canonical basis (such as the 'eigh' basis removed 2026-10-12); its learned "
                     "tables would load against the wrong frames.")
+        if self.cfg.use_block_mlp and self.cfg.block_mlp_tie_layers and self.cfg.n_layers > 1:
+            # The per-layer keys of a shared block MLP alias one tensor, so loading copies every layer's entry into it
+            # in turn. A checkpoint whose layers differ (an untied model) would leave the last layer's values; refuse it.
+            for key, value in state_dict.items():
+                if not key.startswith("block_mlps."):
+                    continue
+                layer, _, rest = key[len("block_mlps."):].partition(".")
+                if layer.isdigit() and int(layer) > 0:
+                    first = state_dict.get(f"block_mlps.0.{rest}")
+                    if first is None or not torch.equal(first.detach().cpu(), value.detach().cpu()):
+                        raise ValueError(
+                            f"block_mlp_tie_layers=True shares one block MLP across layers, but the checkpoint's "
+                            f"{key} differs from block_mlps.0.{rest}: it was saved from an untied model")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
@@ -1005,8 +1025,9 @@ class VFEModel(nn.Module):
         """
         from vfe3.model.block_mlp import CueResultMemoryBlockMLP, PrototypeAgentBlockMLP
 
-        targets = [mlp for mlp in (self.block_mlps or [])
-                   if isinstance(mlp, (PrototypeAgentBlockMLP, CueResultMemoryBlockMLP))]
+        # A module shared across layers (block_mlp_tie_layers) is calibrated once, on the input of its first layer.
+        targets = list({id(mlp): mlp for mlp in (self.block_mlps or [])
+                        if isinstance(mlp, (PrototypeAgentBlockMLP, CueResultMemoryBlockMLP))}.values())
         generator = torch.Generator().manual_seed(int(seed))
         results: List[Dict[str, float]] = []
         was_training = self.training

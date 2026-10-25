@@ -2340,9 +2340,11 @@ def block_mlp_build_metadata(
     n_layers: int,
     covariance_layout: str = "full",
     regression_rank: Optional[int] = None,
+    tied_layers: bool = False,
 ) -> BlockMLPBuildMetadata:
-    r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs and
-    ``regression_rank`` the cue_result_memory parameter count (other modes ignore it)."""
+    r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs,
+    ``regression_rank`` the cue_result_memory parameter count (other modes ignore it), and ``tied_layers`` (one
+    module shared by every layer) counts the parameters once while the FLOPs stay per layer."""
     registration = get_block_mlp_registration(mode)
     if covariance not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance!r}")
@@ -2351,7 +2353,7 @@ def block_mlp_build_metadata(
         embed_dim=embed_dim,
         irrep_dims=realized_irrep_dims,
         expansion=expansion,
-        n_layers=n_layers,
+        n_layers=1 if tied_layers else n_layers,
         regression_rank=regression_rank,
     )
     realized_flops_per_token = registration.flops_per_token(

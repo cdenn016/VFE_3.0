@@ -189,6 +189,7 @@ config = dict(
     #################################
     
     use_block_mlp                    = True,
+    block_mlp_tie_layers             = False,          # True | False: one block MLP shared by every layer (depth as time; labels persist across layers)
     per_type_hidden_bias             = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
      
     block_mlp_activation             = "gelu",         # "gelu" | "silu" | "relu" (not read by gaussian_template / prototype_agents)   
