@@ -339,10 +339,12 @@ def build_optimizer(
         # weight_decay=0 on the prototype_agents template log-variances log(lambda) and log-weights log(pi):
         # decaying them pulls lambda toward 1 and pi toward uniform, a prior on the templates rather than a
         # capacity penalty. The template means nu keep the global decay.
-        # cue_result_memory adds its result-noise log variances log(q) to the same undecayed group.
-        template_priors = [p for mlp in model.block_mlps if isinstance(mlp, PrototypeAgentBlockMLP)
+        # cue_result_memory adds its result-noise log variances log(q) to the same undecayed group. A module
+        # shared across layers (block_mlp_tie_layers) is listed once.
+        unique_mlps = list({id(mlp): mlp for mlp in model.block_mlps}.values())
+        template_priors = [p for mlp in unique_mlps if isinstance(mlp, PrototypeAgentBlockMLP)
                            for p in (mlp.log_lambda, mlp.log_pi)]
-        template_priors += [p for mlp in model.block_mlps if isinstance(mlp, CueResultMemoryBlockMLP)
+        template_priors += [p for mlp in unique_mlps if isinstance(mlp, CueResultMemoryBlockMLP)
                             for p in mlp.undecayed_parameters()]
         exempt = {id(p) for p in template_priors}
         groups.append({"params": [p for p in model.block_mlps.parameters() if id(p) not in exempt],

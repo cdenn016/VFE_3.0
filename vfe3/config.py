@@ -757,6 +757,10 @@ class VFE3Config:
     ##################################################
 
     use_block_mlp:                    bool            = True         # residual feed-forward unit after each block
+    # One block MLP shared by every layer (every block_mlp_mode): depth then applies one set of dynamics, and the
+    # template or component labels of prototype_agents / cue_result_memory keep their meaning from layer to layer.
+    # The state dict keeps the per-layer keys block_mlps.<layer>.* as aliases of one tensor.
+    block_mlp_tie_layers:             bool            = False
 
     # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" | "prototype_agents" | "cue_result_memory"
     #   coordinate         standard MLP on the mean coordinates
@@ -2137,6 +2141,8 @@ class VFE3Config:
                 f"got {self.block_mlp_template_init_variance!r}"
             )
         _require(self.block_mlp_template_init, ("absolute", "working_variance"), "block_mlp_template_init")
+        if type(self.block_mlp_tie_layers) is not bool:
+            raise ValueError(f"block_mlp_tie_layers must be a bool, got {self.block_mlp_tie_layers!r}")
         # cue_result_memory knobs (validated in every mode; inactive_fields reports them off that mode).
         rank = self.block_memory_regression_rank
         if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int)
@@ -2690,9 +2696,11 @@ class VFE3Config:
             mark(("block_norm_trace_cap",), "only read by a LayerNorm covariance pushforward (block_norm_covariance "
                  "'pushforward' or 'pushforward_moment', or block_mlp_covariance='delta_full')")
         if not self.use_block_mlp:
-            mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
+            mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor, "block_mlp_tie_layers",
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
                  "only read when use_block_mlp=True")
+        elif self.n_layers == 1:
+            mark(("block_mlp_tie_layers",), "a single layer has one block MLP either way")
         elif self.block_mlp_mode == "gaussian_template":
             mark(("block_mlp_activation", *norm_floor),
                  "gaussian_template gates by softmax over template KLs and keeps covariance")
