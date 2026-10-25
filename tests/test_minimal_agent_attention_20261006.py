@@ -715,12 +715,34 @@ def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
     return float((got.detach().double() - want).abs().max() / want.abs().max())
 
 
+def _escalation_expectation(ops32, mu32: torch.Tensor, sigma32: torch.Tensor, frame32: CanonicalFrameContext,
+                            lp32: torch.Tensor, anchor32: torch.Tensor, wide_mean: torch.Tensor,
+                            wide_cov: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""The escalation contract of audit 2026-10-25 F20: the receivers a raised float32 flag reaches (the readout's
+    ``flagged_receivers``, the receivers failing the covariance screen) take the float64 values, cast back; every
+    other receiver keeps the float32 body output. Returns the expected mean, covariance and receiver mask."""
+    with torch.no_grad():
+        diagonal = sigma32.dim() == mu32.dim()
+        floor = ops32.floor_term(anchor32, sigma32, frame32, diagonal=diagonal)
+        body_mean, body_cov, _, status, receivers = ops32._minimal_agent_body(
+            mu32, sigma32, frame32, lp32, True, False, floor)
+    failed, ill_conditioned, covariance_failed = status.tolist()
+    rows = torch.zeros_like(receivers[0])
+    for raised, flagged in ((failed or ill_conditioned, receivers[0]), (covariance_failed, receivers[1])):
+        if raised:
+            rows = rows | (flagged if bool(flagged.any()) else torch.ones_like(flagged))
+    mean = torch.where(rows[..., None], wide_mean.detach().float(), body_mean)
+    cov = torch.where(rows[..., None] if diagonal else rows[..., None, None], wide_cov.detach().float(), body_cov)
+    return mean, cov, rows
+
+
 @pytest.mark.parametrize("inference", INFERENCE)
 def test_float32_failure_is_recomputed_in_float64(inference: str) -> None:
     r"""A float32 layer call whose ADF query covariance loses positive definiteness is recomputed whole in float64.
 
-    The result and every gradient equal, bitwise, the float64 readout of the float32 inputs and parameters cast back
-    to float32. The recovery counter grows by every query and key entry (2 B N H), and the result lies within 1e-4
+    The flagged receivers take, bitwise, the float64 readout of the float32 inputs and parameters cast back to float32;
+    the others keep the float32 outputs (audit 2026-10-25 F20). Every gradient equals, bitwise, the float64 readout's
+    cast back. The recovery counter grows by every query and key entry (2 B N H), and the result lies within 1e-4
     of the float64 readout of the unrounded inputs (measured: 3e-6 to 8e-6, from the rounding of the inputs)."""
     frame, mu, sigma, S, T_, lp = _k32_case("coupled")
     ops32 = _k32_operators(inference, S, T_, torch.float32)
@@ -745,7 +767,9 @@ def test_float32_failure_is_recomputed_in_float64(inference: str) -> None:
     sigma64 = sigma32.detach().double().requires_grad_(True)
     mean64, cov64 = ops64.minimal_agent_update(mu64, sigma64, frame32, lp, return_covariance=True,
                                                floor_anchor=sigma.float().double())
-    assert torch.equal(mean32, mean64.float()) and torch.equal(cov32, cov64.float())
+    want_mean, want_cov, rows = _escalation_expectation(ops32, mu32.detach(), sigma32.detach(), frame32, lp.float(),
+                                                        sigma.float(), mean64, cov64)
+    assert bool(rows.any()) and torch.equal(mean32, want_mean) and torch.equal(cov32, want_cov)
     g = _gen(8)
     w_mean, w_cov = _rn(g, *mean32.shape).float(), _rn(g, *cov32.shape).float()
     ((w_mean * mean32).sum() + (w_cov * cov32).sum()).backward()
@@ -756,9 +780,13 @@ def test_float32_failure_is_recomputed_in_float64(inference: str) -> None:
     with torch.no_grad():
         mean_ref, cov_ref = _k32_operators(inference, S, T_, F64).minimal_agent_update(
             mu, sigma, frame, lp, return_covariance=True, floor_anchor=sigma)
-    gap_mean, gap_cov = _relative(mean32, mean_ref), _relative(cov32, cov_ref)
+    gap_mean, gap_cov = _relative(mean32[rows], mean_ref[rows]), _relative(cov32[rows], cov_ref[rows])
+    kept_mean, kept_cov = _relative(mean32[~rows], mean_ref[~rows]), _relative(cov32[~rows], cov_ref[~rows])
     print(f"\n[minimal agent] float32 failure recomputed in float64 ({inference}): relative gap to the unrounded "
-          f"float64 readout, mean {gap_mean:.2e}, covariance {gap_cov:.2e}")
+          f"float64 readout at the {int(rows.sum())} flagged receivers, mean {gap_mean:.2e}, covariance "
+          f"{gap_cov:.2e}; float32 receivers, mean {kept_mean:.2e}, covariance {kept_cov:.2e}")
+    # Only the flagged receivers carry the float64 accuracy; the others keep the float32 values of a healthy call
+    # (without the opt-in certificate nothing screens their conditioning).
     assert gap_mean < 1e-4 and gap_cov < 1e-4
 
 
@@ -767,7 +795,8 @@ def test_float32_operating_range_and_the_query_certificate(inference: str) -> No
     r"""Two K = 32 instances without a float32 failure. Certificate off, neither is recomputed and both lie within
     1e-4 of the float64 readout with positive variances (measured: about 1e-6 benign, 1e-5 ill-conditioned). Under
     ``projected_factorization="gram_certified"`` the benign one still runs in float32. The ill-conditioned one fails the
-    query certificate and is recomputed in float64, bitwise equal to the float64 readout of its float32 inputs."""
+    query certificate and is recomputed in float64: its flagged receivers are bitwise the float64 readout of the
+    float32 inputs, the others the float32 outputs (audit 2026-10-25 F20)."""
     for kind, trips in (("benign", False), ("ill_conditioned", True)):
         frame, mu, sigma, S, T_, lp = _k32_case(kind)
         ops32 = _k32_operators(inference, S, T_, torch.float32)
@@ -786,6 +815,9 @@ def test_float32_operating_range_and_the_query_certificate(inference: str) -> No
                     mean32, cov32 = ops32.minimal_agent_update(mu.float(), sigma.float(), frame32, lp.float(),
                                                                return_covariance=True, floor_anchor=sigma.float())
                 recovered = int(source_recovery_counter(mu.device)) - before
+                if recovered:
+                    want_mean, want_cov, rows = _escalation_expectation(
+                        ops32, mu.float(), sigma.float(), frame32, lp.float(), sigma.float(), *rounded)
             finally:
                 set_projected_condition_recovery(previous)
             assert recovered == (2 * _N32 * _H32 if recovery and trips else 0), (kind, recovery)
@@ -795,7 +827,7 @@ def test_float32_operating_range_and_the_query_certificate(inference: str) -> No
                   f"covariance {gap_cov:.2e}")
             assert gap_mean < 1e-4 and gap_cov < 1e-4 and bool((cov32 > 0).all())
             if recovered:
-                assert torch.equal(mean32, rounded[0].float()) and torch.equal(cov32, rounded[1].float())
+                assert bool(rows.any()) and torch.equal(mean32, want_mean) and torch.equal(cov32, want_cov)
 
 
 @pytest.mark.parametrize("inference", INFERENCE)

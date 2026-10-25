@@ -147,13 +147,23 @@ def fisher_spectrum_bounds(
     :math:`\tfrac12(2 + a \pm \sqrt{a^2 + 4})` (:math:`c_1 = c_2 = 1`), the smaller of which is about
     :math:`a/2` for small :math:`a`; at :math:`a = 0` the stabilizer is every rotation and the smaller
     member is :math:`\lambda`.
+
+    The smaller pair member is evaluated in the rationalized form
+    :math:`\lambda_- = \lambda_+^{-1}(c_1^2 - c_2^2 + c_1 a)`, from the product of the roots
+    :math:`\lambda_+\lambda_- = c_1^2 - c_2^2 + c_1 a`, so it carries no cancellation; the subtractive
+    form :math:`\tfrac12(2c_1 + a - \sqrt{a^2 + 4c_2^2})` rounds to zero at small :math:`a` (audit
+    2026-10-25 F11). The substitution of :math:`\lambda` at :math:`a = 0` under ``'stabilizer'`` is the
+    separate conditioning policy above and is unchanged.
     """
     if _check_completion(completion) == "stabilizer":
         root = torch.sqrt(a.square() + 4.0)
         members = [2.0 + a]
         if d >= 2:
-            minus = torch.where(a > 0, 0.5 * (2.0 + a - root), torch.full_like(a, float(rotation_weight)))
-            members += [minus, 0.5 * (2.0 + a + root), torch.full_like(a, 2.0)]
+            plus = 0.5 * (2.0 + a + root)
+            # lambda_+ lambda_- = a for c_1 = c_2 = 1, so lambda_- = a / lambda_+ without cancellation.
+            fisher_minus = a / plus
+            minus = torch.where(a > 0, fisher_minus, torch.full_like(a, float(rotation_weight)))
+            members += [minus, plus, torch.full_like(a, 2.0)]
         if d >= 3:
             members.append(torch.full_like(a, float(rotation_weight)))
         stacked = torch.stack(members)                                     # (m, ...)
@@ -162,8 +172,9 @@ def fisher_spectrum_bounds(
     root = torch.sqrt(a.square() + 4.0 * c2 * c2)
     members = [2.0 + a]
     if d >= 2:
-        members += [0.5 * (2.0 * c1 + a - root), 0.5 * (2.0 * c1 + a + root),
-                    torch.full_like(a, 2.0)]
+        plus = 0.5 * (2.0 * c1 + a + root)
+        # lambda_+ lambda_- = c_1^2 - c_2^2 + c_1 a (= 2 lambda + c_1 a), free of cancellation.
+        members += [(c1 * c1 - c2 * c2 + c1 * a) / plus, plus, torch.full_like(a, 2.0)]
     if d >= 3:
         members.append(torch.full_like(a, float(rotation_weight)))
     stacked = torch.stack(members)                                         # (m, ...)

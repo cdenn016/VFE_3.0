@@ -1,9 +1,11 @@
 r"""Click-to-run local-learner test (design: docs/research/2026-10-21-local-learner-test/design.md).
 
 Edit CONFIG and run. Stage "timing" measures one chunk per arm; "A" is the synthetic identifiability check;
-"B" is WikiText-103 bytes. Results append to ``<out_dir>/results_<stage>.jsonl`` and completed runs are
-skipped on relaunch. The seeds of one (arm, d) train as one stacked batch, so each kernel launch serves all
-of them; stacked runs never exchange information. With ``device = "cuda"`` run it under the CUDA interpreter (``$CUDA_PYTHON``,
+"B" is WikiText-103 bytes. Results append to ``<out_dir>/results_<stage>.jsonl``; each record stores its effective
+arm settings, data protocol and source hash, and a completed run is skipped on relaunch only when these match the
+current ones (a mismatch stops with the differing fields; records without them are reused with a warning). The
+seeds of one (arm, d) train as one stacked batch, so each kernel launch serves all of them; stacked runs never
+exchange information. With ``device = "cuda"`` run it under the CUDA interpreter (``$CUDA_PYTHON``,
 ``C:/anaconda/python.exe``); the n-gram references and synthetic sampling stay on the CPU.
 """
 
@@ -118,11 +120,14 @@ def as_streams(x: np.ndarray, S: int) -> torch.Tensor:
     return torch.from_numpy(x[:S * L].reshape(S, L).copy())
 
 
-def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
+def arm_settings(arm: str, chunk: int | None = None) -> dict:
+    r"""The effective training settings of an arm under CONFIG: the learning rule and every keyword its trainer
+    receives (schedules resolved to their values). ``train_arm`` trains from exactly this dict, and each result
+    record stores it, so a completed run is reused only under the same settings."""
     c = CONFIG
     chunk = c["chunk"] if chunk is None else chunk
     if arm == "backprop":
-        return train_backprop(prm0, train, tree, chunk=chunk, lr=c["backprop_lr"], log=log)
+        return {"rule": "backprop", "chunk": chunk, "lr": c["backprop_lr"]}
     base, _, name = arm.partition("@")
     sensor_stats = "sequential"
     if base.endswith("_cav"):                   # node statistics at the EP cavity of the token's posterior
@@ -133,13 +138,55 @@ def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log
         if c["stage"] != "A":
             raise ValueError("the 'pass' reset needs repeated passes (stage A)")
         reset = max(1, c["A_train_len"] // c["chunk"])
-    kw = dict(chunk=chunk, ridge=c["ridge"], q_floor=c["q_floor"], gamma_exponent=sched["alpha"],
-              gamma_floor=sched["floor"], reset_every=reset, sensor_stats=sensor_stats, log=log)
     if base == "blind":
-        return train_local(prm0, train, tree, window=1, blind=True, **kw)
-    if base.startswith("local_w"):
-        return train_local(prm0, train, tree, window=int(base[7:]), **kw)
-    raise ValueError(arm)
+        window, blind = 1, True
+    elif base.startswith("local_w"):
+        window, blind = int(base[7:]), False
+    else:
+        raise ValueError(arm)
+    return {"rule": "local", "chunk": chunk, "window": window, "blind": blind, "ridge": c["ridge"],
+            "q_floor": c["q_floor"], "gamma_exponent": sched["alpha"], "gamma_floor": sched["floor"],
+            "reset_every": reset, "sensor_stats": sensor_stats}
+
+
+def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
+    kw = arm_settings(arm, chunk)
+    if kw.pop("rule") == "backprop":
+        return train_backprop(prm0, train, tree, log=log, **kw)
+    return train_local(prm0, train, tree, log=log, **kw)
+
+
+def protocol(stage: str, streams: int | None = None) -> dict:
+    r"""Data and evaluation identity of a stage: corpus, budgets, stream layout, validation and particle-filter
+    slices. ``streams`` overrides the training stream count (stage S sets it per run)."""
+    c = CONFIG
+    common = {"stage": stage, "streams": c["streams"] if streams is None else streams, "pf_streams": c["pf_streams"],
+              "pf_len": c["pf_len"], "pf_particles": c["pf_particles"]}
+    if stage == "A":
+        return {**common, "data": "synthetic", "A_d": c["A_d"], "A_train_len": c["A_train_len"],
+                "A_epochs": c["A_epochs"], "A_val_streams": c["A_val_streams"], "A_val_len": c["A_val_len"]}
+    return {**common, "data": "wikitext-103 bytes", "B_train_bytes": c["B_train_bytes"],
+            "B_val_bytes": c["B_val_bytes"], "B_val_streams": c["B_val_streams"]}
+
+
+def source_identity() -> str:
+    r"""SHA-256 of the local-learner package source and of this script's training, scoring and data-loading
+    functions (line endings normalized), so a result is not reused across a change of the code that made it."""
+    import hashlib
+    import inspect
+    import vfe3.local_learner as pkg
+    h = hashlib.sha256()
+    for f in sorted(Path(pkg.__file__).parent.glob("*.py")):
+        h.update(f.name.encode() + b"\0" + f.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    for fn in (arm_settings, train_arm, protocol, scores, load_bytes, as_streams):
+        h.update(inspect.getsource(fn).replace("\r\n", "\n").encode() + b"\0")
+    return h.hexdigest()
+
+
+def identity(arm_cfg: dict | None, proto: dict) -> dict:
+    r"""The identity stored in a result record and compared before reuse (JSON round-tripped so it compares
+    equal to the stored copy)."""
+    return json.loads(json.dumps({"arm_settings": arm_cfg, "protocol": proto, "source": source_identity()}))
 
 
 def scores(prm: Params, val: torch.Tensor, pf: torch.Tensor, tree: TreeSensor, seed: int) -> list[dict]:
@@ -151,10 +198,41 @@ def scores(prm: Params, val: torch.Tensor, pf: torch.Tensor, tree: TreeSensor, s
              "pf_subset_exact_bits": float(p_nll[r]) / p_n / LN2, "n_val": n, "n_pf": p_n} for r in range(prm.R)]
 
 
-def done_keys(path: Path) -> set:
+def done_records(path: Path) -> dict:
+    r"""Completed result records keyed by (arm, d, seed); a later record of the same key replaces an earlier one."""
     if not path.exists():
-        return set()
-    return {(r["arm"], r["d"], r["seed"]) for r in map(json.loads, path.read_text().splitlines()) if "arm" in r}
+        return {}
+    return {(r["arm"], r["d"], r["seed"]): r for r in map(json.loads, path.read_text().splitlines()) if "arm" in r}
+
+
+def _differences(old: object, new: object, prefix: str = "") -> list[str]:
+    r"""Dotted paths at which two nested identity dicts differ."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return [p for k in sorted(set(old) | set(new)) for p in _differences(old.get(k), new.get(k), f"{prefix}{k}.")]
+    return [] if old == new else [prefix.rstrip(".") or "identity"]
+
+
+def pending(done: dict, arm: str, d: int, seeds: list[int], ident: dict) -> list[int]:
+    r"""Seeds of (arm, d) still to run. A completed record is reused only when its stored identity equals
+    ``ident``; a record with a different identity raises, since appending a second result under the same key
+    would leave two incompatible results in one file. Records written before identities were stored cannot be
+    checked: they are reused and reported."""
+    todo, legacy, clash = [], [], []
+    for s in seeds:
+        r = done.get((arm, d, s))
+        if r is None:
+            todo.append(s)
+        elif "identity" not in r:
+            legacy.append(s)
+        elif r["identity"] != ident:
+            clash.append(f"seed {s}: {', '.join(_differences(r['identity'], ident))}")
+    if clash:
+        raise RuntimeError(f"completed results for arm {arm!r}, d={d} were made under different settings "
+                           f"({'; '.join(clash)}). Set a new out_dir or remove those records to rerun.")
+    if legacy:
+        print(f"warning: reusing results for arm {arm!r}, d={d}, seeds {legacy} that predate stored settings; "
+              f"their settings cannot be checked against CONFIG", flush=True)
+    return todo
 
 
 def append(path: Path, row: dict) -> None:
@@ -186,7 +264,7 @@ def run_scaling(tree: TreeSensor) -> None:
     out = Path(c["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     path = out / "results_S.jsonl"
-    done = done_keys(path)
+    done = done_records(path)
     xtrain = load_bytes("train", c["B_train_bytes"])
     xval = load_bytes("validation", c["B_val_bytes"])
     val = as_streams(xval, c["B_val_streams"]).to(DEVICE)
@@ -195,7 +273,8 @@ def run_scaling(tree: TreeSensor) -> None:
         arm, d, chunk, streams = spec["arm"], spec["d"], spec["chunk"], spec["streams"]
         label = f"{arm}_c{chunk}"
         train = as_streams(xtrain, streams).to(DEVICE)
-        todo = [s for s in c["B_seeds"] if (label, d, s) not in done]
+        ident = identity(arm_settings(arm, chunk), protocol("S", streams))
+        todo = pending(done, label, d, c["B_seeds"], ident)
         for i in range(0, len(todo), spec["stack"]):
             group = todo[i:i + spec["stack"]]
             t0 = time.perf_counter()
@@ -210,7 +289,7 @@ def run_scaling(tree: TreeSensor) -> None:
                               "train_tokens": int(train.shape[0] * (train.shape[1] - 1)),
                               "updates": history[-1]["chunk"] if history else None,
                               "final_train_bits": history[-1]["train_bits"][r] if history else None,
-                              "G_spectral": spectral[r], **sc})
+                              "G_spectral": spectral[r], **sc, "identity": ident})
             del prm
             if DEVICE.type == "cuda":
                 torch.cuda.empty_cache()
@@ -276,7 +355,8 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
     out = Path(c["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"results_{stage}.jsonl"
-    done = done_keys(path)
+    done = done_records(path)
+    proto = protocol(stage)
     if stage == "A":
         g = torch.Generator().manual_seed(1234)
         d = c["A_d"]
@@ -292,11 +372,15 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
         pf = sample_sequences(truth, tree, c["pf_streams"], c["pf_len"], seed=3).to(DEVICE)
         truth = truth.to(DEVICE)
         dims, seeds = [d], c["A_seeds"]
-        if ("truth", d, -1) not in done:
-            append(path, {"stage": "A", "arm": "truth", "d": d, "seed": -1, **scores(truth, val, pf, tree, 0)[0]})
+        ident = identity({"rule": "truth"}, proto)
+        if pending(done, "truth", d, [-1], ident):
+            append(path, {"stage": "A", "arm": "truth", "d": d, "seed": -1, **scores(truth, val, pf, tree, 0)[0],
+                          "identity": ident})
         uni, n = ngram_nll(train_cpu.reshape(-1).numpy(), val_cpu.numpy(), tree.V, 1, 1.0)
-        if ("unigram", 0, 0) not in done:
-            append(path, {"stage": "A", "arm": "unigram", "d": 0, "seed": 0, "val_bits": uni / n / LN2})
+        ident = identity({"rule": "ngram", "order": 1, "k": 1.0}, proto)
+        if pending(done, "unigram", 0, [0], ident):
+            append(path, {"stage": "A", "arm": "unigram", "d": 0, "seed": 0, "val_bits": uni / n / LN2,
+                          "identity": ident})
     else:
         xtrain = load_bytes("train", c["B_train_bytes"])
         xval = load_bytes("validation", c["B_val_bytes"])
@@ -306,15 +390,18 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
         pf = as_streams(xval[:c["pf_streams"] * c["pf_len"]], c["pf_streams"]).to(DEVICE)
         for order in (1, 2, 3):
             key = (f"{order}-gram", 0, 0)
-            if key in done:
+            ident = identity({"rule": "ngram", "order": order, "k_grid": c["ngram_k_grid"]}, proto)
+            if not pending(done, key[0], 0, [0], ident):
                 continue
             best = min((ngram_nll(xtrain, val_cpu.numpy(), tree.V, order, k), k) for k in c["ngram_k_grid"])
             (nll, n), k = best
-            append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k})
+            append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k,
+                          "identity": ident})
         dims, seeds = c["B_dims"], c["B_seeds"]
     for d in dims:
         for arm in (c["A_arms"] if stage == "A" else c["arms"]):
-            todo = [s for s in seeds if (arm, d, s) not in done]
+            ident = identity(arm_settings(arm), proto)
+            todo = pending(done, arm, d, seeds, ident)
             if not todo:
                 continue
             t0 = time.perf_counter()
@@ -327,7 +414,7 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
                 append(path, {"stage": stage, "arm": arm, "d": d, "seed": seed, "train_sec": sec,
                               "stacked_runs": len(todo), "train_tokens": int(train.shape[0] * (train.shape[1] - 1)),
                               "final_train_bits": history[-1]["train_bits"][r] if history else None,
-                              "G_spectral": spectral[r], **sc})
+                              "G_spectral": spectral[r], **sc, "identity": ident})
 
 
 def sync() -> None:

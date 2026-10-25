@@ -15,7 +15,10 @@ Per element (:math:`W = c_{ik} + \lambda_{ak}`, :math:`\delta = \xi_{ik} - \nu_{
     t_{ia,r} = \sum_k g V_{akr},\qquad G_{ia,rs} = \sum_k V_{akr}\,p\,V_{aks},
 
     m^Y_{iak} = \omega_{ak} + g + \sum_r t_{ia,r}U_{akr},\qquad
-    v^Y_{iak} = q_{ak} + p\Big(1 + 2\sum_r U_{akr}V_{akr}\Big) + \sum_{rs}U_{akr}G_{ia,rs}U_{aks}.
+    v^Y_{iak} = p(1 + a)^2 + \max\Big(\sum_{rs}U_{akr}G_{ia,rs}U_{aks} - pa^2, 0\Big) + q_{ak},
+    \qquad a = \sum_rU_{akr}V_{akr},
+
+the regression variance as a sum of squares with the result noise added last (audit 2026-10-25 F02).
 
 Kernels (one owner per output element, no atomics):
   ``cr_fwd_weights_kernel``   program = (row, BA components); k loop; writes the unnormalized log weights and the
@@ -90,7 +93,12 @@ def _col(tile, offs_p, j):
 @triton.jit
 def _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p,
                     RANK: tl.constexpr, RP: tl.constexpr):
-    r"""m^Y and v^Y of the tile from the (BA, RP) t and (BA, RP*RP) G tiles, and uv = sum_r U_r V_r."""
+    r"""m^Y and v^Y of the tile from the (BA, RP) t and (BA, RP*RP) G tiles, uv = a = sum_r U_r V_r, and the
+    indicator ind = [quad - p a^2 >= 0] of the unclamped remainder.
+
+    v^Y = p (1 + a)^2 + max(quad - p a^2, 0) + q: the regression variance as diag(F P F^T)_k = p_k (1 + a_k)^2 plus the
+    sum of squares over l != k, clamped to its sign, with the result noise added last (audit 2026-10-25 F02; as the
+    torch route's ``_diagonal_tile``)."""
     omega = tl.load(OMEGA + idx, mask=m2, other=0.0)
     q = tl.load(Q + idx, mask=m2, other=0.0)
     mY = omega + g
@@ -104,8 +112,10 @@ def _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p,
         for s in tl.static_range(RANK):
             u_s = tl.load(U + idx * RANK + s, mask=m2, other=0.0)
             quad += _col(Gm, offs_rr, r * RP + s) * u_r * u_s
-    vY = q + p * (1.0 + 2.0 * uv) + quad
-    return mY, vY, uv
+    rem = quad - p * uv * uv
+    ind = tl.where(rem >= 0.0, 1.0, 0.0)                                       # torch.clamp_min passes x >= 0
+    vY = (p * (1.0 + uv) * (1.0 + uv) + rem * ind) + q
+    return mY, vY, uv, ind
 
 
 @triton.jit
@@ -180,7 +190,7 @@ def cr_fwd_moments_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, T, G, MEAN, VAR,
         m2, idx, c, lam, W, inv, delta, gain, g, p = _elem(X, C, NU, LAM, row, offs_a, offs_k, ma, mk, K)
         t = _load_planes(T, RM, row, M, offs_a, ma, offs_r, valid_r)
         Gm = _load_planes(G, RM, row, M, offs_a, ma, offs_rr, valid_rr)
-        mY, vY, uv = _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p, RANK, RP)
+        mY, vY, uv, ind = _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p, RANK, RP)
         w = tl.where(ma, _exp(tl.load(LOGWN + row * M + offs_a, mask=ma, other=float("-inf")), ACC), 0.0)
         bw = tl.sum(w, 0)
         bw_safe = tl.where(bw > 0.0, bw, 1.0)
@@ -231,7 +241,7 @@ def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G
         offs_k = k0 + tl.arange(0, BK)
         mk = offs_k < K
         m2, idx, c, lam, W, inv, delta, gain, g, p = _elem(X, C, NU, LAM, row, offs_a, offs_k, ma, mk, K)
-        mY, vY, uv = _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p, RANK, RP)
+        mY, vY, uv, ind = _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p, RANK, RP)
         mean = tl.load(MEAN + row * K + offs_k, mask=mk, other=0.0)
         gm = tl.load(GM + row * K + offs_k, mask=mk, other=0.0)
         gv = tl.load(GV + row * K + offs_k, mask=mk, other=0.0)
@@ -244,7 +254,7 @@ def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G
             tbar += tl.sum(mbar * u_r, 1)[:, None] * (offs_r == r)[None, :]
             for s in tl.static_range(RANK):
                 u_s = tl.load(U + idx * RANK + s, mask=m2, other=0.0)
-                Gbar += tl.sum(vbar * u_r * u_s, 1)[:, None] * (offs_rr == r * RP + s)[None, :]
+                Gbar += tl.sum(vbar * ind * u_r * u_s, 1)[:, None] * (offs_rr == r * RP + s)[None, :]
     tl.store(WBAR + row * M + offs_a, wbar, mask=ma)
     _store_planes(TBAR, RM, row, M, offs_a, ma, tbar, offs_r, valid_r)
     _store_planes(GBAR, RM, row, M, offs_a, ma, Gbar, offs_rr, valid_rr)
@@ -255,7 +265,7 @@ def _chain(U, V, t, Gm, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx, m2
            mean, gm, gv, c, lam, inv, delta, gain, g, p, RANK: tl.constexpr, RP: tl.constexpr, ACC: tl.constexpr):
     r"""The element adjoints of one tile: mbar, vbar, and dL/d(delta), dL/dlambda, dL/dc (module docstring of
     ``cue_result.py``)."""
-    mY, vY, uv = _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p, RANK, RP)
+    mY, vY, uv, ind = _result_moments(U, V, t, Gm, offs_r, offs_rr, idx, m2, OMEGA, Q, g, p, RANK, RP)
     w = tl.where(ma, _exp(tl.load(LOGWN + row * M + offs_a, mask=ma, other=float("-inf")), ACC), 0.0)
     lbar = tl.load(LBAR + row * M + offs_a, mask=ma, other=0.0)
     mbar = tl.where(m2, w[:, None] * (gm[None, :] + 2.0 * gv[None, :] * (mY - mean[None, :])), 0.0)
@@ -268,14 +278,14 @@ def _chain(U, V, t, Gm, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx, m2
         for s in tl.static_range(RANK):
             v_s = tl.load(V + idx * RANK + s, mask=m2, other=0.0)
             vv += _col(Gbar, offs_rr, r * RP + s) * v_r * v_s
-    pbar = vbar * (1.0 + 2.0 * uv) + vv
+    pbar = vbar * ((1.0 + uv) * (1.0 + uv) - ind * uv * uv) + vv               # Gbar already carries ind
     dbar = gbar * gain - lbar[:, None] * delta * inv
     gainbar = gbar * delta + pbar * c[None, :]
     Wbar = -gainbar * lam * inv * inv - 0.5 * lbar[:, None] * (inv - delta * delta * inv * inv)
     lambar = gainbar * inv + Wbar
     cbar = Wbar + pbar * gain
     zero = tl.zeros_like(g)
-    return (mbar, vbar, tl.where(m2, dbar, zero), tl.where(m2, lambar, zero), tl.where(m2, cbar, zero))
+    return (mbar, vbar, tl.where(m2, dbar, zero), tl.where(m2, lambar, zero), tl.where(m2, cbar, zero), uv, ind)
 
 
 @triton.jit
@@ -304,7 +314,7 @@ def cr_bwd_rows_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G,
         Gm = _load_planes(G, RM, row, M, offs_a, ma, offs_rr, valid_rr)
         tbar = _load_planes(TBAR, RM, row, M, offs_a, ma, offs_r, valid_r)
         Gbar = _load_planes(GBAR, RM, row, M, offs_a, ma, offs_rr, valid_rr)
-        mbar, vbar, dbar, lambar, cbar = _chain(U, V, t, Gm, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx,
+        mbar, vbar, dbar, lambar, cbar, uv, ind = _chain(U, V, t, Gm, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx,
                                                 m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam, inv, delta, gain,
                                                 g, p, RANK, RP, ACC)
         dx += tl.sum(dbar, 0)
@@ -349,7 +359,7 @@ def cr_bwd_cols_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G,
         Gm = _load_planes(G, RM, row, M, offs_a, ma, offs_rr, valid_rr)
         tbar = _load_planes(TBAR, RM, row, M, offs_a, ma, offs_r, valid_r)
         Gbar = _load_planes(GBAR, RM, row, M, offs_a, ma, offs_rr, valid_rr)
-        mbar, vbar, dbar, lambar, cbar = _chain(U, V, t, Gm, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx,
+        mbar, vbar, dbar, lambar, cbar, uv, ind = _chain(U, V, t, Gm, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx,
                                                 m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam, inv, delta, gain,
                                                 g, p, RANK, RP, ACC)
         dnu -= dbar
@@ -366,8 +376,9 @@ def cr_bwd_cols_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G,
             for s in tl.static_range(RANK):
                 gu += _col(Gm, offs_rr, r * RP + s) * tl.load(U + idx * RANK + s, mask=m2, other=0.0)
                 gbv += _col(Gbar, offs_rr, r * RP + s) * tl.load(V + idx * RANK + s, mask=m2, other=0.0)
-            u_bar = mbar * t_r + vbar * (2.0 * p * v_r + 2.0 * gu)
-            v_bar = g * tb_r + 2.0 * p * (vbar * u_r + gbv)
+            coef = 1.0 + uv - ind * uv                                          # dv/da / (2p) = (1 + a) - ind a
+            u_bar = mbar * t_r + vbar * (2.0 * p * coef * v_r + 2.0 * ind * gu)
+            v_bar = g * tb_r + 2.0 * p * (vbar * coef * u_r + gbv)
             sel = (offs_r == r)[None, None, :]
             du += tl.where(m2, u_bar, 0.0)[:, :, None] * sel
             dv += tl.where(m2, v_bar, 0.0)[:, :, None] * sel

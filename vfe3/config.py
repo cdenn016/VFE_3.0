@@ -2762,17 +2762,21 @@ class VFE3Config:
             mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor, "block_mlp_tie_layers",
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
                  "only read when use_block_mlp=True")
-        elif self.n_layers == 1:
-            mark(("block_mlp_tie_layers",), "a single layer has one block MLP either way")
-        elif self.block_mlp_mode == "gaussian_template":
-            mark(("block_mlp_activation", *norm_floor),
-                 "gaussian_template gates by softmax over template KLs and keeps covariance")
-        elif self.block_mlp_mode in ("prototype_agents", "cue_result_memory"):
-            mark(("block_mlp_activation", *norm_floor),
-                 f"{self.block_mlp_mode} has no hidden activation, and its posterior covariance is exact, "
-                 "with no floor")
-        elif self.block_mlp_covariance != "delta_full":
-            mark(norm_floor, "only read by block_mlp_covariance='delta_full' or a block_norm_covariance pushforward")
+        else:
+            # The singleton tying mark is independent of the mode chain below, which must still run at
+            # depth one (audit 2026-10-25 F12).
+            if self.n_layers == 1:
+                mark(("block_mlp_tie_layers",), "a single layer has one block MLP either way")
+            if self.block_mlp_mode == "gaussian_template":
+                mark(("block_mlp_activation", *norm_floor),
+                     "gaussian_template gates by softmax over template KLs and keeps covariance")
+            elif self.block_mlp_mode in ("prototype_agents", "cue_result_memory"):
+                mark(("block_mlp_activation", *norm_floor),
+                     f"{self.block_mlp_mode} has no hidden activation, and its posterior covariance is exact, "
+                     "with no floor")
+            elif self.block_mlp_covariance != "delta_full":
+                mark(norm_floor,
+                     "only read by block_mlp_covariance='delta_full' or a block_norm_covariance pushforward")
         memory = self.use_block_mlp and self.block_mlp_mode == "cue_result_memory"
         if not memory:
             mark(("block_memory_regression_rank", "block_memory_result_noise_ratio", "block_memory_regime_transition",

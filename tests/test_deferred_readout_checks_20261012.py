@@ -135,11 +135,11 @@ def test_flagged_minimal_agent_layer_takes_the_float64_recomputation(monkeypatch
     dtypes: list = []
 
     def flag_first(self: RelationalOperators, *args: Any) -> Any:
-        mu_plus, sigma_plus, record, status = call(self, *args)
+        mu_plus, sigma_plus, record, status, receivers = call(self, *args)
         dtypes.append(args[0].dtype)
         if len(dtypes) == 1:
             status = status | torch.tensor([False, True, False])   # the first layer: ill-conditioned
-        return mu_plus, sigma_plus, record, status
+        return mu_plus, sigma_plus, record, status, receivers
 
     monkeypatch.setattr(RelationalOperators, "_minimal_agent_call", flag_first)
     reset_source_recovery_elements()

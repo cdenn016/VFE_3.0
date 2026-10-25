@@ -83,6 +83,47 @@ def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
     return torch.float64 if any(t.dtype == torch.float64 for t in tensors) else torch.float32
 
 
+def _shifted_mass(
+    log_w: torch.Tensor,                        # (r, m) unnormalized log weights
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Row maximum :math:`s` (detached; 0 where a row has no finite entry), scaled mass
+    :math:`l = \sum_a e^{\ell_a - s}` and normalized weights :math:`w_a = e^{\ell_a - s}/l`.
+
+    The absolute log mass :math:`s + \log l` is never subtracted from :math:`\ell_a`: at large log densities its
+    :math:`\log l` increment rounds away (float32 spacing is 2 near :math:`-2.5\cdot10^7`), which made two identical
+    components carry weight one each (audit 2026-10-25 F01). The shift cancels exactly in :math:`w`, so detaching it
+    leaves every gradient unchanged."""
+    s = log_w.detach().amax(dim=-1)
+    s = torch.where(torch.isfinite(s), s, torch.zeros_like(s))
+    e = torch.exp(log_w - s.unsqueeze(-1))
+    l = e.sum(-1)
+    return s, l, e / l.unsqueeze(-1)
+
+
+def _merge_scales(
+    s_a: torch.Tensor, l_a: torch.Tensor,
+    s_b: torch.Tensor, l_b: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Merge two (shift, scaled mass) pairs: the common shift, the merged scaled mass and the two mixing fractions
+    :math:`\alpha = l_ae^{s_a - s}/l`, :math:`\beta = l_be^{s_b - s}/l`, all relative to the common shift."""
+    s = torch.maximum(s_a, s_b)
+    a = l_a * torch.exp(s_a - s)
+    b = l_b * torch.exp(s_b - s)
+    l = a + b
+    return s, l, (a / l).unsqueeze(-1), (b / l).unsqueeze(-1)
+
+
+def _normalized_outputs(
+    log_w: torch.Tensor,                        # (R, M) unnormalized log weights
+    s: torch.Tensor,                            # (R,) shift
+    l: torch.Tensor,                            # (R,) scaled mass relative to s
+) -> Tuple[torch.Tensor, torch.Tensor]:         # normalized log weights (R, M), log evidence (R,)
+    r"""Normalized log weights :math:`(\ell_a - s) - \log l` and the log evidence :math:`s + \log l`, formed only as an
+    output (F01)."""
+    log_l = torch.log(l)
+    return (log_w - s.unsqueeze(-1)) - log_l.unsqueeze(-1), s + log_l
+
+
 def _check_inputs(
     xi: torch.Tensor,
     C: torch.Tensor,
@@ -165,7 +206,8 @@ def _chunk_moments(
     left: Optional[torch.Tensor],
     right: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""One chunk: log weights (T, m), the chunk's log mass (T,), and its normalized result mean and covariance."""
+    r"""One (tokens x components) tile: log weights (T, m), the tile's shift and scaled mass (T,) (:func:`_shifted_mass`),
+    and its normalized result mean and covariance."""
     K = xi.shape[-1]
     W = C.unsqueeze(-3) + torch.diag_embed(lam)                                          # (T, m, K, K) L_a + C
     L_W, info = torch.linalg.cholesky_ex(W)
@@ -182,27 +224,24 @@ def _chunk_moments(
     P_X = 0.5 * (P_X + P_X.transpose(-2, -1))
     m_Y = omega + _apply_regression(lam * gain, offset, left, right)                     # (T, m, K) omega + F L W^-1 d
     P_Y = torch.diag_embed(q) + _sandwich_regression(P_X, offset, left, right)           # (T, m, K, K)
-    log_mass = torch.logsumexp(log_w, dim=-1)                                            # (T,)
-    w = torch.exp(log_w - log_mass.unsqueeze(-1))                                        # (T, m) within-chunk weights
+    s, l, w = _shifted_mass(log_w)                                                       # (T,), (T,), (T, m)
     mean = (w.unsqueeze(-1) * m_Y).sum(-2)                                               # (T, K)
     centered = m_Y - mean.unsqueeze(-2)                                                  # (T, m, K)
     cov = (w[..., None, None] * (P_Y + centered.unsqueeze(-1) * centered.unsqueeze(-2))).sum(-3)
-    return log_w, log_mass, mean, cov
+    return log_w, s, l, mean, cov
 
 
 def _merge(
-    log_mass_a: torch.Tensor, mean_a: torch.Tensor, cov_a: torch.Tensor,
-    log_mass_b: torch.Tensor, mean_b: torch.Tensor, cov_b: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Law of total covariance for two normalized mixtures with log masses: a positive sum."""
-    log_mass = torch.logaddexp(log_mass_a, log_mass_b)
-    alpha = torch.exp(log_mass_a - log_mass).unsqueeze(-1)                               # (T, 1)
-    beta = torch.exp(log_mass_b - log_mass).unsqueeze(-1)
+    s_a: torch.Tensor, l_a: torch.Tensor, mean_a: torch.Tensor, cov_a: torch.Tensor,
+    s_b: torch.Tensor, l_b: torch.Tensor, mean_b: torch.Tensor, cov_b: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Law of total covariance for two normalized mixtures with (shift, scaled mass) pairs: a positive sum."""
+    s, l, alpha, beta = _merge_scales(s_a, l_a, s_b, l_b)                                # alpha, beta (T, 1)
     diff = mean_a - mean_b                                                               # (T, K)
     mean = alpha * mean_a + beta * mean_b
     cov = (alpha.unsqueeze(-1) * cov_a + beta.unsqueeze(-1) * cov_b
            + (alpha * beta).unsqueeze(-1) * diff.unsqueeze(-1) * diff.unsqueeze(-2))
-    return log_mass, mean, cov
+    return s, l, mean, cov
 
 
 @ieee_fp32_matmul()
@@ -241,20 +280,40 @@ def cue_result_exact_posterior(
             log_pi_hat = log_pi_hat.reshape(-1, M)                                       # (T, M) per token
         offset, left, right = (cast(t) for t in reg)
         T = xi_f.shape[0]
-        per_component = max(1, T) * K * K * torch.finfo(dtype).bits // 8 * 6             # ~6 (T, K, K) tensors live
-        chunk = max(1, min(M, int(tile_bytes) // max(1, per_component)))
-        log_ws = []
-        running = None
-        for start in range(0, M, chunk):
-            sl = slice(start, min(M, start + chunk))
-            log_w, log_mass, mean, cov = _chunk_moments(
-                xi_f, C_f, nu_c[sl], omega_c[sl], lam[sl], q[sl], log_pi_hat[..., sl],
-                None if offset is None else offset[sl], None if left is None else left[sl],
-                None if right is None else right[sl])
-            log_ws.append(log_w)
-            running = (log_mass, mean, cov) if running is None else _merge(*running, log_mass, mean, cov)
-        log_evidence, mean, cov = running
-        log_weights = torch.cat(log_ws, dim=-1) - log_evidence.unsqueeze(-1)             # (T, M) normalized
+        per_token = log_pi_hat.dim() > 1
+        # About six (K, K) tensors live per (token, component) pair. Tokens and components are both tiled, so the
+        # budget bounds the transient whenever one pair fits; with gradients on and more than one tile each tile is
+        # checkpointed, so backward recomputes its factors instead of retaining them (audit 2026-10-25 F15).
+        per_pair = 6 * K * K * (torch.finfo(dtype).bits // 8)
+        pairs = max(1, int(tile_bytes) // per_pair)
+        m_step = min(M, pairs)
+        r_step = max(1, min(max(1, T), pairs // m_step))
+        tiled = T > r_step or M > m_step
+        grad = torch.is_grad_enabled()
+        log_w_rows, s_rows, l_rows, mean_rows, cov_rows = [], [], [], [], []
+        for i in range(0, T, r_step):
+            running = None
+            chunks = []
+            for j in range(0, M, m_step):
+                sl = slice(j, j + m_step)
+                prior = log_pi_hat[i:i + r_step, sl] if per_token else log_pi_hat[sl]
+                args = (xi_f[i:i + r_step], C_f[i:i + r_step], nu_c[sl], omega_c[sl], lam[sl], q[sl], prior,
+                        None if offset is None else offset[sl], None if left is None else left[sl],
+                        None if right is None else right[sl])
+                if tiled and grad and any(t is not None and t.requires_grad for t in args):
+                    log_w, s, l, mean, cov = checkpoint(_chunk_moments, *args, use_reentrant=False,
+                                                        preserve_rng_state=False)
+                else:
+                    log_w, s, l, mean, cov = _chunk_moments(*args)
+                chunks.append(log_w)
+                running = (s, l, mean, cov) if running is None else _merge(*running, s, l, mean, cov)
+            s_rows.append(running[0])
+            l_rows.append(running[1])
+            mean_rows.append(running[2])
+            cov_rows.append(running[3])
+            log_w_rows.append(torch.cat(chunks, dim=-1))
+        mean, cov = torch.cat(mean_rows), torch.cat(cov_rows)                            # (T, K), (T, K, K)
+        log_weights, log_evidence = _normalized_outputs(torch.cat(log_w_rows), torch.cat(s_rows), torch.cat(l_rows))
         cov = 0.5 * (cov + cov.transpose(-2, -1))
     return CueResultPosterior(mean.reshape(*batch, K), cov.reshape(*batch, K, K),
                               log_weights.reshape(*batch, M), log_evidence.reshape(batch))
@@ -273,8 +332,17 @@ def _diagonal_tile(
     left:       Optional[torch.Tensor],         # (m, K, rank) U_a
     right:      Optional[torch.Tensor],         # (m, K, rank) V_a
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""One (rows x components) tile, elementwise: log weights (r, m), the tile's log mass (r,), and its normalized
-    result mean and variances (r, K)."""
+    r"""One (rows x components) tile, elementwise: log weights (r, m), the tile's shift and scaled mass (r,)
+    (:func:`_shifted_mass`), and its normalized result mean and variances (r, K).
+
+    Low-rank result variances. With :math:`a_k = \sum_rU_{kr}V_{kr}` and :math:`G = V^\top PV`,
+    :math:`\operatorname{diag}(FPF^\top)_k = p_k(1 + a_k)^2 + \sum_{l\ne k}p_l(\sum_rU_{kr}V_{lr})^2`, and the second
+    sum is formed as :math:`[UGU^\top]_{kk} - p_ka_k^2`, a sum of squares clamped to its sign, so the regression
+    variance is non-negative and the result noise :math:`q_k` is added last: the variance is never below :math:`q_k`.
+    The expanded form :math:`q + p + 2pa + [UGU^\top]_{kk}` cancelled a positive :math:`q` against :math:`p` where
+    :math:`F` cancels a coordinate (audit 2026-10-25 F02). The clamp acts only on a rounding residue; where the
+    remainder is positive the gradients are those of the expanded form. The absolute rounding error of the regression
+    variance stays of order :math:`\epsilon(p_ka_k^2 + [UGU^\top]_{kk})`."""
     K = xi.shape[-1]
     W = c.unsqueeze(-2) + lam                                                            # (r, m, K) diag(L_a + C)
     delta = xi.unsqueeze(-2) - nu                                                        # (r, m, K) xi - nu_a
@@ -285,30 +353,29 @@ def _diagonal_tile(
     if offset is not None:
         F = offset + torch.eye(K, dtype=offset.dtype, device=offset.device)              # (m, K, K) I + D_a
         m_Y = omega + torch.einsum("akl,ial->iak", F, g)
-        v_Y = q + torch.einsum("akl,ial->iak", F.square(), p)                            # sum_l F_kl^2 p_l
+        v_Y = torch.einsum("akl,ial->iak", F.square(), p) + q                            # sum_l F_kl^2 p_l, then Q
     else:
         t = torch.einsum("iak,akr->iar", g, right)                                       # (r, m, rank) V^T g
         m_Y = omega + g + torch.einsum("iar,akr->iak", t, left)
-        cross = 2.0 * p * (left * right).sum(-1)                                         # 2 p_k sum_r U_kr V_kr
+        a = (left * right).sum(-1)                                                       # (m, K) a_k = sum_r U_kr V_kr
         G = torch.einsum("akr,iak,aks->iars", right, p, right)                           # (r, m, rank, rank) V^T P V
         quad = torch.einsum("akr,iars,aks->iak", left, G, left)                          # diag U G U^T
-        v_Y = q + p + cross + quad
-    log_mass = torch.logsumexp(log_w, dim=-1)                                            # (r,)
-    w = torch.exp(log_w - log_mass.unsqueeze(-1))                                        # (r, m)
+        off = torch.clamp_min(quad - p * a.square(), 0.0)                                # sum_{l != k} p_l (U_k V_l)^2
+        v_Y = (p * (1.0 + a).square() + off) + q                                         # diag F P F^T, then Q
+    s, l, w = _shifted_mass(log_w)                                                       # (r,), (r,), (r, m)
     mean = (w.unsqueeze(-1) * m_Y).sum(-2)                                               # (r, K)
     var = (w.unsqueeze(-1) * (v_Y + (m_Y - mean.unsqueeze(-2)).square())).sum(-2)       # (r, K)
-    return log_w, log_mass, mean, var
+    return log_w, s, l, mean, var
 
 
 def _merge_diagonal(
-    log_mass_a: torch.Tensor, mean_a: torch.Tensor, var_a: torch.Tensor,
-    log_mass_b: torch.Tensor, mean_b: torch.Tensor, var_b: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Law of total variance for two normalized mixtures with log masses, coordinatewise: a positive sum."""
-    log_mass = torch.logaddexp(log_mass_a, log_mass_b)
-    alpha = torch.exp(log_mass_a - log_mass).unsqueeze(-1)                               # (r, 1)
-    beta = torch.exp(log_mass_b - log_mass).unsqueeze(-1)
-    return (log_mass, alpha * mean_a + beta * mean_b,
+    s_a: torch.Tensor, l_a: torch.Tensor, mean_a: torch.Tensor, var_a: torch.Tensor,
+    s_b: torch.Tensor, l_b: torch.Tensor, mean_b: torch.Tensor, var_b: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Law of total variance for two normalized mixtures with (shift, scaled mass) pairs, coordinatewise: a positive
+    sum."""
+    s, l, alpha, beta = _merge_scales(s_a, l_a, s_b, l_b)                                # alpha, beta (r, 1)
+    return (s, l, alpha * mean_a + beta * mean_b,
             alpha * var_a + beta * var_b + alpha * beta * (mean_a - mean_b).square())
 
 
@@ -375,7 +442,7 @@ def cue_result_diagonal_posterior(
         r_step = max(1, min(rows, pairs // m_step))
         tiled = rows > r_step or M > m_step
         grad = torch.is_grad_enabled()
-        log_w_rows, mean_rows, var_rows, mass_rows = [], [], [], []
+        log_w_rows, mean_rows, var_rows, s_rows, l_rows = [], [], [], [], []
         for i in range(0, rows, r_step):
             running = None
             chunks = []
@@ -386,18 +453,19 @@ def cue_result_diagonal_posterior(
                         None if offset is None else offset[sl], None if left is None else left[sl],
                         None if right is None else right[sl])
                 if tiled and grad and any(t is not None and t.requires_grad for t in args):
-                    log_w, log_mass, mean, var = checkpoint(_diagonal_tile, *args, use_reentrant=False,
-                                                            preserve_rng_state=False)
+                    log_w, s, l, mean, var = checkpoint(_diagonal_tile, *args, use_reentrant=False,
+                                                        preserve_rng_state=False)
                 else:
-                    log_w, log_mass, mean, var = _diagonal_tile(*args)
+                    log_w, s, l, mean, var = _diagonal_tile(*args)
                 chunks.append(log_w)
-                running = (log_mass, mean, var) if running is None else _merge_diagonal(*running, log_mass, mean, var)
-            mass_rows.append(running[0])
-            mean_rows.append(running[1])
-            var_rows.append(running[2])
+                running = (s, l, mean, var) if running is None else _merge_diagonal(*running, s, l, mean, var)
+            s_rows.append(running[0])
+            l_rows.append(running[1])
+            mean_rows.append(running[2])
+            var_rows.append(running[3])
             log_w_rows.append(torch.cat(chunks, dim=-1))
-        log_evidence = torch.cat(mass_rows)                                              # (R,)
         mean, var = torch.cat(mean_rows), torch.cat(var_rows)                            # (R, K)
-        log_weights = torch.cat(log_w_rows) - log_evidence.unsqueeze(-1)                 # (R, M)
+        log_weights, log_evidence = _normalized_outputs(torch.cat(log_w_rows), torch.cat(s_rows),
+                                                        torch.cat(l_rows))              # (R, M), (R,)
     return CueResultPosterior(mean.reshape(*batch, K), var.reshape(*batch, K),
                               log_weights.reshape(*batch, M), log_evidence.reshape(batch))

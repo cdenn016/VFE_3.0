@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Iterator
 
 import numpy as np
 import pytest
@@ -14,8 +15,19 @@ from vfe3.local_learner.core import (Params, TreeSensor, assimilate, forecast, i
 from vfe3.local_learner.learners import (Stats, SensorCollector, accumulate_transition, m_step, node_moments,
                                          train_backprop, train_local)
 
-torch.set_default_dtype(torch.float64)
 D, d = 4, 3
+
+
+@pytest.fixture(autouse=True)
+def _float64_default() -> Iterator[None]:
+    r"""Runs each test of this module with a float64 default dtype and restores the previous default after it,
+    so collecting the module leaves the dtype of every other test in the worker unchanged."""
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 @pytest.fixture

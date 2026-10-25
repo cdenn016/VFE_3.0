@@ -5650,6 +5650,8 @@ def _train_loop(
         selection_data_identity = _loader_data_identity(val_loader, cfg.vocab_size)
         artifacts.bind_selection_data_identity(selection_data_identity)
     resume_data_state: DataStateBuffer = {}
+    # Filled by load_checkpoint whether or not artifacts persist output (audit 2026-10-25 F06).
+    resume_divergence_state: Dict[str, object] = {}
     if (cursor_requested and shuffled_loader
             and not isinstance(loader_generator, torch.Generator)):
         raise RuntimeError(
@@ -5675,7 +5677,8 @@ def _train_loop(
                                      expected_data_identity=loader_data_identity,
                                      expected_selection_data_identity=selection_data_identity,
                                      expected_steps_per_epoch=steps_per_epoch,
-                                     weight_ema=weight_ema)
+                                     weight_ema=weight_ema,
+                                     divergence_state=resume_divergence_state)
         if not resume_data_state:
             raise RuntimeError(
                 "exact data resume requires checkpoint data_state; this checkpoint predates "
@@ -5784,14 +5787,17 @@ def _train_loop(
     # A resumed run continues the monitor, the skip counters and the last logged group norms from the
     # checkpoint, so its spikes and divergence columns match the uninterrupted run (audit 2026-10-16 F77).
     # An older checkpoint carries none: the monitor restarts and spikes wait for DIVERGENCE_EMA_WARMUP steps.
-    resumed_divergence = getattr(artifacts, "resumed_divergence_state", None) if start_step > 0 else None
+    # The record comes from the checkpoint itself, not the artifacts, so an output-disabled resume (artifacts=None)
+    # keeps the same loss-spike threshold and skip budgets (audit 2026-10-25 F06).
+    resumed_divergence: Optional[Dict[str, Any]] = (
+        resume_divergence_state if start_step > 0 and resume_divergence_state else None)
     if resumed_divergence is not None and divergence.load_state_dict(resumed_divergence["monitor"]):
         skipped_steps = resumed_divergence["skipped_steps"]
         consecutive_skips = resumed_divergence["consecutive_skips"]
         last_group_norms.update(resumed_divergence["last_group_norms"])
         failed_step_skips = int(resumed_divergence.get("failed_step_skips", 0))
         loss_spike_rejections = int(resumed_divergence.get("loss_spike_rejections", 0))
-    elif start_step > 0 and artifacts is not None:
+    elif start_step > 0:
         logger.info(" resume: the checkpoint carries no divergence-monitor state; spike detection restarts "
                     "and waits %d finite steps", DIVERGENCE_EMA_WARMUP)
     if weight_ema is not None and start_step >= weight_ema.start_step and not weight_ema.active:
