@@ -237,3 +237,43 @@ def test_gamma_schedule_options(setup):
     assert float((reset1.G - default.G).abs().max()) > 1e-6
     with pytest.raises(ValueError):
         train_local(start, streams, tree, chunk=8, gamma_exponent=0.0)
+
+
+def test_cavity_statistics(setup):
+    r"""The EP cavity of the last path node is its sequential state, so their node statistics agree there and
+    differ at earlier nodes; every cavity equals removing that node's Gaussian site from the posterior in
+    natural parameters and is positive definite; stacked cavity runs equal separate ones."""
+    from vfe3.local_learner.learners import CavitySensorCollector
+    tree, prm = setup
+    m, P = _gaussian(19)
+    y = torch.full((5,), 11)
+    mm, Pm = m.expand(1, 5, d).clone(), P.expand(1, 5, d, d).clone()
+    seq, cav = Stats.zeros(1, d, tree.V), Stats.zeros(1, d, tree.V)
+    _ = assimilate(mm, Pm, y, prm, tree, collect=SensorCollector(seq))
+    hook = CavitySensorCollector(cav)
+    m_post, P_post, _ = assimilate(mm, Pm, y, prm, tree, collect=hook)
+    sites = list(hook.sites)
+    hook.finish(torch.zeros(1, 1, dtype=torch.long), m_post, P_post, prm)
+    path = tree.nodes[11]
+    last, first = int(path[-1]), int(path[0])
+    assert torch.allclose(seq.node_zz[0, last], cav.node_zz[0, last], atol=1e-10)
+    assert torch.allclose(seq.node_uz[0, last], cav.node_uz[0, last], atol=1e-10)
+    assert float((seq.node_uz[0, first] - cav.node_uz[0, first]).abs().max()) > 1e-6
+    Lam, eta = torch.linalg.inv(P_post[0, 0]), torch.linalg.solve(P_post[0, 0], m_post[0, 0])
+    for n, s, tau, nu in sites:
+        a, bb = prm.A[0, int(n[0])], prm.b[0, int(n[0])]
+        Lam_c = Lam - tau[0, 0] * torch.outer(a, a)                    # site exp(-tau f^2/2 + nu f), f = a^T z + b
+        eta_c = eta - (nu[0, 0] - tau[0, 0] * bb) * a
+        P_c = torch.linalg.inv(Lam_c)
+        assert torch.linalg.eigvalsh(P_c).min() > 0
+        w = P_post[0, 0] @ a
+        den = 1 - tau[0, 0] * (a @ w)
+        assert torch.allclose(P_post[0, 0] + tau[0, 0] / den * torch.outer(w, w), P_c, atol=1e-9)
+        m_c = m_post[0, 0] + w / den * (tau[0, 0] * (a @ m_post[0, 0] + bb) - nu[0, 0])
+        assert torch.allclose(m_c, P_c @ eta_c, atol=1e-9)
+    streams = sample_sequences(prm, tree, 16, 25, seed=20)
+    stacked = train_local(init_runs(d, tree.V, [3, 4]), streams, tree, chunk=8, window=4, sensor_stats="cavity")
+    for r, sd in enumerate([3, 4]):
+        alone = train_local(init_params(d, tree.V, sd), streams, tree, chunk=8, window=4, sensor_stats="cavity")
+        assert torch.allclose(stacked.run(r).A, alone.A, atol=1e-9)
+    assert torch.isfinite(stacked.G).all()
