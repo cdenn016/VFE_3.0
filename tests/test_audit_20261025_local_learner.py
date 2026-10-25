@@ -159,3 +159,67 @@ def test_arm_settings_are_exactly_the_trainer_keywords(launcher) -> None:
         kw.pop("rule")
         inspect.signature(fn).bind(None, None, None, log=None, **kw)
     assert llt.arm_settings("blind")["blind"] is True and llt.arm_settings("local_w16")["window"] == 16
+
+
+# Stage W: the same identity check on results_W.jsonl
+
+
+def _warm_rows(llt, ident: dict | None, seeds: list[int], d: int, final: bool = True) -> list[dict]:
+    runs = ["init", "backprop_1pass"] + ([f"backprop_{llt.CONFIG['W_passes']}pass"] if final else [])
+    rows = [{"stage": "W", "run": run, "d": d, "seed": s, "updates_done": u, "val_bits": 1.0}
+            for u, run in enumerate(runs) for s in seeds]
+    return [{**r, "identity": ident} if ident is not None else r for r in rows]
+
+
+@pytest.fixture
+def warm(launcher):
+    launcher.CONFIG["stage"] = "W"
+    return launcher
+
+
+def test_stage_w_complete_matching_results_are_skipped(warm, tmp_path: Path) -> None:
+    llt = warm
+    path = tmp_path / "results_W.jsonl"
+    ident = llt.warm_identity()
+    _write(path, _warm_rows(llt, ident, [0, 1], d=8))
+    assert llt.warm_pending(llt.warm_done(path), 8, [0, 1], ident) is False
+    assert llt.warm_pending(llt.warm_done(path), 8, [0, 1, 2], ident) is True        # a new seed runs the stage
+    _write(path, _warm_rows(llt, ident, [0, 1], d=8, final=False))
+    assert llt.warm_pending(llt.warm_done(path), 8, [0, 1], ident) is True           # incomplete: rerun
+
+
+@pytest.mark.parametrize("key, value, field", [("backprop_lr", 3e-2, "arm_settings.backprop.lr"),
+                                               ("local_schedule", "rm06", "arm_settings.local.gamma_floor"),
+                                               ("W_points", 7, "arm_settings.W_points"),
+                                               ("B_val_bytes", 1_000, "protocol.B_val_bytes")])
+def test_stage_w_changed_settings_refuse_reuse(warm, tmp_path: Path, key: str, value: object, field: str) -> None:
+    llt = warm
+    path = tmp_path / "results_W.jsonl"
+    _write(path, _warm_rows(llt, llt.warm_identity(), [0], d=8))
+    llt.CONFIG[key] = value
+    with pytest.raises(RuntimeError, match=field.replace(".", r"\.")):
+        llt.warm_pending(llt.warm_done(path), 8, [0], llt.warm_identity())
+
+
+def test_stage_w_other_dimensions_and_seeds_do_not_clash(warm, tmp_path: Path) -> None:
+    llt = warm
+    path = tmp_path / "results_W.jsonl"
+    stale = {**llt.warm_identity(), "source": "0" * 64}
+    _write(path, _warm_rows(llt, stale, [0], d=16) + _warm_rows(llt, stale, [5], d=8))
+    assert llt.warm_pending(llt.warm_done(path), 8, [0, 1], llt.warm_identity()) is True
+    with pytest.raises(RuntimeError, match="source"):
+        llt.warm_pending(llt.warm_done(path), 8, [5], llt.warm_identity())
+
+
+def test_stage_w_legacy_results_are_reused_and_reported(warm, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    llt = warm
+    path = tmp_path / "results_W.jsonl"
+    _write(path, _warm_rows(llt, None, [0, 1], d=8))
+    assert llt.warm_pending(llt.warm_done(path), 8, [0, 1], llt.warm_identity()) is False
+    assert "predate stored settings" in capsys.readouterr().out
+
+
+def test_stage_w_source_hash_covers_its_runner(warm) -> None:
+    llt = warm
+    assert llt.warm_identity()["source"] == llt.source_identity(extra=(llt.run_warm,))
+    assert llt.warm_identity()["source"] != llt.source_identity()
