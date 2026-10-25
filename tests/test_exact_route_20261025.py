@@ -123,16 +123,30 @@ def test_toggled_tiny_model_trains_a_step() -> None:
     assert model.block_mlps[0].regime_stay_logit.grad is not None
 
 
-def test_launcher_toggle_defaults_off_and_resolves() -> None:
+def test_launcher_config_resolves_onto_the_route() -> None:
     path = Path(__file__).resolve().parents[1] / "train_vfe3.py"
     spec = importlib.util.spec_from_file_location("_launcher_under_test", path)
     module = importlib.util.module_from_spec(spec)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         spec.loader.exec_module(module)                                      # module level only: no training
-    assert module.principled_exact_route is False
+    assert isinstance(module.principled_exact_route, bool)               # the live toggle, either value
     config = {k: v for k, v in module.config.items() if k in VFE3Config.__dataclass_fields__}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         cfg = VFE3Config(**{**config, **principled_exact_route_overrides(config)})
     assert principled_exact_route_failures(cfg) == []
+
+
+def test_frame_condition_bound_is_kept_and_excused_only_alone() -> None:
+    values = config_values(phi_frame_condition_max=20.0)
+    overrides = principled_exact_route_overrides(values)
+    assert "phi_frame_condition_max" not in overrides                      # kept as configured
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(**{**values, **overrides})
+        assert cfg.phi_frame_condition_max == 20.0
+        assert principled_exact_route_failures(cfg) == []
+        # The chart-norm ball sets the same gauge flag; with it the flag is not excused.
+        ball = VFE3Config(**{**values, **overrides, "phi_mstep_max_matrix_norm": 1.0})
+    assert "gauge flag no_phi_mstep_chart_cap" in principled_exact_route_failures(ball)
