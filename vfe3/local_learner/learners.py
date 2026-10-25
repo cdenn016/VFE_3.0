@@ -33,7 +33,7 @@ from typing import Callable, Optional
 
 import torch
 
-from vfe3.local_learner.core import Params, Tensor, TreeSensor, assimilate, forecast, start_state
+from vfe3.local_learner.core import LOG_SQRT_2PI, Params, Tensor, TreeSensor, assimilate, forecast, start_state
 
 Logger = Callable[[dict], None]
 
@@ -101,6 +101,63 @@ class SensorCollector:
         self.st.node_zz.view(R * nodes, d + 1, d + 1).index_add_(0, idx, blk.reshape(R * B, d + 1, d + 1))
         uz = torch.cat([Euz, Eu.unsqueeze(-1)], -1).reshape(R * B, d + 1)
         self.st.node_uz.view(R * nodes, d + 1).index_add_(0, idx, uz)
+
+
+class CavitySensorCollector:
+    r"""Node statistics at the expectation-propagation cavity: the token's assimilated posterior with that node's
+    own Gaussian site removed, instead of the sequential filter state that has seen only the earlier nodes.
+
+    During the path pass each node's moment-matching update defines a Gaussian site in the projected utility
+    mean :math:`f=a^\top z+b`. With projected cavity mean :math:`\mu_u` and variance :math:`v=a^\top Pa` at the
+    node step, the updated projected moments are :math:`\hat v=v-v^2\lambda(\lambda+\kappa)/\sigma^2` and
+    :math:`\hat\mu=\mu_u+d\lambda v/\sigma`, so the site has precision
+    :math:`\tilde\tau=\hat v^{-1}-v^{-1}=c/(1+v(1-c))` with :math:`c=\lambda(\lambda+\kappa)`, and linear coefficient
+    :math:`\tilde\nu=\hat\mu/\hat v-\mu_u/v=d\lambda/\sigma+\tilde\tau\hat\mu`; the right-hand forms avoid the
+    cancelling differences. After the pass, with :math:`w=P^+a` and
+    :math:`s^+=a^\top P^+a`, removing the site is the rank-one correction
+
+    .. math::
+        P_{\setminus n}=P^++\frac{\tilde\tau}{1-\tilde\tau s^+}ww^\top,\qquad
+        m_{\setminus n}=m^++\frac{w}{1-\tilde\tau s^+}\bigl(\tilde\tau(a^\top m^++b)-\tilde\nu\bigr),
+
+    and the truncated-utility moments of :func:`node_moments` are taken there (Minka 2001; Rasmussen and
+    Williams 2006, Sec. 3.6). For the last node of the path the cavity is the sequential state itself.
+    """
+
+    def __init__(self, stats: Stats) -> None:
+        self.inner = SensorCollector(stats)
+        self.sites: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
+
+    def __call__(self, rows: Tensor, n: Tensor, s: Tensor, m: Tensor, P: Tensor, Pa: Tensor, s2: Tensor,
+                 sig: Tensor, mu_u: Tensor, kappa: Tensor, lam: Tensor) -> None:
+        v = s2 - 1.0                                                   # (R, B) projected variance a^T P a
+        c = lam * (lam + kappa)                                        # in (0, 1)
+        # tau = 1/v_hat - 1/v and nu = mu_hat/v_hat - mu_u/v without the cancelling differences:
+        # 1/v_hat = 1/v + tau gives tau = c / (1 + v(1 - c)) and nu = d lambda / sigma + tau mu_hat.
+        tau = c / (1.0 + v * (1.0 - c))
+        mu_hat = mu_u + s * lam * v / sig
+        nu = s * lam / sig + tau * mu_hat
+        self.sites.append((n, s, tau, nu))
+
+    def finish(self, rows: Tensor, m_post: Tensor, P_post: Tensor, prm: Params) -> None:
+        r"""Accumulate every recorded node at its cavity under the token's final posterior (m+, P+)."""
+        for n, s, tau, nu in self.sites:
+            a, bb = prm.A[:, n], prm.b[:, n]                           # (R, B, d), (R, B)
+            w = (P_post @ a.unsqueeze(-1)).squeeze(-1)                 # (R, B, d)
+            s_plus = (a * w).sum(-1)
+            denom = (1.0 - tau * s_plus).clamp_min(1e-12)              # = 1/(1 + tau v_cav) > 0 in exact arithmetic
+            m_cav = m_post + (w / denom.unsqueeze(-1)) * (tau * ((a * m_post).sum(-1) + bb) - nu).unsqueeze(-1)
+            P_cav = P_post + (tau / denom)[..., None, None] * _outer(w, w)
+            P_cav = 0.5 * (P_cav + P_cav.transpose(-1, -2))
+            Pa = (P_cav @ a.unsqueeze(-1)).squeeze(-1)
+            s2 = 1.0 + (a * Pa).sum(-1)
+            sig = s2.sqrt()
+            mu_u = (a * m_cav).sum(-1) + bb
+            kappa = s * mu_u / sig
+            log_Phi = torch.special.log_ndtr(kappa)
+            lam = torch.exp(-0.5 * kappa ** 2 - LOG_SQRT_2PI - log_Phi)
+            self.inner(rows, n, s, m_cav, P_cav, Pa, s2, sig, mu_u, kappa, lam)
+        self.sites = []
 
 
 def accumulate_transition(st: Stats, G: Tensor, m_prev: Tensor, P_prev: Tensor, mf: list[Tensor],
@@ -174,7 +231,7 @@ def m_step(st: Stats, prm: Params, ridge: float, q_floor: float, learn_transitio
 def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int = 128, window: int = 1,
                 blind: bool = False, ridge: float = 1e-6, q_floor: float = 1e-4,
                 gamma_exponent: float = 0.6, gamma_floor: float = 0.0, reset_every: Optional[int] = None,
-                log: Optional[Logger] = None) -> Params:
+                sensor_stats: str = "sequential", log: Optional[Logger] = None) -> Params:
     r"""Stepwise variational EM over token streams (B, L), for all runs of ``prm0`` at once. ``blind`` uses the
     forecast in place of the assimilated state in the transition statistics (the target-blind control;
     requires window = 1). The averaging step is :math:`\max((k+1)^{-\alpha},\gamma_{\min})` with
@@ -184,6 +241,8 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
         raise ValueError("gamma_exponent must lie in (0, 1] and gamma_floor in [0, 1]")
     if reset_every is not None and reset_every < 1:
         raise ValueError("reset_every must be a positive number of updates")
+    if sensor_stats not in ("sequential", "cavity"):
+        raise ValueError(f"sensor_stats must be 'sequential' or 'cavity', got {sensor_stats!r}")
     if blind and window != 1:
         raise ValueError("the target-blind control is defined for window = 1")
     if chunk % window:
@@ -200,12 +259,15 @@ def train_local(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: int =
         for c0 in range(1, Ltot, chunk):
             steps = range(c0, min(c0 + chunk, Ltot))
             st = Stats.zeros(R, d, V, dev)
-            hook = SensorCollector(st)
+            hook = CavitySensorCollector(st) if sensor_stats == "cavity" else SensorCollector(st)
+            rows = torch.arange(R, device=dev)[:, None]
             mf, Pf, mm_l, Pm_l, yp_l = [], [], [], [], []
             m_block, P_block = m, P
             for i, t in enumerate(steps):
                 mm, Pm = forecast(m, P, streams[:, t - 1], prm)
                 m, P, logp = assimilate(mm, Pm, streams[:, t], prm, tree, collect=hook)
+                if sensor_stats == "cavity":
+                    hook.finish(rows, m, P, prm)
                 nll -= logp.sum(-1)
                 ntok += B
                 post_m, post_P = (mm, Pm) if blind else (m, P)

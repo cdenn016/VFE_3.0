@@ -19,7 +19,7 @@ from pathlib import Path
 
 CONFIG = {
     
-    "stage":            "B",                    # "timing" | "A" | "B" | "S" (scaling follow-up to B)
+    "stage":            "W",                    # "timing" | "A" | "B" | "S" (scaling) | "W" (warm start, passes)
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
@@ -27,7 +27,8 @@ CONFIG = {
     "streams":          512,                    # parallel training streams (512 * 16 = 8192 tokens per update)
     "arms":             ["local_w1", "local_w4", "local_w16", "blind", "backprop"],   # stage B: local_w<window>[@schedule] | blind | backprop
     "A_arms":           ["local_w1", "local_w4", "local_w16", "blind", "backprop",      # stage A arms (the schedule comparison)
-                         "local_w16@a03", "local_w16@floor05", "local_w16@floor20", "local_w16@reset"],
+                         "local_w16@a03", "local_w16@floor05", "local_w16@floor20", "local_w16@reset",
+                         "local_w16_cav@floor20"],                                    # cavity node statistics
     "local_schedule":   "floor20",                 # schedule of local arms without "@": a key of local_schedules
     # Stepwise-EM averaging gamma_k = max((k+1)^-alpha, floor), k restarted every reset updates ("pass" = one
     # pass over the stage A training set; None = never). rm06 is the original Cappe-Moulines schedule.
@@ -59,7 +60,21 @@ CONFIG = {
                          {"arm": "local_w64", "d": 32, "chunk": 64, "streams": 128, "stack": 3},
                          {"arm": "backprop",  "d": 32, "chunk": 64, "streams": 128, "stack": 3},
                          {"arm": "local_w64", "d": 64, "chunk": 64, "streams": 128, "stack": 3},
-                         {"arm": "backprop",  "d": 64, "chunk": 64, "streams": 128, "stack": 1}],
+                         {"arm": "backprop",  "d": 64, "chunk": 64, "streams": 128, "stack": 1},
+                         # Node statistics at the EP cavity of the token's posterior (local_w<window>_cav).
+                         {"arm": "local_w16_cav", "d": 32, "chunk": 16, "streams": 512, "stack": 3},
+                         {"arm": "local_w16_cav", "d": 64, "chunk": 16, "streams": 512, "stack": 3}],
+
+    # stage W (diagnostic on the stage B data; results_W.jsonl). warm: backpropagation trains one pass, then the
+    # local arm continues from its parameters for one pass; if validation NLL drifts up, approximate EM's fixed
+    # point differs from the predictive optimum, and if it holds, the gap is optimization. passes: the local arm
+    # and backpropagation from the stage B initialization for W_passes passes. Validation is scored at W_points
+    # evenly spaced points per pass; local_arm uses local_schedule. Training restarts the filter and the
+    # stepwise-EM averages at each scoring point (a few updates of averaging memory under floor20).
+    "W_d":              32,
+    "W_local_arm":      "local_w16",
+    "W_passes":         3,
+    "W_points":         5,                      # scoring points per pass
 
     # stage B (WikiText-103 bytes)
     "B_dims":           [8, 16, 32],
@@ -114,6 +129,9 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
     if arm == "backprop":
         return {"rule": "backprop", "chunk": chunk, "lr": c["backprop_lr"]}
     base, _, name = arm.partition("@")
+    sensor_stats = "sequential"
+    if base.endswith("_cav"):                   # node statistics at the EP cavity of the token's posterior
+        base, sensor_stats = base[:-4], "cavity"
     sched = c["local_schedules"][name or c["local_schedule"]]
     reset = sched["reset"]
     if reset == "pass":
@@ -128,7 +146,7 @@ def arm_settings(arm: str, chunk: int | None = None) -> dict:
         raise ValueError(arm)
     return {"rule": "local", "chunk": chunk, "window": window, "blind": blind, "ridge": c["ridge"],
             "q_floor": c["q_floor"], "gamma_exponent": sched["alpha"], "gamma_floor": sched["floor"],
-            "reset_every": reset}
+            "reset_every": reset, "sensor_stats": sensor_stats}
 
 
 def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
@@ -277,6 +295,61 @@ def run_scaling(tree: TreeSensor) -> None:
                 torch.cuda.empty_cache()
 
 
+def run_warm(tree: TreeSensor) -> None:
+    r"""Stage W: warm-start the local arm from backpropagation's solution, and train both arms for several passes,
+    scoring validation along the way."""
+    c = CONFIG
+    out = Path(c["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "results_W.jsonl"
+    done = set()
+    if path.exists():
+        done = {(r["run"], r["d"], r["seed"], r["updates_done"]) for r in map(json.loads, path.read_text().splitlines())}
+    d, seeds, local_arm, P = c["W_d"], c["B_seeds"], c["W_local_arm"], c["W_points"]
+    xtrain = load_bytes("train", c["B_train_bytes"])
+    xval = load_bytes("validation", c["B_val_bytes"])
+    train = as_streams(xtrain, c["streams"]).to(DEVICE)
+    val = as_streams(xval, c["B_val_streams"]).to(DEVICE)
+    L = train.shape[1]
+    cuts = [round(i * (L - 1) / P) for i in range(P + 1)]             # scoring points within one pass
+    per_pass = (L - 1) // c["chunk"]
+
+    def score(run: str, prm: Params, updates: int, sec: float) -> None:
+        nll, n = evaluate_filter(prm, val, tree)
+        for r, seed in enumerate(seeds):
+            if (run, d, seed, updates) not in done:
+                append(path, {"stage": "W", "run": run, "d": d, "seed": seed, "updates_done": updates,
+                              "val_bits": float(nll[r]) / n / LN2, "train_sec": sec, "stacked_runs": len(seeds),
+                              "local_arm": local_arm, "local_schedule": c["local_schedule"],
+                              "backprop_lr": c["backprop_lr"]})
+
+    def train_passes(run: str, arm: str, prm: Params, passes: int, start_updates: int = 0) -> Params:
+        t0, updates = time.perf_counter(), start_updates
+        for _ in range(passes):
+            for i in range(P):
+                segment = train[:, cuts[i]:cuts[i + 1] + 1]                # overlapping first token is context only
+                prm = train_arm(arm, prm, segment, tree, None)
+                sync()
+                updates += -(-(segment.shape[1] - 1) // c["chunk"])
+                score(run, prm, updates, time.perf_counter() - t0)
+        return prm
+
+    t0 = time.perf_counter()
+    init = init_runs(d, tree.V, seeds, DEVICE)
+    score("init", init, 0, 0.0)
+    bp = train_arm("backprop", init, train, tree, None)                    # one uninterrupted pass, as in stage B
+    sync()
+    score("backprop_1pass", bp, per_pass, time.perf_counter() - t0)
+    torch.save({f: getattr(bp, f).cpu() for f in ("G", "E", "Q", "A", "b")}, out / f"W_backprop_d{d}.pt")
+    train_passes("warm_local_from_backprop", local_arm, bp, 1, per_pass)
+    train_passes(f"local_{c['W_passes']}pass", local_arm, init, c["W_passes"])
+    # Backpropagation trains its passes as one call (segmenting would restart Adam's moments) and is scored once.
+    t0 = time.perf_counter()
+    bp_multi = train_arm("backprop", init, train.repeat(1, c["W_passes"]), tree, None)
+    sync()
+    score(f"backprop_{c['W_passes']}pass", bp_multi, per_pass * c["W_passes"], time.perf_counter() - t0)
+
+
 def run_stage(stage: str, tree: TreeSensor) -> None:
     c = CONFIG
     out = Path(c["out_dir"])
@@ -361,6 +434,8 @@ def main() -> None:
         run_timing(tree)
     elif CONFIG["stage"] == "S":
         run_scaling(tree)
+    elif CONFIG["stage"] == "W":
+        run_warm(tree)
     else:
         run_stage(CONFIG["stage"], tree)
 
