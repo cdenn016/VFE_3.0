@@ -201,6 +201,8 @@ _CONFIG_VALUES: dict[str, Any] = {
     'frame_pair_escalation_tol': None,
     'phi_mstep_max_matrix_norm': None,
     'phi_frame_condition_max': None,
+    'phi_type_dropout': 0.0,
+    'phi_type_dropout_freq_scale': None,
     'val_diagnostic_batches': 1,
     'diagnose_canonical_free_energy': False,
     'diagnose_agent_elbo': False,

@@ -919,6 +919,16 @@ class VFE3Config:
     # su_n; refused for block_borel and block_unipotent. None: no bound.
     phi_frame_condition_max:          Optional[float] = None
 
+    # Type-level frame dropout (2026-10-25), training only. In each training sequence every vocabulary type is
+    # dropped with probability p_v and all its occurrences in that sequence read the identity frame (phi = 0);
+    # evaluation is deterministic and unchanged. p_v = phi_type_dropout uniformly, or, with
+    # phi_type_dropout_freq_scale = f_0, p_v = phi_type_dropout * f_0 / (f_0 + pi_v) with pi_v the corpus unigram
+    # frequency, which spares frequent types and aims at the rare and mid-frequency types whose frames hold the
+    # memorized component (table shrinkage probe of the 29.83 run). The frequency form needs
+    # decode_unigram_prior=True (pi_v is that table). encode_mode="per_token" only. 0.0: off.
+    phi_type_dropout:                 float           = 0.0
+    phi_type_dropout_freq_scale:      Optional[float] = None
+
     # Row-lazy AdamW for the frame table phi_embed (audit 2026-10-20 items 2, 49; M2). Dense AdamW moves a row whose
     # gradient is zero this step by its momentum tail and its decoupled decay, and a rarely visited row by about
     # min(sqrt(T), 31.6) lr per coordinate per appearance whatever the gradient size. True: a row that is neither in
@@ -1314,6 +1324,22 @@ class VFE3Config:
             raise ValueError(
                 f"e_sigma_q_trust must be finite and positive, got {self.e_sigma_q_trust}"
             )
+        if (isinstance(self.phi_type_dropout, bool) or not isinstance(self.phi_type_dropout, Real)
+                or not (0.0 <= float(self.phi_type_dropout) < 1.0)):
+            raise ValueError(f"phi_type_dropout must be a float in [0, 1), got {self.phi_type_dropout!r}")
+        if self.phi_type_dropout_freq_scale is not None:
+            if (isinstance(self.phi_type_dropout_freq_scale, bool)
+                    or not isinstance(self.phi_type_dropout_freq_scale, Real)
+                    or not math.isfinite(self.phi_type_dropout_freq_scale)
+                    or self.phi_type_dropout_freq_scale <= 0.0):
+                raise ValueError("phi_type_dropout_freq_scale must be None or a finite positive frequency, got "
+                                 f"{self.phi_type_dropout_freq_scale!r}")
+            if not self.decode_unigram_prior:
+                raise ValueError("phi_type_dropout_freq_scale reads the corpus unigram table; it needs "
+                                 "decode_unigram_prior=True")
+        if self.phi_type_dropout > 0.0 and self.encode_mode != "per_token":
+            raise ValueError(f"phi_type_dropout drops per-type frames; it needs encode_mode='per_token', "
+                             f"got {self.encode_mode!r}")
         if self.phi_mstep_max_matrix_norm is not None and not (
             math.isfinite(self.phi_mstep_max_matrix_norm)
             and self.phi_mstep_max_matrix_norm > 0.0
@@ -2896,6 +2922,8 @@ class VFE3Config:
                  "with its own optimizer-group value")
         if self.beta_attention_prior != "causal_windowed":
             mark(("attention_window",), "only the causal_windowed prior reads the band width")
+        if self.phi_type_dropout == 0.0:
+            mark(("phi_type_dropout_freq_scale",), "phi_type_dropout=0.0 drops no frame")
         if self.gauge_transport in ("off", "frozen"):
             mark(("m_phi_sparse_rows",),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on phi_embed, so no row steps")

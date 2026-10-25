@@ -2195,7 +2195,36 @@ def _encode_per_token(
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) token prior
     sigma = _encode_prior_sigma(pb, token_ids)                               # (B,N,K) or (B,N,K,K)
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
+    if pb.training and getattr(pb, "phi_type_dropout", 0.0) > 0.0:
+        phi = phi * phi_type_keep_mask(pb, token_ids).unsqueeze(-1).to(phi.dtype)
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
+
+
+def phi_type_drop_probabilities(pb: PriorBank) -> torch.Tensor:          # (V,) float32
+    r"""Per-type frame-drop probabilities :math:`p_v`.
+
+    :math:`p_v = p_0` for every type, or :math:`p_v = p_0 f_0 / (f_0 + \pi_v)` with :math:`\pi_v` the corpus
+    unigram frequency (the ``unigram_log_prior`` table) when ``phi_type_dropout_freq_scale`` :math:`= f_0` is set,
+    which spares frequent types and drops rare and mid-frequency ones at nearly :math:`p_0`.
+    """
+    p0 = float(pb.phi_type_dropout)
+    f0 = getattr(pb, "phi_type_dropout_freq_scale", None)
+    if f0 is None:
+        return torch.full((pb.vocab_size,), p0, device=pb.phi_embed.device)
+    pi = pb.unigram_log_prior.exp().to(pb.phi_embed.device)                  # (V,)
+    return p0 * float(f0) / (float(f0) + pi)
+
+
+def phi_type_keep_mask(pb: PriorBank, token_ids: torch.Tensor) -> torch.Tensor:   # (B, N) bool
+    r"""Type-level frame dropout mask: one Bernoulli draw per (sequence, type), shared by every occurrence.
+
+    A dropped position reads :math:`\varphi = 0`, the identity frame, so all occurrences of a dropped type in a
+    sequence agree. Drawn from the global torch generator; training forwards only.
+    """
+    b = token_ids.shape[0]
+    p = phi_type_drop_probabilities(pb)                                      # (V,)
+    keep_types = torch.rand(b, pb.vocab_size, device=token_ids.device) >= p.to(token_ids.device)  # (B, V)
+    return torch.gather(keep_types, 1, token_ids.reshape(b, -1)).reshape(token_ids.shape)
 
 
 @register_encode("per_token_additive", can_omit_base_mean=True, can_omit_base_variance=True)
