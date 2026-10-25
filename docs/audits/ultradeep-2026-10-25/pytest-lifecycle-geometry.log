@@ -1,0 +1,45 @@
+........................................................................ [ 94%]
+....                                                                     [100%]
+============================== warnings summary ===============================
+tests/test_tied_block_mlp_20261025.py::test_optimizer_lists_each_shared_parameter_once[coordinate]
+  C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find cuobjdump.exe
+    warnings.warn(f"Failed to find {binary}")
+
+tests/test_tied_block_mlp_20261025.py::test_optimizer_lists_each_shared_parameter_once[coordinate]
+  C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find nvdisasm.exe
+    warnings.warn(f"Failed to find {binary}")
+
+tests/test_weight_ema_20261021.py::test_start_step_from_the_fraction_of_max_steps
+tests/test_weight_ema_20261021.py::test_validator_and_inactive_fields
+tests/test_weight_ema_20261021.py::test_ema_leaves_the_raw_training_trajectory_bitwise_unchanged
+tests/test_weight_ema_20261021.py::test_rejected_updates_do_not_update_the_ema_in_training
+tests/test_weight_ema_20261021.py::test_checkpoint_round_trip_and_resume_continue_the_shadow
+tests/test_weight_ema_20261021.py::test_a_checkpoint_without_the_record_resumes_and_restarts_the_ema
+tests/test_weight_ema_20261021.py::test_finalize_fields_score_the_ema_weights_and_restore_the_raw_ones
+  <string>:195: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - decode_logits_amp=False (only read by decode_mode='linear' with amp_dtype set)
+    - minimal_agent_inference='exact' (only read by predictive_readout='minimal_agent')
+    - relational_receiver_update='euler' (only read by projected_gradient receiving laws)
+    - relational_receiver_measurement='adjoint' (only read by projected_gradient receiving laws)
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance)
+    - decode_ce_triton=False (read only by the diagonal_chunked and full_chunked KL decode CE)
+    - decode_av_precision='fp64' (read only by the diagonal_chunked and full_chunked KL decoders (the a_v reduction) and their ranking guard)
+    - decode_ranking_fp64_escalation=True (read only by the diagonal_chunked and full_chunked KL decoders (the a_v reduction) and their ranking guard)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+
+tests/test_weight_ema_20261021.py::test_a_checkpoint_without_the_record_resumes_and_restarts_the_ema
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\train.py:5671: UserWarning: resume config drift: the checkpoint at step_3.pt was written under a different config for field(s) ['weight_ema_decay', 'weight_ema_start_frac']; ['weight_ema_decay', 'weight_ema_start_frac'] use the CURRENT values (weights/optimizer load strictly, but semantic knobs are not restored from the bundle).
+    start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
+
+tests/test_audit_20261016_a1_fisher_stabilizer.py::test_config_field_default_validation_and_inactive_marks
+  <string>:195: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - decode_logits_amp=False (only read by decode_mode='linear' with amp_dtype set)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive': the gradient receiver's covariance comes from its receiver update, and its self-information enters through alpha KL(q||p) and the closed-form damping)
+    - minimal_agent_inference='exact' (only read by predictive_readout='minimal_agent')
+    - decode_ce_triton=False (read only by the diagonal_chunked and full_chunked KL decode CE)
+    - decode_av_precision='fp64' (read only by the diagonal_chunked and full_chunked KL decoders (the a_v reduction) and their ranking guard)
+    - decode_ranking_fp64_escalation=True (read only by the diagonal_chunked and full_chunked KL decoders (the a_v reduction) and their ranking guard)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: C:\Users\chris and christine\Desktop\VFE_3.0\docs\audits\ultradeep-2026-10-25\pytest-lifecycle-geometry.xml -

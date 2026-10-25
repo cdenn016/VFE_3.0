@@ -1,0 +1,49 @@
+[
+  {
+    "status": "completed",
+    "value": {
+      "length": 3,
+      "expected": 3.164442363155753,
+      "cost": {
+        "status": "error",
+        "type": "RuntimeError",
+        "message": "The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 2",
+        "trace": [
+          "    value = action()",
+          "            ^^^^^^^^",
+          "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\audits\\ultradeep-2026-10-25\\probe_full_link_oracle.py\", line 22, in <lambda>",
+          "    observed = attempt(lambda: float(full_link_cost(mu, sigma, ctx).detach()))",
+          "                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+          "  File \"C:\\anaconda\\Lib\\contextlib.py\", line 81, in inner",
+          "    return func(*args, **kwds)",
+          "           ^^^^^^^^^^^^^^^^^^^",
+          "  File \"C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\full_link.py\", line 607, in full_link_cost",
+          "    return (.5 * quadratic - linear + .5 * trace - .5 * c * logdet).sum()",
+          "                                                   ~~~~~~~^~~~~~~~",
+          "RuntimeError: The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 2"
+        ]
+      },
+      "parts": [
+        0.0,
+        3.164442363155753,
+        0.0
+      ]
+    }
+  },
+  {
+    "status": "completed",
+    "value": {
+      "length": 1,
+      "expected": 1.0548141210519175,
+      "cost": {
+        "status": "completed",
+        "value": 2.3123607961579173
+      },
+      "parts": [
+        0.0,
+        1.0548141210519175,
+        0.0
+      ]
+    }
+  }
+]

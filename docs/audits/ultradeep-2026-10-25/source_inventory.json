@@ -1,0 +1,18 @@
+{
+  "groups": {
+    "package": {
+      "files": 132,
+      "physical_lines": 96783
+    },
+    "tests": {
+      "files": 391,
+      "physical_lines": 95967
+    },
+    "root_scripts": {
+      "files": 24,
+      "physical_lines": 20189
+    }
+  },
+  "syntax_errors": [],
+  "duplicate_literal_keys": []
+}

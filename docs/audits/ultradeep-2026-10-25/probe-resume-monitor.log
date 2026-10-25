@@ -1,0 +1,24 @@
+C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find cuobjdump.exe
+  warnings.warn(f"Failed to find {binary}")
+C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find nvdisasm.exe
+  warnings.warn(f"Failed to find {binary}")
+C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\train.py:5504: UserWarning: parameter motion: 12 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, relational_operators.raw_score_q, relational_operators.raw_score_k, relational_operators.T, relational_operators.O, prior_bank.mu_embed, prior_bank.sigma_log_embed, prior_bank.phi_embed, prior_bank.output_proj_weight, prior_bank.output_proj_bias, block_norm.weight, block_norm.bias. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+  return _train_loop(
+{
+  "saved_monitor": {
+    "loss_seen": 1,
+    "loss_ema": 1.2419383525848389
+  },
+  "with_artifacts": {
+    "loss_skip_threshold": 2.241938352584839,
+    "loss": 12.472694396972656,
+    "did_step": false,
+    "loss_spike_skip": true
+  },
+  "without_artifacts": {
+    "loss_skip_threshold": null,
+    "loss": 12.472694396972656,
+    "did_step": true,
+    "loss_spike_skip": false
+  }
+}

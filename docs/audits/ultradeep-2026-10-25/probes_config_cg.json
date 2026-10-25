@@ -1,0 +1,102 @@
+{
+  "inactive_activation": {
+    "1": false,
+    "2": true
+  },
+  "cg_inference_cache": {
+    "error": "RuntimeError",
+    "message": "Inference tensors cannot be saved for backward. Please do not use Tensors created in inference mode in computation tracked by autograd. To work around this, you can make a clone to get a normal tensor and use it in autograd, or use `torch.no_grad()` instead of `torch.inference_mode()`."
+  },
+  "cue_logmass_tiling": [
+    {
+      "dense": false,
+      "tile_bytes": 1,
+      "mean": [
+        [
+          10000.0
+        ]
+      ],
+      "covariance": [
+        [
+          3.0
+        ]
+      ],
+      "weight_sum": [
+        2.0
+      ]
+    },
+    {
+      "dense": false,
+      "tile_bytes": 1000000,
+      "mean": [
+        [
+          10000.0
+        ]
+      ],
+      "covariance": [
+        [
+          50000004.0
+        ]
+      ],
+      "weight_sum": [
+        2.0
+      ]
+    },
+    {
+      "dense": true,
+      "tile_bytes": 1,
+      "mean": [
+        [
+          10000.0
+        ]
+      ],
+      "covariance": [
+        [
+          [
+            3.0
+          ]
+        ]
+      ],
+      "weight_sum": [
+        2.0
+      ]
+    },
+    {
+      "dense": true,
+      "tile_bytes": 1000000,
+      "mean": [
+        [
+          10000.0
+        ]
+      ],
+      "covariance": [
+        [
+          [
+            50000004.0
+          ]
+        ]
+      ],
+      "weight_sum": [
+        2.0
+      ]
+    }
+  ],
+  "hidden_bias_parameter_count": [
+    {
+      "per_type_hidden_bias": false,
+      "predicted": [
+        460,
+        8
+      ],
+      "actual": 460
+    },
+    {
+      "per_type_hidden_bias": true,
+      "predicted": [
+        460,
+        8
+      ],
+      "actual": 516
+    }
+  ]
+}
