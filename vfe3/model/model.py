@@ -50,6 +50,7 @@ from vfe3.geometry.transport import (
     _build_flat,
 )
 from vfe3.model.block_mlp import (
+    CueResultMemoryBlockMLP,
     block_mlp_build_metadata,
     build_block_mlp,
     get_block_mlp_registration,
@@ -421,7 +422,7 @@ class VFEModel(nn.Module):
         # module serves every layer: the list holds the same object n_layers times, so the state dict keeps the
         # per-layer keys block_mlps.<layer>.* (aliases of one tensor) and parameters() yields it once.
         def _new_block_mlp() -> nn.Module:
-            return build_block_mlp(
+            mlp = build_block_mlp(
                 cfg.block_mlp_mode,
                 embed_dim=cfg.embed_dim,
                 irrep_dims=self.group.irrep_dims,
@@ -439,6 +440,9 @@ class VFEModel(nn.Module):
                 regime_beta=cfg.block_memory_regime_beta,
                 regime_stay=cfg.block_memory_regime_stay,
             )
+            if isinstance(mlp, CueResultMemoryBlockMLP):
+                mlp.tile_bytes = cfg.block_memory_tile_mib * 1024 ** 2         # exact-posterior tile budget (not state)
+            return mlp
 
         if not cfg.use_block_mlp:
             self.block_mlps = None

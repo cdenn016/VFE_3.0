@@ -840,6 +840,11 @@ class VFE3Config:
     block_memory_regime_transition:   str             = "off"
     block_memory_regime_beta:         float           = 1.0          # trust beta >= 0 in the carried belief (0 = shared prior)
     block_memory_regime_stay:         float           = 0.9          # initial stay probability s in (0, 1)
+    # cue_result_memory only: byte budget (MiB) of one (tokens x components) tile of the exact posterior. Larger tiles
+    # dispatch fewer kernels and hold more transient memory; the result is the same at every budget. 32 is the CPU-safe
+    # introduction value; on a large GPU about 1024 removes the launch-bound regime (32 MiB at K=192, M=1536, rank 2
+    # leaves 3 tokens per tile, about 2,700 tiles per layer for 32 x 256 tokens).
+    block_memory_tile_mib:            int             = 32
 
     ##################################################
     #   15. E-step (belief updates)
@@ -2192,6 +2197,8 @@ class VFE3Config:
         if (isinstance(self.block_memory_regime_stay, bool) or not isinstance(self.block_memory_regime_stay, Real)
                 or not 0.0 < float(self.block_memory_regime_stay) < 1.0):
             raise ValueError(f"block_memory_regime_stay must be a real value in (0, 1), got {self.block_memory_regime_stay!r}")
+        if type(self.block_memory_tile_mib) is not int or self.block_memory_tile_mib < 1:
+            raise ValueError(f"block_memory_tile_mib must be an int >= 1 (MiB), got {self.block_memory_tile_mib!r}")
         if self.use_block_mlp and self.block_mlp_mode == "cue_result_memory":
             memory_problems = []
             if self.block_memory_regime_transition != "off" and not self.block_mlp_tie_layers:
@@ -2755,7 +2762,7 @@ class VFE3Config:
         memory = self.use_block_mlp and self.block_mlp_mode == "cue_result_memory"
         if not memory:
             mark(("block_memory_regression_rank", "block_memory_result_noise_ratio", "block_memory_regime_transition",
-                  "block_memory_regime_beta", "block_memory_regime_stay"),
+                  "block_memory_regime_beta", "block_memory_regime_stay", "block_memory_tile_mib"),
                  "only read by block_mlp_mode='cue_result_memory' with use_block_mlp=True")
         elif self.block_memory_regime_transition == "off":
             mark(("block_memory_regime_beta", "block_memory_regime_stay"),

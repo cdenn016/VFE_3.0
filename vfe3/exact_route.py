@@ -17,7 +17,15 @@ leaving every other key as given:
   decoder, reads the reference moments and the diagonal truncation commutes with frame changes), with the Gaussian-KL
   ``diagonal_chunked`` decoder at unit temperature and an untied decode bank (``decode_tau=1``);
 * everything :func:`vfe3.gauge_covariant.fully_gauge_covariant_overrides` requires on top of that (frame transport on,
-  reference decoding, no fixed-coordinate caps or trust regions, the total-KL self term).
+  reference decoding, no fixed-coordinate caps or trust regions, the total-KL self term), except the frame condition
+  bound ``phi_frame_condition_max``, which is kept as configured.
+
+The frame condition bound is an M-step constraint on the frame table, not part of inference: after an optimizer step
+it projects each frame back to :math:`\operatorname{cond}_2(U_i) \le \kappa_{\max}`. Every forward pass is still exact
+inference on the projected parameters, and the forward map stays covariant; what the bound breaks is the gauge
+invariance of the training trajectory (the constraint set is not invariant under :math:`U_i 	o g_iU_i`), so the run's
+pure-path report shows ``no_phi_mstep_chart_cap`` false whenever the bound is set. Set it to None for the strictly
+covariant route.
 
 Each layer is then exact inference in a declared per-agent model, collapsed to the stored Gaussian once per step:
 attention conditions the receiver on its peers' records, and the memory conditions the result on the cue record. The
@@ -57,6 +65,8 @@ EXACT_ROUTE_SETTINGS: Mapping[str, Any] = {
     "use_cg_coupling":         False,
 }
 _REGIME_TRANSITIONS = ("sticky", "learned")
+# Gauge overrides the exact route does not apply (kept as configured), and the gauge flag each may leave false.
+_KEPT_GAUGE_KEYS: Mapping[str, str] = {"phi_frame_condition_max": "no_phi_mstep_chart_cap"}
 
 
 def principled_exact_route_overrides(
@@ -75,7 +85,8 @@ def principled_exact_route_overrides(
         # rotation as a record channel by exact conditioning ('comparison').
         wanted["rope_mode"] = "comparison"
     overrides = {key: value for key, value in wanted.items() if get(key) != value}
-    gauge = fully_gauge_covariant_overrides({**config, **overrides})
+    gauge = {key: value for key, value in fully_gauge_covariant_overrides({**config, **overrides}).items()
+             if key not in _KEPT_GAUGE_KEYS}
     clash = {key for key in gauge if key in EXACT_ROUTE_SETTINGS and gauge[key] != EXACT_ROUTE_SETTINGS[key]}
     if clash:                                     # the gauge switch never changes these on the exact route
         raise ValueError(f"principled_exact_route: the gauge-covariant overrides would change {sorted(clash)}")
@@ -104,5 +115,9 @@ def principled_exact_route_failures(cfg: Any) -> List[str]:   # cfg: a resolved 
     if cfg.block_memory_regime_transition not in _REGIME_TRANSITIONS:
         failures.append(f"block_memory_regime_transition={cfg.block_memory_regime_transition!r} "
                         f"(requires one of {_REGIME_TRANSITIONS})")
-    failures.extend(f"gauge flag {name}" for name in gauge_covariance_failures(cfg))
+    # A kept key's flag is excused only when the kept key is its sole cause (the chart-norm ball sets the same flag).
+    excused = {flag for key, flag in _KEPT_GAUGE_KEYS.items() if getattr(cfg, key) is not None}
+    if getattr(cfg, "phi_mstep_max_matrix_norm", None) is not None:
+        excused.discard("no_phi_mstep_chart_cap")
+    failures.extend(f"gauge flag {name}" for name in gauge_covariance_failures(cfg) if name not in excused)
     return failures

@@ -322,10 +322,10 @@ fully_gauge_covariant = False
 # True: every cell runs the principled exact route (vfe3.exact_route, as in train_vfe3.py). The keys the route fixes
 # (exact minimal-agent attention, the tied exact cue/result memory with its regime belief carried through depth, no
 # block norm, gaussian_frame_diagonal with the diagonal_chunked decoder at decode_tau=1, and the fully gauge-covariant
-# overrides) are applied to the baseline before the arms, and an arm that leaves the route is refused at startup and
+# overrides except phi_frame_condition_max, which is kept as configured) are applied to the baseline before the arms, and an arm that leaves the route is refused at startup and
 # as a config error, except in a sweep that declares "leaves_exact_route" (exact_route_components). The exact_route_*
 # sweeps carry these settings in their own 'requires', so they run on the route with this switch either way.
-# Implies fully_gauge_covariant. False: the baseline as written.
+# Implies fully_gauge_covariant when phi_frame_condition_max is None. False: the baseline as written.
 principled_exact_route = False
 
 
@@ -431,6 +431,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
     block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
+    block_memory_tile_mib            = 1024,           # cue_result_memory only: int >= 1 (MiB), one exact-posterior tile; same result at every budget, larger = fewer kernels and more transient memory (32 = CPU-safe default)
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 

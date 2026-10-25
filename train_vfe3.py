@@ -108,10 +108,11 @@ fully_gauge_covariant = False
 # minimal-agent attention with its posterior covariance; the exact cue/result memory in reference coordinates with no
 # block norm, one bank tied across depth and the regime belief carried through it ('sticky' unless 'learned' is
 # chosen); the covariant diagonal family gaussian_frame_diagonal with the diagonal_chunked decoder at decode_tau=1 and
-# an untied bank; and everything fully_gauge_covariant overrides on top of that. The run is refused unless every
+# an untied bank; and everything fully_gauge_covariant overrides on top of that except phi_frame_condition_max, which
+# is kept as configured (an M-step bound on the frames; None for the strictly covariant route). The run is refused unless every
 # requirement holds. The memory's regression rank and result noise, the regime beta and stay, routing prior, floors,
 # learning rates, shape and numerics are not touched. The overrides are logged and listed in config.md.
-# Implies fully_gauge_covariant. False: the config exactly as written.
+# Implies fully_gauge_covariant when phi_frame_condition_max is None. False: the config exactly as written.
 principled_exact_route = True
 
 config = dict(
@@ -216,6 +217,7 @@ config = dict(
     
     block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
     block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
+    block_memory_tile_mib            = 1024,           # cue_result_memory only: int >= 1 (MiB), one exact-posterior tile; same result at every budget, larger = fewer kernels and more transient memory (32 = CPU-safe default)
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 
@@ -648,7 +650,8 @@ def _run_once(
             write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
                                   header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg),
                                           "principled_exact_route": principled_exact_route,
-                                          "fully_gauge_covariant": fully_gauge_covariant or principled_exact_route,
+                                          "fully_gauge_covariant": fully_gauge_covariant or (
+                                              principled_exact_route and cfg.phi_frame_condition_max is None),
                                           "launch overrides": overrides})
         except Exception as exc:
             logger.warning("config.md was not written (%s: %s); the run continues", type(exc).__name__, exc)
