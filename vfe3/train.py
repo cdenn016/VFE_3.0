@@ -62,7 +62,7 @@ from vfe3.sparse_row_optim import RowLazyAdamW, RowLazyTableFisherAdamW
 from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
-from vfe3.model.block_mlp import PrototypeAgentBlockMLP
+from vfe3.model.block_mlp import CueResultMemoryBlockMLP, PrototypeAgentBlockMLP
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS, MINIMAL_AGENT_IS_SAMPLES
 from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
@@ -339,8 +339,11 @@ def build_optimizer(
         # weight_decay=0 on the prototype_agents template log-variances log(lambda) and log-weights log(pi):
         # decaying them pulls lambda toward 1 and pi toward uniform, a prior on the templates rather than a
         # capacity penalty. The template means nu keep the global decay.
+        # cue_result_memory adds its result-noise log variances log(q) to the same undecayed group.
         template_priors = [p for mlp in model.block_mlps if isinstance(mlp, PrototypeAgentBlockMLP)
                            for p in (mlp.log_lambda, mlp.log_pi)]
+        template_priors += [p for mlp in model.block_mlps if isinstance(mlp, CueResultMemoryBlockMLP)
+                            for p in mlp.undecayed_parameters()]
         exempt = {id(p) for p in template_priors}
         groups.append({"params": [p for p in model.block_mlps.parameters() if id(p) not in exempt],
                        "lr": block_mlp_lr, "weight_decay": cfg.weight_decay,
@@ -5718,7 +5721,8 @@ def _train_loop(
     # start only, on cfg.batch_size training windows drawn by a private generator, so the data order and the
     # global RNG streams are unchanged (audit 2026-10-07, F77/F78).
     if (resume_path is None and getattr(cfg, "block_mlp_template_init", "absolute") == "working_variance"
-            and getattr(cfg, "use_block_mlp", False) and getattr(cfg, "block_mlp_mode", None) == "prototype_agents"):
+            and getattr(cfg, "use_block_mlp", False)
+            and getattr(cfg, "block_mlp_mode", None) in ("prototype_agents", "cue_result_memory")):
         dataset = getattr(loader, "dataset", None)
         if dataset is None or not hasattr(dataset, "__getitem__"):
             raise RuntimeError("block_mlp_template_init='working_variance' needs a window dataset on the loader")

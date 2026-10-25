@@ -22,6 +22,7 @@ from vfe3.model.prototype_agents import (
     prototype_mean_field_posterior,
     template_kl_logits,
 )
+from vfe3.model.cue_result_memory import CUE_RESULT_TILE_BYTES, CueResultPosterior, cue_result_exact_posterior
 from vfe3.numerics import validated_cholesky_solve
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -1941,6 +1942,148 @@ class PrototypeAgentBlockMLP(nn.Module):
         }
 
 
+class CueResultMemoryBlockMLP(nn.Module):
+    r"""Block as exact conditioning of a cue/result component model (``block_mlp_mode='cue_result_memory'``).
+
+    The model and its posterior are in :mod:`vfe3.model.cue_result_memory`: component :math:`a` has a cue law
+    :math:`\mathcal N(\nu_a, L_a)`, a result law :math:`Y\mid X\sim\mathcal N(\omega_a + F_a(X - \nu_a), Q_a)` and a
+    prior weight :math:`\hat\pi_a`; the working belief :math:`(\xi_i, C_i)` is a Gaussian record of the cue. The block
+    returns the first two moments of the exact result marginal, so the new belief is
+    :math:`\mathcal N(\sum_aw_am_{Y,a},\ \sum_aw_a[P_{Y,a} + (m_{Y,a} - \bar m)(m_{Y,a} - \bar m)^\top])`. There is no
+    additional residual: at :math:`\omega_a = \nu_a`, :math:`F_a = I` the result mean is the same-state posterior mean
+    of the cue, and :math:`F_a` lets a component rotate or reverse the response, which same-state conditioning cannot
+    (its whitened Jacobian is positive definite). Read as a transition, a component is one regime of a switching
+    linear-Gaussian step with Bayesian regime selection, collapsed to one Gaussian.
+
+    Scope (enforced by :class:`vfe3.config.VFE3Config`): reference coordinates on ``gaussian_full``, so the block reads the
+    dense invariant :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` and its covariance returns as :math:`U_iC_i^+U_i^\top`;
+    exact inference only, covariance contract ``'posterior'`` only, no dropout and no EM term.
+
+    Parameters, in registration order: ``nu``, ``log_lambda`` (M, K), ``log_pi`` (M,), ``omega``, ``log_result_noise``
+    (M, K), then ``regression_offset`` (M, K, K) when ``regression_rank`` is None, or ``regression_left`` and
+    ``regression_right`` (M, K, r). Initialization: ``nu``, ``log_lambda`` and ``log_pi`` as in
+    :class:`PrototypeAgentBlockMLP`, ``omega = nu``, :math:`Q_a = \rho L_a` with :math:`\rho` = ``result_noise_ratio``,
+    ``regression_offset = 0`` or ``regression_left = 0`` and ``regression_right`` normal with standard deviation
+    :math:`0.01/\sqrt K`, so :math:`F_a = I` with nonzero initial gradients for both factors. ``log_lambda``, ``log_pi``
+    and ``log_result_noise`` train without weight decay (:func:`vfe3.train.build_optimizer`); decay on the regression
+    parameters pulls :math:`F_a` toward the identity.
+    """
+
+    covariance_contract = "posterior"
+
+    def __init__(
+        self,
+        embed_dim: int,
+        expansion: int,
+        dropout: float,
+        *,
+        covariance_contract: str = "posterior",
+        inference: str = "exact",
+        template_init_variance: float = 10.0,
+        regression_rank: Optional[int] = None,
+        result_noise_ratio: float = 0.01,
+    ) -> None:
+        super().__init__()
+        if covariance_contract != "posterior":
+            raise ValueError(f"cue_result_memory supports only covariance_contract='posterior', got {covariance_contract!r}")
+        if inference != "exact":
+            raise ValueError(f"cue_result_memory supports only inference='exact', got {inference!r}")
+        if float(dropout) != 0.0:
+            raise ValueError(f"cue_result_memory takes no dropout (the output is a posterior), got {dropout!r}")
+        if (isinstance(template_init_variance, bool) or not isinstance(template_init_variance, (int, float))
+                or not math.isfinite(float(template_init_variance)) or float(template_init_variance) <= 0.0):
+            raise ValueError(f"template_init_variance must be a finite real value > 0, got {template_init_variance!r}")
+        if regression_rank is not None and (isinstance(regression_rank, bool) or not isinstance(regression_rank, int)
+                                            or not 1 <= regression_rank <= embed_dim):
+            raise ValueError(f"regression_rank must be None or an int in [1, {embed_dim}], got {regression_rank!r}")
+        if (isinstance(result_noise_ratio, bool) or not isinstance(result_noise_ratio, (int, float))
+                or not math.isfinite(float(result_noise_ratio)) or float(result_noise_ratio) <= 0.0):
+            raise ValueError(f"result_noise_ratio must be a finite real value > 0, got {result_noise_ratio!r}")
+        M, K = embed_dim * expansion, embed_dim
+        self.regression_rank = regression_rank
+        self.result_noise_ratio = float(result_noise_ratio)
+        self.tile_bytes = CUE_RESULT_TILE_BYTES                                    # chunk budget (not state)
+        bound_in = embed_dim ** -0.5
+        self.nu = nn.Parameter(torch.empty(M, K).uniform_(-bound_in, bound_in))                     # (M, K)
+        self.log_lambda = nn.Parameter(torch.full((M, K), math.log(float(template_init_variance))))  # (M, K)
+        self.log_pi = nn.Parameter(torch.zeros(M))                                                  # (M,)
+        self.omega = nn.Parameter(self.nu.detach().clone())                                        # (M, K)
+        self.log_result_noise = nn.Parameter(self.log_lambda.detach() + math.log(self.result_noise_ratio))  # (M, K)
+        if regression_rank is None:
+            self.regression_offset = nn.Parameter(torch.zeros(M, K, K))                             # (M, K, K) D_a
+        else:
+            self.regression_left = nn.Parameter(torch.zeros(M, K, regression_rank))                 # (M, K, r) U_a
+            self.regression_right = nn.Parameter(
+                torch.randn(M, K, regression_rank) * (0.01 / math.sqrt(K)))                         # (M, K, r) V_a
+
+    def undecayed_parameters(self) -> Tuple[nn.Parameter, ...]:
+        r"""Log variances and log weights: decay would pull them toward 1 and uniform, a prior, not a penalty."""
+        return (self.log_lambda, self.log_pi, self.log_result_noise)
+
+    def _regression(self) -> Dict[str, torch.Tensor]:
+        if self.regression_rank is None:
+            return {"regression_offset": self.regression_offset}
+        return {"regression_left": self.regression_left, "regression_right": self.regression_right}
+
+    def posterior(
+        self,
+        mu:    torch.Tensor,                          # (..., K) record values (reference working means)
+        sigma: torch.Tensor,                          # (..., K, K) dense record covariance
+    ) -> CueResultPosterior:
+        r"""The exact result posterior at the working belief (:func:`vfe3.model.cue_result_memory.cue_result_exact_posterior`)."""
+        return cue_result_exact_posterior(mu, sigma, self.nu, self.omega, self.log_lambda, self.log_result_noise,
+                                          self.log_pi, tile_bytes=self.tile_bytes, **self._regression())
+
+    @torch.no_grad()
+    def calibrate_templates(
+        self,
+        mu:        torch.Tensor,                      # (..., K) working means this block receives
+        sigma:     torch.Tensor,                      # (..., K, K) dense working covariance
+        *,
+        pull:      float,                             # target initial pull p in (0, 1)
+        generator: torch.Generator,                   # CPU generator for the template draw
+    ) -> Dict[str, float]:
+        r"""``block_mlp_template_init='working_variance'``: the cue bank as in :meth:`PrototypeAgentBlockMLP.calibrate_templates`
+        (same draw), then :math:`\omega = \nu` and :math:`Q_a = \rho L_a`, so the calibrated block still starts at
+        :math:`F_a = I` with the result centered on the cue."""
+        K = self.nu.shape[-1]
+        diag = sigma.diagonal(dim1=-2, dim2=-1)
+        c_bar = float(diag.double().mean())
+        lam0 = c_bar * (1.0 - pull) / pull
+        rows = mu.reshape(-1, K)
+        M, n = self.nu.shape[0], rows.shape[0]
+        index = (torch.randperm(n, generator=generator)[:M] if n >= M
+                 else torch.randint(0, n, (M,), generator=generator))
+        self.nu.copy_(rows[index.to(rows.device)].to(self.nu.dtype))
+        self.log_lambda.fill_(math.log(lam0))
+        self.omega.copy_(self.nu)
+        self.log_result_noise.copy_(self.log_lambda + math.log(self.result_noise_ratio))
+        return {"working_variance": c_bar, "lambda0": lam0}
+
+    def forward_moments(
+        self,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        *,
+        frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,
+        em_rows: Optional[list[torch.Tensor]] = None,
+    ) -> BlockMLPMomentResult:
+        r""":math:`(\xi, C) \mapsto` the result posterior moments :math:`(\bar m_Y, \bar P_Y)`."""
+        del frame_context
+        _reject_hidden_bias(hidden_bias, "the cue_result_memory block conditions on components and has no fc1 hidden layer")
+        if em_rows is not None:
+            raise ValueError("cue_result_memory has no EM objective (block_mlp_em_weight must be 0)")
+        if sigma.dim() != mu.dim() + 1:
+            raise ValueError("cue_result_memory reads a dense (..., K, K) covariance (reference coordinates on "
+                             f"gaussian_full); got sigma {tuple(sigma.shape)} for mu {tuple(mu.shape)}")
+        result = self.posterior(mu, sigma)
+        return BlockMLPMomentResult(result.mean.to(mu.dtype), result.covariance.to(sigma.dtype), None)
+
+    def forward(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        return self.forward_moments(mu, sigma).mu
+
+
 BlockMLPFactory = Callable[..., nn.Module]
 BlockMLPReportLabel = Callable[[str], str]
 BlockMLPWidth = Callable[[int, Sequence[int]], int]
@@ -1969,6 +2112,9 @@ class BlockMLPRegistration:
     # Keyword options beyond the shared construction arguments that this mode's factory reads;
     # build_block_mlp forwards only these, so every other factory is called exactly as before.
     factory_options: frozenset[str] = frozenset()
+    # (width, expansion, regression_rank) -> per-layer count, for modes whose count depends on the regression rank
+    # (cue_result_memory); takes precedence over parameter_count_per_layer.
+    rank_parameter_count_per_layer: Optional[Callable[[int, int, Optional[int]], int]] = None
 
     def parameter_count(
         self,
@@ -1977,8 +2123,11 @@ class BlockMLPRegistration:
         irrep_dims: Sequence[int],
         expansion: int,
         n_layers: int = 1,
+        regression_rank: Optional[int] = None,
     ) -> int:
         width = self.width(embed_dim, irrep_dims)
+        if self.rank_parameter_count_per_layer is not None:
+            return int(n_layers) * self.rank_parameter_count_per_layer(width, expansion, regression_rank)
         if self.parameter_count_per_layer is not None:
             return int(n_layers) * self.parameter_count_per_layer(width, expansion)
         per_layer = 2 * expansion * width * width + (expansion + 1) * width
@@ -2046,6 +2195,18 @@ def _prototype_agents_factory(**kwargs) -> nn.Module:
     for unused in ("irrep_dims", "activation", "covariance_floor"):
         kwargs.pop(unused)
     return PrototypeAgentBlockMLP(**kwargs)
+
+
+def _cue_result_memory_factory(**kwargs) -> nn.Module:
+    for unused in ("irrep_dims", "activation", "covariance_floor"):
+        kwargs.pop(unused)
+    return CueResultMemoryBlockMLP(**kwargs)
+
+
+def _cue_result_parameter_count(width: int, expansion: int, regression_rank: Optional[int]) -> int:
+    M = expansion * width
+    regression = M * width * width if regression_rank is None else 2 * M * width * int(regression_rank)
+    return 4 * M * width + M + regression          # nu, log_lambda, omega, log_result_noise; log_pi; F_a
 
 
 def _coordinate_report_label(covariance: str) -> str:
@@ -2135,6 +2296,24 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         diagonal_extra_flops_per_layer=lambda embed_dim, _irrep_dims: 7.0 * embed_dim,
         factory_options=frozenset({"inference", "template_init_variance", "cavi_steps"}),
     ),
+    # nu, log_lambda, omega, log_result_noise: (M, K) each; log_pi: (M,); regression_offset (M, K, K) or
+    # regression_left/right (M, K, r); M = expansion * K. Exact inference in reference coordinates on a dense C only.
+    # The FLOP metadata is the dense-regression exact path per token: per component a K x K Cholesky (K^3/3), the
+    # solve W^-1 L (2 K^3), C W^-1 L (2 K^3) and F P F^T (4 K^3), about 25/3 K^3; the low-rank form is cheaper and
+    # is booked at the same bound.
+    "cue_result_memory": BlockMLPRegistration(
+        factory=_cue_result_memory_factory,
+        requires_frame_context=False,
+        covariance_kinds=frozenset({"posterior"}),
+        gauge_class="coordinate_nonintertwiner",
+        intertwiner_compatible=False,
+        width=lambda embed_dim, _irrep_dims: embed_dim,
+        extra_flops_per_layer=lambda _embed_dim, _irrep_dims: 0.0,
+        report_label=lambda _covariance: "cue_result_memory_posterior_covariance_nonintertwiner",
+        matmul_flops_per_layer=lambda width, expansion: (25.0 / 3.0) * expansion * width ** 4,
+        factory_options=frozenset({"inference", "template_init_variance", "regression_rank", "result_noise_ratio"}),
+        rank_parameter_count_per_layer=_cue_result_parameter_count,
+    ),
 })
 
 
@@ -2160,8 +2339,10 @@ def block_mlp_build_metadata(
     irrep_dims: Sequence[int],
     n_layers: int,
     covariance_layout: str = "full",
+    regression_rank: Optional[int] = None,
 ) -> BlockMLPBuildMetadata:
-    r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs."""
+    r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs and
+    ``regression_rank`` the cue_result_memory parameter count (other modes ignore it)."""
     registration = get_block_mlp_registration(mode)
     if covariance not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance!r}")
@@ -2171,6 +2352,7 @@ def block_mlp_build_metadata(
         irrep_dims=realized_irrep_dims,
         expansion=expansion,
         n_layers=n_layers,
+        regression_rank=regression_rank,
     )
     realized_flops_per_token = registration.flops_per_token(
         embed_dim=embed_dim,
@@ -2217,13 +2399,16 @@ def build_block_mlp(
     inference: str = "mean_field",
     template_init_variance: float = 10.0,
     cavi_steps: int = 1,
+    regression_rank: Optional[int] = None,
+    result_noise_ratio: float = 0.01,
 ) -> nn.Module:
-    r"""Build one block MLP; ``inference``, ``template_init_variance`` and ``cavi_steps`` reach only the modes that
-    read them."""
+    r"""Build one block MLP; ``inference``, ``template_init_variance``, ``cavi_steps``, ``regression_rank`` and
+    ``result_noise_ratio`` reach only the modes that read them."""
     registration = get_block_mlp_registration(mode)
     if covariance_contract not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
-    options = {"inference": inference, "template_init_variance": template_init_variance, "cavi_steps": cavi_steps}
+    options = {"inference": inference, "template_init_variance": template_init_variance, "cavi_steps": cavi_steps,
+               "regression_rank": regression_rank, "result_noise_ratio": result_noise_ratio}
     return registration.factory(
         embed_dim=embed_dim,
         irrep_dims=irrep_dims,

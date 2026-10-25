@@ -659,6 +659,7 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
             irrep_dims=group.irrep_dims,
             expansion=int(cfg.block_mlp_expansion),
             n_layers=int(cfg.n_layers),
+            regression_rank=getattr(cfg, "block_memory_regression_rank", None),    # cue_result_memory only
         )
     if cfg.layernorm_affine and cfg.norm_type_block == "layernorm":
         n += 2 * K

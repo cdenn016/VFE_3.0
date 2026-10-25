@@ -192,14 +192,16 @@ config = dict(
     per_type_hidden_bias             = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
      
     block_mlp_activation             = "gelu",         # "gelu" | "silu" | "relu" (not read by gaussian_template / prototype_agents)   
-    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
-    block_mlp_covariance             = "passthrough",   # "passthrough" | "posterior" (prototype_agents) | "delta_full" (block norm "none"/"layernorm", no post-norm)  | gaussian_template: "passthrough" only
+    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "cue_result_memory" (exact reference route, gaussian_full) | "canonical_frame" | "gaussian_template" | "gauge_gate"
+    block_mlp_covariance             = "passthrough",   # "passthrough" | "posterior" (prototype_agents; required by cue_result_memory) | "delta_full" (block norm "none"/"layernorm", no post-norm)  | gaussian_template: "passthrough" only
     
       
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
     block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
     block_mlp_em_weight              = 0.0,            # prototype_agents only: EM M-step term on the templates (nu, lambda, pi); 0 = off
+    block_memory_regression_rank     = None,           # cue_result_memory only: None (dense F_a = I + D_a) | int r in [1, K] (F_a = I + U_a V_a^T)
+    block_memory_result_noise_ratio  = 0.01,           # cue_result_memory only: initial result noise Q_a / L_a > 0
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 

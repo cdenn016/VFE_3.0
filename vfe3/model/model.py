@@ -432,6 +432,8 @@ class VFEModel(nn.Module):
                     inference=cfg.block_mlp_inference,                    # read by prototype_agents only
                     template_init_variance=cfg.block_mlp_template_init_variance,
                     cavi_steps=cfg.block_mlp_cavi_steps,                  # prototype_agents mean field only
+                    regression_rank=cfg.block_memory_regression_rank,     # cue_result_memory only
+                    result_noise_ratio=cfg.block_memory_result_noise_ratio,   # cue_result_memory only
                 )
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
@@ -470,6 +472,7 @@ class VFEModel(nn.Module):
                 irrep_dims=self.group.irrep_dims,
                 n_layers=cfg.n_layers,
                 covariance_layout=_get_family(cfg.family).cov_kind,     # 'full' also for the dense head-block storage
+                regression_rank=cfg.block_memory_regression_rank,       # cue_result_memory parameter count only
             )
         )
         # Under a comparison rope_mode no frame carries R_i: the MLP and the values both read U_i.
@@ -1000,9 +1003,10 @@ class VFEModel(nn.Module):
         afterwards. Run once at a fresh start (``block_mlp_template_init='working_variance'``); it rewrites
         ``nu`` and ``log_lambda`` in place, so it must not run on a resumed model.
         """
-        from vfe3.model.block_mlp import PrototypeAgentBlockMLP
+        from vfe3.model.block_mlp import CueResultMemoryBlockMLP, PrototypeAgentBlockMLP
 
-        targets = [mlp for mlp in (self.block_mlps or []) if isinstance(mlp, PrototypeAgentBlockMLP)]
+        targets = [mlp for mlp in (self.block_mlps or [])
+                   if isinstance(mlp, (PrototypeAgentBlockMLP, CueResultMemoryBlockMLP))]
         generator = torch.Generator().manual_seed(int(seed))
         results: List[Dict[str, float]] = []
         was_training = self.training

@@ -205,6 +205,8 @@ INTRODUCED_AFTER_CAA0114: Mapping[str, Any] = {
     'm_phi_sparse_rows':                     False,           # 1f94d7d (2026-10-21)
     'm_decode_update_mode':                  'adamw',         # 1f94d7d (2026-10-21)
     'relational_score_weight_decay':         0.0,             # 11db517 (2026-10-21)
+    'block_memory_regression_rank':          None,            # cue_result_memory (2026-10-24)
+    'block_memory_result_noise_ratio':       0.01,            # cue_result_memory (2026-10-24)
 }
 
 FIELD_INTRODUCTION_VALUES: Mapping[str, Any] = {**SNAPSHOT_CAA0114, **INTRODUCED_AFTER_CAA0114}
