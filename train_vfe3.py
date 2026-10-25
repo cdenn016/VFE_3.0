@@ -113,7 +113,7 @@ fully_gauge_covariant = False
 # requirement holds. The memory's regression rank and result noise, the regime beta and stay, routing prior, floors,
 # learning rates, shape and numerics are not touched. The overrides are logged and listed in config.md.
 # Implies fully_gauge_covariant when phi_frame_condition_max is None. False: the config exactly as written.
-principled_exact_route = True
+principled_exact_route = False
 
 config = dict(
        
@@ -123,16 +123,16 @@ config = dict(
    
     vocab_size                       = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / word 267735)
                                                                   
-    embed_dim                        = 32,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                          = 2,                   # = number of irrep blocks (alibi priors require this)
+    embed_dim                        = 192,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                          = 6,                   # = number of irrep blocks (alibi priors require this)
     
-    max_seq_len                      = 64,                 # N, context length
-    eval_stride                      = 16,
+    max_seq_len                      = 256,                 # N, context length
+    eval_stride                      = 64,
     
     batch_size                       = 32,
-    max_steps                        = 60000,
+    max_steps                        = 120000,
     
-    n_layers                         = 4,                   # L, number of blocks
+    n_layers                         = 8,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
 
     warmup_steps                     = 250,         # int >= 0: linear warmup steps before the cosine decay
@@ -141,9 +141,9 @@ config = dict(
     #         Misc/Logging
     #################################
 
-    log_interval                     = 500,       # console log every N steps (0 = off)
-    eval_interval                    = 3000,      # periodic validation every N steps (0 = off)
-    checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off) 
+    log_interval                     = 2500,       # console log every N steps (0 = off)
+    eval_interval                    = 15000,      # periodic validation every N steps (0 = off)
+    checkpoint_interval              = 60000,     # save a resumable checkpoint every N steps (0 = off) 
    
     checkpoint_keep_last             = 1,        # None (keep every checkpoint) | int >= 1 (keep the newest N)
     checkpoint_at_end                = True,     # True | False (also save a resumable checkpoint after the last step)
@@ -218,7 +218,7 @@ config = dict(
     block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
     block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     block_memory_tile_mib            = 1024,           # cue_result_memory only: int >= 1 (MiB), one exact-posterior tile; same result at every budget, larger = fewer kernels and more transient memory (32 = CPU-safe default)
-    block_memory_triton              = False,          # True | False: cue_result_memory on gaussian_frame_diagonal, rank 1..4: fused Triton kernels on CUDA (CPU runs torch either way)
+    block_memory_triton              = True,          # True | False: cue_result_memory on gaussian_frame_diagonal, rank 1..4: fused Triton kernels on CUDA (CPU runs torch either way)
     
     block_mlp_expansion              = 8,               # K*block_mlp_expansion = number of templates
     block_mlp_template_init_variance = 10.0,            # initial template variance lambda_0 > 0 (absolute init only) 
@@ -376,7 +376,7 @@ config = dict(
     #################################
     #   Numerics/Speed
     #################################
-    weight_ema_decay                 = None,         # None (off) | float in (0, 1): EMA of the trainable weights, scored at every eval and at the end
+    weight_ema_decay                 = 0.9998,         # None (off) | float in (0, 1): EMA of the trainable weights, scored at every eval and at the end
     weight_ema_start_frac            = 0.5,          # float in [0, 1]: the EMA starts at this fraction of max_steps
     weight_ema_update_interval       = 1,            # int >= 1: accepted updates between EMA updates (decay d^k per update)
     weight_ema_device                = "same",       # "same" (shadow on the parameters' device) | "cpu" (host memory; pair with interval > 1)
@@ -396,6 +396,8 @@ config = dict(
     pair_kl_gemm_tol                 = None,         # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128) 
     relational_tile_mib              = 512,          # int >= 1 (MiB): scorer and routed-spread tile budget; larger dispatches fewer kernels, more transient memory (A/B on CUDA before raising)
     phi_frame_condition_max          = 20,         # None (off) | kappa_max > 1, e.g. 20 or 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
+    phi_type_dropout                 = 0.1,       # float in [0, 1): training-only type-level frame dropout, each type per sequence reads the identity frame with prob p_v (0.0 = off)
+    phi_type_dropout_freq_scale      = 1e-05,     # None (uniform p_v = phi_type_dropout) | f0 > 0: p_v = phi_type_dropout * f0 / (f0 + pi_v), sparing frequent types (needs decode_unigram_prior)
     
     frame_pair_escalation_tol        = None,         # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     decode_ranking_fp64_escalation   = False, 

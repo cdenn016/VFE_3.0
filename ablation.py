@@ -661,7 +661,7 @@ SWEEP_ORDER: List[str] = [
   #  "m_decode_mu_lr",
    
     
-    "weight_decay",  
+   # "weight_decay",  
   # "m_relational_score_lr", 
   # "m_relational_content_lr",
    
@@ -692,7 +692,7 @@ SWEEP_ORDER: List[str] = [
    
  # "warmup_steps", 
  
-   
+   "frame_capacity",   #TODO
   
    
     
