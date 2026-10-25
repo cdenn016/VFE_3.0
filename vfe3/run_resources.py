@@ -26,7 +26,11 @@ listed in the separate ``frozen`` section and excluded from the four sections, `
 parameters read per token (``total_including_frozen`` adds them back).
 
 Buffers are not parameters: a state dict passed in place of ``named_parameters()`` has its known
-buffers (:data:`BUFFER_LEAVES`) removed and listed under ``excluded_buffers``.
+persistent buffers (:data:`BUFFER_LEAVES` and the CG intertwiners ``cg_coupling.cg_<t>``) removed and listed
+under ``excluded_buffers``. A state dict of a model with ``block_mlp_tie_layers=True`` holds one key per layer
+for the single shared block MLP; the aliases ``block_mlps.<l>.*`` (``l > 0``) are validated against
+``block_mlps.0.*`` and counted once, as ``named_parameters()`` counts them, and are listed under
+``tied_aliases``.
 
 Parameters read per token count what one scored token touches: one row of every per-type table the
 encoder looks up, every row of the tables the decoder reads (the softmax normalizes over the whole
@@ -48,6 +52,7 @@ import csv
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence,
                     Tuple, Union)
@@ -60,8 +65,15 @@ if TYPE_CHECKING:
     from vfe3.config import VFE3Config
 
 
-# Leaf names of persistent buffers that can appear in a model state dict but are not parameters.
-BUFFER_LEAVES: Tuple[str, ...] = ("unigram_log_prior",)
+# Leaf names of persistent buffers that can appear in a model state dict but are not parameters: the unigram
+# log prior, the frozen additive-control readout R (encode_mode='per_token_additive') and the irrep-basis digest.
+BUFFER_LEAVES: Tuple[str, ...] = ("unigram_log_prior", "additive_R", "gauge_basis_fingerprint")
+
+# Persistent CG intertwiner buffers of the opt-in CG coupling (vfe3/model/cg_coupling.py), cg_coupling.cg_<t>.
+_CG_BUFFER = re.compile(r"^cg_coupling\.cg_\d+$")
+
+# Per-layer state-dict keys of the block MLPs, block_mlps.<layer>.<rest>.
+_BLOCK_MLP_KEY = re.compile(r"^block_mlps\.(\d+)\.(.+)$")
 
 # Prior-bank tables the ENCODER reads one row of per token.
 ENCODE_TABLE_LEAVES: Tuple[str, ...] = ("mu_embed", "sigma_log_embed", "phi_embed")
@@ -88,6 +100,58 @@ _TELEMETRY_COLUMNS: Tuple[str, ...] = (
 
 def _leaf(name: str) -> str:
     return name.rsplit(".", 1)[-1]
+
+
+def _is_buffer_name(name: str) -> bool:
+    r"""Whether canonical ``name`` is a known persistent buffer rather than a parameter."""
+    return _leaf(name) in BUFFER_LEAVES or _CG_BUFFER.match(name) is not None
+
+
+def tied_block_mlp_aliases(
+    named_params: Mapping[str, torch.Tensor],
+    cfg:          Any,
+) -> Dict[str, str]:
+    r"""State-dict aliases of a block MLP shared across layers, mapped to the layer-zero name they alias.
+
+    Under ``block_mlp_tie_layers=True`` (with ``use_block_mlp=True``) the model holds one block MLP in
+    ``nn.ModuleList([shared] * n_layers)``, so its state dict carries ``block_mlps.<l>.<rest>`` for every
+    layer ``l`` while ``named_parameters()`` yields only ``block_mlps.0.<rest>``. This returns
+    ``{"block_mlps.<l>.<rest>": "block_mlps.0.<rest>"}`` for ``l > 0`` (canonical names). The topology is
+    validated rather than assumed: every layer must carry exactly layer zero's names with equal shapes, and
+    tensors holding data (not ``meta``) must be equal, as the tied model's load guard requires; a mismatch
+    raises ``ValueError``. Storage identity is not used, since a CPU snapshot copies each alias. An untied
+    configuration (or one without block MLPs, or another model family) returns ``{}``.
+    """
+    if (model_family_of(cfg) != VFE_MODEL_FAMILY or _cfg_value(cfg, "block_mlp_tie_layers", False) is not True
+            or not _cfg_value(cfg, "use_block_mlp", False)):
+        return {}
+    tensors = {canonical_name(name): tensor for name, tensor in named_params.items()}
+    by_layer: Dict[int, Dict[str, torch.Tensor]] = {}
+    for name, tensor in tensors.items():
+        match = _BLOCK_MLP_KEY.match(name)
+        if match is not None:
+            by_layer.setdefault(int(match.group(1)), {})[match.group(2)] = tensor
+    first = by_layer.get(0, {})
+    aliases: Dict[str, str] = {}
+    for layer, entries in sorted(by_layer.items()):
+        if layer == 0:
+            continue
+        if set(entries) != set(first):
+            raise ValueError(
+                f"block_mlp_tie_layers=True shares one block MLP across layers, but block_mlps.{layer} holds "
+                f"{sorted(set(entries) ^ set(first))} that block_mlps.0 does not (or the reverse): the parameters "
+                "were not saved from a tied model")
+        for rest, tensor in entries.items():
+            reference = first[rest]
+            same_shape = tuple(tensor.shape) == tuple(reference.shape)
+            same_values = (same_shape and (tensor.device.type == "meta" or reference.device.type == "meta"
+                                           or torch.equal(tensor.detach().cpu(), reference.detach().cpu())))
+            if not same_values:
+                raise ValueError(
+                    f"block_mlp_tie_layers=True shares one block MLP across layers, but block_mlps.{layer}.{rest} "
+                    f"differs from block_mlps.0.{rest}: the parameters were not saved from a tied model")
+            aliases[f"block_mlps.{layer}.{rest}"] = f"block_mlps.0.{rest}"
+    return aliases
 
 
 def canonical_name(name: str) -> str:
@@ -211,7 +275,9 @@ def parameter_breakdown(
     r"""Counts and shares of the trainable parameters by role, and the parameters read per token.
 
     ``named_params`` is ``dict(model.named_parameters())`` or a model state dict (known buffers are
-    dropped). Only shapes are read, so memory-mapped or meta tensors are fine. A parameter is frozen
+    dropped, and the per-layer aliases of a tied block MLP are counted once: :func:`tied_block_mlp_aliases`).
+    Only shapes are read, apart from the tied-alias equality check on tensors that hold data, so memory-mapped
+    or meta tensors are fine. A parameter is frozen
     when it is an ``nn.Parameter`` with ``requires_grad=False`` (``named_parameters()`` input) or when
     its name is in ``frozen`` (pass :func:`frozen_parameter_names` for a state dict, whose tensors
     carry no ``requires_grad``). Frozen parameters are listed under ``frozen`` and counted in no other
@@ -223,7 +289,7 @@ def parameter_breakdown(
          "other":              {<leaf>: n, ..., "total", "share"},
          "frozen":             {<name>: n, ..., "total"},
          "total", "total_including_frozen", "parameters_read_per_token", "read_per_token_components",
-         "roles_by_name", "excluded_buffers", "definition", "model_family"}
+         "roles_by_name", "excluded_buffers", "tied_aliases", "definition", "model_family"}
     """
     V = int(cfg.vocab_size)
     family = model_family_of(cfg)
@@ -232,10 +298,13 @@ def parameter_breakdown(
     frozen_section: Dict[str, int] = {}
     roles_by_name: Dict[str, Dict[str, Any]] = {}
     excluded: List[str] = []
+    aliases = tied_block_mlp_aliases(named_params, cfg)               # {alias: layer-zero name}; {} untied
     for name, tensor in named_params.items():
         name = canonical_name(name)
-        if _leaf(name) in BUFFER_LEAVES:
+        if _is_buffer_name(name):
             excluded.append(name)
+            continue
+        if name in aliases:                                           # the shared bank, already counted at layer 0
             continue
         shape = tuple(int(s) for s in tensor.shape)
         numel = int(math.prod(shape))
@@ -298,6 +367,7 @@ def parameter_breakdown(
     out["read_per_token_components"] = components
     out["roles_by_name"] = roles_by_name
     out["excluded_buffers"] = excluded
+    out["tied_aliases"] = sorted(aliases)
     out["model_family"] = family
     if family == VFE_MODEL_FAMILY:
         out["definition"] = (

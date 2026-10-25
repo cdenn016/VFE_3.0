@@ -175,7 +175,12 @@ def discover_runs(runs: "str | Path | Sequence[str | Path]") -> List[Path]:
 
 @dataclass
 class SeedRecord:
-    r"""One analyzed seed: its opened run, its semantic metrics and its training provenance."""
+    r"""One analyzed seed: its opened run, its semantic metrics and its training provenance.
+
+    ``analysis_checkpoint`` is the checkpoint file name the saved semantic ``metrics`` were measured on (``None``
+    when the analysis did not record it); ``run.checkpoint_path`` is the checkpoint loaded here, which the
+    cross-seed stability reads. They differ only under an explicit checkpoint override.
+    """
 
     run_dir:       Path
     semantics_dir: Path
@@ -186,6 +191,7 @@ class SeedRecord:
     provenance:    Optional[Dict[str, Any]] = field(repr=False, default=None)
     label:         str = ""
     notes:         List[str] = field(default_factory=list)
+    analysis_checkpoint: Optional[str] = None
 
 
 def load_seed(run_dir: "str | Path", *, checkpoint: Optional[str] = None, vocab: Any = None,
@@ -193,7 +199,9 @@ def load_seed(run_dir: "str | Path", *, checkpoint: Optional[str] = None, vocab:
     r"""Open one analyzed run: ``metrics.json``, ``provenance.json`` (optional) and the checkpoint.
 
     The checkpoint is ``checkpoint`` or the one the analysis recorded (``metrics["run"]["checkpoint"]``,
-    by file name, so a moved run still resolves), else ``best_model.pt``. The seed is the checkpoint
+    by file name, so a moved run still resolves), else ``best_model.pt``. The saved metrics are not recomputed:
+    an override naming a different checkpoint than the recorded one is kept as a separate provenance
+    (``analysis_checkpoint`` versus the loaded ``run.checkpoint_path``) and stated in the notes. The seed is the checkpoint
     config's ``seed``; the data seed is ``provenance.json["data_seed"]`` (``None`` when unrecorded).
     ``drop_unknown_config_fields`` is passed to :func:`~vfe3.semantics.run.load_semantic_run`
     (retired config toggles are dropped and noted); ``None`` takes the value the analysis recorded
@@ -205,13 +213,19 @@ def load_seed(run_dir: "str | Path", *, checkpoint: Optional[str] = None, vocab:
     sem_dir = find_semantics_dir(run_dir)
     metrics = _read_json(sem_dir / "metrics.json") or {}
     recorded = _get(metrics, "run", "checkpoint")
-    name = checkpoint or (Path(str(recorded).replace("\\", "/")).name if recorded else "best_model.pt")
+    analysis_checkpoint = Path(str(recorded).replace("\\", "/")).name if recorded else None
+    name = checkpoint or analysis_checkpoint or "best_model.pt"
     if drop_unknown_config_fields is None:
         drop_unknown_config_fields = bool(_get(metrics, "options", "drop_unknown_config_fields") or False)
     run = load_semantic_run(run_dir, checkpoint=name, vocab=vocab,
                             drop_unknown_config_fields=bool(drop_unknown_config_fields))
     provenance = _read_json(run_dir / "provenance.json")
     notes: List[str] = [f"{run_dir.name}: {n}" for n in run.notes if "no longer declares" in n]
+    loaded = Path(run.checkpoint_path).name
+    if analysis_checkpoint != loaded:
+        notes.append(f"{run_dir.name}: the saved semantic metrics were measured on "
+                     f"{analysis_checkpoint or 'an unrecorded checkpoint'}, while the stability reads {loaded}; "
+                     "the headline metrics and the stability describe different weights")
     seed = int(run.cfg.seed)
     data_seed = None
     if provenance is not None:
@@ -221,7 +235,8 @@ def load_seed(run_dir: "str | Path", *, checkpoint: Optional[str] = None, vocab:
         if isinstance(prov_seed, int) and prov_seed != seed:
             notes.append(f"{run_dir.name}: provenance seed {prov_seed} differs from the checkpoint config seed {seed}")
     return SeedRecord(run_dir=run_dir, semantics_dir=sem_dir, metrics=metrics, run=run, seed=seed,
-                      data_seed=data_seed, provenance=provenance, notes=notes)
+                      data_seed=data_seed, provenance=provenance, notes=notes,
+                      analysis_checkpoint=analysis_checkpoint)
 
 
 def _labels(records: Sequence[SeedRecord]) -> List[str]:
@@ -814,10 +829,13 @@ def _render_markdown(payload: Mapping[str, Any], labels: Sequence[str], out: Pat
 
     add("## Runs\n")
     add(markdown_table([{"seed": lab, "run": Path(r["run_dir"]).name, "data seed": r["data_seed"],
-                         "preset": r["preset"], "checkpoint": r["checkpoint"],
+                         "preset": r["preset"],
+                         "metrics checkpoint": r["analysis_checkpoint"] or "unrecorded",
+                         "stability checkpoint": r["stability_checkpoint"],
                          "semantics": Path(r["semantics_dir"]).name}
                         for lab, r in zip(labels, payload["runs"])],
-                       ["seed", "run", "data seed", "preset", "checkpoint", "semantics"]))
+                       ["seed", "run", "data seed", "preset", "metrics checkpoint", "stability checkpoint",
+                        "semantics"]))
 
     add("## Headline metrics across seeds\n")
     add("Mean, unbiased SD (n − 1), minimum and maximum over the seeds that report the metric; view "
@@ -915,7 +933,9 @@ def aggregate_seeds(
 
     ``runs`` is a list of run directories or one parent folder whose children are the runs
     (:func:`discover_runs`). ``out_dir`` defaults to ``<parent>/multiseed_semantics``.
-    ``checkpoint`` overrides the checkpoint each analysis recorded. ``stability=False`` skips the
+    ``checkpoint`` overrides the checkpoint each analysis recorded for the stability only; the headline
+    metrics stay those saved by each analysis, and every run records both ``analysis_checkpoint`` and
+    ``stability_checkpoint``. ``stability=False`` skips the
     cross-seed stability, which rebuilds each seed's channel tables (the frame chart is the costly
     part). ``device`` runs the stability kNN and CKA (``"cpu"`` or ``"cuda[:i]"``); ``threads`` pins
     torch's intra-op threads for the call. ``vocab`` overrides the tokenizer vocabulary (tests).
@@ -999,7 +1019,10 @@ def aggregate_seeds(
             "schema": "vfe3.semantics.multiseed/1",
             "created": started.isoformat(timespec="seconds"),
             "runs": [{"label": lab, "run_dir": str(r.run_dir), "semantics_dir": str(r.semantics_dir),
-                      "checkpoint": r.run.checkpoint_path.name, "seed": r.seed, "data_seed": r.data_seed,
+                      # The saved headline metrics and the stability can read different checkpoints (override).
+                      "analysis_checkpoint": r.analysis_checkpoint,
+                      "stability_checkpoint": Path(r.run.checkpoint_path).name,
+                      "seed": r.seed, "data_seed": r.data_seed,
                       "preset": _get(r.metrics, "options", "preset") or "full (pre-preset analysis)",
                       "n_candidates": _get(r.metrics, "run", "n_candidates")}
                      for lab, r in zip(labels, records)],
