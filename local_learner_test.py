@@ -17,7 +17,7 @@ from pathlib import Path
 
 CONFIG = {
     
-    "stage":            "B",                    # "timing" | "A" | "B"
+    "stage":            "B",                    # "timing" | "A" | "B" | "S" (scaling follow-up to B)
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
@@ -46,6 +46,19 @@ CONFIG = {
     "A_val_len":        1000,
     "A_seeds":          [0],
     
+    # stage S (scaling follow-up on the stage B data; results_S.jsonl). Each run sets its own chunk and stream
+    # count with chunk * streams = 8192 tokens per update, as in stage B, so every run makes 610 updates; "stack"
+    # caps how many seeds train in one batch (backprop at d = 64 keeps one seed per batch for GPU memory).
+    # Part 1 adds d = 64 to the stage B grid; part 2 lengthens the smoothing window and the truncated-backprop
+    # horizon to 64 steps at d = 32 and 64.
+    "S_runs":           [{"arm": "local_w16", "d": 64, "chunk": 16, "streams": 512, "stack": 3},
+                         {"arm": "blind",     "d": 64, "chunk": 16, "streams": 512, "stack": 3},
+                         {"arm": "backprop",  "d": 64, "chunk": 16, "streams": 512, "stack": 1},
+                         {"arm": "local_w64", "d": 32, "chunk": 64, "streams": 128, "stack": 3},
+                         {"arm": "backprop",  "d": 32, "chunk": 64, "streams": 128, "stack": 3},
+                         {"arm": "local_w64", "d": 64, "chunk": 64, "streams": 128, "stack": 3},
+                         {"arm": "backprop",  "d": 64, "chunk": 64, "streams": 128, "stack": 1}],
+
     # stage B (WikiText-103 bytes)
     "B_dims":           [8, 16, 32],
     "B_seeds":          [0, 1, 2],
@@ -90,10 +103,11 @@ def as_streams(x: np.ndarray, S: int) -> torch.Tensor:
     return torch.from_numpy(x[:S * L].reshape(S, L).copy())
 
 
-def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log) -> Params:
+def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log, chunk: int | None = None) -> Params:
     c = CONFIG
+    chunk = c["chunk"] if chunk is None else chunk
     if arm == "backprop":
-        return train_backprop(prm0, train, tree, chunk=c["chunk"], lr=c["backprop_lr"], log=log)
+        return train_backprop(prm0, train, tree, chunk=chunk, lr=c["backprop_lr"], log=log)
     base, _, name = arm.partition("@")
     sched = c["local_schedules"][name or c["local_schedule"]]
     reset = sched["reset"]
@@ -101,7 +115,7 @@ def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log
         if c["stage"] != "A":
             raise ValueError("the 'pass' reset needs repeated passes (stage A)")
         reset = max(1, c["A_train_len"] // c["chunk"])
-    kw = dict(chunk=c["chunk"], ridge=c["ridge"], q_floor=c["q_floor"], gamma_exponent=sched["alpha"],
+    kw = dict(chunk=chunk, ridge=c["ridge"], q_floor=c["q_floor"], gamma_exponent=sched["alpha"],
               gamma_floor=sched["floor"], reset_every=reset, log=log)
     if base == "blind":
         return train_local(prm0, train, tree, window=1, blind=True, **kw)
@@ -146,6 +160,42 @@ def run_timing(tree: TreeSensor) -> None:
             sec = (time.perf_counter() - t0) / chunks
             print(f"d={d:3d} {arm:11s} {sec:7.3f} s per chunk of {CONFIG['streams'] * CONFIG['chunk']} tokens "
                   f"for {len(seeds)} stacked seeds", flush=True)
+
+
+def run_scaling(tree: TreeSensor) -> None:
+    r"""Stage S: the runs of ``S_runs`` on the stage B data, each with its own chunk, stream count and stack size."""
+    c = CONFIG
+    out = Path(c["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "results_S.jsonl"
+    done = done_keys(path)
+    xtrain = load_bytes("train", c["B_train_bytes"])
+    xval = load_bytes("validation", c["B_val_bytes"])
+    val = as_streams(xval, c["B_val_streams"]).to(DEVICE)
+    pf = as_streams(xval[:c["pf_streams"] * c["pf_len"]], c["pf_streams"]).to(DEVICE)
+    for spec in c["S_runs"]:
+        arm, d, chunk, streams = spec["arm"], spec["d"], spec["chunk"], spec["streams"]
+        label = f"{arm}_c{chunk}"
+        train = as_streams(xtrain, streams).to(DEVICE)
+        todo = [s for s in c["B_seeds"] if (label, d, s) not in done]
+        for i in range(0, len(todo), spec["stack"]):
+            group = todo[i:i + spec["stack"]]
+            t0 = time.perf_counter()
+            history: list[dict] = []
+            prm = train_arm(arm, init_runs(d, tree.V, group, DEVICE), train, tree, history.append, chunk=chunk)
+            sync()
+            sec = time.perf_counter() - t0
+            spectral = torch.linalg.matrix_norm(prm.G, 2).tolist()
+            for r, (seed, sc) in enumerate(zip(group, scores(prm, val, pf, tree, 1000 * d + group[0]))):
+                append(path, {"stage": "S", "arm": label, "base_arm": arm, "d": d, "seed": seed, "chunk": chunk,
+                              "streams": streams, "train_sec": sec, "stacked_runs": len(group),
+                              "train_tokens": int(train.shape[0] * (train.shape[1] - 1)),
+                              "updates": history[-1]["chunk"] if history else None,
+                              "final_train_bits": history[-1]["train_bits"][r] if history else None,
+                              "G_spectral": spectral[r], **sc})
+            del prm
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
 
 
 def run_stage(stage: str, tree: TreeSensor) -> None:
@@ -222,6 +272,8 @@ def main() -> None:
     tree = TreeSensor(8, DEVICE)
     if CONFIG["stage"] == "timing":
         run_timing(tree)
+    elif CONFIG["stage"] == "S":
+        run_scaling(tree)
     else:
         run_stage(CONFIG["stage"], tree)
 
