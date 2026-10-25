@@ -85,6 +85,7 @@ import torch
 
 from vfe3.config import VFE3Config, config_notices_shown
 from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
+from vfe3.exact_route import principled_exact_route_failures, principled_exact_route_overrides
 from vfe3.data.datasets import (
     _sha256_file,
     _tokenizer_tag,
@@ -131,6 +132,7 @@ _RESERVED_SWEEP_KEYS = {
 _DECLARATIVE_ABLATION_NAMES = {
     "BASELINE_CONFIG",
     "fully_gauge_covariant",
+    "principled_exact_route",
     "LR_WIDTH_TRANSFER",
     "CONFIG",
     "DATA_SEED",
@@ -316,6 +318,15 @@ LR_WIDTH_TRANSFER: Dict[str, Any] = {
 # links (Lie-algebra L_ij), routing, readout and learning rates are not touched. False: the baseline as written.
 fully_gauge_covariant = False
 
+# True: every cell runs the principled exact route (vfe3.exact_route, as in train_vfe3.py). The keys the route fixes
+# (exact minimal-agent attention, the tied exact cue/result memory with its regime belief carried through depth, no
+# block norm, gaussian_frame_diagonal with the diagonal_chunked decoder at decode_tau=1, and the fully gauge-covariant
+# overrides) are applied to the baseline before the arms, and an arm that leaves the route is refused at startup and
+# as a config error, except in a sweep that declares "leaves_exact_route" (exact_route_components). The exact_route_*
+# sweeps carry these settings in their own 'requires', so they run on the route with this switch either way.
+# Implies fully_gauge_covariant. False: the baseline as written.
+principled_exact_route = False
+
 
 BASELINE_CONFIG: Dict[str, Any] = dict(
     
@@ -411,6 +422,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     block_mlp_template_init_pull     = 0.09,            # working_variance only: initial pull p in (0, 1)
     block_mlp_dropout                = 0.00,
     block_mlp_covariance_floor       = 1e-4,            # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
+    block_mlp_tie_layers             = False,          # True | False: one block MLP shared by every layer (depth as time; labels persist across layers)
+    block_memory_regression_rank     = 2,              # cue_result_memory only: None (dense F_a = I + D_a; M K^2 per bank, ~10x slower) | int r in [1, K] (F_a = I + U_a V_a^T)
+    block_memory_result_noise_ratio  = 0.01,           # cue_result_memory only: initial result noise Q_a / L_a > 0
+    block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
+    block_memory_regime_beta         = 1.0,            # beta >= 0: trust in the carried regime belief, prior pi_b (w T)_b^beta (0 = shared prior)
+    block_memory_regime_stay         = 0.9,            # initial stay probability s in (0, 1) of the transition T
     
   
     #################################
@@ -1273,6 +1290,78 @@ SWEEPS["new_attention_features"] = {
 }
 
 
+# Principled exact route (vfe3.exact_route). Each exact_route_* sweep requires the route's settings resolved from
+# BASELINE_CONFIG, so it runs on the route whether or not principled_exact_route is set, and every cell must meet
+# the route's requirements; exact_route_components alone declares "leaves_exact_route", since each of its arms
+# replaces one component of the route by the setting it was derived from (the reference arm is the route itself).
+# Cheap-to-expensive: the components screen first, then the memory's own tunables, then attention's.
+_EXACT_ROUTE_REQUIRES: Dict[str, Any] = principled_exact_route_overrides(BASELINE_CONFIG)
+SWEEPS.update({
+    "exact_route_components": {
+        "description": "exact route with one component replaced (reference arm: the route itself)",
+        "requires": _EXACT_ROUTE_REQUIRES,
+        "exact_route": True,
+        "leaves_exact_route": True,
+        "configs": [
+            {"label": "exact_route"},
+            {"label": "decode_tau_0.1", "decode_tau": 0.1},
+            {"label": "regime_not_carried", "block_memory_regime_transition": "off"},
+            {"label": "untied_memory", "block_mlp_tie_layers": False, "block_memory_regime_transition": "off"},
+            {"label": "attention_mean_field", "minimal_agent_inference": "mean_field"},
+            {"label": "kernel_readout", "predictive_readout": "kernel"},
+            {"label": "coordinate_mlp", "block_mlp_mode": "coordinate",
+             "block_mlp_covariance": "passthrough", "block_mlp_tie_layers": False,
+             "block_memory_regime_transition": "off"},
+            {"label": "no_block_mlp", "use_block_mlp": False, "block_mlp_tie_layers": False,
+             "block_memory_regime_transition": "off"},
+        ],
+    },
+    "exact_route_regression_rank": {
+        "description": "exact route: rank r of the memory's regression F_a = I + U_a V_a^T",
+        "param": "block_memory_regression_rank", "values": [1, 2, 4, 8], "scale": "log",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+    "exact_route_regime_beta": {
+        "description": "exact route: trust beta in the carried regime belief (0 = the shared prior at every layer)",
+        "param": "block_memory_regime_beta", "values": [0.0, 0.5, 1.0, 2.0], "scale": "linear",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+    "exact_route_regime_stay": {
+        "description": "exact route: initial stay probability s of the sticky regime transition",
+        "param": "block_memory_regime_stay", "values": [0.5, 0.75, 0.9, 0.97], "scale": "linear",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+    "exact_route_regime_transition": {
+        "description": "exact route: sticky versus learned regime transition",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+        "configs": [
+            {"label": "sticky", "block_memory_regime_transition": "sticky"},
+            {"label": "learned", "block_memory_regime_transition": "learned"},
+        ],
+    },
+    "exact_route_result_noise": {
+        "description": "exact route: initial result noise ratio Q_a / L_a of the memory",
+        "param": "block_memory_result_noise_ratio", "values": [0.001, 0.01, 0.1], "scale": "log",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+    "exact_route_memory_size": {
+        "description": "exact route: number of memory components M = K * block_mlp_expansion",
+        "param": "block_mlp_expansion", "values": [2, 4, 8], "scale": "log",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+    "exact_route_channel_noise": {
+        "description": "exact route: initial minimal-agent channel noise n_h",
+        "param": "minimal_agent_channel_noise", "values": [0.3, 1.0, 3.0], "scale": "log",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+    "exact_route_covariance_floor": {
+        "description": "exact route: predictive covariance floor scale f",
+        "param": "predictive_covariance_floor", "values": [1e-5, 1e-4, 1e-3], "scale": "log",
+        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+    },
+})
+
+
 SWEEPS["component_ablation_forest"] = {
     "description": "paired-token component ablation forest",
     "configs": [
@@ -1725,6 +1814,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
                 # Activity is structural, including default-valued fields; warnings are display only.
                 resolved = VFE3Config(**cfg)
                 _require_gauge_covariant(resolved)
+                _require_exact_route(resolved, name)
                 inert_per_arm.append(set(resolved.inactive_fields()) & varying_keys)
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
@@ -1936,6 +2026,17 @@ def _require_gauge_covariant(cfg: VFE3Config) -> None:
             raise ValueError(f"fully_gauge_covariant=True: this arm breaks gauge covariance ({', '.join(failures)})")
 
 
+def _require_exact_route(cfg: VFE3Config, sweep_name: Optional[str]) -> None:
+    r"""Refuse a cell that leaves the principled exact route when ``principled_exact_route`` is set or its sweep
+    declares ``exact_route``, unless the sweep declares ``leaves_exact_route``."""
+    sweep = SWEEPS.get(str(sweep_name), {}) if sweep_name is not None else {}
+    if not (principled_exact_route or sweep.get("exact_route")) or sweep.get("leaves_exact_route"):
+        return
+    failures = principled_exact_route_failures(cfg)
+    if failures:
+        raise ValueError(f"this arm leaves the principled exact route ({', '.join(failures)})")
+
+
 def baseline_default_divergence(
     launcher: Optional[Dict[str, Any]] = None,   # train_vfe3.config; None imports it
 ) -> Dict[str, Tuple[Any, Any]]:                 # field -> (VFE3Config default the baseline runs, launcher value)
@@ -1974,7 +2075,9 @@ def _resolved_sweep_baseline() -> Dict[str, Any]:
     sweep baseline once before expansion so labels and arm overrides state only their contrast.
     """
     resolved = copy.deepcopy(BASELINE_CONFIG)
-    if fully_gauge_covariant:
+    if principled_exact_route:
+        resolved.update(principled_exact_route_overrides(resolved))
+    elif fully_gauge_covariant:
         resolved.update(fully_gauge_covariant_overrides(resolved))
     return resolved
 
@@ -2291,6 +2394,7 @@ def run_single(
     max_steps:              Optional[int] = None,
     stop_after_steps:       Optional[int] = None,
     extrapolation_lengths:  Optional[Sequence[int]] = None,
+    sweep_name:             Optional[str] = None,
 ) -> Dict[str, Any]:
     r"""Build a fresh model from baseline+overrides, train it, and score validation.
 
@@ -2333,6 +2437,7 @@ def run_single(
     try:
         cfg = VFE3Config(**cfg_dict)
         _require_gauge_covariant(cfg)
+        _require_exact_route(cfg, sweep_name)
         stop_after_steps = _validated_stop_after_steps(stop_after_steps)
         n_steps = cfg.max_steps if stop_after_steps is None else min(cfg.max_steps, stop_after_steps)
     except (ValueError, NotImplementedError, TypeError) as exc:
@@ -4636,7 +4741,7 @@ def run_sweep(
             generation_started = True
             try:
                 result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
-                                    seed=cell_seed, collect_diagnostics=collect_diagnostics,
+                                    sweep_name=sweep_name, seed=cell_seed, collect_diagnostics=collect_diagnostics,
                                     collect_extrapolation=collect_extrapolation,
                                     paired_token_bootstrap=paired_token_bootstrap,
                                     save_model_artifacts=save_model_artifacts,
@@ -5055,14 +5160,14 @@ def _same_setting(a: Any, b: Any) -> bool:
 
 
 def _sweep_base_settings(sweep: Mapping[str, Any]) -> Dict[str, Any]:
-    r"""The settings a sweep's cells start from: VFE3Config defaults, ``BASELINE_CONFIG``, the sweep's ``requires``."""
+    r"""The settings a sweep's cells start from: VFE3Config defaults, the resolved baseline (``BASELINE_CONFIG`` after the route or gauge switch), the sweep's ``requires``."""
     defaults: Dict[str, Any] = {}
     for f in dataclass_fields(VFE3Config):
         if f.default is not MISSING:
             defaults[f.name] = f.default
         elif f.default_factory is not MISSING:
             defaults[f.name] = f.default_factory()
-    return {**defaults, **BASELINE_CONFIG, **dict(sweep.get("requires", {}) or {})}
+    return {**defaults, **_resolved_sweep_baseline(), **dict(sweep.get("requires", {}) or {})}
 
 
 def _paired_reference_label(sweep_name: Optional[str]) -> Optional[str]:
