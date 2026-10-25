@@ -214,13 +214,20 @@ class CGCoupling(nn.Module):
         return super()._apply(fn, recurse)
 
     def _cast_buffers(self, dtype: torch.dtype, device: torch.device) -> List[torch.Tensor]:
+        r"""The intertwiner buffers cast to ``(dtype, device)``, cached outside inference mode.
+
+        A cast built under ``torch.inference_mode()`` is an inference tensor that a later
+        gradient-enabled call cannot save for backward, so it is returned uncached (audit 2026-10-25
+        F13); a cached ordinary cast is still reused inside inference mode.
+        """
         key = (dtype, device)
         cached = self._cast_cache.get(key)
         if cached is None:
             n_triples = len(self._triple_index)
             cached = [getattr(self, f"cg_{t}").to(dtype=dtype, device=device)
                       for t in range(n_triples)]
-            self._cast_cache[key] = cached
+            if not torch.is_inference_mode_enabled():
+                self._cast_cache[key] = cached
         return cached
 
     def is_identity(self) -> bool:
@@ -235,8 +242,12 @@ class CGCoupling(nn.Module):
         # input belief -- sigma is deliberately untouched (means-only phase; see module
         # docstring). Grad-free identity short-circuit only: under autograd a zero-weight
         # short-circuit would sever path_weights from the graph and the zero-init weights
-        # could never train (audit 2026-06-09 overnight CR2 verifier correction).
-        if not torch.is_grad_enabled() and self.is_identity():
+        # could never train (audit 2026-06-09 overnight CR2 verifier correction). The shortcut is
+        # restricted to passthrough covariance: at zero weights 'delta_full' still adds its
+        # covariant floor, sym(Sigma) + floor * Sigma, so it takes the ordinary moment path in every
+        # grad mode (audit 2026-10-25 F14).
+        if (self.cg_covariance_mode != "delta_full" and not torch.is_grad_enabled()
+                and self.is_identity()):
             return mu, sigma
         if self.cg_covariance_mode == "delta_full":
             res = self.forward_moments(mu, sigma)                 # delta-method covariance pushforward

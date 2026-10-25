@@ -614,6 +614,26 @@ def _neutralize_nonfinite_tangent(
     return torch.where(finite, tangent, torch.zeros_like(tangent))
 
 
+def _overflow_safe_norm(
+    tangent:    torch.Tensor,     # (..., K) or (..., K, K)
+    event_ndim: int,              # 1: Euclidean norm of a vector, 2: Frobenius norm of a matrix
+) -> torch.Tensor:                # (..., 1) or (..., 1, 1), keepdim
+    r"""Euclidean (Frobenius) norm that does not overflow for finite entries.
+
+    The plain norm squares the entries, so a finite float32 tangent with entries near
+    :math:`\sqrt{f_{\max}/n}` overflows to ``inf`` and a trust scaling ``r / inf`` turns it into a zero
+    step (audit 2026-10-25 F21). Where the plain norm is not finite, the norm is formed as
+    :math:`m\|X/m\|` with :math:`m = \max|X_{ij}|`, which is finite for every finite tangent whose
+    norm is representable. In the normal range the plain norm is returned, bitwise unchanged.
+    """
+    reduce_axes = tuple(range(-event_ndim, 0))
+    plain = torch.linalg.vector_norm(tangent, dim=reduce_axes, keepdim=True)
+    scale = tangent.abs().amax(dim=reduce_axes, keepdim=True)
+    scale_safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+    rescaled = scale_safe * torch.linalg.vector_norm(tangent / scale_safe, dim=reduce_axes, keepdim=True)
+    return torch.where(torch.isfinite(plain), plain, rescaled)
+
+
 def nonfinite_tangent_elements() -> int:
     r"""Total tangent elements neutralized by :func:`_neutralize_nonfinite_tangent` since the last
     reset. Reads the on-device counters, so it host-syncs: call it at an existing logging cadence,
@@ -658,7 +678,7 @@ def retract_spd_diagonal(
         # multiplies the poison through rather than bounding it (see the helper).
         exp_arg = _neutralize_nonfinite_tangent(exp_arg, event_ndim=1)
         if trust_region is not None and trust_region > 0:
-            tangent_norm = torch.linalg.vector_norm(exp_arg, dim=-1, keepdim=True)
+            tangent_norm = _overflow_safe_norm(exp_arg, event_ndim=1)
             exp_arg = exp_arg * torch.clamp(trust_region / (tangent_norm + eps), max=1.0)
         exp_arg = exp_arg.clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
@@ -752,7 +772,7 @@ def _retract_spd_full(
         # either that or a NaN. Placed before the norm guard for the reason given in the helper.
         R = _neutralize_nonfinite_tangent(R, event_ndim=2)
         if trust_region is not None and trust_region > 0:
-            R_norm = torch.linalg.norm(R, ord='fro', dim=(-2, -1), keepdim=True)
+            R_norm = _overflow_safe_norm(R, event_ndim=2)          # Frobenius norm, overflow-safe
             R = R * torch.clamp(trust_region / (R_norm + eps), max=1.0)
 
         R_spectrum: Dict[str, torch.Tensor] = {}

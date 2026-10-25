@@ -237,6 +237,7 @@ class RecordPosterior(NamedTuple):
     Lambda_bar: torch.Tensor   # (..., I, r, r) sum_j w_ij W_ij^{-1}
     R:          torch.Tensor   # (..., I, r, r) between-source spread of r_ij
     failed:     torch.Tensor   # () bool: a zero-jitter factorization failed or a cost is not finite
+    row_failed: Optional[torch.Tensor] = None   # (..., I) bool: the receivers whose row ``failed`` flags
 
 
 class MeanFieldPosterior(NamedTuple):
@@ -297,6 +298,10 @@ class MinimalAgentResult(NamedTuple):
     ``failed`` reports a failed
     zero-jitter factorization or a non-finite cost anywhere in the call; ``ill_conditioned`` reports a float32 ADF
     query covariance that failed the certificate (only under a certified ``projected_factorization``, else False).
+    ``flagged_receivers`` localizes both: a receiver whose own query, record, label cost or information step is
+    flagged, or one whose admissible sources include a flagged utterance covariance :math:`B_j`. Under a causal
+    prior it depends only on the tokens up to the receiver, so a caller that escalates only these receivers keeps
+    the others' outputs independent of later tokens (audit 2026-10-25 F20).
     """
 
     xi:               torch.Tensor             # (..., N, K) xi_i^+
@@ -322,6 +327,7 @@ class MinimalAgentResult(NamedTuple):
     is_evidence:      Optional[torch.Tensor] = None         # (..., N) float64 importance-sampled log evidence (elbo only)
     channel_noise_mstep_boundary: Optional[torch.Tensor] = None   # (H,) bool: n_h^* at the n -> 0 bracket (diagnostics)
     is_ess:           Optional[torch.Tensor] = None         # (..., N) float64 ESS / n of the importance weights (elbo only)
+    flagged_receivers: Optional[torch.Tensor] = None        # (..., N) bool: receivers ``failed`` or ``ill_conditioned`` reaches
 
 
 def _symmetrize(X: torch.Tensor) -> torch.Tensor:          # (..., r, r) -> (..., r, r)
@@ -373,7 +379,8 @@ def _exact_tile(
     :math:`r_{ij}` does not cancel in finite precision). The caller combines tiles by an online log-sum-exp with Chan's
     pairwise update outside any checkpoint, so a checkpointed tile saves only its input slices. A masked pair
     (:math:`\log\pi_{ij} = -\infty`) contributes exactly 0; its :math:`W_{ij}` is still positive definite. A row with no
-    live pair has :math:`s_i = 0` and mean 0. Returns ``(cost, t, s, mean, Lam, M2, failed)``.
+    live pair has :math:`s_i = 0` and mean 0. Returns ``(cost, t, s, mean, Lam, M2, failed)``, ``failed`` per
+    receiver row ``(..., Iq)``: a failed factorization of some :math:`W_{ij}` or a non-finite :math:`c_{ij}` of the row.
     """
     delta = b.unsqueeze(-3) - a.unsqueeze(-2)                                   # (..., Iq, Jk, r) b_j - a_i
     W = A.unsqueeze(-3) + B.unsqueeze(-4)                                       # (..., Iq, Jk, r, r), exactly symmetric
@@ -392,7 +399,7 @@ def _exact_tile(
     Lam = torch.einsum("...ij,...ijrs->...irs", e, W_inv)
     centered = r_ij - mean.unsqueeze(-2)                                        # (..., Iq, Jk, r)
     M2 = torch.einsum("...ij,...ijr,...ijs->...irs", e, centered, centered)
-    failed = (info != 0).any() | ~torch.isfinite(cost).all()
+    failed = (info != 0).any(dim=-1) | ~torch.isfinite(cost).all(dim=-1)        # (..., Iq) per receiver row
     return cost, t, s, mean, Lam, M2, failed
 
 
@@ -460,6 +467,7 @@ def exact_record_posterior(
         rows, U_rows, Lam_rows, Q_rows, s_rows, flags = [], [], [], [], [], []
         for i in range(0, I, q_step):
             n_i = min(q_step, I - i)
+            row_flag = torch.zeros((*batch, n_i), dtype=torch.bool, device=a.device)   # (..., n_i) failed rows
             # Online log-sum-exp over the source tiles with Chan's pairwise update. At the running row maximum m_i
             # the accumulators hold the weight s = sum_j exp(l_ij - m_i), the weighted mean U of r_ij, the weighted
             # sum Lam of W^-1, and the CENTERED spread Q = sum_j exp(l_ij - m_i)(r_ij - U)(r_ij - U)^T, so R never
@@ -496,7 +504,8 @@ def exact_record_posterior(
                 s = S
                 m = m_new
                 columns.append(cost)
-                flags.append(failed)
+                row_flag = row_flag | failed
+            flags.append(row_flag)
             rows.append(torch.cat(columns, dim=-1))
             s_rows.append(s)
             U_rows.append(U)
@@ -508,10 +517,11 @@ def exact_record_posterior(
         Lambda_bar = _symmetrize(torch.cat(Lam_rows, dim=-3) / s[..., None, None])
         R = _symmetrize(torch.cat(Q_rows, dim=-3) / s[..., None, None])         # sum_j w_ij (r_ij - u_i)(r_ij - u_i)^T
         weights = torch.softmax(lp - cost, dim=-1)                              # (..., I, J)
-        failed = torch.stack(flags).any()
+        row_failed = torch.cat(flags, dim=-1)                                   # (..., I)
+        failed = row_failed.any()
     if check:
         _raise_on_failure([failed], "minimal-agent record covariance W_ij = A_i + B_j")
-    return RecordPosterior(weights, cost, u, Lambda_bar, R, failed)
+    return RecordPosterior(weights, cost, u, Lambda_bar, R, failed, row_failed)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -608,7 +618,7 @@ def information_step(
     A:      torch.Tensor,                       # (..., I, r, r) query covariance of the current Gaussian, S C S^T
     Lambda: torch.Tensor,                       # (..., I, r, r) label-averaged channel precision
     eta:    torch.Tensor,                       # (..., I, r) label-averaged information vector
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # u (..., I, r), M (..., I, r, r), failed ()
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # u (..., I, r), M (..., I, r, r), failed (..., I)
     r"""Kalman step of the pseudo-observation :math:`y = \Lambda^{-1}\eta` of :math:`SX` with covariance :math:`\Lambda^{-1}`.
 
     .. math::
@@ -618,7 +628,8 @@ def information_step(
     so that with :math:`\mathsf K = CS^\top` the update :math:`\xi + \mathsf Ku`, :math:`C - \mathsf KM\mathsf K^\top` multiplies the
     current Gaussian by :math:`\exp(-\tfrac12x^\top S^\top\Lambda Sx + x^\top S^\top\eta)`: the precision gains exactly
     :math:`S^\top\Lambda S` and the information vector :math:`S^\top\eta`. :math:`E` has eigenvalues at least 1, so no
-    inverse of :math:`\Lambda` is formed.
+    inverse of :math:`\Lambda` is formed. ``failed`` flags, per receiver, a failed factorization of
+    :math:`\Lambda` or :math:`E`.
     """
     r = a.shape[-1]
     L, info_L = torch.linalg.cholesky_ex(Lambda)                                # (..., I, r, r)
@@ -628,7 +639,7 @@ def information_step(
          - L.transpose(-1, -2) @ a.unsqueeze(-1))                               # (..., I, r, 1)
     u = (L @ torch.cholesky_solve(v, L_E)).squeeze(-1)                          # (..., I, r)
     M = _symmetrize(L @ torch.cholesky_inverse(L_E) @ L.transpose(-1, -2))
-    return u, M, (info_L != 0).any() | (info_E != 0).any()
+    return u, M, (info_L != 0) | (info_E != 0)                                  # (..., I) failed
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1365,6 +1376,8 @@ def minimal_agent_readout(
         spreads: List[torch.Tensor] = []                                        # exact: tr(A R) / tr(A Lambda_bar)
         flags: List[torch.Tensor] = []                                          # failed factorizations
         screens: List[torch.Tensor] = []                                        # certificate flags (certify only)
+        receivers: List[torch.Tensor] = []                                      # (..., N) flagged receivers
+        sources: List[torch.Tensor] = []                                        # (..., H, N) flagged utterances B_j
 
         def check_query(h: int, A: torch.Tensor) -> None:
             r"""Factor the ADF query covariance :math:`A^h` with zero jitter (a failure is a flag) and, under
@@ -1373,10 +1386,13 @@ def minimal_agent_readout(
                 L_A, info = torch.linalg.cholesky_ex(A)                         # (..., N, d, d)
                 bad = info != 0                                                 # (..., N)
                 flags.append(bad.any())
+                receivers.append(bad)
                 if certify:
                     A_inv = torch.cholesky_inverse(torch.where(bad[..., None, None], eye, L_A))
-                    screens.append((torch.finfo(dtype).eps * V_Q[..., h, :, :].norm(dim=(-2, -1))
-                                    * A_inv.norm(dim=(-2, -1)) > projected_gram_condition_tol()).any())
+                    screen = (torch.finfo(dtype).eps * V_Q[..., h, :, :].norm(dim=(-2, -1))
+                              * A_inv.norm(dim=(-2, -1)) > projected_gram_condition_tol())   # (..., N)
+                    screens.append(screen.any())
+                    receivers.append(screen)
 
         if inference == "exact":
             def head_update(h: int, a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1394,6 +1410,7 @@ def minimal_agent_readout(
                         fractions.append(removed / d)
                         spreads.append(torch.diagonal(A @ spread, dim1=-2, dim2=-1).sum(-1) / removed)
                 flags.append(post.failed)
+                receivers.append(post.row_failed)                               # (..., N)
                 return u, _symmetrize(Lambda_bar - spread)
         else:
             a0 = torch.einsum("hsk,...nk->...hns", S, xi)                       # (..., H, N, d) input query means
@@ -1407,6 +1424,8 @@ def minimal_agent_readout(
             factors = key_factors(b, B)                                         # B_j: (..., H, N, d, d)
             bad_B = factors.failed                                              # (..., H, N)
             flags += [bad_Q.any(), bad_B.any()]
+            receivers.append(bad_Q.any(dim=-1))                                 # (..., N)
+            sources.append(bad_B)                                               # (..., H, N)
             V_Q_kl = torch.where(bad_Q[..., None, None], eye, V_Q)
             B_kl = torch.where(bad_B[..., None, None], eye, B)
             a0_r, V_Q_r = a0, V_Q_kl.movedim(-3, -4)                            # (..., H, N, d), (..., H, N, d, d)
@@ -1418,6 +1437,7 @@ def minimal_agent_readout(
                 # with the identity placeholder, as for the unrotated one (audit 2026-10-08).
                 logdet_r, bad_Q_r = _query_logdet(V_Q_r)                        # (..., H, N) each
                 flags.append(bad_Q_r.any())
+                receivers.append(bad_Q_r.any(dim=-2))                           # (..., N)
                 V_Q_r = torch.where(bad_Q_r[..., None, None], eye, V_Q_r)
 
             def label_step(a_r: torch.Tensor, A_r: torch.Tensor, logdet_A: torch.Tensor) -> MeanFieldPosterior:
@@ -1436,6 +1456,8 @@ def minimal_agent_readout(
                 weights.append(step.weights)
                 costs.append(step.cost)
                 flags.append(step.failed)
+                # step.failed is the flagged B_j (bad_B, in sources) or a non-finite label cost of a receiver row.
+                receivers.append((~torch.isfinite(step.cost)).any(dim=-1).any(dim=-2))   # (..., N)
                 return step
 
             labels = label_step(a0_r, V_Q_r, logdet_r)                          # sweep 1: the input moments
@@ -1443,7 +1465,8 @@ def minimal_agent_readout(
             def head_update(h: int, a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 check_query(h, A)
                 u, M, failed = information_step(a, A, labels.Lambda[..., h, :, :, :], labels.eta[..., h, :, :])
-                flags.append(failed)
+                flags.append(failed.any())
+                receivers.append(failed)                                        # (..., N)
                 return u, M
         route_update = head_update
 
@@ -1461,6 +1484,7 @@ def minimal_agent_readout(
             logdet_post, bad_post = _query_logdet(A_post)                       # (..., N, H) each
             bad_post = bad_post | ~torch.isfinite(a_post).all(dim=-1)
             flags.append(bad_post.any())
+            receivers.append(bad_post.any(dim=-1))                              # (..., N)
             A_post = torch.where(bad_post[..., None, None], eye, A_post)
             a_post = torch.where(bad_post[..., None], torch.zeros((), dtype=dtype, device=xi.device), a_post)
             labels = label_step(a_post.movedim(-2, -3), A_post.movedim(-3, -4),
@@ -1545,12 +1569,20 @@ def minimal_agent_readout(
         failed = torch.stack([flag.reshape(()) for flag in flags]).any()
         ill_conditioned = (torch.stack([screen.reshape(()) for screen in screens]).any() if screens
                            else torch.zeros((), dtype=torch.bool, device=xi.device))
+        with torch.no_grad():
+            # Receiver i reads source j only where its prior admits the pair, so a flagged B_j reaches exactly
+            # the receivers that admit j under some head (label_spread's flag is the same B_j factorization).
+            flagged_receivers = torch.zeros(xi_plus.shape[:-1], dtype=torch.bool, device=xi.device)   # (..., N)
+            for mask in receivers:
+                flagged_receivers = flagged_receivers | mask
+            for mask in sources:
+                flagged_receivers = flagged_receivers | (mask.unsqueeze(-2) & admissible).any(dim=-1).any(dim=-2)
     if check and bool(failed):                                                  # the one host check
         raise ValueError(readout_failure_message(dtype))
     return MinimalAgentResult(xi_plus, gains, M, weights_out, cost_out, gain_fraction, V_Q, V_K, coupling,
                               failed, ill_conditioned, contraction, staleness, spread, mstep,
                               spread_gains, label_spread_out, elbo_out, adf_evidence_out, evidence_out,
-                              is_evidence_out, mstep_boundary, is_ess_out)
+                              is_evidence_out, mstep_boundary, is_ess_out, flagged_receivers)
 
 
 # ----------------------------------------------------------------------------------------------

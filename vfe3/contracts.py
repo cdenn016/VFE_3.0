@@ -189,7 +189,12 @@ def mark_gathered_frame_pair(
     :class:`CanonicalFrameContext` residual check is the same over the unique rows as over the
     occurrences. The record holds only for these exact tensor objects at their current version: any
     view, slice, product or in-place write produces a tensor the context validates in full.
+
+    Inference tensors (created under ``torch.inference_mode()``) carry no version counter, so no record is
+    kept for them and the context validates the occurrence pair in full (audit 2026-10-25 F05).
     """
+    if any(t.is_inference() for t in (forward, inverse, unique_forward, unique_inverse)):
+        return
     record = (unique_forward, unique_inverse, forward._version, inverse._version)
     setattr(forward, _GATHER_SOURCE, record)
     setattr(inverse, _GATHER_SOURCE, record)
