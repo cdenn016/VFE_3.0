@@ -193,7 +193,7 @@ config = dict(
     per_type_hidden_bias             = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
      
     block_mlp_activation             = "gelu",         # "gelu" | "silu" | "relu" (not read by gaussian_template / prototype_agents)   
-    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "cue_result_memory" (exact reference route, gaussian_full) | "canonical_frame" | "gaussian_template" | "gauge_gate"
+    block_mlp_mode                   = "coordinate",   # "coordinate" | "prototype_agents" | "cue_result_memory" (exact reference route; gaussian_full dense or gaussian_frame_diagonal elementwise) | "canonical_frame" | "gaussian_template" | "gauge_gate"
     block_mlp_covariance             = "passthrough",   # "passthrough" | "posterior" (prototype_agents; required by cue_result_memory) | "delta_full" (block norm "none"/"layernorm", no post-norm)  | gaussian_template: "passthrough" only
     
       

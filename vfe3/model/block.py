@@ -431,6 +431,9 @@ def _reference_coordinate_block(
     # prototype_agents and cue_result_memory read the whole reference covariance C_i; under 'posterior' (the only
     # contract of cue_result_memory) their C^+ returns as U C^+ U^T.
     prototype = isinstance(block_mlp, (PrototypeAgentBlockMLP, CueResultMemoryBlockMLP))
+    # On gaussian_frame_diagonal the cue/result memory reads the stored reference variances c_i themselves and returns
+    # the reference variances of its result, the family's diagonal M-projection, so no dense C is formed.
+    diagonal_memory = frame_diagonal and isinstance(block_mlp, CueResultMemoryBlockMLP)
     delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
     push = push_norm and block_norm is not None and not delta_full
     sigma = out.sigma
@@ -448,6 +451,7 @@ def _reference_coordinate_block(
             sigma = readout(local_covariance(out.mu, pushed, cov_frame,
                                              diagonal=frame_diagonal).to(out.sigma.dtype))
     c = (C if delta_full                                                     # the composite reads the pre-norm C
+         else sigma if diagonal_memory                                       # c_i (of the pushed belief), (B, N, K)
          else reference_variances(out.mu, sigma, cov_frame) if template      # diag C (of the pushed belief)
          else reference_covariance_compact(out.mu, sigma, cov_frame) if prototype   # C blocks or dense
          else sigma)                                                         # unread
@@ -470,6 +474,8 @@ def _reference_coordinate_block(
             if delta_full:
                 sigma = readout(local_covariance(out.mu, result.sigma, cov_frame,  # Sigma' = U C' U^T
                                                  diagonal=frame_diagonal).to(out.sigma.dtype))
+            elif diagonal_memory:
+                sigma = result.sigma.to(out.sigma.dtype)                     # c_i^+, reference variances
             elif prototype and block_mlp.covariance_contract == "posterior":
                 sigma = readout(local_covariance(out.mu, result.sigma, cov_frame,  # Sigma^+ = U C^+ U^T
                                                  diagonal=out.sigma.dim() == out.mu.dim()).to(out.sigma.dtype))
