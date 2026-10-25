@@ -17,7 +17,7 @@ from pathlib import Path
 
 CONFIG = {
     
-    "stage":            "B",                    # "timing" | "A" | "B" | "S" (scaling follow-up to B)
+    "stage":            "S",                    # "timing" | "A" | "B" | "S" (scaling follow-up to B)
     "device":           "cuda",                 # "cuda" | "cpu"
     "threads":          12,                      # CPU intra-op threads (machine stays usable)
     "out_dir":          "docs/research/2026-10-21-local-learner-test/results",
@@ -25,7 +25,8 @@ CONFIG = {
     "streams":          512,                    # parallel training streams (512 * 16 = 8192 tokens per update)
     "arms":             ["local_w1", "local_w4", "local_w16", "blind", "backprop"],   # stage B: local_w<window>[@schedule] | blind | backprop
     "A_arms":           ["local_w1", "local_w4", "local_w16", "blind", "backprop",      # stage A arms (the schedule comparison)
-                         "local_w16@a03", "local_w16@floor05", "local_w16@floor20", "local_w16@reset"],
+                         "local_w16@a03", "local_w16@floor05", "local_w16@floor20", "local_w16@reset",
+                         "local_w16_cav@floor20"],                                    # cavity node statistics
     "local_schedule":   "floor20",                 # schedule of local arms without "@": a key of local_schedules
     # Stepwise-EM averaging gamma_k = max((k+1)^-alpha, floor), k restarted every reset updates ("pass" = one
     # pass over the stage A training set; None = never). rm06 is the original Cappe-Moulines schedule.
@@ -57,7 +58,10 @@ CONFIG = {
                          {"arm": "local_w64", "d": 32, "chunk": 64, "streams": 128, "stack": 3},
                          {"arm": "backprop",  "d": 32, "chunk": 64, "streams": 128, "stack": 3},
                          {"arm": "local_w64", "d": 64, "chunk": 64, "streams": 128, "stack": 3},
-                         {"arm": "backprop",  "d": 64, "chunk": 64, "streams": 128, "stack": 1}],
+                         {"arm": "backprop",  "d": 64, "chunk": 64, "streams": 128, "stack": 1},
+                         # Node statistics at the EP cavity of the token's posterior (local_w<window>_cav).
+                         {"arm": "local_w16_cav", "d": 32, "chunk": 16, "streams": 512, "stack": 3},
+                         {"arm": "local_w16_cav", "d": 64, "chunk": 16, "streams": 512, "stack": 3}],
 
     # stage B (WikiText-103 bytes)
     "B_dims":           [8, 16, 32],
@@ -109,6 +113,9 @@ def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log
     if arm == "backprop":
         return train_backprop(prm0, train, tree, chunk=chunk, lr=c["backprop_lr"], log=log)
     base, _, name = arm.partition("@")
+    sensor_stats = "sequential"
+    if base.endswith("_cav"):                   # node statistics at the EP cavity of the token's posterior
+        base, sensor_stats = base[:-4], "cavity"
     sched = c["local_schedules"][name or c["local_schedule"]]
     reset = sched["reset"]
     if reset == "pass":
@@ -116,7 +123,7 @@ def train_arm(arm: str, prm0: Params, train: torch.Tensor, tree: TreeSensor, log
             raise ValueError("the 'pass' reset needs repeated passes (stage A)")
         reset = max(1, c["A_train_len"] // c["chunk"])
     kw = dict(chunk=chunk, ridge=c["ridge"], q_floor=c["q_floor"], gamma_exponent=sched["alpha"],
-              gamma_floor=sched["floor"], reset_every=reset, log=log)
+              gamma_floor=sched["floor"], reset_every=reset, sensor_stats=sensor_stats, log=log)
     if base == "blind":
         return train_local(prm0, train, tree, window=1, blind=True, **kw)
     if base.startswith("local_w"):
