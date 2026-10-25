@@ -77,17 +77,39 @@ def _float32(inference: str, seed: int = 43):
     return ops32, rounded, frame, frame32, mu, sigma, prior, S, T_, lp
 
 
+def _escalation_expectation(ops32, mu32: torch.Tensor, sigma32: torch.Tensor, frame32: CanonicalFrameContext,
+                            lp32: torch.Tensor, anchor32: torch.Tensor, wide_mean: torch.Tensor,
+                            wide_cov: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""The escalation contract of audit 2026-10-25 F20: the receivers a raised float32 flag reaches (the readout's
+    ``flagged_receivers``, the receivers failing the covariance screen) take the float64 values, cast back; every
+    other receiver keeps the float32 body output. Returns the expected mean, covariance and receiver mask."""
+    with torch.no_grad():
+        diagonal = sigma32.dim() == mu32.dim()
+        floor = ops32.floor_term(anchor32, sigma32, frame32, diagonal=diagonal)
+        body_mean, body_cov, _, status, receivers = ops32._minimal_agent_body(
+            mu32, sigma32, frame32, lp32, True, False, floor)
+    failed, ill_conditioned, covariance_failed = status.tolist()
+    rows = torch.zeros_like(receivers[0])
+    for raised, flagged in ((failed or ill_conditioned, receivers[0]), (covariance_failed, receivers[1])):
+        if raised:
+            rows = rows | (flagged if bool(flagged.any()) else torch.ones_like(flagged))
+    mean = torch.where(rows[..., None], wide_mean.detach().float(), body_mean)
+    cov = torch.where(rows[..., None] if diagonal else rows[..., None, None], wide_cov.detach().float(), body_cov)
+    return mean, cov, rows
+
+
 @pytest.mark.parametrize("inference", INFERENCE)
 @pytest.mark.parametrize("certify", [False, True])
 def test_nonpositive_float32_output_is_recomputed_in_float64(inference: str, certify: bool) -> None:
     r"""The float32 body returns a nonpositive variance with no factorization failure (certificate off); the call
-    returns the float64 recompute instead, positive, the float64 readout of the float32 inputs, and counts
-    its N tokens as a covariance escalation. The source-recovery counter grows only when the certificate trips."""
+    returns the float64 recompute at the failing receivers (positive, the float64 readout of the float32 inputs) and
+    the float32 body elsewhere (audit 2026-10-25 F20), and counts its N tokens as a covariance escalation. The
+    source-recovery counter grows only when the certificate trips."""
     ops32, rounded, frame, frame32, mu, sigma, prior, S, T_, lp = _float32(inference)
     args32 = (mu.float(), sigma.float(), frame32, lp.float())
     with torch.no_grad():
         floor = ops32.floor_term(prior.float(), args32[1], frame32, diagonal=True)
-        _, body, _, status = ops32._minimal_agent_body(*args32, True, False, floor)
+        _, body, _, status, _ = ops32._minimal_agent_body(*args32, True, False, floor)
     assert bool((body <= 0).any()) and status.tolist() == [False, False, True]       # the screen alone flags it
     previous = set_projected_condition_recovery(certify)
     try:
@@ -99,12 +121,14 @@ def test_nonpositive_float32_output_is_recomputed_in_float64(inference: str, cer
         with torch.no_grad():
             mean64, cov64 = rounded.minimal_agent_update(mu.float().double(), sigma.float().double(), frame32, lp,
                                                          return_covariance=True, floor_anchor=prior.float().double())
+        want_mean, want_cov, rows = _escalation_expectation(ops32, *args32, prior.float(), mean64, cov64)
     finally:
         set_projected_condition_recovery(previous)
     assert cov32.dtype == torch.float32 and bool((cov32 > 0).all())
-    assert torch.equal(mean32, mean64.float())
+    assert bool(rows.any()) and torch.equal(mean32, want_mean)
+    assert torch.equal(cov32[~rows], want_cov[~rows])                                 # healthy receivers: float32
     # The escalated call floors with f Sigma_p formed in float32 (``floor.double()``), the reference in float64.
-    torch.testing.assert_close(cov32, cov64.float(), rtol=1e-5, atol=0.0)
+    torch.testing.assert_close(cov32[rows], want_cov[rows], rtol=1e-5, atol=0.0)
     assert covariance_escalation_elements() == N
     assert (recovered > 0) == certify
 
@@ -189,7 +213,12 @@ def test_screened_full_and_diagonal_outputs_take_the_float64_values(full: bool,
     with torch.no_grad():
         _, got = ops32.minimal_agent_update(mu.float(), sigma32, frame32, lp.float(), return_covariance=True,
                                             floor_anchor=prior32)
-    torch.testing.assert_close(got, want.float(), rtol=1e-5, atol=1e-8)
+    _, body, rows = _escalation_expectation(ops32, mu.float(), sigma32, frame32, lp.float(), prior32, mu.float(),
+                                            want)
+    # Token 0 alone fails the screen: it takes the float64 values, the rest keep the float32 output (F20).
+    assert rows.tolist() == [[True] + [False] * (N - 1)]
+    torch.testing.assert_close(got[:, :1], want[:, :1].float(), rtol=1e-5, atol=1e-8)
+    assert torch.equal(got[:, 1:], body[:, 1:])
     assert covariance_escalation_elements() == N
 
 
