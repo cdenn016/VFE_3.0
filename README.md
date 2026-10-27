@@ -278,9 +278,11 @@ can enter through learned positional frames (`pos_phi="learned"`), through rotar
 (`rope_mode`: folded into the frame under `"frame"` or `"frame_value"`, or applied to the
 projected comparison moments under `"comparison"` or `"comparison_invariant"`), or through an ALiBi source
 prior (`beta_attention_prior="causal_alibi"`). The launcher dictionary in `train_vfe3.py`
-holds the current choice and each run records its own in `config.json`; the reported K = 128
-run (34.48 test perplexity) used the uniform `causal` prior with learned positional frames and
-no rotation.
+holds the current choice and each run records its own in `config.json`. The best run so far
+(K = 192, 25.12 test perplexity) uses the ALiBi prior together with comparison-invariant rotary
+positions and no positional frames; the paper-arms base (K = 128, 35.06) uses the ALiBi prior
+without rotation; the earlier K = 128 run (34.48 test perplexity) used the uniform `causal`
+prior with learned positional frames and no rotation.
 `attention_window` is read only by the windowed priors, so the launcher's value is inactive.
 
 Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
@@ -813,15 +815,89 @@ approximation should remain distinct.
 
 ## Results
 
-Every result below is a single-seed run on WikiText-103 with the GPT-2 BPE tokenizer
-(50,257 types), context 128, and the evaluation of `vfe3.train.evaluate` (windows of 128
-tokens at stride 32; 280,541 scored test targets). Perplexities are per BPE token, on the
-test split, at the final training weights. Within a run nothing is selected on the test
-split, but run directories are named by test perplexity and the recipes compared here were
-chosen across runs by those names, so the test perplexities are not untouched held-out
-estimates; the validation perplexities are reported beside them.
+Every result below is on WikiText-103 with the GPT-2 BPE tokenizer (50,257 types) and the
+evaluation of `vfe3.train.evaluate`, which scores 280,541 test targets. Perplexities are per
+BPE token on the test split. Context length, evaluation stride, checkpoint and seed count are
+stated per subsection. Within a run nothing is selected on the test split, but run directories
+are named by test perplexity and the recipes compared here were chosen across runs by those
+names, so single-run test perplexities are not untouched held-out estimates; the validation
+perplexities are reported beside them. The paper-arms comparison is the exception: its arms
+and decision rule were registered before the runs.
+
+### Best run so far: K = 192
+
+| | |
+|---|---|
+| Run | `D:/DATA_KEEP/25.12_wikitext-103_K192_block_glk_mlp_s6` |
+| **Test perplexity** | **25.12** (CE 3.224 nats) |
+| Validation perplexity | 24.53 (CE 3.200 nats, step 120,000; the best checkpoint is the final one) |
+| Width, heads, layers, context | 192, 6 of width 32, 8, 256 |
+| Updates and tokens | 120,000 at batch 32 (983.0M tokens, about 8.4 epochs) |
+| Model seed, data seed | 6, 3 |
+| Total parameters | 353,288,833 (context processing 5,912,448) |
+| Positions | ALiBi source prior (slope 1.0) with comparison-invariant rotary positions (base 100), no positional frames |
+| Evaluation | windows of 256 tokens at stride 64, final weights |
+| Wall time, RTX 5090 | 29,550 s |
+
+The model is the projected-predictive route with Gaussian-KL routing, the diagonal Gaussian
+family on six $\mathrm{GL}(32)$ frame blocks, the exponential content chart, the attention
+residual, a coordinate block MLP of expansion 8 with covariance passthrough, the chunked
+diagonal decoder ($\tau=0.1$, unigram prior) and no decay on the stored covariance. The
+optimizer is per-group AdamW (prior means 0.02, frames 0.002, score 0.0075, content 0.001,
+MLP 0.0025) with 250 warmup steps, cosine decay to zero, weight decay 0.06 and 0.2 on the
+frames. The run had no skipped updates and no numerical fallbacks. Its last logged training
+loss (2.831) sits 0.369 nats below its validation CE, so at eight epochs it has entered a
+memorization regime that the one-epoch comparisons below exclude. It is one seed, and no
+conventional transformer has been trained at this width, depth and budget.
+
+### Registered paper arms at K = 128, one epoch (October 26, 2026)
+
+`paper_arms.py` with base `k128_paper_arms`
+(`vfe3_runs/35.06_wikitext-103_K128_paper-arms`: $K=128$, four heads, six layers, ALiBi
+without rotation, otherwise the configuration above) trained eleven arms for 15,000 updates
+of 32 by 256 tokens (122.9M tokens, about 1.05 epochs) at the seed pairs (6, 3), (23, 23) and
+(54, 54): 33 runs, all completed. Statistics are test CE at the best-validation checkpoint,
+paired by seed pair, with 95% Student-t intervals on two degrees of freedom. The full report
+is `docs/paper-arms-results_2026-10-26.md`.
+
+| Arm | Test perplexity (mean ± SD) | Paired test CE minus evaluated (nats) | 95% interval | Wall time per run |
+|---|---|---|---|---|
+| Evaluated: learned frames | 35.16 ± 0.18 | 0 | | 83 min |
+| Covariance-blind routing (mean distance) | 35.23 ± 0.31 | +0.002 | [−0.010, +0.015] | 51 min |
+| Identity frames, per-type additive table of the frame table's size | 41.00 ± 0.18 | +0.154 | [+0.142, +0.166] | 77 min |
+| Frames frozen at random initialization | 43.24 ± 0.13 | +0.207 | [+0.190, +0.224] | 75 min |
+| Identity frames | 43.47 ± 0.39 | +0.212 | [+0.178, +0.247] | 74 min |
+| Conventional, matched total parameters (width 1024) | 29.96 ± 0.04 | −0.160 | [−0.171, −0.149] | 39 min |
+| Conventional, matched context-processing parameters | 57.99 ± 0.54 | +0.500 | [+0.482, +0.519] | 8 min |
+| Per-type read table, ALiBi (as run) | 50.43 ± 0.17 | +0.361 | [+0.346, +0.375] | 11 min |
+| Per-type read table, ALiBi, the VFE optimizer | 39.61 ± 0.26 | +0.119 | [+0.091, +0.147] | 11 min |
+| Per-type read-and-write table, ALiBi | 50.03 ± 0.16 | +0.353 | [+0.336, +0.370] | 28 min |
+| Per-type read table, ALiBi, shared post-norm | 50.96 ± 0.08 | +0.371 | [+0.362, +0.380] | 11 min |
+
+The registered decision rule (`vfe3.paper.tables.decision_rule`, margin
+$\max(2\,\mathrm{SE},0.03)$ nats) returns **stands**: the read-table comparator is worse by
+0.361 nats, frozen frames by 0.207 and the equal-size capacity table by 0.154. Random frozen
+frames recover 0.005 of the 0.212-nat cost of removing the frames and the additive table
+recovers 0.058, so the gain comes from learned frames and not from additive capacity; a
+per-type multiplicative map without group structure is untested. Two results limit the
+broader claim. The conventional transformer of matched total parameters is better by 0.160
+nats, spending about 126M parameters on context processing against 2.0M, at half the wall
+time and an untuned hidden-matrix rate (0.003 scaled by 128/1024). Giving the read-table
+comparator the VFE optimizer (Adam $\beta_2=0.999$, no decay on matrices, 0.1 on the table)
+cuts its gap from 0.361 to 0.119 nats, which is the defensible size of the frame model's
+advantage over it. Mean-distance routing matches Gaussian-KL routing at 61% of the wall time.
+
+Per step, the VFE model learns faster early than every conventional arm: it leads the
+matched-total transformer by 0.153 nats of training CE at step 1,000, the validation curves
+cross near step 4,700, and the transformer is ahead thereafter. That arm's untuned rate
+confounds the early lead. The frame gaps, by contrast, are present from step 500 and widen
+through training, though part of the learned frames' late training advantage does not carry
+to validation.
 
 ### K = 128 against a parameter-matched conventional transformer
+
+This earlier comparison uses context 128, evaluation windows of 128 tokens at stride 32, and
+final training weights, with one seed per arm.
 
 | | VFE | Conventional transformer |
 |---|---|---|
