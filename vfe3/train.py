@@ -747,6 +747,7 @@ def _gradients_finite(gradients: Sequence[torch.Tensor]) -> torch.Tensor:
     return torch.stack(flags).all() if len(flags) > 1 else flags[0]
 
 
+_FLOAT32_MAX: float = float(torch.finfo(torch.float32).max)   # the range of the exact finiteness check
 CLIP_COEFFICIENT_EPS: float = 1e-6        # clip_grads_with_norm_ scales by c / (||g|| + 1e-6), at most 1
 
 
@@ -1073,7 +1074,6 @@ def train_step(
     )
     _live_grads = ([p.grad for g in optimizer.param_groups for p in g["params"] if p.grad is not None]
                    if explicit_grad_check else [])
-    _flags = [_gradients_finite(_live_grads)] if _live_grads else []
     # Clip sets (audit 2026-10-10 round 2, items 8 and 9). Under grad_clip_scope='role' the optimizer
     # groups partition parameters into roles and each role gets one L2 bound (the historical sets, in
     # the same order); under 'group' each optimizer group gets its own. Groups marked table_fisher are
@@ -1095,6 +1095,16 @@ def train_step(
         norm_sets += [(group.get("role", "other"), list(group["params"]), False)
                       for group in optimizer.param_groups if group.get("table_fisher") and group["params"]]
     clip_roles: List[list] = [parameters for _, parameters, clipped in norm_sets if clipped]
+    # Finite gradients from the set norms (docs/perf-investigation_2026-10-28.md, rank 12). When the L2 set norms of the
+    # fused transfer below cover every live gradient, a NaN or Inf gradient makes its set norm nonfinite, so finite set
+    # norms certify finite gradients and the separate infinity-norm pass over every gradient is skipped. A nonfinite
+    # set norm (a nonfinite gradient, or finite gradients whose norm overflows) reruns the exact check, so every
+    # verdict is the one the exact check gives.
+    _normed = {id(p) for _, parameters, _ in norm_sets for p in parameters}
+    _verdict_from_norms = (not _scaler_enabled and step_loss is None and bool(_live_grads) and bool(norm_sets)
+                           and all(id(p) in _normed for g in optimizer.param_groups for p in g["params"]
+                                   if p.grad is not None))
+    _flags = [_gradients_finite(_live_grads)] if _live_grads and not _verdict_from_norms else []
 
     def _set_norms() -> List[torch.Tensor]:
         # L2 norm of each set's unscaled, accumulated gradients, exactly what clip_grad_norm_ computes.
@@ -1105,14 +1115,15 @@ def train_step(
     set_norm_values: Optional[List[float]] = None              # host copies, one per norm set
     clip_norms: Optional[List[torch.Tensor]] = None
     clip_finite: Optional[bool] = None
-    if not _scaler_enabled and _flags and step_loss is None:    # fuse default-path loss + grad flag
+    if not _scaler_enabled and (_flags or _verdict_from_norms) and step_loss is None:   # fuse loss + grad flag
         if norm_sets:
             # Taken before this barrier (nothing below changes a gradient before the clip), so the norms
             # themselves, not only their finiteness, join this one transfer instead of a second sync.
             set_norms = _set_norms()
         _values = torch.stack((
             _loss_det.to(dtype=torch.float64),
-            torch.stack(_flags).all().to(dtype=torch.float64),
+            (torch.stack(_flags).all().to(dtype=torch.float64) if _flags
+             else _loss_det.new_ones((), dtype=torch.float64)),         # read from the set norms below
             _target_partition_valid_det.to(dtype=torch.float64),
             _zero_scored_det.to(dtype=torch.float64),
             *_ce_tail,
@@ -1126,6 +1137,11 @@ def train_step(
             step_ce_value = _values[4]
         if set_norms is not None:
             set_norm_values = _values[4 + len(_ce_tail):]
+            # The exact check reads each infinity norm in float32, so a set norm above the float32 maximum (finite in
+            # float64) also defers to it; an L2 norm bounds the infinity norm, so the two verdicts then agree.
+            if _verdict_from_norms and not all(math.isfinite(value) and abs(value) <= _FLOAT32_MAX
+                                               for value in set_norm_values):
+                grad_finite = bool(_gradients_finite(_live_grads))   # rare: the exact verdict decides
             if clip_roles:
                 clip_norms = [norm for norm, (_, _, clipped) in zip(set_norms, norm_sets) if clipped]
                 clip_finite = all(math.isfinite(value) for value, (_, _, clipped)

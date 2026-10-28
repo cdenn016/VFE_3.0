@@ -199,7 +199,9 @@ def _store_planes(P, RM, row, M, offs_a, ma, vals, offs_p, valid_p):
 @triton.jit
 def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE, HALF_K_LOG2PI,
                           BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
-                          ACC: tl.constexpr):
+                          ACC: tl.constexpr, WRITE_LOGW: tl.constexpr):
+    r"""Unnormalized log weights (only with ``WRITE_LOGW``; the backward's rerun needs just the planes), the t
+    planes and the per-tile Gram partial planes."""
     row = tl.program_id(0).to(tl.int64)
     offs_a = tl.program_id(1) * BA + tl.arange(0, BA)
     ma = offs_a < M
@@ -214,14 +216,16 @@ def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_ST
         offs_k = k0 + tl.arange(0, BK)
         mk = offs_k < K
         m2, idx, c, lam, W, inv, delta, gain, g, p = _elem(X, C, NU, LAM, row, offs_a, offs_k, ma, mk, K)
-        s_acc += tl.sum(tl.where(m2, delta * delta * inv + _log(W, ACC), 0.0), 1)
+        if WRITE_LOGW:
+            s_acc += tl.sum(tl.where(m2, delta * delta * inv + _log(W, ACC), 0.0), 1)
         dt_, dG = _pair_sums(V, idx, m2, g, p, offs_r, offs_rr, BA, RANK, RP)
         t += dt_
         # the Gram partial of coordinate tile j = k0 / BK, plane (r, s) at index (r RP + s) NKT + j
         _store_planes(GP + (k0 // BK) * RM, RM * NKT, row, M, offs_a, ma, dG, offs_rr, valid_rr)
-    lp = tl.load(LP + row * LP_STRIDE + offs_a, mask=ma, other=0.0)
-    logw = lp - 0.5 * s_acc - HALF_K_LOG2PI
-    tl.store(LOGW + row * M + offs_a, tl.where(ma, logw, float("-inf")), mask=ma)
+    if WRITE_LOGW:
+        lp = tl.load(LP + row * LP_STRIDE + offs_a, mask=ma, other=0.0)
+        logw = lp - 0.5 * s_acc - HALF_K_LOG2PI
+        tl.store(LOGW + row * M + offs_a, tl.where(ma, logw, float("-inf")), mask=ma)
     _store_planes(T, RM, row, M, offs_a, ma, t, offs_r, offs_r < RANK)
 
 

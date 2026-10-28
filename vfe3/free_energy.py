@@ -170,6 +170,11 @@ def attention_weights(
     log_prior: Optional[torch.Tensor] = None,   # (..., N/NxN) bias B_ij; None -> 0
 ) -> torch.Tensor:                         # (...) softmax_j(B - E/tau)
     r"""Attention weights beta*_ij = softmax_j(B_ij - E_ij / tau)."""
+    if log_prior is not None and not isinstance(tau, torch.Tensor) and tau == 1.0:
+        # -E / 1 + B is B - E exactly in IEEE arithmetic (x / 1 = x, a + (-b) = a - b), with the same promotion,
+        # broadcast and gradients: one kernel instead of negate, divide and add (the noisy-key routing temperature
+        # is exactly 1).
+        return torch.softmax(torch.sub(log_prior, energy), dim=-1)
     logits = -energy / _broadcast_tau(tau, energy)
     if log_prior is not None:
         if (log_prior.dtype == logits.dtype

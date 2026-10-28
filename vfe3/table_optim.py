@@ -96,6 +96,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from vfe3.contracts import deferred_host_checks
 from vfe3.gauge_optim import GaugeManifoldAdamW
 from vfe3.model.frame_actions import frame_matvec
 from vfe3.numerics import bounded_variance_from_log
@@ -475,7 +476,10 @@ class _TableFisherMixin:
         # included), so the frame step's Fisher metric reads the pre-step prior rows; the table step follows.
         tables = [group["params"][0] for group in self._table_fisher_groups() if group is not None]
         if self.table_statistics_provider.reads_frames and any(p.grad is not None for p in tables):
-            self.table_statistics_provider.capture_frames()                 # U_v at the pre-step phi
+            # U_v at the pre-step phi. Its frame checks only raise, so they join one transfer at the scope's end
+            # instead of synchronizing one by one (docs/perf-investigation_2026-10-28.md, rank 5).
+            with deferred_host_checks():
+                self.table_statistics_provider.capture_frames()
         decode_tables = [group["params"][0] for group in self._decode_fisher_groups() if group is not None]
         stashed = [(p, p.grad) for p in tables + decode_tables]
         for p, _ in stashed:
