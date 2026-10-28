@@ -103,11 +103,12 @@ def _tile_k() -> int:
 
 
 def plane_count(rank: int, K: int, bk: int = 32) -> int:
-    r"""(rows, M)-sized buffers per row the route holds at once: in the backward, t and tbar (RP each), the Gram
-    partials (RP^2 per coordinate tile of width ``bk``) and Gbar (RP^2), with a factor two of slack, plus the log
-    weights, their scratch and wbar."""
+    r"""(rows, M)-sized buffers per row the route holds at once: in the backward, t and tbar (RP each), the
+    exclusive Gram tile sums (RP^2 per coordinate tile of width ``bk``) and Gbar (RP^2), with a factor two of slack,
+    plus the log weights, their scratch, wbar and the int32 indicator bits (one per coordinate tile)."""
     RP = _rank_pad(rank)
-    return 2 * (2 * RP + RP * RP * (_cdiv(K, bk) + 1)) + 3
+    nkt = _cdiv(K, bk)
+    return 2 * (2 * RP + RP * RP * (nkt + 1)) + 3 + nkt
 
 
 class CueResultDiagonalLowRank(torch.autograd.Function):
@@ -158,7 +159,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 f = cfg["fwd_weights"]
                 tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
                     xs, cs, nu, lam, V, lps, logw, T, GP, Rc, M, K, NKT, M if per_token else 0, half_k_log2pi,
-                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=True,
+                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=True, NKTP=_rank_pad(NKT),
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 # Shift and scaled mass kept apart: subtracting the absolute log evidence rounds its log l increment
                 # away at large log densities (audit 2026-10-25 F01).
@@ -214,17 +215,18 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 T, GP = empty(RP, Rc, M), empty(RP * RP * NKT, Rc, M)
                 TB, GB = empty(RP, Rc, M), empty(RP * RP, Rc, M)
                 wbar = torch.empty(Rc, M, dtype=dtype, device=device)
+                ind_bits = torch.empty(NKT, Rc, M, dtype=torch.int32, device=device)   # pairs -> rows (rank 2)
                 # The weights kernel rewrites the t and Gram partial planes of these rows; it writes no log weights
                 # (the saved normalized ones are used; rank 13), so LOGW is an unused pointer.
                 f = cfg["fwd_weights"]
                 tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
                     x[r0:r1], c[r0:r1], nu, lam, V, lp[r0:r1] if per_token else lp, wbar, T, GP, Rc, M, K, NKT,
                     M if per_token else 0, ctx.half_k_log2pi,
-                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=False,
+                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=False, NKTP=_rank_pad(NKT),
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 f = cfg["bwd_pairs"]
                 tk.cr_bwd_pairs_kernel[(Rc, _cdiv(M, f["BA"]))](
-                    *args_rows, T, GP, wbar, TB, GB, Rc, M, K, NKT,
+                    *args_rows, T, GP, wbar, TB, GB, ind_bits, Rc, M, K, NKT,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 w = logwn[r0:r1].exp()                                           # (Rc, M)
@@ -247,7 +249,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                     dlp += lbar.sum(0)
                 f = cfg["bwd_rows"]
                 tk.cr_bwd_rows_kernel[(Rc, _cdiv(K, f["BK"]))](
-                    *args_rows, T, GP, TB, GB, lbar, dx[r0:r1], dc[r0:r1], Rc, M, K, NKT,
+                    *args_rows, T, GP, TB, GB, lbar, ind_bits, dx[r0:r1], dc[r0:r1], Rc, M, K, NKT,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 f = cfg["bwd_cols"]

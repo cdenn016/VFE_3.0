@@ -1416,7 +1416,7 @@ def bound_phi_frame_condition_(
         checked += rows.shape[0]
         work = torch.float64 if rows.dtype == torch.float64 else torch.float32
         block_bytes = H * d * d * torch.finfo(work).bits // 8                 # one (H, d, d) stack at the work dtype
-        screen_rows = max(1, temporary_bytes // (6 * block_bytes))
+        screen_rows = max(1, temporary_bytes // (3 * block_bytes))         # _doubled_traceless_symmetric: 3 temporaries
         solve_rows = max(1, temporary_bytes // (16 * block_bytes))
         # A traceless spectrum has lambda_max - lambda_min <= sqrt(2) ||S_0||_F, so a row whose every head block
         # has 2 ||S_0||_F^2 <= (2c)^2 is within the bound and needs no eigensolver. The margin flags a row on the
@@ -1424,8 +1424,10 @@ def bound_phi_frame_condition_(
         screen = (0.5 * (2.0 * c) ** 2 * (1.0 - 1e-4)).to(torch.float32)      # (H,)
         flagged = []
         for start in range(0, rows.shape[0], screen_rows):
-            S0 = _traceless_symmetric_blocks(rows[start : start + screen_rows], basis, H, d, torch.float32)
-            flagged.append((S0.square().sum(dim=(-2, -1)) > screen).any(-1))     # (r,)
+            # T = 2 S_0 bit for bit (halving is exact), so ||T||^2 > 4 screen is the S_0 test exactly, with three
+            # full-size temporaries instead of six (docs/perf-investigation_2026-10-28.md, rank 4).
+            T2 = _doubled_traceless_symmetric(rows[start : start + screen_rows], basis, H, d, torch.float32)
+            flagged.append((T2.square().sum(dim=(-2, -1)) > 4.0 * screen).any(-1))   # (r,)
         index = torch.cat(flagged).nonzero().squeeze(-1)                      # host read 1: the flagged rows
         if index.numel() == 0:
             return
@@ -1526,6 +1528,26 @@ def _traceless_symmetric_blocks(
     S = _symmetric_part(_head_blocks(phi, basis, H, d, dtype))
     trace_mean = S.diagonal(dim1=-2, dim2=-1).mean(-1)                        # (r, H)
     return S - trace_mean[..., None, None] * torch.eye(d, dtype=dtype, device=S.device)
+
+
+def _doubled_traceless_symmetric(
+    phi:   torch.Tensor,                    # (r, n_gen) frame coordinates
+    basis: Optional[torch.Tensor],          # (n_gen, H, d, d) head-block basis, or None for row-major blocks
+    H:     int,
+    d:     int,
+    dtype: torch.dtype,
+) -> torch.Tensor:                          # (r, H, d, d) 2 S_0, equal bit for bit to 2 * _traceless_symmetric_blocks
+    r""":math:`T = X + X^\top - \tfrac1d\operatorname{tr}(X + X^\top)I = 2S_0`, formed in place on one buffer.
+
+    :func:`_traceless_symmetric_blocks` scales by 1/2 before its trace mean and subtraction; every one of those
+    scalings by 2 is exact in binary floating point (barring overflow), so each entry here is exactly twice its
+    entry there.
+    """
+    X = _head_blocks(phi, basis, H, d, dtype)
+    T = X + X.transpose(-1, -2)                                               # (r, H, d, d)
+    diagonal = T.diagonal(dim1=-2, dim2=-1)                                   # (r, H, d) view
+    diagonal.sub_(diagonal.mean(-1, keepdim=True))
+    return T
 
 
 def _head_blocks(

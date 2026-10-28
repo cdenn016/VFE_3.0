@@ -209,3 +209,18 @@ def test_a_float64_gradient_beyond_the_float32_range_takes_the_exact_verdict(mon
     # finite but above the float32 maximum, so the exact check decides and the step is skipped as before.
     calls, moved, _ = _step(_cfg(), poison=1e39, monkeypatch=monkeypatch, dtype=torch.float64)
     assert calls == [1] and not moved
+
+
+# ------------------------------------------------------------------------------------------------ rank 4
+
+@pytest.mark.parametrize("scale,trace", [(1.0, 0.0), (30.0, 0.0), (5.0, 40.0), (1e-3, 0.0)])
+def test_frame_screen_doubled_blocks_are_twice_the_traceless_blocks_bit_for_bit(scale: float, trace: float) -> None:
+    from vfe3.gauge_optim import _doubled_traceless_symmetric, _traceless_symmetric_blocks
+    g = torch.Generator().manual_seed(11)
+    H, d = 2, 8
+    phi = scale * torch.randn(40, H * d * d, generator=g)
+    phi.view(40, H, d, d).diagonal(dim1=-2, dim2=-1).add_(trace)            # a large trace stresses cancellation
+    S0 = _traceless_symmetric_blocks(phi, None, H, d, torch.float32)
+    T = _doubled_traceless_symmetric(phi, None, H, d, torch.float32)
+    assert torch.equal(2.0 * S0, T)
+    assert torch.equal(4.0 * S0.square().sum(dim=(-2, -1)), T.square().sum(dim=(-2, -1)))

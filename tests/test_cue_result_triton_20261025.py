@@ -246,8 +246,10 @@ for rank in (2, 4):
         consts = {"BA": cfg["BA"], "BK": cfg["BK"], "RANK": rank, "RP": 1 << (rank - 1).bit_length(), "ACC": True}
         if "WRITE_LOGW" in kernel.arg_names:                    # the forward's variant (it writes the log weights)
             consts["WRITE_LOGW"] = True
+        if "NKTP" in kernel.arg_names:                          # K = 128 at BK = 32: four coordinate tiles
+            consts["NKTP"] = 4
         sig = {n: ("constexpr" if n in consts else "i32" if n in ints else "fp32" if n == "HALF_K_LOG2PI"
-                   else "*fp32") for n in kernel.arg_names}
+                   else "*i32" if n == "IND" else "*fp32") for n in kernel.arg_names}
         compiled = triton.compile(ASTSource(fn=kernel, signature=sig, constexprs=consts),
                                   target=GPUTarget("cuda", 120, 32),
                                   options={"num_warps": cfg["num_warps"], "num_stages": cfg["num_stages"]})
