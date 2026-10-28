@@ -328,6 +328,29 @@ class CanonicalFrameContext:
             )
 
 
+def trusted_identity_context(
+    identity:       torch.Tensor,  # (..., K, K) or (..., H, d, d): an expanded torch.eye, never a computed frame
+    block_diagonal: bool,
+) -> CanonicalFrameContext:
+    r"""A :class:`CanonicalFrameContext` whose factors are both ``identity``, without the value validation.
+
+    The validation multiplies the pair in float64 at the full occurrence shape and checks the residual and finiteness;
+    an exact identity passes it by construction, so for ``identity_frame`` it cost float64 products over every token's
+    head blocks and no verdict (docs/perf-investigation_2026-10-28.md, rank 1). Only the layout checks the identity can
+    fail are kept. The caller guarantees ``identity`` is an expanded ``torch.eye``; any computed frame goes through the
+    validating constructor.
+    """
+    if type(block_diagonal) is not bool:
+        raise TypeError(f"block_diagonal must be a bool, got {type(block_diagonal).__name__}")
+    if not identity.is_floating_point() or identity.shape[-1] != identity.shape[-2]:
+        raise ValueError("the identity frame must be a floating square matrix (stack)")
+    context = object.__new__(CanonicalFrameContext)
+    object.__setattr__(context, "forward", identity)
+    object.__setattr__(context, "inverse", identity)
+    object.__setattr__(context, "block_diagonal", block_diagonal)
+    return context
+
+
 @dataclass(frozen=True)
 class BlockMLPBuildMetadata:
     """Immutable executable BlockMLP structure captured when a model is built.

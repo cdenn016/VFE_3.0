@@ -241,11 +241,12 @@ def identity_frame(frame: Any) -> Any:             # CanonicalFrameContext -> Ca
     consumer written for local moments and a frame reads its reference moments :math:`(\xi_i, c_i)` exactly through
     this frame: :math:`I^{-1}\xi_i = \xi_i` and :math:`I\operatorname{diag}(c_i)I^\top = \operatorname{diag}(c_i)`.
     """
-    from vfe3.contracts import CanonicalFrameContext
+    from vfe3.contracts import trusted_identity_context
 
     eye = torch.eye(frame.forward.shape[-1], dtype=frame.forward.dtype, device=frame.forward.device)
     eye = eye.expand(frame.forward.shape)                                              # (..., N, [G,] d|K, d|K)
-    return CanonicalFrameContext(forward=eye, inverse=eye, block_diagonal=frame.block_diagonal)
+    # An exact identity: the float64 value validation of CanonicalFrameContext cannot fail on it.
+    return trusted_identity_context(eye, frame.block_diagonal)
 
 
 def frame_diagonal_reference(

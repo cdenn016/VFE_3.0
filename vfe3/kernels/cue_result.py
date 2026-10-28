@@ -150,20 +150,23 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 Rc = r1 - r0
                 xs, cs = x[r0:r1], c[r0:r1]
                 lps = lp[r0:r1] if per_token else lp
-                T = torch.zeros(RP, Rc, M, dtype=dtype, device=device)          # (RP, Rc, M) t planes
-                GP = torch.zeros(RP * RP * NKT, Rc, M, dtype=dtype, device=device)   # (RP^2 NKT, Rc, M) Gram partials
+                # Every plane element a reader consumes is written first (readers mask the padded rank planes), so
+                # no initialization (docs/perf-investigation_2026-10-28.md, rank 3).
+                T = torch.empty(RP, Rc, M, dtype=dtype, device=device)          # (RP, Rc, M) t planes
+                GP = torch.empty(RP * RP * NKT, Rc, M, dtype=dtype, device=device)   # (RP^2 NKT, Rc, M) Gram partials
                 logw = torch.empty(Rc, M, dtype=dtype, device=device)
                 f = cfg["fwd_weights"]
                 tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
                     xs, cs, nu, lam, V, lps, logw, T, GP, Rc, M, K, NKT, M if per_token else 0, half_k_log2pi,
-                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
+                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=True,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 # Shift and scaled mass kept apart: subtracting the absolute log evidence rounds its log l increment
                 # away at large log densities (audit 2026-10-25 F01).
                 shift = logw.amax(dim=-1)
                 shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
-                log_l = torch.log(torch.exp(logw - shift.unsqueeze(-1)).sum(-1))            # (Rc,)
-                logwn[r0:r1] = (logw - shift.unsqueeze(-1)) - log_l.unsqueeze(-1)
+                logw.sub_(shift.unsqueeze(-1))                                  # l - s, formed once (rank 15)
+                log_l = torch.log(torch.exp(logw).sum(-1))                                  # (Rc,)
+                torch.sub(logw, log_l.unsqueeze(-1), out=logwn[r0:r1])
                 log_ev[r0:r1] = shift + log_l
                 f = cfg["fwd_moments"]
                 tk.cr_fwd_moments_kernel[(Rc, _cdiv(K, f["BK"]))](
@@ -171,6 +174,9 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
         ctx.save_for_backward(x, c, nu, omega, lam, q, lp, U, V, logwn, mean)
+        # Unused outputs (the log weights and evidence without a carried regime) keep None gradients rather than
+        # zero tensors, and the backward skips their terms (docs/perf-investigation_2026-10-28.md, rank 11).
+        ctx.set_materialize_grads(False)
         ctx.row_chunk = row_chunk
         ctx.half_k_log2pi = half_k_log2pi
         return mean, var, logwn, log_ev
@@ -192,8 +198,8 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
         zeros = lambda *shape: torch.zeros(*shape, dtype=dtype, device=device)       # noqa: E731
         g_mean = zeros(R, K) if g_mean is None else g_mean.contiguous()
         g_var = zeros(R, K) if g_var is None else g_var.contiguous()
-        g_logw = zeros(R, M) if g_logw is None else g_logw.contiguous()
-        g_lev = zeros(R) if g_lev is None else g_lev.contiguous()
+        g_logw = None if g_logw is None else g_logw.contiguous()
+        g_lev = None if g_lev is None else g_lev.contiguous()
         dx, dc = torch.empty_like(x), torch.empty_like(c)
         dnu, dlam, domega, dq = zeros(M, K), zeros(M, K), zeros(M, K), zeros(M, K)
         dU, dV = zeros(M, K, rank), zeros(M, K, rank)
@@ -204,16 +210,17 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 Rc = r1 - r0
                 args_rows = (x[r0:r1], c[r0:r1], nu, lam, omega, q, U, V, logwn[r0:r1], mean[r0:r1],
                              g_mean[r0:r1], g_var[r0:r1])
-                T, GP = zeros(RP, Rc, M), zeros(RP * RP * NKT, Rc, M)
-                TB, GB = zeros(RP, Rc, M), zeros(RP * RP, Rc, M)
+                empty = lambda *shape: torch.empty(*shape, dtype=dtype, device=device)   # noqa: E731, rank 3
+                T, GP = empty(RP, Rc, M), empty(RP * RP * NKT, Rc, M)
+                TB, GB = empty(RP, Rc, M), empty(RP * RP, Rc, M)
                 wbar = torch.empty(Rc, M, dtype=dtype, device=device)
-                # The weights kernel rewrites the t and Gram partial planes of these rows; its log weights go to the
-                # wbar buffer as scratch, overwritten below (the saved normalized log weights are the ones used).
+                # The weights kernel rewrites the t and Gram partial planes of these rows; it writes no log weights
+                # (the saved normalized ones are used; rank 13), so LOGW is an unused pointer.
                 f = cfg["fwd_weights"]
                 tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
                     x[r0:r1], c[r0:r1], nu, lam, V, lp[r0:r1] if per_token else lp, wbar, T, GP, Rc, M, K, NKT,
                     M if per_token else 0, ctx.half_k_log2pi,
-                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
+                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=False,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 f = cfg["bwd_pairs"]
                 tk.cr_bwd_pairs_kernel[(Rc, _cdiv(M, f["BA"]))](
@@ -221,9 +228,19 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 w = logwn[r0:r1].exp()                                           # (Rc, M)
-                glw = g_logw[r0:r1]
-                lbar = (w * (wbar - (w * wbar).sum(-1, keepdim=True)) + glw
-                        - w * glw.sum(-1, keepdim=True) + w * g_lev[r0:r1].unsqueeze(-1)).contiguous()
+                lbar = w * (wbar - (w * wbar).sum(-1, keepdim=True))
+                # An absent gradient's terms are zeros; adding +0.0 where they were added keeps the sign of zero of
+                # the materialized expression ((A + g) - w sum g) + w g_lev bit for bit.
+                if g_logw is not None:
+                    glw = g_logw[r0:r1]
+                    lbar = lbar + glw - w * glw.sum(-1, keepdim=True)
+                else:
+                    lbar = lbar + 0.0
+                if g_lev is not None:
+                    lbar = lbar + w * g_lev[r0:r1].unsqueeze(-1)
+                elif g_logw is not None:
+                    lbar = lbar + 0.0
+                lbar = lbar.contiguous()
                 if per_token:
                     dlp[r0:r1] = lbar
                 else:
@@ -236,7 +253,8 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 f = cfg["bwd_cols"]
                 splits = max(1, min(32, _cdiv(Rc, 256)))
                 per_split = _cdiv(Rc, splits)
-                parts = [zeros(splits, M, K) for _ in range(4)] + [zeros(splits, M, K, rank) for _ in range(2)]
+                # Every split stores every (a, k) of its partials, an empty split its zero accumulators (rank 3).
+                parts = [empty(splits, M, K) for _ in range(4)] + [empty(splits, M, K, rank) for _ in range(2)]
                 tk.cr_bwd_cols_kernel[(_cdiv(M, f["BA"]), _cdiv(K, f["BK"]), splits)](
                     *args_rows, T, GP, TB, GB, lbar, *parts, Rc, M, K, NKT, per_split,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,

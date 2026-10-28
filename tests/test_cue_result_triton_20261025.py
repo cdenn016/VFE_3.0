@@ -244,6 +244,8 @@ for rank in (2, 4):
     for key, kernel in kernels.items():
         cfg = cfgs[key]
         consts = {"BA": cfg["BA"], "BK": cfg["BK"], "RANK": rank, "RP": 1 << (rank - 1).bit_length(), "ACC": True}
+        if "WRITE_LOGW" in kernel.arg_names:                    # the forward's variant (it writes the log weights)
+            consts["WRITE_LOGW"] = True
         sig = {n: ("constexpr" if n in consts else "i32" if n in ints else "fp32" if n == "HALF_K_LOG2PI"
                    else "*fp32") for n in kernel.arg_names}
         compiled = triton.compile(ASTSource(fn=kernel, signature=sig, constexprs=consts),
