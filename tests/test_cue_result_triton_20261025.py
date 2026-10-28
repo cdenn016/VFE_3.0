@@ -238,7 +238,7 @@ assert not tk.INTERPRETED
 cfgs = tk.launch_config()
 kernels = {"fwd_weights": tk.cr_fwd_weights_kernel, "fwd_moments": tk.cr_fwd_moments_kernel,
            "bwd_pairs": tk.cr_bwd_pairs_kernel, "bwd_rows": tk.cr_bwd_rows_kernel, "bwd_cols": tk.cr_bwd_cols_kernel}
-ints = {"R", "M", "K", "LP_STRIDE", "ROWS_PER_SPLIT"}
+ints = {"R", "M", "K", "NKT", "LP_STRIDE", "ROWS_PER_SPLIT"}
 out = {}
 for rank in (2, 4):
     for key, kernel in kernels.items():
