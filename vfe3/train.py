@@ -6039,6 +6039,7 @@ def _train_loop(
     floor_reference: Optional[float] = None                   # _covariance_floor_reference, read at log steps
     last_table_step_norm: Optional[float] = None              # table_fisher_step_norm_mean of the previous row
     checkpoint_ms_pending: List[float] = []                   # checkpoint saves since the previous row
+    last_checkpoint_step: Optional[int] = None                # step of the last periodic checkpoint that was written
     peak_memory = _PeakMemory(device)
     device_telemetry = _DeviceTelemetry(device)               # allocator and clock columns (audit 2026-10-20 item 20)
 
@@ -6782,6 +6783,7 @@ def _train_loop(
                 try:
                     artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler,
                                               data_state=checkpoint_data_state)
+                    last_checkpoint_step = step + 1
                     # checkpoint_keep_last (audit 2026-10-17 item 48): only after a successful save.
                     artifacts.prune_checkpoints(getattr(cfg, "checkpoint_keep_last", None))
                 except Exception as exc:
@@ -7167,10 +7169,10 @@ def _train_loop(
             _record_diagnostic_failure(diagnostics_failures, "numerics_summary", exc, logger)
         # checkpoint_at_end (audit 2026-10-17 item 48): a resumable checkpoint of the final iterate, unless the periodic
         # cadence just wrote this step. Off by default, since each checkpoint holds the optimizer moments (several GB
-        # at the live scale).
+        # at the live scale). A failed periodic save of the final step does not count as written: the end save
+        # retries it (audit 2026-10-28 F02).
         if (getattr(cfg, "checkpoint_at_end", False) and getattr(artifacts, "save_model_artifacts", False)
-                and n_steps > start_step
-                and not (cfg.checkpoint_interval and n_steps % cfg.checkpoint_interval == 0)):
+                and n_steps > start_step and last_checkpoint_step != n_steps):
             _t0 = time.perf_counter()
             try:
                 artifacts.save_checkpoint(n_steps, model, optimizer, cfg, scaler=scaler,

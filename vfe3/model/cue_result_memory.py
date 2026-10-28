@@ -335,14 +335,17 @@ def _diagonal_tile(
     r"""One (rows x components) tile, elementwise: log weights (r, m), the tile's shift and scaled mass (r,)
     (:func:`_shifted_mass`), and its normalized result mean and variances (r, K).
 
-    Low-rank result variances. With :math:`a_k = \sum_rU_{kr}V_{kr}` and :math:`G = V^\top PV`,
+    Low-rank result variances. With :math:`a_k = \sum_rU_{kr}V_{kr}`,
     :math:`\operatorname{diag}(FPF^\top)_k = p_k(1 + a_k)^2 + \sum_{l\ne k}p_l(\sum_rU_{kr}V_{lr})^2`, and the second
-    sum is formed as :math:`[UGU^\top]_{kk} - p_ka_k^2`, a sum of squares clamped to its sign, so the regression
-    variance is non-negative and the result noise :math:`q_k` is added last: the variance is never below :math:`q_k`.
-    The expanded form :math:`q + p + 2pa + [UGU^\top]_{kk}` cancelled a positive :math:`q` against :math:`p` where
-    :math:`F` cancels a coordinate (audit 2026-10-25 F02). The clamp acts only on a rounding residue; where the
-    remainder is positive the gradients are those of the expanded form. The absolute rounding error of the regression
-    variance stays of order :math:`\epsilon(p_ka_k^2 + [UGU^\top]_{kk})`."""
+    sum is formed as :math:`U_k^\top G^{(-k)}U_k` with the leave-one-out Gram
+    :math:`G^{(-k)} = \sum_{l\ne k}p_lV_lV_l^\top`, an exclusive prefix plus an exclusive suffix over :math:`l`,
+    clamped to its sign; the result noise :math:`q_k` is added last, so the variance is never below :math:`q_k`. The
+    expanded form :math:`q + p + 2pa + [UGU^\top]_{kk}` cancelled a positive :math:`q` against :math:`p` where :math:`F`
+    cancels a coordinate (audit 2026-10-25 F02), and the remainder :math:`[UGU^\top]_{kk} - p_ka_k^2` with the full
+    Gram :math:`G = V^\top PV` lost any off-axis remainder below :math:`\epsilon p_ka_k^2` while accumulating
+    :math:`G` (audit 2026-10-28 F01). :math:`G^{(-k)}` holds no self term and is formed without subtraction, so the
+    rounding error of the off-axis sum is of order :math:`\epsilon\lvert U_k\rvert^2\sum_{l\ne k}p_l\lvert V_l\rvert^2`,
+    which vanishes with the off-axis couplings themselves."""
     K = xi.shape[-1]
     W = c.unsqueeze(-2) + lam                                                            # (r, m, K) diag(L_a + C)
     delta = xi.unsqueeze(-2) - nu                                                        # (r, m, K) xi - nu_a
@@ -358,10 +361,12 @@ def _diagonal_tile(
         t = torch.einsum("iak,akr->iar", g, right)                                       # (r, m, rank) V^T g
         m_Y = omega + g + torch.einsum("iar,akr->iak", t, left)
         a = (left * right).sum(-1)                                                       # (m, K) a_k = sum_r U_kr V_kr
-        G = torch.einsum("akr,iak,aks->iars", right, p, right)                           # (r, m, rank, rank) V^T P V
-        quad = torch.einsum("akr,iars,aks->iak", left, G, left)                          # diag U G U^T
-        off = torch.clamp_min(quad - p * a.square(), 0.0)                                # sum_{l != k} p_l (U_k V_l)^2
-        v_Y = (p * (1.0 + a).square() + off) + q                                         # diag F P F^T, then Q
+        e = p[..., None, None] * (right.unsqueeze(-1) * right.unsqueeze(-2))             # (r, m, K, rank, rank) p_l V_l V_l^T
+        zero = torch.zeros_like(e[..., :1, :, :])
+        before = torch.cat([zero, e[..., :-1, :, :].cumsum(-3)], dim=-3)                 # sum over l < k, no self term
+        after = torch.cat([e[..., 1:, :, :].flip(-3).cumsum(-3).flip(-3), zero], dim=-3)  # sum over l > k
+        off = torch.einsum("akr,iakrs,aks->iak", left, before + after, left)             # U_k^T G^(-k) U_k
+        v_Y = (p * (1.0 + a).square() + torch.clamp_min(off, 0.0)) + q                   # diag F P F^T, then Q
     s, l, w = _shifted_mass(log_w)                                                       # (r,), (r,), (r, m)
     mean = (w.unsqueeze(-1) * m_Y).sum(-2)                                               # (r, K)
     var = (w.unsqueeze(-1) * (v_Y + (m_Y - mean.unsqueeze(-2)).square())).sum(-2)       # (r, K)
@@ -412,7 +417,7 @@ def cue_result_diagonal_posterior(
         from vfe3.kernels import cue_result as fused_kernels
         if regression_left.shape[-1] <= fused_kernels.MAX_RANK and fused_kernels.fused_route_active(xi):
             rank = regression_left.shape[-1]
-            planes = 2 * (2 * fused_kernels._rank_pad(rank) + 2 * fused_kernels._rank_pad(rank) ** 2) + 2
+            planes = fused_kernels.plane_count(rank, K)
             row_chunk = max(1, int(tile_bytes) // ((torch.finfo(dtype).bits // 8) * planes * M))
             with torch.autocast(device_type=xi.device.type, enabled=False):
                 log_pi_hat = torch.log_softmax(log_pi.to(dtype), dim=-1)
@@ -435,8 +440,9 @@ def cue_result_diagonal_posterior(
             log_pi_hat = log_pi_hat.reshape(rows, M)                                     # (R, M) per token
         offset, left, right = (cast(t) for t in reg)
         rank = 0 if left is None else left.shape[-1]
-        # About eight (r, m, K) tensors per tile, plus (r, m, K, K)-sized work for a dense F or (r, m, rank^2).
-        per_pair = K * (8 + (K if offset is not None else 0)) + rank * rank
+        # About eight (r, m, K) tensors per tile, plus (r, m, K, K)-sized work for a dense F or about four
+        # (r, m, K, rank, rank) leave-one-out Gram tensors for a low-rank one.
+        per_pair = K * (8 + (K if offset is not None else 0) + 4 * rank * rank)
         pairs = max(1, int(tile_bytes) // ((torch.finfo(dtype).bits // 8) * per_pair))
         m_step = min(M, pairs)
         r_step = max(1, min(rows, pairs // m_step))

@@ -7,7 +7,10 @@ register tiles (``_cue_result_triton.py``, whose docstring lists the per-element
 buffers are the log weights and a few planes per rank index. The torch route is unchanged and remains the reference.
 
 Forward. ``cr_fwd_weights_kernel`` writes the unnormalized log weights :math:`\ell_{ia}` and the planes
-:math:`t_{ia,r}`, :math:`G_{ia,rs}`; torch normalizes, :math:`\log w_{ia} = \ell_{ia} - \operatorname{LSE}_b\ell_{ib}`;
+:math:`t_{ia,r}` and :math:`G^{(j)}_{ia,rs}`, the Gram partial of each coordinate tile :math:`j` (``NKT`` tiles of the
+kernels' common BK), from which the moment and backward kernels assemble the leave-one-out Gram
+:math:`G^{(-k)} = \sum_{l\ne k}p_lV_lV_l^\top` without subtraction (``_cue_result_triton.py``, audit 2026-10-28 F01);
+torch normalizes, :math:`\log w_{ia} = \ell_{ia} - \operatorname{LSE}_b\ell_{ib}`;
 ``cr_fwd_moments_kernel`` returns :math:`\bar m_{ik} = \sum_a w_{ia}m^Y_{iak}` and
 :math:`\bar v_{ik} = \sum_a w_{ia}[v^Y_{iak} + (m^Y_{iak} - \bar m_{ik})^2]` by a weighted Chan merge over component
 tiles, so the variance is a sum of non-negative terms with no cancellation.
@@ -23,15 +26,16 @@ Backward, for incoming :math:`\bar g^m, \bar g^v` (rows, K), :math:`\bar g^{\log
     \bar w_{ia} = \sum_k \bar g^m_{ik}m^Y + \bar g^v_{ik}(v^Y + (m^Y - \bar m_{ik})^2),\quad
     \bar t_{ia,r} = \sum_k \bar m\,U_{akr},\quad \bar G_{ia,rs} = \sum_k \bar v\,U_{akr}U_{aks}
 
-(``cr_bwd_pairs_kernel``), then in torch the log-weight adjoint
+(``cr_bwd_pairs_kernel``, over t and Gram partial planes that the weights kernel rewrites for the backward's rows),
+then in torch the log-weight adjoint
 
 .. math::
     \bar\ell_{ia} = w_{ia}\Big(\bar w_{ia} - \sum_b w_{ib}\bar w_{ib}\Big) + \bar g^{\log w}_{ia}
                     - w_{ia}\sum_b\bar g^{\log w}_{ib} + w_{ia}\bar g^{\log Z}_i,
 
 which is also :math:`\partial L/\partial\log\hat\pi_{ia}`. With :math:`a = \sum_rU_rV_r` and the indicator
-:math:`\iota = [\sum_{rs}U_rG_{rs}U_s - pa^2 \ge 0]` of the unclamped remainder of
-:math:`v^Y = p(1 + a)^2 + \max(\sum_{rs}U_rG_{rs}U_s - pa^2, 0) + q` (``_cue_result_triton.py``), and
+:math:`\iota = [U^\top G^{(-k)}U \ge 0]` of the unclamped off-axis sum of
+:math:`v^Y = p(1 + a)^2 + \max(U^\top G^{(-k)}U, 0) + q` (``_cue_result_triton.py``), and
 :math:`\bar G_{ia,rs} = \sum_k\iota\,\bar v\,U_{akr}U_{aks}`, per element :math:`\bar g = \bar m + \sum_r\bar t_rV_r`,
 :math:`\bar p = \bar v((1 + a)^2 - \iota a^2) + \sum_{rs}\bar G_{rs}V_rV_s`,
 :math:`\bar\delta = \bar g\,\mathrm{gain} - \bar\ell\,\delta/W`,
@@ -43,10 +47,12 @@ which is also :math:`\partial L/\partial\log\hat\pi_{ia}`. With :math:`a = \sum_
     \bar\nu = -\sum_i\bar\delta,\quad \bar\lambda = \sum_i(\overline{\mathrm{gain}}/W + \bar W),\quad
     \bar\omega = \sum_i\bar m,\quad \bar q = \sum_i\bar v,
 
-    \bar U_r = \sum_i\Big[\bar m\,t_r + \bar v\Big(2p(1 + a - \iota a)V_r + 2\iota\sum_sG_{rs}U_s\Big)\Big],\quad
+    \bar U_r = \sum_i\Big[\bar m\,t_r + \bar v\Big(2p(1 + a)V_r + 2\iota\sum_sG^{(-k)}_{rs}U_s\Big)\Big],\quad
     \bar V_r = \sum_i\Big[g\,\bar t_r + 2p\Big(\bar v(1 + a - \iota a)U_r + \sum_s\bar G_{rs}V_s\Big)\Big]
 
-(``cr_bwd_rows_kernel`` owns :math:`\bar\xi, \bar c`; ``cr_bwd_cols_kernel`` owns the parameter sums, one partial per
+The :math:`\bar p` and :math:`\bar V` forms are the leave-one-out adjoints written with the full :math:`\bar G` minus
+the coordinate's own term :math:`\iota\bar vU_rU_s`; their rounding error is relative to the self terms they contain,
+not to the variance. (``cr_bwd_rows_kernel`` owns :math:`\bar\xi, \bar c`; ``cr_bwd_cols_kernel`` owns the parameter sums, one partial per
 row split, summed in torch). Rows are processed in chunks of ``row_chunk`` so the planes stay bounded. The kernels use
 no atomics, so results are bitwise reproducible for a fixed GPU, shape and dtype. ``triton`` is imported only when
 this route launches; CPU tensors run the torch route.
@@ -88,6 +94,22 @@ def _rank_pad(rank: int) -> int:
     return 1 << max(0, (rank - 1).bit_length())
 
 
+def _tile_k() -> int:
+    r"""The coordinate tile width BK shared by every kernel (the Gram partials are stored per tile of this width)."""
+    widths = {cfg["BK"] for cfg in _kernels().launch_config().values()}
+    if len(widths) != 1:
+        raise RuntimeError(f"the fused cue/result kernels must share one BK, got {sorted(widths)}")
+    return widths.pop()
+
+
+def plane_count(rank: int, K: int, bk: int = 32) -> int:
+    r"""(rows, M)-sized buffers per row the route holds at once: in the backward, t and tbar (RP each), the Gram
+    partials (RP^2 per coordinate tile of width ``bk``) and Gbar (RP^2), with a factor two of slack, plus the log
+    weights, their scratch and wbar."""
+    RP = _rank_pad(rank)
+    return 2 * (2 * RP + RP * RP * (_cdiv(K, bk) + 1)) + 3
+
+
 class CueResultDiagonalLowRank(torch.autograd.Function):
     r"""The fused exact posterior on diagonal records with :math:`F_a = I + U_aV_a^\top`; see the module docstring.
 
@@ -116,6 +138,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
         dtype, device = x.dtype, x.device
         acc = not tk.INTERPRETED
         cfg = tk.launch_config()
+        NKT = _cdiv(K, _tile_k())
         half_k_log2pi = 0.5 * K * float(torch.log(torch.tensor(2.0 * torch.pi, dtype=torch.float64)))
         mean = torch.empty(R, K, dtype=dtype, device=device)
         var = torch.empty(R, K, dtype=dtype, device=device)
@@ -128,11 +151,11 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 xs, cs = x[r0:r1], c[r0:r1]
                 lps = lp[r0:r1] if per_token else lp
                 T = torch.zeros(RP, Rc, M, dtype=dtype, device=device)          # (RP, Rc, M) t planes
-                G = torch.zeros(RP * RP, Rc, M, dtype=dtype, device=device)     # (RP^2, Rc, M) G planes
+                GP = torch.zeros(RP * RP * NKT, Rc, M, dtype=dtype, device=device)   # (RP^2 NKT, Rc, M) Gram partials
                 logw = torch.empty(Rc, M, dtype=dtype, device=device)
                 f = cfg["fwd_weights"]
                 tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
-                    xs, cs, nu, lam, V, lps, logw, T, G, Rc, M, K, M if per_token else 0, half_k_log2pi,
+                    xs, cs, nu, lam, V, lps, logw, T, GP, Rc, M, K, NKT, M if per_token else 0, half_k_log2pi,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 # Shift and scaled mass kept apart: subtracting the absolute log evidence rounds its log l increment
@@ -144,11 +167,12 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 log_ev[r0:r1] = shift + log_l
                 f = cfg["fwd_moments"]
                 tk.cr_fwd_moments_kernel[(Rc, _cdiv(K, f["BK"]))](
-                    xs, cs, nu, lam, omega, q, U, V, logwn[r0:r1], T, G, mean[r0:r1], var[r0:r1], Rc, M, K,
+                    xs, cs, nu, lam, omega, q, U, V, logwn[r0:r1], T, GP, mean[r0:r1], var[r0:r1], Rc, M, K, NKT,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
         ctx.save_for_backward(x, c, nu, omega, lam, q, lp, U, V, logwn, mean)
         ctx.row_chunk = row_chunk
+        ctx.half_k_log2pi = half_k_log2pi
         return mean, var, logwn, log_ev
 
     @staticmethod
@@ -164,6 +188,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
         dtype, device = x.dtype, x.device
         acc = not tk.INTERPRETED
         cfg = tk.launch_config()
+        NKT = _cdiv(K, _tile_k())
         zeros = lambda *shape: torch.zeros(*shape, dtype=dtype, device=device)       # noqa: E731
         g_mean = zeros(R, K) if g_mean is None else g_mean.contiguous()
         g_var = zeros(R, K) if g_var is None else g_var.contiguous()
@@ -179,12 +204,20 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 Rc = r1 - r0
                 args_rows = (x[r0:r1], c[r0:r1], nu, lam, omega, q, U, V, logwn[r0:r1], mean[r0:r1],
                              g_mean[r0:r1], g_var[r0:r1])
-                T, G = zeros(RP, Rc, M), zeros(RP * RP, Rc, M)
+                T, GP = zeros(RP, Rc, M), zeros(RP * RP * NKT, Rc, M)
                 TB, GB = zeros(RP, Rc, M), zeros(RP * RP, Rc, M)
                 wbar = torch.empty(Rc, M, dtype=dtype, device=device)
+                # The weights kernel rewrites the t and Gram partial planes of these rows; its log weights go to the
+                # wbar buffer as scratch, overwritten below (the saved normalized log weights are the ones used).
+                f = cfg["fwd_weights"]
+                tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
+                    x[r0:r1], c[r0:r1], nu, lam, V, lp[r0:r1] if per_token else lp, wbar, T, GP, Rc, M, K, NKT,
+                    M if per_token else 0, ctx.half_k_log2pi,
+                    BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
+                    num_warps=f["num_warps"], num_stages=f["num_stages"])
                 f = cfg["bwd_pairs"]
                 tk.cr_bwd_pairs_kernel[(Rc, _cdiv(M, f["BA"]))](
-                    *args_rows, T, G, wbar, TB, GB, Rc, M, K,
+                    *args_rows, T, GP, wbar, TB, GB, Rc, M, K, NKT,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 w = logwn[r0:r1].exp()                                           # (Rc, M)
@@ -197,7 +230,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                     dlp += lbar.sum(0)
                 f = cfg["bwd_rows"]
                 tk.cr_bwd_rows_kernel[(Rc, _cdiv(K, f["BK"]))](
-                    *args_rows, T, G, TB, GB, lbar, dx[r0:r1], dc[r0:r1], Rc, M, K,
+                    *args_rows, T, GP, TB, GB, lbar, dx[r0:r1], dc[r0:r1], Rc, M, K, NKT,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 f = cfg["bwd_cols"]
@@ -205,7 +238,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 per_split = _cdiv(Rc, splits)
                 parts = [zeros(splits, M, K) for _ in range(4)] + [zeros(splits, M, K, rank) for _ in range(2)]
                 tk.cr_bwd_cols_kernel[(_cdiv(M, f["BA"]), _cdiv(K, f["BK"]), splits)](
-                    *args_rows, T, G, TB, GB, lbar, *parts, Rc, M, K, per_split,
+                    *args_rows, T, GP, TB, GB, lbar, *parts, Rc, M, K, NKT, per_split,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 for total, part in zip((dnu, dlam, domega, dq, dU, dV), parts):
