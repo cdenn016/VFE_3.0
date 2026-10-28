@@ -112,13 +112,10 @@ def _shift_p(C, LAM, V, row, offs_a, ma, ks, valid, K, RANK: tl.constexpr):
 def _gram_loo(GP, RM, NKT, j, row, M, offs_a, ma, V, r, s, p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi,
               BA: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr):
     r"""(BA, BK) entries (r, s) of the leave-one-out Gram G^(-k) = sum_{l != k} p_l V_l V_l^T over coordinate tile j:
-    the stored partials of the other tiles, plus the exclusive in-tile prefix (scan of the tile shifted down by one)
-    and suffix (reverse scan of the tile shifted up by one). Sums only, no self term."""
-    other = tl.zeros([BA], dtype=p_lo.dtype)
-    plane = (r * RP + s) * NKT
-    for jj in range(0, NKT):
-        ptr = GP + (plane + jj) * RM + row * M + offs_a      # RM is int64
-        other += tl.load(ptr, mask=ma & (jj != j), other=0.0)
+    the stored sum over the other tiles (the weights kernel's exclusive tile sum), plus the exclusive in-tile prefix
+    (scan of the tile shifted down by one) and suffix (reverse scan of the tile shifted up by one). Sums only, no self
+    term."""
+    other = tl.load(GP + ((r * RP + s) * NKT + j) * RM + row * M + offs_a, mask=ma, other=0.0)   # RM is int64
     lo = p_lo * tl.load(V + idx_lo * RANK + r, mask=m_lo, other=0.0) * tl.load(V + idx_lo * RANK + s, mask=m_lo,
                                                                                other=0.0)
     hi = p_hi * tl.load(V + idx_hi * RANK + r, mask=m_hi, other=0.0) * tl.load(V + idx_hi * RANK + s, mask=m_hi,
@@ -154,15 +151,9 @@ def _off_axis(U, V, GP, RM, NKT, j, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m
 
 
 @triton.jit
-def _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK: tl.constexpr):
-    r"""m^Y and v^Y of the tile from the (BA, RP) t tile and the off-axis sum ``off`` of :func:`_off_axis`,
-    uv = a = sum_r U_r V_r, and the indicator ind = [off >= 0] of the unclamped off-axis sum.
-
-    v^Y = p (1 + a)^2 + max(off, 0) + q: the regression variance as diag(F P F^T)_k = p_k (1 + a_k)^2 plus the
-    leave-one-out sum of squares over l != k, clamped to its sign, with the result noise added last (audits 2026-10-25
-    F02 and 2026-10-28 F01; as the torch route's ``_diagonal_tile``)."""
+def _result_mean(U, V, t, offs_r, idx, m2, OMEGA, g, RANK: tl.constexpr):
+    r"""m^Y of the tile from the (BA, RP) t tile, and uv = a = sum_r U_r V_r."""
     omega = tl.load(OMEGA + idx, mask=m2, other=0.0)
-    q = tl.load(Q + idx, mask=m2, other=0.0)
     mY = omega + g
     uv = tl.zeros_like(g)
     for r in tl.static_range(RANK):
@@ -170,6 +161,19 @@ def _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK: tl.cons
         v_r = tl.load(V + idx * RANK + r, mask=m2, other=0.0)
         mY += _col(t, offs_r, r) * u_r
         uv += u_r * v_r
+    return mY, uv
+
+
+@triton.jit
+def _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK: tl.constexpr):
+    r"""m^Y and v^Y of the tile from the (BA, RP) t tile and the off-axis sum ``off`` of :func:`_off_axis`,
+    uv = a = sum_r U_r V_r, and the indicator ind = [off >= 0] of the unclamped off-axis sum.
+
+    v^Y = p (1 + a)^2 + max(off, 0) + q: the regression variance as diag(F P F^T)_k = p_k (1 + a_k)^2 plus the
+    leave-one-out sum of squares over l != k, clamped to its sign, with the result noise added last (audits 2026-10-25
+    F02 and 2026-10-28 F01; as the torch route's ``_diagonal_tile``)."""
+    q = tl.load(Q + idx, mask=m2, other=0.0)
+    mY, uv = _result_mean(U, V, t, offs_r, idx, m2, OMEGA, g, RANK)
     ind = tl.where(off >= 0.0, 1.0, 0.0)                                        # torch.clamp_min passes x >= 0
     vY = (p * (1.0 + uv) * (1.0 + uv) + off * ind) + q
     return mY, vY, uv, ind
@@ -199,9 +203,12 @@ def _store_planes(P, RM, row, M, offs_a, ma, vals, offs_p, valid_p):
 @triton.jit
 def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE, HALF_K_LOG2PI,
                           BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
-                          ACC: tl.constexpr, WRITE_LOGW: tl.constexpr):
+                          ACC: tl.constexpr, WRITE_LOGW: tl.constexpr, NKTP: tl.constexpr):
     r"""Unnormalized log weights (only with ``WRITE_LOGW``; the backward's rerun needs just the planes), the t
-    planes and the per-tile Gram partial planes."""
+    planes, and for each coordinate tile j the exclusive tile sum O^(j) = sum_{j' != j} G^(j') of the Gram partials,
+    accumulated in registers in ascending j' from zero with a zero added at j' = j, the order in which the consumers
+    used to sum the stored partials, so the values are the same (docs/perf-investigation_2026-10-28.md, rank 7).
+    ``NKTP`` is NKT padded to a power of two."""
     row = tl.program_id(0).to(tl.int64)
     offs_a = tl.program_id(1) * BA + tl.arange(0, BA)
     ma = offs_a < M
@@ -212,6 +219,8 @@ def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_ST
     dt = X.dtype.element_ty
     s_acc = tl.zeros([BA], dtype=dt)
     t = tl.zeros([BA, RP], dtype=dt)
+    offs_j = tl.arange(0, NKTP)
+    O = tl.zeros([BA, NKTP, RP * RP], dtype=dt)                                 # exclusive tile sums
     for k0 in range(0, K, BK):
         offs_k = k0 + tl.arange(0, BK)
         mk = offs_k < K
@@ -220,13 +229,16 @@ def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_ST
             s_acc += tl.sum(tl.where(m2, delta * delta * inv + _log(W, ACC), 0.0), 1)
         dt_, dG = _pair_sums(V, idx, m2, g, p, offs_r, offs_rr, BA, RANK, RP)
         t += dt_
-        # the Gram partial of coordinate tile j = k0 / BK, plane (r, s) at index (r RP + s) NKT + j
-        _store_planes(GP + (k0 // BK) * RM, RM * NKT, row, M, offs_a, ma, dG, offs_rr, valid_rr)
+        O += tl.where((offs_j != k0 // BK)[None, :, None], dG[:, None, :], 0.0)  # tile j' = k0 / BK into every O^(j)
     if WRITE_LOGW:
         lp = tl.load(LP + row * LP_STRIDE + offs_a, mask=ma, other=0.0)
         logw = lp - 0.5 * s_acc - HALF_K_LOG2PI
         tl.store(LOGW + row * M + offs_a, tl.where(ma, logw, float("-inf")), mask=ma)
     _store_planes(T, RM, row, M, offs_a, ma, t, offs_r, offs_r < RANK)
+    # O^(j) for plane (r, s) at index (r RP + s) NKT + j
+    optr = (GP + (offs_rr[None, None, :] * NKT + offs_j[None, :, None]).to(tl.int64) * RM + row * M
+            + offs_a[:, None, None])
+    tl.store(optr, O, mask=ma[:, None, None] & (offs_j < NKT)[None, :, None] & valid_rr[None, None, :])
 
 
 @triton.jit
@@ -272,11 +284,12 @@ def cr_fwd_moments_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, T, GP, MEAN, VAR
 
 
 @triton.jit
-def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP, WBAR, TBAR, GBAR, R, M, K, NKT,
-                        BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
+def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP, WBAR, TBAR, GBAR, IND, R, M, K,
+                        NKT, BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
                         ACC: tl.constexpr):
     r"""wbar_ia = sum_k gm m^Y + gv (v^Y + (m^Y - mean)^2); tbar_r = sum_k mbar U_r; Gbar_rs = sum_k vbar U_r U_s.
-    The t and Gram partial planes are those the weights kernel rewrote for these rows."""
+    The t and Gram planes are those the weights kernel rewrote for these rows. The indicator ind = [off >= 0] of each
+    coordinate tile is packed into one int32 per (tile, row, component), bit k - k0, for the rows kernel (rank 2)."""
     row = tl.program_id(0).to(tl.int64)
     offs_a = tl.program_id(1) * BA + tl.arange(0, BA)
     ma = offs_a < M
@@ -299,6 +312,9 @@ def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G
         off = _off_axis(U, V, GP, RM, NKT, k0 // BK, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi,
                         m_hi, BA, RANK, RP)
         mY, vY, uv, ind = _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK)
+        lane = tl.arange(0, BK)
+        bits = tl.sum(tl.where(ind > 0.5, 1, 0).to(tl.int32) << lane[None, :], axis=1)   # (BA,) distinct bits
+        tl.store(IND + (k0 // BK) * RM + row * M + offs_a, bits, mask=ma)
         mean = tl.load(MEAN + row * K + offs_k, mask=mk, other=0.0)
         gm = tl.load(GM + row * K + offs_k, mask=mk, other=0.0)
         gv = tl.load(GV + row * K + offs_k, mask=mk, other=0.0)
@@ -318,11 +334,11 @@ def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G
 
 
 @triton.jit
-def _chain(U, V, t, off, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx, m2, OMEGA, Q, LOGWN, LBAR,
+def _chain(U, V, t, ind, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx, m2, OMEGA, Q, LOGWN, LBAR,
            mean, gm, gv, c, lam, inv, delta, gain, g, p, RANK: tl.constexpr, RP: tl.constexpr, ACC: tl.constexpr):
     r"""The element adjoints of one tile: mbar, vbar, and dL/d(delta), dL/dlambda, dL/dc (module docstring of
-    ``cue_result.py``)."""
-    mY, vY, uv, ind = _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK)
+    ``cue_result.py``), given the indicator ind = [off >= 0] of the unclamped off-axis sum (v^Y itself is not read)."""
+    mY, uv = _result_mean(U, V, t, offs_r, idx, m2, OMEGA, g, RANK)
     w = tl.where(ma, _exp(tl.load(LOGWN + row * M + offs_a, mask=ma, other=float("-inf")), ACC), 0.0)
     lbar = tl.load(LBAR + row * M + offs_a, mask=ma, other=0.0)
     mbar = tl.where(m2, w[:, None] * (gm[None, :] + 2.0 * gv[None, :] * (mY - mean[None, :])), 0.0)
@@ -342,13 +358,15 @@ def _chain(U, V, t, off, tbar, Gbar, offs_r, offs_rr, row, M, offs_a, ma, idx, m
     lambar = gainbar * inv + Wbar
     cbar = Wbar + pbar * gain
     zero = tl.zeros_like(g)
-    return (mbar, vbar, tl.where(m2, dbar, zero), tl.where(m2, lambar, zero), tl.where(m2, cbar, zero), uv, ind)
+    return (mbar, vbar, tl.where(m2, dbar, zero), tl.where(m2, lambar, zero), tl.where(m2, cbar, zero), uv)
 
 
 @triton.jit
-def cr_bwd_rows_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP, TBAR, GBAR, LBAR, DX, DC, R, M, K,
-                       NKT, BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
+def cr_bwd_rows_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP, TBAR, GBAR, LBAR, IND, DX, DC, R, M,
+                       K, NKT, BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
                        ACC: tl.constexpr):
+    r"""dL/dxi and dL/dc. The indicator comes from the pairs kernel's bits (the same tile and expression), so this
+    kernel evaluates no leave-one-out Gram (docs/perf-investigation_2026-10-28.md, rank 2)."""
     row = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1)
     k0 = j * BK
@@ -370,14 +388,13 @@ def cr_bwd_rows_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP
         ma = offs_a < M
         m2, idx, c, lam, W, inv, delta, gain, g, p = _elem(X, C, NU, LAM, row, offs_a, offs_k, ma, mk, K)
         t = _load_planes(T, RM, row, M, offs_a, ma, offs_r, valid_r)
-        p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi = _shifts(C, LAM, V, row, offs_a, ma, offs_k, k0, K, BK, RANK)
-        off = _off_axis(U, V, GP, RM, NKT, j, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi,
-                        BA, RANK, RP)
+        bits = tl.load(IND + j * RM + row * M + offs_a, mask=ma, other=0)                  # (BA,) int32
+        ind = ((bits[:, None] >> tl.arange(0, BK)[None, :]) & 1).to(dt)
         tbar = _load_planes(TBAR, RM, row, M, offs_a, ma, offs_r, valid_r)
         Gbar = _load_planes(GBAR, RM, row, M, offs_a, ma, offs_rr, valid_rr)
-        mbar, vbar, dbar, lambar, cbar, uv, ind = _chain(U, V, t, off, tbar, Gbar, offs_r, offs_rr, row, M, offs_a,
-                                                         ma, idx, m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam,
-                                                         inv, delta, gain, g, p, RANK, RP, ACC)
+        mbar, vbar, dbar, lambar, cbar, uv = _chain(U, V, t, ind, tbar, Gbar, offs_r, offs_rr, row, M, offs_a,
+                                                    ma, idx, m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam,
+                                                    inv, delta, gain, g, p, RANK, RP, ACC)
         dx += tl.sum(dbar, 0)
         dc += tl.sum(cbar, 0)
     tl.store(DX + row * K + offs_k, dx, mask=mk)
@@ -424,9 +441,10 @@ def cr_bwd_cols_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP
                         BA, RANK, RP)
         tbar = _load_planes(TBAR, RM, row, M, offs_a, ma, offs_r, valid_r)
         Gbar = _load_planes(GBAR, RM, row, M, offs_a, ma, offs_rr, valid_rr)
-        mbar, vbar, dbar, lambar, cbar, uv, ind = _chain(U, V, t, off, tbar, Gbar, offs_r, offs_rr, row, M, offs_a,
-                                                         ma, idx, m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam,
-                                                         inv, delta, gain, g, p, RANK, RP, ACC)
+        ind = tl.where(off >= 0.0, 1.0, 0.0)                                    # torch.clamp_min passes x >= 0
+        mbar, vbar, dbar, lambar, cbar, uv = _chain(U, V, t, ind, tbar, Gbar, offs_r, offs_rr, row, M, offs_a,
+                                                    ma, idx, m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam,
+                                                    inv, delta, gain, g, p, RANK, RP, ACC)
         dnu -= dbar
         dlam += lambar
         domega += mbar
