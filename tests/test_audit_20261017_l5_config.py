@@ -174,19 +174,25 @@ _TRAIN_LOOP = {"log_interval", "eval_interval", "checkpoint_interval", "max_step
                # lane L3 (audit 2026-10-17): output policy and failure handling, inert on a healthy two-step run
                "checkpoint_at_end", "checkpoint_keep_last", "block_variance_at_log", "max_failed_step_skips",
                "max_consecutive_skips", "loss_spike_skip_nats",
-               # audit 2026-10-20 item 8: the weight EMA shadows the weights and never feeds back into training
-               "weight_ema_decay"}
+               # audit 2026-10-20 item 8: the weight EMA shadows the weights and never feeds back into training, so
+               # neither its rate nor its schedule nor the shadow's device can move a training step
+               "weight_ema_decay", "weight_ema_start_frac", "weight_ema_update_interval", "weight_ema_device"}
 _PRECISION = {"deterministic", "fp32_matmul_precision", "amp_dtype", "decode_av_precision",
               "predictive_covariance_precision", "projected_factorization", "decode_ce_triton", "decode_logits_amp",
               "decode_chunk_size", "relational_tile_mib", "decode_ce_checkpoint", "predictive_covariance_checkpoint",
-              "pair_kl_gemm_tol", "relational_diag_moments_kernel"}
+              "pair_kl_gemm_tol", "relational_diag_moments_kernel",
+              # audit 2026-10-31 decode package: CUDA-only (a TF32 policy, the fused Triton CE), bitwise on the CPU
+              "decode_backward_ieee_fp32", "decode_bank_triton",
+              # audit 2026-10-31 A140: the causal router tiles change only the float32 reduction order
+              "routing_causal_tiles"}
 # Thresholds that act only when crossed (clamps, caps, escalations, trust radii), and the corpus unigram tempering,
 # which the synthetic batches here do not populate.
 _RARE_TRIGGER = {"predictive_covariance_ceiling", "phi_frame_condition_max", "frame_pair_escalation_tol", "kl_max",
                  "sigma_max", "transport_chart_max_norm", "phi_mstep_max_matrix_norm", "eps", "grad_clip",
                  "e_mu_q_trust", "e_sigma_q_trust", "predictive_covariance_fp64_escalation",
                  "decode_ranking_fp64_escalation", "unigram_kappa", "block_norm_trace_cap",
-                 "m_table_fisher_trust_radius", "m_phi_group_trust_radius", "attention_window"}
+                 "m_table_fisher_trust_radius", "m_phi_group_trust_radius", "attention_window",
+                 "sigma_log_floor_mode"}
 _ALLOWLIST = _TRAIN_LOOP | _PRECISION | _RARE_TRIGGER
 
 
@@ -194,10 +200,15 @@ def _route_rare_triggers(values: Dict[str, Any]) -> set:
     r"""Knobs that act only through a threshold on this route. Under ``predictive_covariance_floor_mode='max'``
     without a ceiling the layer prior covariance is read only by the prior term :math:`f\Sigma_p` of the floor's
     maximum, which acts only where it exceeds the relative term, so the variance handoff can leave two steps
-    unchanged (it is marked live, and changes them, under the ``'prior'`` floor: item 23)."""
+    unchanged (it is marked live, and changes them, under the ``'prior'`` floor: item 23). Frequency-scaled frame
+    dropout draws at :math:`p_v = p_0 f_0 / (f_0 + \pi_v)`, and the unigram table the synthetic batches never set
+    holds :math:`\pi_v = 1`, so at the launcher's :math:`f_0 = 10^{-5}` two steps draw no drop."""
+    triggers = set()
     if values.get("predictive_covariance_floor_mode") == "max" and values.get("predictive_covariance_ceiling") is None:
-        return {"prior_handoff_sigma"}
-    return set()
+        triggers.add("prior_handoff_sigma")
+    if values.get("phi_type_dropout_freq_scale") is not None:
+        triggers |= {"phi_type_dropout", "phi_type_dropout_freq_scale"}
+    return triggers
 # Shape and run fields the tiny profile sets; perturbing them changes the problem, not a knob.
 _SHAPE = {"vocab_size", "embed_dim", "n_heads", "max_seq_len", "batch_size", "n_layers", "block_mlp_expansion"}
 
@@ -258,14 +269,16 @@ _PROFILES: Dict[str, Callable[[], Dict[str, Any]]] = {
 @pytest.mark.parametrize("profile", sorted(_PROFILES))
 def test_inactive_fields_agree_with_two_executed_steps(profile: str) -> None:
     r"""For each launcher key, a valid perturbation leaves two optimizer steps bitwise identical when
-    ``inactive_fields`` marks the key inert (at the base and the perturbed value), and changes them when the key is
-    unmarked and not allowlisted (a train-loop, precision or rare-trigger knob)."""
+    ``inactive_fields`` marks the key inert (at the base and the perturbed value) or ``route_fingerprint`` maps the
+    perturbed value onto the base route (a value-level coincidence, audit 2026-10-31 A314), and changes them when the
+    key is unmarked, not coincident and not allowlisted (a train-loop, precision or rare-trigger knob)."""
     torch.set_num_threads(min(2, torch.get_num_threads()))
     values = _PROFILES[profile]()
     base_cfg = VFE3Config(**values)
     reference = _two_steps(base_cfg)
     assert _identical(reference, _two_steps(base_cfg))            # the probe is deterministic
     base_inert = base_cfg.inactive_fields()
+    base_route = base_cfg.route_fingerprint()
     keys = sorted(key for key in values if key not in _SHAPE)     # every field: the launcher may omit a live one
     disagreements, checked = [], 0
     for key in keys:
@@ -280,10 +293,15 @@ def test_inactive_fields_agree_with_two_executed_steps(profile: str) -> None:
                 continue
             checked += 1
             inert = key in base_inert and key in cfg.inactive_fields()
+            # route_fingerprint leaves out the seed, which changes the draw rather than the route
+            coincident = not inert and key != "seed" and cfg.route_fingerprint() == base_route
             same = _identical(reference, run)
             if inert and not same:
                 disagreements.append(f"{key}={candidate!r}: marked inert ({base_inert[key]}) but the run changed")
-            elif not inert and same and key not in _ALLOWLIST | _route_rare_triggers(values):
+            elif coincident and not same:
+                disagreements.append(f"{key}={candidate!r}: route_fingerprint maps it onto the base route but the "
+                                     "run changed")
+            elif not inert and not coincident and same and key not in _ALLOWLIST | _route_rare_triggers(values):
                 disagreements.append(f"{key}={candidate!r}: unmarked but the run is bitwise identical "
                                      "(mark it in inactive_fields, or allowlist a train-loop, precision or "
                                      "rare-trigger knob here)")

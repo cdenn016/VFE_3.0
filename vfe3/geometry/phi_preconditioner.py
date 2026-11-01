@@ -420,7 +420,10 @@ def _adaptive_phi_differentials(
 
 
 def set_phi_group_differential_mode(mode: str) -> str:
-    r"""Set the process-wide Psi evaluation route; returns the previous value."""
+    r"""Set the process-wide Psi evaluation route; returns the previous value.
+
+    Test hook: referenced only by the tests.
+    """
     global _PHI_GROUP_DIFFERENTIAL_MODE
     if mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
         raise ValueError(
@@ -1374,7 +1377,7 @@ def uspace_spatial_covector(
     r"""Right-trivialized (spatial) covector :math:`G_W = \bar G U^\top = \Psi_R(\mathrm{ad}_{X^\top})^{-1}(M)`.
 
     It pairs with a spatial velocity :math:`W` (:math:`\delta U = W U`) as
-    :math:`\langle \bar G, W U \rangle = \langle G_W, W \rangle`.
+    :math:`\langle \bar G, W U \rangle = \langle G_W, W \rangle`. Test oracle: referenced only by the tests.
     """
     if U is None:
         U = torch.linalg.matrix_exp(X)

@@ -580,6 +580,11 @@ class FullGaussian(BeliefParams):
         Individual contributions depend on coordinate order; the unclipped sum
         does not. Each term is clipped separately, matching diagonal alpha weights.
         Renyi orders other than one have no such chain rule and are refused (ValueError).
+
+        Returned in the public dtype always: a float32 pair whose certificate fails is recomputed in float64
+        and cast back, unlike :meth:`renyi_closed_form`, which returns its escalated grid in float64. The two
+        dtypes differ by design (the closed form's promotion is pinned by
+        tests/test_full_cov_kl_condition_toggle_20260814.py; audit 2026-10-31, numerics-6).
         """
         _require_kl_order(alpha, "FullGaussian.renyi_per_coord (per-coordinate self-coupling)")
         public_dtype = _full_gaussian_public_dtype(self._public_dtype, other._public_dtype)
@@ -608,7 +613,14 @@ class FullGaussian(BeliefParams):
     ) -> torch.Tensor:
         r"""Closed-form full-covariance Gaussian KL (ported verbatim from
         ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other). ``alpha`` must lie in the KL
-        switch (ValueError otherwise)."""
+        switch (ValueError otherwise).
+
+        Result dtype: the public dtype (float64 when either operand's public dtype is), except that a float32
+        pair grid failing the certificate below is recomputed and RETURNED in float64 for the whole grid, so the
+        dtype of a float32 call depends on the data. That promotion is the pinned policy
+        (tests/test_full_cov_kl_condition_toggle_20260814.py), keeping the escalated digits for the caller;
+        :meth:`renyi_per_coord` casts its escalated terms back to the public dtype instead (audit 2026-10-31,
+        numerics-6)."""
         _require_kl_order(alpha, "FullGaussian.renyi_closed_form")
         K = self.mu.shape[-1]
         # Public dtype: float64 when either operand's public dtype is float64, otherwise float32.

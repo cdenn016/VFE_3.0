@@ -9,10 +9,9 @@ This is the active gauge-theoretic VFE transformer codebase (import package `vfe
 - The CPU lanes run through `run_cpu_tests.py`, which sets `VFE3_TEST_DEVICE=cpu`, hides CUDA, pins one thread per worker, and runs workers in parallel. For focused checks, run the relevant files under `tests/` directly.
 - GPU tests need both the CUDA interpreter and `VFE3_TEST_DEVICE=cuda`; `check_gpu_tests.py` sets this up.
 - Tests take their configuration from `tests/profiles.py` (`test_config`, `tiny_config`, `config_values`), never from `vfe3/config.py` defaults. A new config field needs an explicit test baseline value there; `tests/test_config_isolation.py` reports omissions.
-- Every new `VFE3Config` field (toggle, mode or tunable value) must also be added to the `config` dictionary of `train_vfe3.py`, at its default value and in the group matching `vfe3/config.py`, with an inline comment listing its valid values. Adding the key is not a change to the user's live settings; changing an existing key's value is.
 
 ## Conventions
 
 - Keep checkpoint parameter names and the `vfe3` import package stable; saved runs depend on them.
 - Real-corpus loaders are cache-only and never substitute synthetic data for a missing corpus.
-- Record each day's changes in `docs/<date>.md`.
+- Record each day's changes in `docs/<date>.md`. `docs/` is gitignored: these and the other records there stay local and are not committed.

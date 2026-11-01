@@ -466,8 +466,11 @@ def train_backprop(prm0: Params, streams: Tensor, tree: TreeSensor, *, chunk: in
         ntok += n
         k += 1
         if log is not None and (k % log_every == 0 or c0 + chunk >= Ltot):
+            # The transition, not the leaf: under the exponential chart the leaf G holds L and the transition is e^L.
+            with torch.no_grad():
+                transition = torch.linalg.matrix_exp(G) if link_chart == "exp" else G.detach()   # (R, d, d)
             log({"arm": "backprop", "chunk": k, "train_bits": (nll / ntok / math.log(2)).tolist(),
-                 "G_spectral": torch.linalg.matrix_norm(G.detach(), 2).tolist(), "sec": time.perf_counter() - t0})
+                 "G_spectral": torch.linalg.matrix_norm(transition, 2).tolist(), "sec": time.perf_counter() - t0})
             nll, ntok = torch.zeros_like(nll), 0
     with torch.no_grad():
         return current().clone()

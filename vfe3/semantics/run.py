@@ -28,7 +28,9 @@ import torch
 from vfe3.config import VFE3Config, config_from_serialized
 from vfe3.semantics.common import GAUSSIAN_BANK_DECODE_KINDS, AnalogyQuestion, AnalysisContext
 from vfe3.semantics.resources import (
+    GOOGLE_ANALOGY_FILE,
     SIMILARITY_FILES,
+    benchmark_source,
     load_fields,
     load_google_analogies,
     load_relations,
@@ -78,6 +80,9 @@ CORE_DEFAULT_OPTIONS: Dict[str, Any] = {
     # fraction of their training occurrences. Curated/benchmark words are exempt (" cat" is followed
     # by a continuation 56% of the time but is a word). None disables the filter.
     "max_continuation_fraction": 0.9,
+    # Directory holding questions-words.txt, simlex999.txt and wordsim353.tsv; None reads the copies in gensim's
+    # test data (resources.benchmark_source). coverage records the file each benchmark was read from.
+    "benchmark_dir":  None,
 }
 
 _CONTINUATION_CHUNK = 1 << 24          # stream tokens per chunk of the continuation-fraction scan
@@ -814,10 +819,17 @@ def prepare_context(run: SemanticRun, out_dir: Path, *, options: Mapping[str, An
         coverage["curated_analogies"] = _coverage_entry(
             len(resource["curated_analogies"]), len(curated), missing_curated)
 
-        google = load_google_analogies()
+        bench_dir = None if opts.get("benchmark_dir") is None else Path(opts["benchmark_dir"])
+        where = f"not in benchmark_dir {str(bench_dir)!r}" if bench_dir is not None else "gensim test data not found"
+
+        def source(file_name: str) -> Optional[str]:
+            path = benchmark_source(file_name, bench_dir)
+            return None if path is None else str(path)
+
+        google = load_google_analogies(directory=bench_dir)
         if google is None:
-            coverage["google_analogies"] = {"available": False, "n_total": 0, "n_resolved": 0}
-            notes.append("Google analogy set unavailable (gensim test data not found)")
+            coverage["google_analogies"] = {"available": False, "n_total": 0, "n_resolved": 0, "source": None}
+            notes.append(f"Google analogy set unavailable ({where})")
         else:
             per_category: Dict[str, Dict[str, int]] = {}
             for category, a, a_star, b, b_star in google:
@@ -829,15 +841,15 @@ def prepare_context(run: SemanticRun, out_dir: Path, *, options: Mapping[str, An
                     entry["n_resolved"] += 1
             coverage["google_analogies"] = {
                 "available": True, "n_total": len(google), "n_resolved": len(analogies),
-                "per_category": per_category,
+                "per_category": per_category, "source": source(GOOGLE_ANALOGY_FILE),
             }
 
         coverage["similarity"] = {}
         for bench in SIMILARITY_FILES:
-            rows = load_similarity(bench)
+            rows = load_similarity(bench, directory=bench_dir)
             if rows is None:
-                coverage["similarity"][bench] = {"available": False, "n_total": 0, "n_resolved": 0}
-                notes.append(f"similarity benchmark {bench} unavailable (gensim test data not found)")
+                coverage["similarity"][bench] = {"available": False, "n_total": 0, "n_resolved": 0, "source": None}
+                notes.append(f"similarity benchmark {bench} unavailable ({where})")
                 continue
             kept_rows = []
             for w1, w2, score in rows:
@@ -846,7 +858,7 @@ def prepare_context(run: SemanticRun, out_dir: Path, *, options: Mapping[str, An
                     kept_rows.append((i1, i2, float(score)))
             similarity[bench] = kept_rows
             coverage["similarity"][bench] = {"available": True, "n_total": len(rows),
-                                             "n_resolved": len(kept_rows)}
+                                             "n_resolved": len(kept_rows), "source": source(SIMILARITY_FILES[bench])}
 
         per_hypernym: Dict[str, Any] = {}
         n_hyponyms = 0

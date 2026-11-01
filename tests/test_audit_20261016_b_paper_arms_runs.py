@@ -73,9 +73,12 @@ def test_a_base_with_its_own_checkpoint_cadence_is_reused_by_the_plan_and_the_la
     assert (base.cfg.checkpoint_interval, plan.cfg.checkpoint_interval) == (6, 8)
     assert plan.reused == [(6, 3)]
     assert any("checkpoint_interval" in note and "ignored" in note for note in plan.notes)
-    # An experiment-directory run is still checked on every field, the cadence included.
-    strict = pa.reuse_mismatch(base.run_dir, plan.cfg, dataset=plan.dataset, seed=6, data_seed=3)
-    assert strict is not None and "checkpoint_interval" in strict
+    # The checkpoint cadence is ignored for every run, an experiment-directory run too (audit 2026-10-31,
+    # paper-arms-harness-10: a launch may write resumable checkpoints); every other field is still checked.
+    assert pa.reuse_mismatch(base.run_dir, plan.cfg, dataset=plan.dataset, seed=6, data_seed=3) is None
+    other = pa.rebuild(plan.cfg, {"m_p_mu_lr": float(plan.cfg.m_p_mu_lr) * 2}, "test")
+    strict = pa.reuse_mismatch(base.run_dir, other, dataset=plan.dataset, seed=6, data_seed=3)
+    assert strict is not None and "m_p_mu_lr" in strict
 
     exp = pa.experiment_dir(tmp_path / "out", "tiny", "base_protocol")
     stale: List[Dict[str, str]] = []

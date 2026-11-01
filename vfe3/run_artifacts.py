@@ -8,7 +8,9 @@ A training run produces a self-contained directory::
       checkpoints/
         step_<N>.pt      resumable {step, model_state, optimizer_state, config}
       best_model.pt      {model_state, config, config_fingerprint} at the lowest validation PPL
-      test_results.json  end-of-run TEST-split eval on the reloaded best checkpoint
+      final_model.pt     the final weights, scored on TEST and replayed by the figure worker
+      test_results.json  end-of-run TEST-split eval of the final weights, with the validation-selected
+                         weights' scores beside them as test_best_*
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     per-step training-loss trajectory (the optimizer objective, metrics.csv's
                          train_loss) at the absolute training step
@@ -19,8 +21,9 @@ A training run produces a self-contained directory::
                          diagnose_canonical_free_energy: canonical F at the captured beliefs (a diagnostic)
 
 ``RunArtifacts`` is OPT-IN: ``train`` only touches it when an instance is passed, so the silent
-path (``artifacts=None``) writes nothing and is unchanged. ``finalize_run`` reloads the best-val
-checkpoint, scores the held-out test split, and writes the summary + figures. Figure generation
+path (``artifacts=None``) writes nothing and is unchanged. ``finalize_run`` scores the final weights
+on the held-out test split (the headline ``test_*``), scores the validation-selected weights of
+``best_model.pt`` beside them as ``test_best_*``, and writes the summary + figures. Figure generation
 is best-effort (a plotting/dependency error is logged, never fatal) so the numeric results
 survive a viz problem.
 """
@@ -41,7 +44,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, is_dataclass
 from numbers import Real
 from pathlib import Path, PureWindowsPath
@@ -244,11 +247,10 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "factorization_policy": "zero_jitter_no_covariance_repairs",
         # The minimal agent passes no source tuples, so no source-root recovery exists. A float32 layer call with a
         # failed factorization (or, under a certified projected_factorization, an ADF query covariance that fails the
-        # certificate) is recomputed whole in float64; a float64 failure raises. Its mean field also keeps the
-        # Gram-route certificate of projected_gaussian_kl (a whole-tensor float64 refactor of the KL factors).
-        "factorization_fallback": (("fp32_failure_or_certificate_layer_fp64_recompute"
-                                    + ("" if cfg.minimal_agent_inference == "exact"
-                                       else "_kl_certificate_fp64_refactor")) if minimal_agent
+        # certificate) is recomputed whole in float64; a float64 failure raises. Both inference modes record this: the
+        # mean field's label KL reads the readout's own factors and refactors nothing (audit 2026-10-31 A078; mean-field
+        # records written before it carry the suffix "_kl_certificate_fp64_refactor", a refactor that never ran).
+        "factorization_fallback": ("fp32_failure_or_certificate_layer_fp64_recompute" if minimal_agent
                                    else _kernel_factorization_fallback(cfg, dims)),
         "temperature_convention": ((f"unit_temperature_{'exact' if cfg.minimal_agent_inference == 'exact' else 'mean_field'}"
                                     "_posterior_no_clamp") if minimal_agent
@@ -310,26 +312,35 @@ def _kernel_factorization_fallback(cfg: VFE3Config, dims: List[int]) -> str:
     r"""The kernel router's recovery of a failed or flagged comparison factorization (audit 2026-10-20 item 25).
 
     ``mean_distance`` and the closed-form diagonal comparison route
-    (:func:`vfe3.gradients.relational._diagonal_comparison_route`) factor nothing. On the other routes
-    (:func:`vfe3.relational_scoring._strict_cholesky`) ``cholesky_qr2_certified`` with a source-root
+    (:func:`vfe3.gradients.relational._diagonal_comparison_route`, whose costs are
+    ``vfe3.gradients.relational._DIAGONAL_ROUTE_COSTS``: the Gaussian KL and both noisy forms) factor nothing. On the
+    other routes (:func:`vfe3.relational_scoring._strict_cholesky`) ``cholesky_qr2_certified`` with a source-root
     factor route rebuilds every flagged or failed entry by the float64 QR of its source root; otherwise the rebuilt
     entries (failures, plus certificate-flagged entries under a certified setting) are factored from the source root
     by float32 shifted CholeskyQR3, from the commutant root under ``comparison_invariant``, with float64 QR on its
-    failure. ``noisy_query`` and ``comparison_invariant`` have no source-root factor route, so
-    ``cholesky_qr2_certified`` acts there as ``gram_certified``.
+    failure. ``noisy_query``, ``noisy_key`` and ``comparison_invariant`` have no source-root factor route, so
+    ``cholesky_qr2_certified`` acts there as ``gram_certified``. ``noisy_key`` scores the broadened key law
+    :math:`G_{k,j} + n_hI` without a key source tuple
+    (:func:`vfe3.relational_scoring.projected_noisy_key_cost`), so only query entries are rebuilt: a flagged key
+    keeps its working-dtype factor and a failed key raises (audit 2026-10-31 artifacts-resume-1,
+    gap-certified-factorization-routes-4).
     """
+    from vfe3.gradients.relational import _DIAGONAL_ROUTE_COSTS
+
     routing = getattr(cfg, "relational_routing", "gaussian_kl")
     if routing == "mean_distance":
         return "none_mean_distance_has_no_factorization"
     factorization = getattr(cfg, "projected_factorization", "gram")
     invariant = getattr(cfg, "rope_mode", "none") == "comparison_invariant"
-    if invariant and routing == "gaussian_kl" and factorization == "gram" and _diagonal_comparison_covariance(cfg, dims):
+    if (invariant and routing in _DIAGONAL_ROUTE_COSTS and factorization == "gram"
+            and _diagonal_comparison_covariance(cfg, dims)):
         return "none_closed_form_diagonal_comparison_route"
-    if factorization == "cholesky_qr2_certified" and not invariant and routing != "noisy_query":
+    if factorization == "cholesky_qr2_certified" and not invariant and routing not in ("noisy_query", "noisy_key"):
         return "certificate_flagged_or_failed_entries_source_root_qr_fp64"
     rebuilt = "failed_entries" if factorization == "gram" else "certificate_flagged_or_failed_entries"
     root = "commutant_root" if invariant else "source_root"
-    return f"{rebuilt}_{root}_shifted_cholesky_qr3_fp32_then_qr_fp64"
+    fallback = f"{rebuilt}_{root}_shifted_cholesky_qr3_fp32_then_qr_fp64"
+    return fallback + ("_query_entries_only_broadened_keys_not_rebuilt" if routing == "noisy_key" else "")
 
 
 def _relational_clip_policy(cfg: VFE3Config) -> str:
@@ -729,6 +740,15 @@ def _float_config_fields() -> frozenset:
     return _FLOAT_CONFIG_FIELDS
 
 
+def _float_field_value(value: object) -> object:
+    r"""A float-typed field's value with every integer spelled as the equal float, inside lists and tuples too."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_float_field_value(item) for item in value)
+    return value
+
+
 def semantic_config_fingerprint(
     config: Mapping[str, Any],
 ) -> str:
@@ -736,35 +756,82 @@ def semantic_config_fingerprint(
 
     A top-level key that names a float-typed ``VFE3Config`` field hashes an integer value as the
     equal float, so ``rope_fraction=1`` and ``rope_fraction=1.0`` fingerprint alike (audit 2026-10-08
-    P2-4). Records that spelled such a field as a float keep their fingerprint.
+    P2-4), and the same holds for the entries of a list value of such a field, so a per-head
+    ``kappa_beta=[1, 2]`` and ``[1.0, 2.0]`` fingerprint alike (audit 2026-10-31 artifacts-resume-2).
+    Records that spelled such a field as a float keep their fingerprint.
     """
     float_fields = _float_config_fields()
     normalized = json.dumps(
-        {key: (float(value) if key in float_fields and isinstance(value, int) and not isinstance(value, bool)
-               else value)
+        {key: (_float_field_value(value) if key in float_fields else value)
          for key, value in dict(config).items()},
         sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+# Resume bookkeeping that the config drift of a resume ignores (_preflight_resume_config), and that the drift
+# fingerprints of resume_provenance.json leave out (audit 2026-10-31 artifacts-resume-5).
+_RESUME_DRIFT_EXCLUDED_FIELDS: Tuple[str, ...] = ("resume_from", "trust_resume_checkpoint")
+
+
+def _resume_drift_fingerprint(
+    serialized: Mapping[str, Any],
+) -> str:
+    r"""Fingerprint of a serialized config without :data:`_RESUME_DRIFT_EXCLUDED_FIELDS`: equal for an unchanged
+    configuration resumed through ``config["resume_from"]``."""
+    return semantic_config_fingerprint(
+        {key: value for key, value in dict(serialized).items() if key not in _RESUME_DRIFT_EXCLUDED_FIELDS})
+
+
 def _migrated_config_fingerprint(
     config: Mapping[str, Any],
+
+    *,
+    drift_projection: bool = False,
 ) -> str:
-    """Fingerprint a saved config in current serialized form, or raw when it no longer loads."""
+    """Fingerprint a saved config in current serialized form, or raw when it no longer loads.
+
+    ``drift_projection`` fingerprints it without the resume bookkeeping (:func:`_resume_drift_fingerprint`).
+    """
+    fingerprint = _resume_drift_fingerprint if drift_projection else semantic_config_fingerprint
     try:
-        return semantic_config_fingerprint(_serialize_run_config(
+        return fingerprint(_serialize_run_config(
             _config_from_run_serialized(config, source="resume provenance fingerprint")))
     except (TypeError, ValueError):
-        return semantic_config_fingerprint(config)
+        return fingerprint(config)
 
 
 def _realized_diag_moments_kernel() -> Dict[str, Any]:
     r"""``diag_moments_kernel`` (``'triton'``, ``'torch'``, ``'mixed'`` or None) and the per-kernel call counts of the
-    diagonal comparison moments since the run's :class:`RunArtifacts` reset them (audit 2026-10-20 item 45)."""
+    diagonal comparison moments since the run's :class:`RunArtifacts` reset them (audit 2026-10-20 item 45), and
+    ``relational_tile_loops``, the scorer tile loops sized by ``relational_tile_mib`` that ran, 0 where the budget
+    acted on nothing (:func:`vfe3.relational_scoring.projection_tile_loops`; audit 2026-10-31 attention-scoring-8)."""
     from vfe3 import relational_scoring as scoring
     return {"diag_moments_kernel": scoring.realized_diagonal_moments_kernel(),
             "diag_moments_kernel_calls": {"triton": scoring.diagonal_moments_triton_calls(),
-                                          "torch": scoring.diagonal_moments_torch_calls()}}
+                                          "torch": scoring.diagonal_moments_torch_calls()},
+            "relational_tile_loops": scoring.projection_tile_loops()}
+
+
+@contextmanager
+def _isolated_diag_moments_record() -> Iterator[Callable[[], Optional[str]]]:
+    r"""Run a finalize-time probe with its own diagonal-moments call record and restore the run's record after it.
+
+    The counters start at zero inside the block, so the yielded :func:`vfe3.relational_scoring
+    .realized_diagonal_moments_kernel` names the kernel the probe ran; on exit the run's counts since
+    :class:`RunArtifacts` reset them are put back. A probe that switches to the torch route (the FLOP measurement,
+    the float64 CPU gradient check) then leaves summary.json's record of the kernel that trained the run unchanged
+    (audit 2026-10-31 artifacts-finalize-1). The scorer tile-loop count of that record
+    (:func:`vfe3.relational_scoring.projection_tile_loops`), which the same reset clears (attention-scoring-8), is
+    put back with them.
+    """
+    from vfe3 import relational_scoring as scoring
+    saved = (scoring._DIAG_MOMENTS_TRITON_CALLS, scoring._DIAG_MOMENTS_TORCH_CALLS, scoring._PROJECTION_TILE_LOOPS)
+    scoring.reset_diagonal_moments_triton_calls()
+    try:
+        yield scoring.realized_diagonal_moments_kernel
+    finally:
+        (scoring._DIAG_MOMENTS_TRITON_CALLS, scoring._DIAG_MOMENTS_TORCH_CALLS,
+         scoring._PROJECTION_TILE_LOOPS) = saved
 
 
 def _phi_chart_norm_route(
@@ -1013,6 +1080,7 @@ def _run_figures_isolated(
     generate_publication:       bool,
     generate_embedding_figures: bool               = False,
     report_loader:              Optional[Iterable] = None,
+    model_bundle_path:          Optional[Path]     = None,
 ) -> bool:
     r"""Generate every end-of-run figure in a disposable process.
 
@@ -1021,6 +1089,10 @@ def _run_figures_isolated(
     handlers cannot contain.  The compatibility setting is therefore scoped to this child only:
     training numerics and the long-lived Spyder kernel never inherit it.  A child failure returns
     ``False`` after all numeric artifacts have already been published.
+
+    ``model_bundle_path`` names a published live-snapshot bundle of the caller's current state
+    (``final_model.pt``), which the publication replay reads instead of a temporary second serialization of
+    the same weights; without it the state is snapshotted to a temporary file.
     """
     if type(generate_embedding_figures) is not bool:
         raise ValueError("generate_embedding_figures must be an exact boolean")
@@ -1029,14 +1101,18 @@ def _run_figures_isolated(
     report_batches: Optional[List[object]] = None
     if generate_publication and report_loader is not None:
         report_batches = _snapshot_report_batches(report_loader)
+    snapshot_needed = generate_publication and model_bundle_path is None
 
     with _unique_sibling_temp(run_dir / "figure_request.json") as request_path:
         with _unique_sibling_temp(run_dir / "figure_report_batches.pt") as batches_path:
-            with _unique_sibling_temp(run_dir / "figure_live_model.pt") as model_path:
+            with (_unique_sibling_temp(run_dir / "figure_live_model.pt") if snapshot_needed
+                  else nullcontext(None)) as model_path:
                 if report_batches is not None:
                     torch.save(report_batches, batches_path)
                 live_model_path: Optional[str] = None
-                if generate_publication:
+                if generate_publication and model_bundle_path is not None:
+                    live_model_path = str(Path(model_bundle_path).absolute())    # the child runs in the repo root
+                elif generate_publication:
                     # Replay the caller's evaluated state even when an earlier best exists.
                     config = _serialize_run_config(artifacts.cfg)
                     torch.save({
@@ -1249,8 +1325,13 @@ def _validate_best_model_mapping(
     *,
     expected_code_identity:           Optional[str] = None,
     expected_selection_data_identity: Optional[Mapping[str, object]] = None,
+    owned:                            bool = True,
 ) -> Dict[str, object]:
-    """Return an owned selected state after validating the complete artifact contract."""
+    """Return an owned selected state after validating the complete artifact contract.
+
+    ``owned=False`` returns the validated tensors themselves instead of clones, for a caller that only
+    re-serializes the bundle at once (:meth:`RunArtifacts.save_checkpoint`).
+    """
     legacy_fields = {"model_state", "config", "config_fingerprint"}
     current_fields = legacy_fields | {"code_identity_sha256", "selection_data_identity"}
     if not isinstance(bundle, Mapping) or set(bundle) not in (legacy_fields, current_fields):
@@ -1307,7 +1388,7 @@ def _validate_best_model_mapping(
             raise _BestModelContractMismatch(
                 f"{context} does not match the active validation-data identity")
     validated["model_state"] = {
-        key: tensor.detach().clone()
+        key: (tensor.detach().clone() if owned else tensor)
         for key, tensor in validated_state.items()
     }
     return validated
@@ -1375,6 +1456,10 @@ def _read_best_model_bundle(
     map_location:                     'str | torch.device',
     expected_code_identity:           str,
     expected_selection_data_identity: Optional[Mapping[str, object]],
+
+    *,
+    mmap:  bool = False,
+    owned: bool = True,
 ) -> Dict[str, object]:
     r"""Safe-load ``best_model.pt`` and validate it as a portable selected-weights bundle, NONMUTATING.
 
@@ -1385,8 +1470,10 @@ def _read_best_model_bundle(
     structurally readable for legacy checkpoint persistence, but it cannot supply cross-run selection or
     headline finalization when a live identity is expected. Neither live configuration nor model state
     is mutated. The returned model-state mapping owns cloned tensors, so later caller mutation cannot
-    alter the validated source bundle."""
-    bundle = torch.load(path, map_location=map_location, weights_only=True)
+    alter the validated source bundle. A caller that only re-serializes the bundle passes ``mmap=True`` and
+    ``owned=False``: the file is memory-mapped and its tensors are returned uncloned, so no host copy of the
+    weights is made (audit 2026-10-31 artifacts-resume-3)."""
+    bundle = torch.load(path, map_location=map_location, weights_only=True, **({"mmap": True} if mmap else {}))
     return _validate_best_model_mapping(
         bundle,
         cfg,
@@ -1394,6 +1481,7 @@ def _read_best_model_bundle(
         f"best-model bundle at {path}",
         expected_code_identity=expected_code_identity,
         expected_selection_data_identity=expected_selection_data_identity,
+        owned=owned,
     )
 
 
@@ -2010,6 +2098,30 @@ def _checkpoint_divergence_state(
     return validated(value)
 
 
+def _host_state_copy(
+    state: Mapping[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    r"""Host copies of a state dict that keep its aliasing: entries viewing one element range share one copy.
+
+    ``block_mlp_tie_layers=True`` lists the one shared block MLP once per layer in ``state_dict()``; copying each key
+    on its own stored a copy per layer, so a saved bundle no longer shared them and held the MLP ``n_layers`` times
+    (audit 2026-10-31 artifacts-resume-3, block-mlp-norm-8). The values are bitwise those of ``state``.
+    """
+    from vfe3.run_resources import tensor_storage_key
+
+    copies: Dict[Tuple[object, ...], torch.Tensor] = {}
+    out: Dict[str, torch.Tensor] = {}
+    for name, tensor in state.items():
+        key = tensor_storage_key(tensor)
+        copied = copies.get(key) if key is not None else None
+        if copied is None:
+            copied = tensor.detach().to("cpu", copy=True)
+            if key is not None:
+                copies[key] = copied
+        out[name] = copied
+    return out
+
+
 class RunArtifacts:
     r"""Owns a run directory and its incremental metrics, reports, and optional model files.
 
@@ -2052,9 +2164,19 @@ class RunArtifacts:
         self.selection_data_identity: Optional[Dict[str, object]] = None
         self.scheduler_base_lrs: List[float] = []
         self.scheduler_group_roles: List[str] = []
+        # Per group, the table Fisher marker of a group stepped by the natural-gradient table step and that step's
+        # rate m_table_fisher_lr (record_scheduler_groups; audit 2026-10-31 artifacts-finalize-3).
+        self.scheduler_table_fisher: List[Optional[str]] = []
+        self.scheduler_table_fisher_lr: Optional[float] = None
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
+        # (step, parameter and buffer versions, bundle metadata) of the published best_model.pt, so a checkpoint at
+        # that step whose live weights have not changed embeds them instead of re-reading the file (save_checkpoint).
+        self._live_best_selection: Optional[Tuple[int, tuple, Dict[str, object]]] = None
+        # Step of the last checkpoint this instance wrote; summary.json publishes it (audit 2026-10-31
+        # artifacts-resume-4). None until a save succeeds.
+        self.last_checkpoint_step: Optional[int] = None
         # In-memory copy of the CSV rows (for figures); cells are normalized floats and ints, and text in the str
         # columns such as row_kind (vfe3.metrics_schema.normalize_metric_cell).
         self.history: List[Dict[str, Union[float, int, str]]] = []
@@ -2255,10 +2377,14 @@ class RunArtifacts:
 
         ``background`` (audit 2026-10-17 item 68): the weights are copied to host memory here, so the bundle is the
         state at this call, and ``torch.save`` plus the atomic replace run on a worker thread while training
-        continues. ``best_val_ppl`` and ``best_step`` advance only when the file has been replaced, as on the
-        synchronous path; a failed save is logged and counted under ``diagnostics_failures["best_model_save"]``.
+        continues. The host copy keeps the state dict's aliasing (:func:`_host_state_copy`), so a block MLP tied
+        across layers is stored once. ``best_val_ppl`` and ``best_step`` advance only when the file has been
+        replaced, as on the synchronous path; a failed or blocked save is logged and counted under
+        ``diagnostics_failures["best_model_save"]``.
         Every reader of the record or the file waits first (:meth:`wait_background`; this method,
         :meth:`save_checkpoint` and the finalizers do). Returns True when a save was published or scheduled."""
+        from vfe3.train import _tensor_versions
+
         self.wait_best_save()
         if val_ppl < self.best_val_ppl:
             if not self.save_model_artifacts:
@@ -2266,8 +2392,9 @@ class RunArtifacts:
                 self.best_step = int(step)
                 return True
             config = _serialize_run_config(self.cfg)
-            state = (model.state_dict() if not background else
-                     {name: tensor.detach().to("cpu", copy=True) for name, tensor in model.state_dict().items()})
+            # The live weights' versions at the copy: equal versions at a later checkpoint mean unchanged weights.
+            versions = _tensor_versions(model)
+            state = model.state_dict() if not background else _host_state_copy(model.state_dict())
             bundle = {
                 "model_state":        state,
                 "config":             config,
@@ -2276,12 +2403,13 @@ class RunArtifacts:
                 "selection_data_identity": self.selection_data_identity,
             }
             if background:
-                worker = threading.Thread(target=self._publish_best, args=(bundle, int(step), float(val_ppl), True),
+                worker = threading.Thread(target=self._publish_best,
+                                          args=(bundle, int(step), float(val_ppl), True, versions),
                                           name=f"best_model_save_step_{int(step)}", daemon=True)
                 self._best_save_thread = worker
                 worker.start()
                 return True
-            return self._publish_best(bundle, int(step), float(val_ppl), False)
+            return self._publish_best(bundle, int(step), float(val_ppl), False, versions)
         return False
 
     def _publish_best(
@@ -2290,8 +2418,13 @@ class RunArtifacts:
         step:       int,
         val_ppl:    float,
         background: bool,
+        versions:   Optional[tuple] = None,
     ) -> bool:
-        r"""Write ``bundle`` to ``best_model.pt`` (same-directory temporary and atomic replace) and advance the record."""
+        r"""Write ``bundle`` to ``best_model.pt`` (same-directory temporary and atomic replace) and advance the record.
+
+        ``versions`` (``vfe3.train._tensor_versions`` of the model the bundle was taken from) is kept with the
+        published step for :meth:`save_checkpoint`."""
+        failures = getattr(self, "diagnostics_failures", None)
         try:
             with _unique_sibling_temp(self.best_path) as tmp:
                 torch.save(bundle, tmp)
@@ -2299,9 +2432,12 @@ class RunArtifacts:
         except PermissionError as exc:
             # A reader holding best_model.pt open on Windows (audit 2026-10-08 P1-6): the record is
             # not advanced, so best_model.pt and best_val_ppl stay consistent and the next eval
-            # that beats the published best retries the save.
+            # that beats the published best retries the save. Counted, so summary.json shows the unpublished
+            # selection (audit 2026-10-31 artifacts-resume-4).
             logging.getLogger(__name__).warning(
                 "best_model.pt publish at step %d blocked (%s); the previous best is kept", step, exc)
+            if isinstance(failures, dict):
+                failures["best_model_save"] = failures.get("best_model_save", 0) + 1
             return False
         except Exception as exc:
             if not background:
@@ -2309,13 +2445,46 @@ class RunArtifacts:
             logging.getLogger(__name__).warning(
                 "(best_model.pt save at step %d failed: %s); training continues, the next improving eval retries",
                 step, exc)
-            failures = getattr(self, "diagnostics_failures", None)
             if isinstance(failures, dict):
                 failures["best_model_save"] = failures.get("best_model_save", 0) + 1
             return False
         self.best_val_ppl = float(val_ppl)
         self.best_step = int(step)
+        self._live_best_selection = (None if versions is None else
+                                     (int(step), versions, {key: value for key, value in bundle.items()
+                                                            if key != "model_state"}))
         return True
+
+    def _live_best_model_bundle(
+        self,
+        step:  int,
+        model: torch.nn.Module,
+        cfg:   VFE3Config,
+        state: Mapping[str, torch.Tensor],
+    ) -> Optional[Dict[str, object]]:
+        r"""The published ``best_model.pt`` bundle built on the live ``state``, or None when it may differ from it.
+
+        When the published selection is this step's and no parameter or buffer of ``model`` changed since its copy
+        (equal ``vfe3.train._tensor_versions``: identity, storage and in-place version), the live weights are the
+        selected weights bit for bit. The bundle then embeds the live tensors, so ``torch.save`` writes the weights
+        once in the checkpoint instead of re-reading, cloning and storing ``best_model.pt`` a second time (audit
+        2026-10-31 artifacts-resume-3). It is validated like the file: selection config, structure, finiteness,
+        code and validation-data identity, without the clone.
+        """
+        from vfe3.train import _tensor_versions
+
+        record = getattr(self, "_live_best_selection", None)
+        if record is None or record[0] != step or self.best_step != step or _tensor_versions(model) != record[1]:
+            return None
+        return _validate_best_model_mapping(
+            {**record[2], "model_state": state},
+            cfg,
+            state,
+            f"live best-model selection at step {step}",
+            expected_code_identity=self.code_identity_sha256,
+            expected_selection_data_identity=self.selection_data_identity,
+            owned=False,
+        )
 
     def wait_best_save(self) -> None:
         r"""Block until a background ``best_model.pt`` save (:meth:`maybe_save_best`) has finished."""
@@ -2469,19 +2638,28 @@ class RunArtifacts:
         # across a cross-run-directory resume (older bundles carried only the scalar, whose file was left
         # behind). A finite best scalar without a readable, matching best_model.pt is an integrity error
         # and MUST prevent checkpoint publication; no validation best -> explicit empty selection state.
+        # When the selection is this step's and the weights have not moved since, the bundle embeds the live
+        # tensors, which torch.save stores once with model_state; otherwise best_model.pt is read memory-mapped
+        # and re-serialized without a host clone (audit 2026-10-31 artifacts-resume-3).
+        live_state = model.state_dict()
         if math.isfinite(float(self.best_val_ppl)):
             if not self.best_path.is_file():
                 raise RuntimeError(
                     f"finite best_val_ppl ({float(self.best_val_ppl)}) but no readable best_model.pt "
                     f"at {self.best_path}; cannot embed a portable best-model bundle")
-            best_model_bundle: Optional[Dict[str, object]] = _read_best_model_bundle(
-                self.best_path,
-                cfg,
-                model.state_dict(),
-                "cpu",
-                self.code_identity_sha256,
-                self.selection_data_identity,
-            )
+            best_model_bundle: Optional[Dict[str, object]] = self._live_best_model_bundle(
+                step, model, cfg, live_state)
+            if best_model_bundle is None:
+                best_model_bundle = _read_best_model_bundle(
+                    self.best_path,
+                    cfg,
+                    live_state,
+                    "cpu",
+                    self.code_identity_sha256,
+                    self.selection_data_identity,
+                    mmap=True,
+                    owned=False,
+                )
             saved_best_val_ppl = float(self.best_val_ppl)
             saved_best_step    = self.best_step
         else:
@@ -2495,7 +2673,7 @@ class RunArtifacts:
         with _unique_sibling_temp(path) as tmp:
             torch.save({
                 "step":            step,
-                "model_state":     model.state_dict(),
+                "model_state":     live_state,
                 "optimizer_state": optimizer_state,
                 "optimizer_parameter_manifest": optimizer_parameter_manifest,
                 "rng_state":       rng_state,
@@ -2522,6 +2700,8 @@ class RunArtifacts:
                 "weight_ema":      getattr(self, "weight_ema_state", None),
             }, tmp)
             _atomic_replace(path, tmp)
+        del best_model_bundle                        # release a memory-mapped best_model.pt before any later replace
+        self.last_checkpoint_step = step
         return path
 
 
@@ -2537,6 +2717,7 @@ def _restore_best_selection(
 
     ckpt_best_ppl = ckpt.get("best_val_ppl")
     had_finite_best = ckpt_best_ppl is not None and math.isfinite(float(ckpt_best_ppl))
+    artifacts._live_best_selection = None              # the restored selection is not the live weights' copy
 
     if validated_selection is None:
         artifacts.best_val_ppl = float("inf")
@@ -2656,7 +2837,7 @@ def _preflight_resume_config(
     current = asdict(cfg)
     drift = sorted(
         key for key in (set(effective) | set(current))
-        if key not in ("resume_from", "trust_resume_checkpoint")
+        if key not in _RESUME_DRIFT_EXCLUDED_FIELDS
         and effective.get(key) != current.get(key)
     )
     return raw_config, drift
@@ -2687,14 +2868,16 @@ def load_checkpoint(
     it restores the AdamW optimizer state (momentum buffers + per-parameter step counts) when an
     ``optimizer`` is supplied, then reapplies that optimizer's current non-parameter group metadata
     so the current config remains authoritative. The CPU/CUDA RNG is restored when ``restore_rng`` is
-    set and the bundle carries it (older checkpoints simply skip absent RNG fields). The returned integer is the number of
-    completed M-steps; ``train(resume_from=...)`` uses it to rebuild the cosine ``LambdaLR`` at the
+    set; a bundle without a valid RNG state is then refused before any state is restored. The returned integer is
+    the number of completed M-steps; ``train(resume_from=...)`` uses it to rebuild the cosine ``LambdaLR`` at the
     saved step and to start the loop from there.
 
 
     ``scaler`` (audit 2026-06-09 IE3): when given AND the bundle carries a saved scaler state,
-    the fp16 GradScaler's scale/growth counters are restored (bundles written before the scaler
-    was persisted, or written from a non-fp16 run, simply skip the step). ``cfg`` (audit IE4):
+    the fp16 GradScaler's scale/growth counters are restored, after the state is validated (a malformed one is
+    refused). A bundle without one (written before the scaler was persisted, or by a run without an enabled
+    fp16 scaler, e.g. a bf16 run resumed as fp16) skips the step with a warning: the enabled scaler starts at its
+    initial scale, as a fresh fp16 run does (audit 2026-10-31 gap-mixed-precision-routes-7). ``cfg`` (audit IE4):
     when given, the CURRENT config is compared against the bundle's saved config and any
     differing fields are warned about -- strict ``load_state_dict`` already catches
     shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
@@ -2884,7 +3067,8 @@ def load_checkpoint(
         successful_updates = _validated_saved_successful_updates(
             saved_optimizer_state["param_groups"], saved_step)
     saved_scaler_state = ckpt.get("scaler_state")
-    if scaler is not None and scaler.is_enabled():
+    scaler_enabled = scaler is not None and scaler.is_enabled()
+    if scaler_enabled and saved_scaler_state is not None:
         saved_scaler_state = _validate_scaler_state(saved_scaler_state, scaler)
     saved_rng_state = None
     if restore_rng:
@@ -2926,8 +3110,13 @@ def load_checkpoint(
     # A bounded run's checkpoint is a fixed point of the frame condition bound, so this is a bitwise no-op
     # there; it bounds the frames of any other state before step 0 or evaluation (audit round 2, M4).
     bound_frame_condition_if_configured_(model)
-    if scaler is not None and scaler.is_enabled():
+    if scaler_enabled and saved_scaler_state is not None:
         scaler.load_state_dict(saved_scaler_state)
+    elif scaler_enabled:
+        import warnings
+        warnings.warn(f"{checkpoint_path.name} carries no GradScaler state (written before the scaler was persisted "
+                      "or by a run without an enabled fp16 scaler); the enabled GradScaler starts at its initial "
+                      "scale", UserWarning, stacklevel=2)
     # Portable best-val model-selection state (PB-03, extends audit 2026-07-01 C2): restore
     # best_val_ppl/best_step AND make the selected weights reachable in the resumed run's directory,
     # so a cross-run_dir resume no longer restores best metadata whose best_model.pt is missing. The
@@ -3046,6 +3235,18 @@ def load_checkpoint(
             ),
             "current_config_fingerprint":      (
                 semantic_config_fingerprint(_serialize_run_config(resume_cfg))
+                if resume_cfg is not None else None
+            ),
+            # The same two configurations without the resume bookkeeping config_drift_fields ignores: equal when
+            # the drift list is empty, also for a resume through config["resume_from"], whose full fingerprints
+            # differ in that field (audit 2026-10-31 artifacts-resume-5).
+            "config_drift_excluded_fields":    list(_RESUME_DRIFT_EXCLUDED_FIELDS),
+            "saved_config_drift_fingerprint":  (
+                _migrated_config_fingerprint(saved_config, drift_projection=True)
+                if isinstance(saved_config, Mapping) else None
+            ),
+            "current_config_drift_fingerprint": (
+                _resume_drift_fingerprint(_serialize_run_config(resume_cfg))
                 if resume_cfg is not None else None
             ),
             "saved_code_identity_sha256":      saved_code_identity,
@@ -3453,10 +3654,14 @@ def _write_provenance(
         if final_code_identity_sha256 is None
         else final_code_identity_sha256 != artifacts.code_identity_sha256
     )
-    if code_identity_drift is True or git_identity_drift is True:
+    # The source identity is the executable-source digest (_package_code_identity: the package sources and the root
+    # drivers' executable logic). The Git fingerprint also hashes every untracked file and the full diff (notes,
+    # media, a tracked log), so it stays a descriptive record (git_identity_status) and does not decide drift: an
+    # edit no executed byte depends on is not source drift (audit 2026-10-31 artifacts-finalize-2).
+    if code_identity_drift is True:
         source_identity_status = "drifted"
         source_identity_drift: Optional[bool] = True
-    elif code_identity_drift is False and git_identity_drift is False:
+    elif code_identity_drift is False:
         source_identity_status = "stable"
         source_identity_drift = False
     else:
@@ -3498,6 +3703,7 @@ def _write_provenance(
         "git_identity_drift":         git_identity_drift,
         "source_identity_status":     source_identity_status,
         "source_identity_drift":      source_identity_drift,
+        "source_identity_basis":      "code_identity_sha256",
     }
     if final_code_identity_error is not None:
         prov["final_code_identity_error"] = final_code_identity_error
@@ -3573,6 +3779,11 @@ def _write_provenance(
     elif source_identity_status == "unverifiable":
         logger.warning(
             "source identity could not be verified at both run boundaries; provenance is marked"
+        )
+    if source_identity_status == "stable" and git_identity_drift is True:
+        logger.info(
+            "the Git working tree changed during the run outside the executable sources "
+            "(git_identity_status='drifted'); the source identity is stable"
         )
     logger.info(
         "wrote provenance.json (git_sha=%s dirty=%s source_identity=%s)",
@@ -3705,14 +3916,22 @@ def _fd_gradient_check(
     truncation error is :math:`O(h^2)` and the rounding floor
     :math:`\varepsilon_{64}|L|/(h\min_j|g_j|)` is recorded as ``fd_gradient_noise_floor``; a correct adjoint reads
     about that floor plus about 1e-8, and a broken one far above it. ``fd_gradient_dtype`` and ``fd_gradient_eps``
-    record the arithmetic."""
+    record the arithmetic.
+
+    The copy runs on the CPU, so it validates the torch adjoints: CPU tensors never take the fused Triton decode
+    cross-entropy (``decode_ce_triton``) or the fused diagonal comparison moments, whose hand-written backward
+    passes a CUDA run trains with. ``fd_gradient_device`` and ``fd_gradient_kernels`` (the decode CE,
+    expected-likelihood CE and diagonal-moments kernels the probe's forward ran, None where that path did not run)
+    record that scope, to be read beside summary.json's ``decode_ce_kernel`` and ``diag_moments_kernel``; the
+    probe's own diagonal-moments calls stay out of the run's record (audit 2026-10-31 artifacts-finalize-8)."""
     if record is None:
         record = {}
     model = _float64_cpu_copy(model)
     device = torch.device("cpu")
     record["fd_gradient_dtype"] = "float64"
     record["fd_gradient_eps"] = float(fd_eps)
-    with _diagnostic_eval_mode(model):
+    record["fd_gradient_device"] = device.type
+    with _diagnostic_eval_mode(model), _isolated_diag_moments_record() as probe_diag_kernel:
         batch = next(iter(test_loader))
         tok, tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
         tok = tok[:2].to(device)
@@ -3730,6 +3949,11 @@ def _fd_gradient_check(
         model.zero_grad(set_to_none=True)
         _, loss, _ = model(tok, tgt)
         loss.backward()
+        record["fd_gradient_kernels"] = {
+            "decode_ce":              getattr(pb, "realized_decode_ce_kernel", None),
+            "expected_likelihood_ce": getattr(pb, "realized_expected_likelihood_kernel", None),
+            "diag_moments":           probe_diag_kernel(),
+        }
         if p.grad is None:                                          # decode param severed under this config
             model.zero_grad(set_to_none=True)
             record["fd_gradient_nan_reason"] = f"prior_bank.{name} received no gradient"
@@ -3761,8 +3985,8 @@ def _fd_gradient_check(
                     return float("nan")
                 worst = max(worst, abs(fd - ana) / max(abs(fd), abs(ana), 1e-8))
         smallest = min(abs(float(gflat[j])) for j in idx)
-        record["fd_gradient_noise_floor"] = (torch.finfo(torch.float64).eps * abs(float(loss)) / (fd_eps * smallest)
-                                             if smallest > 0 else float("inf"))
+        record["fd_gradient_noise_floor"] = (torch.finfo(torch.float64).eps * abs(float(loss.detach()))
+                                             / (fd_eps * smallest) if smallest > 0 else float("inf"))
         model.zero_grad(set_to_none=True)
         return worst
 
@@ -3886,10 +4110,12 @@ def _measured_forward_flops(
     ``est_flops_analytic`` is None there. This counts instead: one sequence of ``max_seq_len`` seeded tokens runs
     through ``forward_beliefs`` under :class:`torch.utils.flop_counter.FlopCounterMode`, once with the logits and once
     without, in eval mode, without gradients and with the RNG streams restored. The diagonal-moments kernel is
-    switched to its torch route for the count, since the counter does not see Triton kernels, and restored. The
-    counter counts matrix-product-class operations (``mm``, ``bmm``, ``addmm``, ``baddbmm``, convolutions,
-    attention); elementwise work, reductions and factorizations are not counted, so the numbers are a lower bound
-    on the forward work and are dominated by the GEMMs that set it on this model.
+    switched to its torch route for the count, since the counter does not see Triton kernels, and restored, and the
+    torch calls of these two forwards are kept out of the run's kernel record
+    (:func:`_isolated_diag_moments_record`), so summary.json's ``diag_moments_kernel`` still names the kernel that
+    trained the run. The counter counts matrix-product-class operations (``mm``, ``bmm``, ``addmm``, ``baddbmm``,
+    convolutions, attention); elementwise work, reductions and factorizations are not counted, so the numbers are a
+    lower bound on the forward work and are dominated by the GEMMs that set it on this model.
 
     ``flops_per_token_forward_measured`` (decode included), ``flops_per_token_beliefs_measured`` (the stack, no
     decode), ``flops_per_token_decode_measured`` (their difference), the top counted operators of the full forward,
@@ -3908,7 +4134,7 @@ def _measured_forward_flops(
     rng_devices = [device] if device.type == "cuda" else []
     previous_kernel = set_diagonal_moments_kernel("torch")
     try:
-        with torch.random.fork_rng(devices=rng_devices), torch.no_grad():
+        with _isolated_diag_moments_record(), torch.random.fork_rng(devices=rng_devices), torch.no_grad():
             model.eval()
             with FlopCounterMode(display=False) as with_decode:
                 model.forward_beliefs(tokens, return_logits=True)
@@ -4073,19 +4299,37 @@ def _scheduler_metadata(
     min_lr_frac: float,
     base_lrs: Iterable[float] = (),
     group_roles: Iterable[str] = (),
+    table_fisher: Iterable[Optional[str]] = (),
+    table_fisher_lr: Optional[float] = None,
 ) -> Dict[str, object]:
-    """Describe the executable per-group floor, including frozen zero-base groups."""
+    r"""Describe the executable per-group floor, including frozen zero-base groups.
+
+    ``base_lr`` is the group's ``LambdaLR`` base. An AdamW group steps at it times the schedule factor
+    :math:`\lambda_t = \mathrm{lr}_t/\mathrm{lr}_0`. A group marked by ``table_fisher`` (the type-prior or decode
+    tables under the natural-gradient table step of :mod:`vfe3.table_optim`) steps at
+    :math:`\eta\lambda_t` instead, :math:`\eta` = ``table_fisher_lr`` (``m_table_fisher_lr``), its ``base_lr`` only
+    setting the schedule and the decoupled decay. ``step_lr_base`` and ``step_lr_floor`` give the rate of the
+    executed update at the schedule's peak and floor in either case, the units of metrics.csv ``lr_*`` (audit
+    2026-10-31 artifacts-finalize-3).
+    """
     bases = [float(value) for value in base_lrs]
     roles = [str(value) for value in group_roles]
+    markers = [None if value is None else str(value) for value in table_fisher]
     if roles and len(roles) != len(bases):
         raise ValueError("scheduler group roles and base learning rates must have equal length")
+    if markers and len(markers) != len(bases):
+        raise ValueError("scheduler table_fisher markers and base learning rates must have equal length")
     if not roles:
         roles = [f"group_{index}" for index in range(len(bases))]
+    if not markers:
+        markers = [None] * len(bases)
     groups = []
-    for index, (role, base) in enumerate(zip(roles, bases)):
+    for index, (role, base, marker) in enumerate(zip(roles, bases, markers)):
         if base < 0.0 or not math.isfinite(base):
             raise ValueError(f"scheduler group {index} base LR must be finite and nonnegative")
         frozen = base == 0.0
+        step_base = (base if marker is None
+                     else None if table_fisher_lr is None else float(table_fisher_lr))
         groups.append({
             "index": index,
             "role": role,
@@ -4093,6 +4337,11 @@ def _scheduler_metadata(
             "frozen": frozen,
             "fractional_floor": 0.0 if frozen else float(min_lr_frac) * base,
             "effective_floor": 0.0 if frozen else float(min_lr_frac) * base,
+            "update": "adamw" if marker is None else "table_fisher",
+            "table_fisher": marker,
+            "step_lr_base": 0.0 if frozen else step_base,
+            "step_lr_floor": (0.0 if frozen else None if step_base is None
+                              else float(min_lr_frac) * step_base),
         })
     return {
         "kind": "warmup_half_cosine_with_floor",
@@ -4102,8 +4351,53 @@ def _scheduler_metadata(
             "0 for group_base_lr == 0; otherwise "
             "fractional_floor * group_base_lr"
         ),
+        "step_lr_description": (
+            "rate of the executed update at the schedule peak (step_lr_base) and floor (step_lr_floor): base_lr "
+            "for an AdamW group; m_table_fisher_lr for a table_fisher group, whose base_lr sets only the "
+            "schedule lr_t/lr_0 and the decoupled decay lr_t*wd"
+        ),
         "groups": groups,
     }
+
+
+# Untied decode bank and linear readout: their groups carry the encoder roles mu/sigma, so the scheduler block names
+# them apart (audit 2026-10-31 artifacts-finalize-3).
+_DECODE_GROUP_ROLES: Tuple[Tuple[str, str], ...] = (
+    ("decode_mu_embed", "decode_mu"), ("decode_sigma_log_embed", "decode_sigma"),
+    ("output_proj_weight", "decode_weight"), ("output_proj_bias", "decode_bias"))
+
+
+def record_scheduler_groups(
+    artifacts: object,
+    model:     torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    base_lrs:  Sequence[float],
+) -> None:
+    r"""Hand ``train``'s optimizer groups to summary.json's scheduler block (:func:`_scheduler_metadata`).
+
+    Sets ``scheduler_base_lrs`` (the configured ``LambdaLR`` bases), ``scheduler_group_roles`` (the group's
+    ``lr_report_role``, ``lr_aux_role`` or ``role``, but ``decode_mu`` / ``decode_sigma`` / ``decode_weight`` /
+    ``decode_bias`` for a group holding only a decode table), ``scheduler_table_fisher`` (each group's
+    ``table_fisher`` marker or None) and ``scheduler_table_fisher_lr`` (the optimizer's natural-gradient table rate,
+    None without one) on ``artifacts``.
+    """
+    prior_bank = getattr(model, "prior_bank", None)
+    decode_roles: Dict[int, str] = {}
+    for attribute, role in _DECODE_GROUP_ROLES:
+        parameter = getattr(prior_bank, attribute, None) if prior_bank is not None else None
+        if isinstance(parameter, torch.nn.Parameter):
+            decode_roles[id(parameter)] = role
+    roles: List[str] = []
+    for index, group in enumerate(optimizer.param_groups):
+        parameters = list(group.get("params", ()))
+        decode_role = decode_roles.get(id(parameters[0])) if len(parameters) == 1 else None
+        roles.append(decode_role or str(group.get("lr_report_role") or group.get("lr_aux_role")
+                                        or group.get("role") or f"group_{index}"))
+    artifacts.scheduler_base_lrs = [float(value) for value in base_lrs]
+    artifacts.scheduler_group_roles = roles
+    artifacts.scheduler_table_fisher = [group.get("table_fisher") for group in optimizer.param_groups]
+    eta = getattr(optimizer, "_table_fisher_lr", None)
+    artifacts.scheduler_table_fisher_lr = None if eta is None else float(eta)
 
 
 def _resolved_alibi_slopes(cfg: VFE3Config) -> Optional[List[float]]:
@@ -4201,8 +4495,8 @@ def _best_weight_and_train_sample_evaluation(
     from vfe3.train import TRAIN_SAMPLE_MAX_TARGETS, TRAIN_SAMPLE_SEED, _build_fixed_train_sample, evaluate
 
     out: Dict[str, object] = {
-        "test_best_ce": None, "test_best_ppl": None, "test_best_step": artifacts.best_step,
-        "test_best_status": None,
+        "test_best_ce": None, "test_best_ppl": None, "test_best_bits_per_token": None,
+        "test_best_step": artifacts.best_step, "test_best_status": None,
         "train_sample_ce_final": None, "train_sample_ce_best": None,
         # The training-time sample is capped at TRAIN_SAMPLE_MAX_TARGETS scored targets (32,768 since PR #75);
         # the post-hoc evaluator keeps its own larger cap, so the two train_sample CEs need not agree.
@@ -4236,13 +4530,13 @@ def _best_weight_and_train_sample_evaluation(
             out["test_best_status"] = "no validation-selected weights"
         elif final_step is not None and best_step == final_step:
             out.update(test_best_ce=final_test.get("test_ce"), test_best_ppl=final_test.get("test_ppl"),
+                       test_best_bits_per_token=final_test.get("test_bits_per_token"),
                        train_sample_ce_best=out["train_sample_ce_final"],
                        test_best_status="best weights are the final weights")
         elif not artifacts.save_model_artifacts or not artifacts.best_path.is_file():
             out["test_best_status"] = "best_model.pt was not saved (save_model_artifacts=False)"
         else:
-            final_state = {name: tensor.detach().to("cpu", copy=True)
-                           for name, tensor in model.state_dict().items()}
+            final_state = _host_state_copy(model.state_dict())          # the tied MLP's aliases share one copy
             try:
                 bundle = _read_best_model_bundle(
                     artifacts.best_path, artifacts.cfg, model.state_dict(), "cpu",
@@ -4319,8 +4613,10 @@ def _resources_record(
         record["parameter_breakdown"] = None
         record["parameter_breakdown_error"] = repr(exc)
     record["optimizer_state_bytes"] = getattr(artifacts, "optimizer_state_bytes", None)
-    record["model_state_bytes"] = int(sum(
-        tensor.numel() * tensor.element_size() for tensor in model.state_dict().values()))
+    # Each storage once: a block MLP tied across layers is one module the state dict lists once per layer
+    # (audit 2026-10-31 artifacts-finalize-4).
+    from vfe3.run_resources import unique_tensor_bytes
+    record["model_state_bytes"] = int(unique_tensor_bytes(model.state_dict()))
     history = list(getattr(artifacts, "history", []) or [])
     peaks = [float(row["peak_mem_mb"]) for row in history
              if isinstance(row.get("peak_mem_mb"), (int, float))
@@ -4475,7 +4771,7 @@ def finalize_run(
             device=device)
     except Exception as exc:
         logger.warning("best-weight / training-sample finalize evaluation failed (%s)", exc)
-        best_weight_fields = {"test_best_ce": None, "test_best_ppl": None,
+        best_weight_fields = {"test_best_ce": None, "test_best_ppl": None, "test_best_bits_per_token": None,
                               "test_best_step": artifacts.best_step,
                               "test_best_status": f"failed: {exc!r}",
                               "train_sample_ce_final": None, "train_sample_ce_best": None}
@@ -4646,6 +4942,8 @@ def finalize_run(
             min_lr_frac=cfg.min_lr_frac,
             base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
             group_roles=getattr(artifacts, "scheduler_group_roles", ()),
+            table_fisher=getattr(artifacts, "scheduler_table_fisher", ()),
+            table_fisher_lr=getattr(artifacts, "scheduler_table_fisher_lr", None),
         ),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
@@ -4653,6 +4951,9 @@ def finalize_run(
         # A resumed run's metrics.csv starts after resume_source.saved_step; earlier rows (and a best_step at or
         # before it) are in resume_source.source_run_dir. None from scratch.
         "resume_source": getattr(artifacts, "resume_source", None),
+        # The newest checkpoint this run directory holds (None: none was written); a failed save is counted under
+        # diagnostics_failures["checkpoint_save"] (audit 2026-10-31 artifacts-resume-4).
+        "last_checkpoint_step": getattr(artifacts, "last_checkpoint_step", None),
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
         # The expected-likelihood CE kernel that last ran ('torch' | 'triton'; None when that decoder never
@@ -4714,7 +5015,9 @@ def finalize_run(
     # Plotting is a separate process because Anaconda NumPy/SciPy and PyTorch may initialize
     # incompatible Intel OpenMP copies. A native abort then kills only the disposable worker, not
     # the long-lived Spyder kernel. The worker also drives the model-replay publication set when
-    # enabled, using the exact bounded test batches snapshotted from this invocation.
+    # enabled, using the exact bounded test batches snapshotted from this invocation. It replays
+    # final_model.pt, which holds the live state the probes above read (they evaluate it and restore it
+    # bitwise), instead of a second serialization of it (audit 2026-10-31 artifacts-finalize-6).
     try:
         _run_figures_isolated(
             model,
@@ -4724,6 +5027,7 @@ def finalize_run(
             generate_publication=True,
             generate_embedding_figures=cfg.generate_embedding_figures,
             report_loader=test_loader,
+            model_bundle_path=(artifacts.final_path if artifacts.save_model_artifacts else None),
         )
     except Exception as exc:
         logger.warning("isolated figure preparation failed (%s); numeric results are saved", exc)
@@ -5146,7 +5450,9 @@ def finalize_validation_run(
     and ``summary.json`` never carries ``test_ce``/``test_ppl``/``test_bpc``.
 
     Successful sequence: evaluate ``val_loader`` once, append a terminal metrics row, publish the
-    selected best weights (``best_model.pt``), write ``validation_results.json``, collect VALIDATION-only
+    selected best weights (``best_model.pt``), validate the opt-in weight-EMA weights on the same loader
+    (:func:`_weight_ema_evaluation` without its test fields; ``weight_ema_status`` says whether it ran), write
+    ``validation_results.json``, collect VALIDATION-only
     provenance and the pure-path report, and render the history-only figures. A ``finally`` block then
     strictly reloads ``terminal_state.raw_model_state`` and
     restores the captured CPU/CUDA RNG. After a successful validation the resumable terminal checkpoint
@@ -5275,6 +5581,11 @@ def finalize_validation_run(
             "terminal_selection_published": terminal_selection_published,
             "unpublished_terminal_val_ppl": unpublished_terminal_val_ppl,
         }
+        # Validation at the opt-in weight-EMA weights, as finalize_run records it, without its test fields: this
+        # finalizer opens no test split (audit 2026-10-31 artifacts-finalize-10). {} when the EMA is off.
+        ema_fields = {key: value for key, value in _weight_ema_evaluation(
+            model, artifacts, logger, val_loader=val_loader, test_loader=None, tokens_per_char=tokens_per_char,
+            device=device).items() if not key.startswith("test_")}
 
         artifacts.save_json("validation_results.json", {
             "selection_split": "validation",
@@ -5290,6 +5601,7 @@ def finalize_validation_run(
             "best_val_ppl":    best_val_ppl,
             "best_step":       artifacts.best_step,
             **selection_fields,
+            **ema_fields,
         })
 
         # Reproducibility provenance -- VALIDATION ONLY (test_loader=None): the ablation finalizer must
@@ -5368,6 +5680,7 @@ def finalize_validation_run(
         "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
         "resume_source":       getattr(artifacts, "resume_source", None),   # as in finalize_run
         "terminal_checkpoint": terminal_checkpoint,
+        "last_checkpoint_step": getattr(artifacts, "last_checkpoint_step", None),   # as in finalize_run
         "save_model_artifacts": artifacts.save_model_artifacts,
         "figures_written":     figures_written,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
@@ -5375,6 +5688,7 @@ def finalize_validation_run(
         "diagnostics_failures": dict(sorted(
             (getattr(artifacts, "diagnostics_failures", None) or {}).items())),
         "numerics_counters":   getattr(artifacts, "numerics_counters", None),
+        **ema_fields,
     })
 
     return {
@@ -5419,6 +5733,15 @@ def _pure_path_report(
     independently from both active attention-prior registrations. ``transport_exactness_status`` is affirmative only when
     complete runtime evidence warrants it; absent evidence is ``unknown``. The conjunctive
     ``on_theory_pure_path`` combines the explicitly enumerated ``theory_flags``.
+
+    No current route satisfies that conjunction: ``theory_flags`` includes the legacy ``pure_flags`` facet
+    ``canonical_attention_entropy``, which holds only without the relational operator record of
+    :func:`_conditional_artifact_fields`, and every VFE configuration carries that record (each projected route also
+    records ``canonical_shared_objective=False``). ``on_theory_pure_path`` is therefore False under every
+    configuration, ``principled_exact_route`` and ``fully_gauge_covariant`` included, and the individual facets carry
+    the information. Whether a route without a canonical shared objective, or the exact route's cue/result memory in
+    the block-MLP slot, should count as theory-pure is a theory decision that this report leaves open (audit
+    2026-10-31 artifacts-finalize-7).
 
     ``pure_flags`` intentionally retains its historical meaning and does not enumerate every
     default-off learned-scalar toggle. The covariance and E-step facets (``full_sigma_update``,
@@ -5648,12 +5971,24 @@ def _pure_path_report(
                                    and (getattr(cfg, "phi_frame_condition_max", None) is None
                                         or getattr(cfg, "gauge_group", None) not in FRAME_CONDITION_GROUPS
                                         or getattr(cfg, "gauge_transport", "on") != "on")),
+        # The fixed-coordinate element of a manifold frame step: the pullback trust region, and for fisher_group (whose
+        # direction and body-norm radius are left invariant) the chart-norm gate phi_chart_max_norm. Chart AdamW has
+        # neither, but its step is not covariant itself (vfe3.gauge_covariant).
         "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") not in (
             "pullback_group", "fisher_group"),
         # The transport exponential is never rescaled: its chart radius is fail-closed (2026-10-02).
         "no_transport_exponential_clipping": True,
         "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
-        "decoder_gauge_compatible": getattr(cfg, "decode_coordinates", "local") == "reference",
+        # Type-level frame dropout gives a dropped type the identity frame in a training forward while its moments keep
+        # their local values, so no frame change of the tables leaves that forward invariant; it acts on nothing when
+        # every frame is the identity (audit 2026-10-31, gauge-covariance-e2e-2).
+        "no_frame_dropout": (float(getattr(cfg, "phi_type_dropout", 0.0)) == 0.0
+                             or getattr(cfg, "gauge_transport", "on") == "off"),
+        # A tied prior-bank decoder scores the reference query against the encoder's prior tables, which move with the
+        # frames (audit 2026-10-31, gauge-covariance-e2e-1); the linear readout has no bank.
+        "decoder_gauge_compatible": (getattr(cfg, "decode_coordinates", "local") == "reference"
+                                     and (getattr(cfg, "decode_mode", "linear") == "linear"
+                                          or bool(getattr(cfg, "untie_decode_bank", True)))),
         # False when a per-coordinate alpha over ordered conditional KLs has a live model consumer (audit 2026-10-10
         # round 2, #16); vfe3.viz.extract.projected_gauge_equivariance witnesses it against an independent prior.
         "self_coupling_frame_invariant": not (per_coord_conditional_kl and model_self_coupling_consumers),
@@ -6085,10 +6420,16 @@ def _save_figures(
         # and numerical-safety scalars diagnostics() logs to metrics.csv but that no standard figure
         # surfaced. The panels self-gate, so a run missing a column simply drops that panel.
         hist_geom = _hist_subset(raw_figs.GEOMETRY_HEALTH_COLUMNS)
+        try:                                                   # frozen at encode: Sigma is the token-table row
+            from vfe3.metrics import covariance_frozen_at_encode
+            sigma_frozen = bool(covariance_frozen_at_encode(artifacts.cfg))
+        except Exception:                                      # config-free artifacts: assume live Sigma
+            sigma_frozen = False
         if hist_geom:
             fig = figs.plot_geometry_health(
                 hist_geom,
                 family=getattr(getattr(artifacts, "cfg", None), "family", None),
+                covariance_frozen=sigma_frozen,
                 path=str(run / "geometry_health.png"),
             )
             figs.plt.close(fig)
@@ -6099,6 +6440,7 @@ def _save_figures(
             fig = figs.plot_validation_sanity(
                 hist_val,
                 family=getattr(getattr(artifacts, "cfg", None), "family", None),
+                covariance_frozen=sigma_frozen,
                 path=str(run / "validation_sanity.png"),
             )
             figs.plt.close(fig)

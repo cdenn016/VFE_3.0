@@ -236,8 +236,8 @@ def test_the_launcher_dictionary_with_this_family_trains() -> None:
     family's envelope for another reason is skipped with that reason.
 
     The toggles the family's envelope couples to it are set with it, whatever the launcher holds: the kernel readout,
-    the coordinate block MLP, a linear or diagonal KL decoder, and token-only frames (``pos_phi='none'``) under the
-    Fisher table step."""
+    the coordinate block MLP, a linear or diagonal KL decoder, and deterministic token-only frames (``pos_phi='none'``,
+    ``phi_type_dropout=0``) under the Fisher table step."""
     path = Path(os.environ.get("VFE3_LAUNCHER_PATH", Path(__file__).resolve().parents[1] / "train_vfe3.py"))
     launcher = _launcher(path)
     envelope: Dict[str, Any] = {"family": FAMILY, "predictive_readout": "kernel", "block_mlp_mode": "coordinate"}
@@ -245,6 +245,7 @@ def test_the_launcher_dictionary_with_this_family_trains() -> None:
         envelope["decode_mode"] = "diagonal_chunked"
     if launcher.get("m_table_update_mode") == "fisher":
         envelope["pos_phi"] = "none"
+        envelope["phi_type_dropout"] = 0.0
     values = {**launcher, **envelope, **_TINY_SHAPES}
     if values.get("kl_max") is not None:
         values["kl_max"] = float(values["kl_max"]) * 8 / _launcher(path)["embed_dim"]

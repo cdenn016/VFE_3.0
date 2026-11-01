@@ -32,7 +32,7 @@ to EXACTLY (and under ``log_softmax``) on the canonical path.
 import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Callable, Dict, FrozenSet, Iterator, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Protocol, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
@@ -47,6 +47,7 @@ from vfe3.divergence import get_family, get_functional, kl
 from vfe3.families.base import _logdet_chol
 from vfe3.runtime import ieee_fp32_matmul
 from vfe3.numerics import (
+    _check_max_log,
     _count_decode_logdet_fallback,
     bounded_variance_from_log,
     safe_cholesky,
@@ -76,11 +77,17 @@ from vfe3.numerics import (
 # "fp64" therefore keeps the expanded algebra and raises the working precision, and the island must
 # extend THROUGH the logit -- a_v itself is large, so rounding it back to float32 before subtracting
 # per_pos and dividing by tau would throw the accuracy straight back away. Callers preserve fp64 for the finished
-# O(1) logit, not a_v. The severity is latent either way: sigma_log_embed trains freely against only
+# O(1) logit, not a_v. The island also starts AT the inputs: the decode tables and the query are upcast before c,
+# mc_v, mc_q, 1/sigma_v, the log-sums and per_pos are formed, so the logits are a float64 bank's. Upcasting those
+# pieces after forming them in float32 gained only about one decade (audit 2026-10-31 prior-bank-decode-1).
+# The severity is latent either way: sigma_log_embed trains freely against only
 # the eps=1e-6 floor, so this is harmless at init (2.4e-4 induced logit error) and about one order
 # of magnitude of shrinkage from material. Default "fp32" is bit-identical to every run on disk.
 _DECODE_AV_PRECISIONS = ("fp32", "fp64")
 _DECODE_AV_PRECISION: str = "fp32"
+
+# max_log of vfe3.numerics.bounded_variance_from_log, which PriorBank._decode_variance_table repeats in float64.
+_DECODE_SIGMA_MAX_LOG: float = 80.0
 
 # Prior covariance table layouts (VFE3Config.prior_covariance_table): the (V, K) log-variance table, or the
 # frame-free per-head Cholesky table (V, H, d(d+1)/2) of PriorBank._prior_covariance_blocks.
@@ -238,6 +245,48 @@ def _decode_av_lhs(
 _ieee_fp32_matmul = ieee_fp32_matmul
 
 
+class _IEEEFP32CrossTerm(torch.autograd.Function):
+    r"""The a_v cross term :math:`A = \mathrm{lhs}\,\mathrm{rhs}^\top` with the forward and both backward GEMMs at IEEE
+    fp32 (``decode_backward_ieee_fp32``; audit 2026-10-31 numerics-1).
+
+    With :math:`G = \partial L/\partial A` the backward is :math:`G\,\mathrm{rhs}` and :math:`G^\top\mathrm{lhs}`, the two
+    GEMMs autograd's matmul backward runs, here inside :func:`vfe3.runtime.ieee_fp32_matmul`. With
+    :math:`\mathrm{lhs} = [s_q + mc_q^2, -2mc_q]`, :math:`\mathrm{rhs} = [1/t_v, mc_v/t_v]` and the bias term they
+    assemble
+
+    .. math::
+        \frac{\partial L}{\partial(1/t_{vk})} = \sum_i G_{iv}\big(s_{q,ik} + mc_{q,ik}^2\big)
+            - 2\,mc_{vk}\sum_i G_{iv}\,mc_{q,ik} + mc_{vk}^2\sum_i G_{iv}
+          = \sum_i G_{iv}\big(s_{q,ik} + (mc_{q,ik} - mc_{vk})^2\big),
+
+    so under a TF32 policy (operands rounded to :math:`2^{-11}`) their relative error grows without bound as the
+    variances fall against the squared spread of the means. Saves only lhs and rhs, as autograd's matmul does, and
+    the backward is plain torch, so a double backward differentiates it (at the caller's policy).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        lhs: torch.Tensor,               # (..., N, 2K) float32
+        rhs: torch.Tensor,               # (Vc, 2K) float32
+    ) -> torch.Tensor:                   # (..., N, Vc)
+        ctx.save_for_backward(lhs, rhs)
+        with ieee_fp32_matmul():
+            return lhs @ rhs.transpose(-1, -2)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        lhs, rhs = ctx.saved_tensors
+        g_lhs = g_rhs = None
+        with ieee_fp32_matmul():
+            if ctx.needs_input_grad[0]:
+                g_lhs = grad @ rhs                                                         # (..., N, 2K) = G rhs
+            if ctx.needs_input_grad[1]:
+                g_rhs = (grad.reshape(-1, grad.shape[-1]).transpose(-1, -2)
+                         @ lhs.reshape(-1, lhs.shape[-1]))                                 # (Vc, 2K) = G^T lhs
+        return g_lhs, g_rhs
+
+
 def _decode_av(
     sq:    torch.Tensor,                  # (..., N, K) query variances (diag(Sigma_q) for the full family)
     mc_q:  torch.Tensor,                  # (..., N, K) centered query means
@@ -250,6 +299,7 @@ def _decode_av(
     return_error_bound: bool = False,
     precision: Optional[str] = None,
     bank_factors: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ieee_backward: bool = False,          # decode_backward_ieee_fp32: pin the cross term's backward GEMMs too
 ) -> 'torch.Tensor | tuple[torch.Tensor, torch.Tensor]':
     r"""``a_v`` under the active working precision -- the ONE place this algebra is written.
 
@@ -257,7 +307,9 @@ def _decode_av(
     to some and not others, which would let the fused CE and the logits it is pinned against
     disagree. Returns float64 under ``"fp64"`` ON PURPOSE: the caller must keep the island open
     through ``-0.5 * (a_v - per_pos) / tau_eff`` and retain fp64 logits for ranking, because a_v is the
-    large quantity and rounding it here would discard the entire gain. See the module note.
+    large quantity and rounding it here would discard the entire gain. See the module note. The
+    callers upcast the tables and the query before forming the pieces; pieces passed in float32 are
+    upcast here.
     """
     precision = _DECODE_AV_PRECISION if precision is None else precision
     if precision == "fp64" and sq.dtype is not torch.float64:
@@ -273,9 +325,14 @@ def _decode_av(
         rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)             # (Vc, 2K)
         bias = (mc_v ** 2 * inv_v).sum(-1) + lsum
     # The fp32 GEMMs run under IEEE fp32 whatever the process-global matmul policy, so the eps-based
-    # certificate below describes the arithmetic that actually ran. fp64 GEMMs ignore the policy.
+    # certificate below describes the arithmetic that actually ran. fp64 GEMMs ignore the policy. The
+    # backward GEMMs follow the caller's policy unless ieee_backward pins them as well.
+    pin_backward = (ieee_backward and lhs.dtype is torch.float32 and torch.is_grad_enabled()
+                    and (lhs.requires_grad or rhs.requires_grad))
     with (_ieee_fp32_matmul() if lhs.dtype is torch.float32 else nullcontext()):
-        out = lhs @ rhs.transpose(-1, -2) + bias                                  # (..., N, Vc)
+        cross = (_IEEEFP32CrossTerm.apply(lhs, rhs) if pin_backward
+                 else lhs @ rhs.transpose(-1, -2))                                # (..., N, Vc)
+        out = cross + bias                                                        # (..., N, Vc)
         if return_error_bound and sq.dtype is torch.float32 and precision == "fp32":
             absolute_sum = lhs.abs() @ rhs.abs().transpose(-1, -2) + bias.abs()
     if not return_error_bound:
@@ -345,7 +402,15 @@ def _outward_upper(logits: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
 
 
 def _final_ranking_uncertain(logits: torch.Tensor, bounds: torch.Tensor) -> bool:
-    r"""Whether any competitor interval overlaps the nominal winner interval."""
+    r"""Whether any competitor interval overlaps the nominal winner interval.
+
+    Float64 logits are not refined. Under ``decode_av_precision="fp64"`` every factor is formed after the decode
+    tables and the query are upcast, so those logits are a float64 bank's, with errors at float64 rounding (about
+    1e-9 logits at sigma_v = 1e-4 in the audit's probe, against about 0.09 before); before that island started at
+    the inputs, its float32-rounded factors cost about a quarter of near-tie rows their exact argmax (audit
+    2026-10-31 prior-bank-decode-1). The full family's per-position log-determinant still comes from the query-dtype
+    Cholesky factor, a constant of each row that every logit difference cancels.
+    """
     if logits.shape[-1] < 2 or logits.dtype is torch.float64:
         return False
     winner = logits.argmax(dim=-1, keepdim=True)
@@ -418,8 +483,8 @@ def _refined_candidate_decode(
         sq, logdet = sq[0], logdet[0]
         per_pos = pb.K + logdet
     else:
-        sq = sigma
-        per_pos = pb.K + torch.log(sigma.clamp(min=pb.eps)).sum(-1)
+        sq = sigma.clamp(min=pb.eps)                           # one clamp for the trace and log-det terms
+        per_pos = pb.K + torch.log(sq).sum(-1)
     a_v = _pairwise_decode_av(sq, mc_q, mc_v, inv_v, torch.log(sigma_v).sum(-1))
     refined = kernel_logits.double()
     refined[b, n, v] = _decode_analytic_kl_logits(a_v, per_pos, tau_eff.double(), torch.float64)
@@ -436,11 +501,13 @@ _ENCODERS: 'Dict[str, EncodeCallable]' = {}
 
 @dataclass(frozen=True)
 class EncodeRegistration:
-    """An encode callable and registration-owned prior-table routing capabilities."""
+    """An encode callable under its registered name.
+
+    The base-table omission capabilities it carried had no reader after the canonical-content encoders retired
+    (2f2772f) and were removed (audit 2026-10-31 prior-bank-decode-6).
+    """
 
     callable:               'EncodeCallable'
-    can_omit_base_mean:     bool = False
-    can_omit_base_variance: bool = False
 
 
 _ENCODER_REGISTRATIONS: Dict[str, EncodeRegistration] = {}
@@ -452,8 +519,9 @@ class DecodeRegistration:
 
     ``covariance_kinds`` is the resolved set of family covariance structures the decoder scores
     ("diagonal" and/or "full"); config validates ``family_cov_kind(cfg.family) in covariance_kinds``
-    rather than treating ``supports_full`` as an exclusive rank bit, so a dual-rank decoder (e.g.
-    ``family``) accepts BOTH a diagonal and a full family. ``supports_full`` is retained (public,
+    rather than treating ``supports_full`` as an exclusive rank bit, so a dual-rank decoder (one registered
+    with ``covariance_kinds={"diagonal", "full"}``; no built-in decoder is, since the generic ``family`` decode
+    was retired) accepts BOTH a diagonal and a full family. ``supports_full`` is retained (public,
     read by legacy callers) and stays coherent with the set: it is ``"full" in covariance_kinds``.
 
     Direct construction ``DecodeRegistration(callable, supports_full, supports_chunked, fused_ce)``
@@ -468,8 +536,6 @@ class DecodeRegistration:
     supports_chunked:  bool
     fused_ce:          'Optional[FusedCECallable]'
     covariance_kinds:  'Optional[FrozenSet[str]]'  = None
-    can_omit_base_mean: bool                       = False
-    can_omit_base_variance: bool                   = False
     fused_ce_supports_stats: bool                  = False
 
     def __post_init__(self) -> None:
@@ -478,8 +544,6 @@ class DecodeRegistration:
         for field_name in (
             "supports_full",
             "supports_chunked",
-            "can_omit_base_mean",
-            "can_omit_base_variance",
             "fused_ce_supports_stats",
         ):
             if type(getattr(self, field_name)) is not bool:
@@ -560,8 +624,6 @@ def register_encode(
 
     *,
     override:               bool           = False,
-    can_omit_base_mean:     bool = False,
-    can_omit_base_variance: bool = False,
 ) -> 'Callable[[EncodeCallable], EncodeCallable]':
     """Decorator registering an encode kernel under ``name``.
 
@@ -571,16 +633,8 @@ def register_encode(
     def _wrap(fn: 'EncodeCallable') -> 'EncodeCallable':
         if name in _ENCODERS and not override:
             raise KeyError(f"encode mode {name!r} already registered; pass override=True to replace")
-        # Capabilities belong to this NAME registration, never to the callable object. An alias or
-        # functools.wraps wrapper is therefore conservative unless this invocation declares otherwise.
-        if type(can_omit_base_mean) is not bool or type(can_omit_base_variance) is not bool:
-            raise TypeError("encoder base-table omission declarations must be bools")
         _ENCODERS[name] = fn
-        _ENCODER_REGISTRATIONS[name] = EncodeRegistration(
-            callable=fn,
-            can_omit_base_mean=can_omit_base_mean,
-            can_omit_base_variance=can_omit_base_variance,
-        )
+        _ENCODER_REGISTRATIONS[name] = EncodeRegistration(callable=fn)
         return fn
     return _wrap
 
@@ -615,8 +669,6 @@ def register_decode(
     override:          bool                        = False,
     fused_ce:          'Optional[FusedCECallable]'      = None,
     covariance_kinds:  'Optional[FrozenSet[str]]'       = None,
-    can_omit_base_mean:     bool                        = False,
-    can_omit_base_variance: bool                        = False,
     fused_ce_supports_stats: bool                       = False,
 ) -> 'Callable[[DecodeCallable], DecodeCallable]':
     """Decorator registering a decode kernel under ``name``.
@@ -666,18 +718,12 @@ def register_decode(
             raise ValueError(
                 f"decode mode {name!r} cannot declare fused-CE stats support without fused_ce"
             )
-        # Capabilities belong only to this registration record. Callable identity, aliases, and
-        # functools.wraps attributes cannot confer omission rights on a new registered name.
-        if type(can_omit_base_mean) is not bool or type(can_omit_base_variance) is not bool:
-            raise TypeError("decoder base-table omission declarations must be bools")
         _DECODERS[name] = DecodeRegistration(
             callable=fn,
             supports_full=resolved_full,
             supports_chunked=supports_chunked,
             fused_ce=fused_ce,
             covariance_kinds=resolved_kinds,
-            can_omit_base_mean=can_omit_base_mean,
-            can_omit_base_variance=can_omit_base_variance,
             fused_ce_supports_stats=fused_ce_supports_stats,
         )
         return fn
@@ -733,8 +779,10 @@ class PriorBank(nn.Module):
         decode_mode:         str,
         decode_chunk_size:   int,
         decode_av_precision: Optional[str],          # None: the module default _DECODE_AV_PRECISION
+        decode_backward_ieee_fp32: bool,
         decode_ce_checkpoint: str,
         decode_ce_triton:     bool,
+        decode_bank_triton:   bool,
         decode_ranking_fp64_escalation: bool,
         unigram_kappa:        float,
         decode_unigram_prior: bool,
@@ -744,7 +792,6 @@ class PriorBank(nn.Module):
 
         diagonal_covariance: bool  = True,           # derived from the family (VFE3Config.diagonal_covariance)
         irrep_dims:             Optional[List[int]] = None,
-        gauge_group_name:       Optional[str]       = None,
     ) -> None:
         super().__init__()
         if prior_covariance_table not in PRIOR_COVARIANCE_TABLES:
@@ -811,10 +858,18 @@ class PriorBank(nn.Module):
             raise ValueError(f"decode_ce_triton must be bool, got {decode_ce_triton!r}")
         self.decode_ce_triton = decode_ce_triton
         self.realized_decode_ce_kernel: Optional[str] = None
+        # decode_bank_triton (VFE3Config): on the fused route above, prepare rhs and bias in one Triton kernel with a
+        # closed-form backward (vfe3/kernels/decode_bank.py). decode_backward_ieee_fp32: run the backward GEMMs of
+        # the a_v cross term at IEEE fp32 on both CE routes (_IEEEFP32CrossTerm, kl_decode.KLDecodeCE).
+        for name, value in (("decode_bank_triton", decode_bank_triton),
+                            ("decode_backward_ieee_fp32", decode_backward_ieee_fp32)):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be bool, got {value!r}")
+        self.decode_bank_triton = decode_bank_triton
+        self.decode_backward_ieee_fp32 = decode_backward_ieee_fp32
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
-        self.gauge_group_name = gauge_group_name
         self.irrep_dims = irrep_dims
         self.n_gen = n_gen
         # Untying applies only to prior-bank decoders; linear is already independent.
@@ -946,8 +1001,8 @@ class PriorBank(nn.Module):
     ) -> Optional[torch.Tensor]:
         r""":math:`\mathrm{diag}\,\Sigma_q` when a diagonal-bank Gaussian decoder receives a full-layout covariance.
 
-        Reached by ``gaussian_block`` with ``decode_mode='diagonal_chunked'``. Against a diagonal bank
-        :math:`p_v = \mathcal N(\mu_v, \mathrm{diag}\,s_v)`,
+        Reached by a full-layout family (``gaussian_full``, ``gaussian_block``) with ``decode_mode='diagonal_chunked'``.
+        Against a diagonal bank :math:`p_v = \mathcal N(\mu_v, \mathrm{diag}\,s_v)`,
 
         .. math::
             2\,\mathrm{KL}(q\|p_v) = \sum_k\frac{\Sigma_{kk} + (\mu_k-\mu_{vk})^2}{s_{vk}} - K + \sum_k\log s_{vk}
@@ -1273,6 +1328,7 @@ class PriorBank(nn.Module):
 
         *,
         tau:     Optional[float] = None,  # override decode_tau; None -> self.decode_tau
+        canonical_frame: Optional[CanonicalFrameContext] = None,
     ) -> torch.Tensor:                   # (B, N, V) logits = -D_configured(q || pi_v)/tau_eff
         r"""Authoritative reference decode: -D_configured(q_i || pi_v)/tau_eff via the seam.
 
@@ -1290,26 +1346,80 @@ class PriorBank(nn.Module):
         scored against the intentionally DIAGONAL vocabulary-prior table (promoted with diag_embed
         only for a full family). (``nan_to_num`` inside ``safe_kl_clamp`` still maps NaN/+inf from
         degenerate pairs to +inf -> -inf logits.)
+
+        The query is read in the coordinates :meth:`decode` reads it (:meth:`_reference_decode_query`): under
+        ``decode_coordinates='reference'`` and for a frame-diagonal family that needs the realized frame
+        ``canonical_frame``, which a local-coordinate decode refuses (audit 2026-10-31 prior-bank-decode-3).
         """
+        mu_q, sigma_q = self._reference_decode_query(mu_q, sigma_q, canonical_frame)
         tau_eff = self._tau_eff(tau)
         logits = _decode_family(self, mu_q, sigma_q, tau_eff)           # configured family/divergence
         if self.decode_unigram_prior:
             logits = logits + self._unigram_bias()                       # same seam as decode()
         return logits
 
+    def _reference_decode_query(
+        self,
+        mu_q:            torch.Tensor,                           # (..., N, K) local means
+        sigma_q:         torch.Tensor,                           # (..., N, K) or (..., N, K, K) local covariance
+        canonical_frame: Optional[CanonicalFrameContext],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""The query of :meth:`reference_decode`: the moments :meth:`decode` scores, in the configured family's layout.
+
+        A frame-diagonal family reads :meth:`_frame_diagonal_query`. Under ``decode_coordinates='reference'`` it is
+        :math:`(\xi_i, C_i) = (U_i^{-1}\mu_i, U_i^{-1}\Sigma_iU_i^{-\top})` (:meth:`_reference_query`), with :math:`C_i`
+        kept full for a full-layout family that :meth:`decode` scores through its diagonal, so the oracle's KL differs
+        from the decoder's by the per-position constant of :meth:`_diagonal_decoder_dispersion` only. Local
+        coordinates read the query as given and refuse a frame.
+        """
+        if self.frame_diagonal and self.decode_mode != "linear":
+            return self._frame_diagonal_query(mu_q, sigma_q, canonical_frame)
+        if self.decode_coordinates == "reference":
+            xi, cov = self._reference_query(mu_q, sigma_q, canonical_frame)        # validates the frame
+            if (self.decode_mode != "linear" and get_family(self.family).cov_kind == "full"
+                    and cov is not None and cov.dim() == mu_q.dim()):
+                inverse = canonical_frame.inverse
+                compact = canonical_frame.block_diagonal or inverse.dim() == mu_q.dim() + 2
+                frame = CanonicalFrameContext(canonical_frame.forward, inverse, compact)
+                cov = reference_covariance(mu_q, sigma_q, frame)                   # (..., N, K, K)
+            return xi, cov
+        if canonical_frame is not None:
+            raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
+        return mu_q, sigma_q
+
+    def _decode_work_dtype(self, dtype: torch.dtype) -> torch.dtype:
+        r"""The working dtype of the a_v island: float64 under ``decode_av_precision="fp64"``, else ``dtype``."""
+        return torch.float64 if self.decode_av_precision == "fp64" else dtype
+
+    def _decode_variance_table(self, dtype: torch.dtype) -> torch.Tensor:   # (V, K)
+        r"""The decode variances :math:`\sigma_v = \max(e^{\min(\ell_v, 80)}, \epsilon)` of the log table, in ``dtype``.
+
+        In the table's own dtype this is :func:`vfe3.numerics.bounded_variance_from_log`. In another dtype (float64
+        under ``decode_av_precision="fp64"``) the same expression runs on the upcast table, and the overflow warning
+        reads the stored table, so its identity/version cache keeps hitting instead of checking a fresh copy per call.
+        """
+        table = self._decode_sigma_log_table()                                     # (V, K) log-variances
+        if table.dtype is dtype:
+            return bounded_variance_from_log(table, eps=self.eps)
+        _check_max_log(table, _DECODE_SIGMA_MAX_LOG)
+        return torch.exp(table.to(dtype).clamp(max=_DECODE_SIGMA_MAX_LOG)).clamp(min=self.eps)
+
     def _prepare_decode_bank_factors(self) -> Dict[str, torch.Tensor]:
-        r"""Prepare fixed vocabulary factors for A_v = lhs @ rhs^T + bias."""
-        sigma_v = bounded_variance_from_log(self._decode_sigma_log_table(), eps=self.eps)
-        mu_v = self._decode_mu_table()
+        r"""Prepare fixed vocabulary factors for A_v = lhs @ rhs^T + bias.
+
+        Under ``decode_av_precision="fp64"`` the tables are upcast before c, mc_v, 1/sigma_v and the log-sum are
+        formed, so every factor (c included, which the caller subtracts from the upcast query) is float64 (audit
+        2026-10-31 prior-bank-decode-1).
+        """
+        work = self._decode_work_dtype(self._decode_mu_table().dtype)
+        sigma_v = self._decode_variance_table(work)                                # (V, K)
+        mu_v = self._decode_mu_table().to(work)
         inv_v = 1.0 / sigma_v
         c = mu_v.mean(dim=0, keepdim=True)
         mc_v = mu_v - c
         lsum = torch.log(sigma_v).sum(-1)
-        work_mc_v, work_inv_v, work_lsum = mc_v, inv_v, lsum
-        if self.decode_av_precision == "fp64":
-            work_mc_v, work_inv_v, work_lsum = mc_v.double(), inv_v.double(), lsum.double()
-        rhs = torch.cat([work_inv_v, work_mc_v * work_inv_v], dim=-1)
-        bias = (work_mc_v.square() * work_inv_v).sum(-1) + work_lsum
+        rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)
+        bias = (mc_v.square() * inv_v).sum(-1) + lsum
         return dict(c=c, mc_v=mc_v, inv_v=inv_v, lsum=lsum, rhs=rhs, bias=bias)
 
     def _decode_bank_factors(self) -> Dict[str, torch.Tensor]:
@@ -1368,7 +1478,7 @@ class PriorBank(nn.Module):
 
     def _decode_ce_triton_active(
         self,
-        lhs:   torch.Tensor,                     # (..., N, 2K) expanded-form left factor
+        lhs:   torch.Tensor,                     # (..., N, ...) a query-side tensor of the call (its device is read)
         u_all: Optional[torch.Tensor],           # (V,) unigram bias or None
     ) -> bool:
         r"""Whether this KL decode CE call runs the fused Triton kernels, and record the kernel that runs."""
@@ -1378,49 +1488,55 @@ class PriorBank(nn.Module):
 
     def _decode_ce_triton_rows(
         self,
-        sq:          torch.Tensor,               # (B, N, K) query variances (diag(Sigma_q) for the full family)
-        mc_q:        torch.Tensor,               # (B, N, K) centered query means
-        lhs:         torch.Tensor,               # (B, N, 2K) _decode_av_lhs(sq, mc_q)
-        per_pos:     torch.Tensor,               # (B, N, 1) per-position v-independent term
-        mu_v_all:    torch.Tensor,               # (V, K) decode mean table
-        sigma_v_all: torch.Tensor,               # (V, K) decode variances
+        lhs:         torch.Tensor,               # (B, N, 2K) _decode_av_lhs(sq, mc_q), working dtype
+        per_pos:     torch.Tensor,               # (B, N, 1) per-position v-independent term, working dtype
+        mu_v_all:    torch.Tensor,               # (V, K) decode mean table, working dtype
+        sigma_v_all: Optional[torch.Tensor],     # (V, K) decode variances, working dtype; None under decode_bank_triton
         c:           torch.Tensor,               # (1, K) centering offset mean_v(mu_v)
         u_all:       Optional[torch.Tensor],     # (V,) unigram bias or None
         tau_eff:     torch.Tensor,               # (1,) effective temperature
         targets:     torch.Tensor,               # (B, N) target ids in [0, V)
         chunk:       int,                        # vocabulary chunk width
+        bytes_ref:   torch.Tensor,               # (B, N, ...) the query in its own dtype, for the checkpoint accounting
     ) -> torch.Tensor:                           # (B, N) CE rows = -log-softmax at the target
         r"""The chunked KL decode CE rows through the fused Triton kernels (``decode_ce_triton``).
 
-        Same factors and working precision as the torch loop of the two callers: the ``_decode_av`` expanded
-        form (built in float64 from the float32 pieces under ``decode_av_precision='fp64'``), the bias add, clamp,
+        Same factors and working precision as the torch loop of ``_kl_decode_ce``: the ``_decode_av`` expanded
+        form (in float64 from the upcast tables and query under ``decode_av_precision='fp64'``), the bias add, clamp,
         temperature and unigram bias of ``_decode_analytic_kl_logits``, and the cross-entropy of
         ``_decode_ce_combine_summaries``. The (S, Vc) cross term is kept for backward exactly when the torch
         route would keep its chunk workspace (``decode_ce_checkpoint`` accounting) and recomputed otherwise.
-        Rounding-level differences are listed in ``vfe3/kernels/kl_decode.py``.
+        Rounding-level differences are listed in ``vfe3/kernels/kl_decode.py``. Under ``decode_bank_triton`` the
+        right factor and bias come from one fused kernel with a closed-form backward
+        (``vfe3/kernels/decode_bank.py``; audit 2026-10-31 perf-live-path-3), rounding-level from the torch
+        preparation below.
         """
         from vfe3.kernels.kl_decode import kl_decode_ce_rows
         V = self.vocab_size
-        work = torch.float64 if self.decode_av_precision == "fp64" else lhs.dtype
-        lhs_w = lhs if lhs.dtype is work else _decode_av_lhs(sq.to(work), mc_q.to(work))
-        mc_v = (mu_v_all - c).to(work)                                      # (V, K) centered prior means
-        inv_v = (1.0 / sigma_v_all).to(work)                                # (V, K)
-        lsum = torch.log(sigma_v_all).sum(-1).to(work)                      # (V,)
-        rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                      # (V, 2K)
-        bias = (mc_v ** 2 * inv_v).sum(-1) + lsum                           # (V,)
+        work = lhs.dtype
+        if sigma_v_all is None:
+            from vfe3.kernels.decode_bank import DECODE_BANK_MAX_LOG, decode_bank_factors
+            table = self._decode_sigma_log_table()
+            _check_max_log(table, DECODE_BANK_MAX_LOG)                      # the warning bounded_variance_from_log gives
+            rhs, bias = decode_bank_factors(mu_v_all, table.to(work), c, eps=self.eps)   # (V, 2K), (V,)
+        else:
+            mc_v = mu_v_all - c                                             # (V, K) centered prior means
+            inv_v = 1.0 / sigma_v_all                                       # (V, K)
+            lsum = torch.log(sigma_v_all).sum(-1)                           # (V,)
+            rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                  # (V, 2K)
+            bias = (mc_v ** 2 * inv_v).sum(-1) + lsum                       # (V,)
         grad_active = torch.is_grad_enabled() and any(
-            value is not None and value.requires_grad for value in
-            (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff))
+            value is not None and value.requires_grad for value in (lhs, per_pos, rhs, bias, tau_eff))
         aggregate = self.decode_ce_checkpoint == "auto_aggregate"
         activation_bytes = _decode_ce_chunk_activation_bytes(
-            lhs, V if aggregate else min(chunk, V), inner=2,
+            bytes_ref, V if aggregate else min(chunk, V), inner=2,
             workspace_bytes_per_scalar=(8 if aggregate and self.decode_av_precision == "fp64" else None))
         keep = grad_active and not _decode_ce_should_checkpoint(
             self.decode_ce_checkpoint, grad_active, activation_bytes)
         ce_rows = kl_decode_ce_rows(
-            lhs_w.reshape(-1, lhs_w.shape[-1]), per_pos.to(work).reshape(-1), rhs, bias,
+            lhs.reshape(-1, lhs.shape[-1]), per_pos.reshape(-1), rhs, bias,
             u_all.to(work) if u_all is not None else None, tau_eff.to(work), targets.reshape(-1),
-            chunk=chunk, keep=keep)                                         # (S,)
+            chunk=chunk, keep=keep, ieee_backward=self.decode_backward_ieee_fp32)   # (S,)
         return ce_rows.reshape(targets.shape)
 
     def decode_ce_diagonal_chunked(
@@ -1448,12 +1564,16 @@ class PriorBank(nn.Module):
         The offset ``c`` is a per-coordinate ``(1, K)`` mean over ALL V, computed in one ``O(V*K)``
         pass with no big tensor, so it is IDENTICAL to the full path (the closed form is
         offset-invariant: ``(mu_q - c) - (mu_v - c) == mu_q - mu_v``). The V-axis reduction (the
-        chunk ``logsumexp`` and the target gather) happens INSIDE a gradient-checkpointed function
-        that returns only the three ``(B, N)`` centered per-chunk summaries, so the ``(B, N, Vc)`` chunk logit
-        is born and dies inside the checkpoint -- it is recomputed in backward and never crosses the
-        boundary (without this the downstream ``logsumexp``/``exp``/``gather`` would save it and the
-        peak would stay ``(B, N, V)``). Recompute is deterministic (no RNG here), so value and
-        gradient match the full path exactly.
+        chunk ``logsumexp`` and the target gather) happens inside a function that returns only the
+        three ``(B, N)`` centered per-chunk summaries, so no ``(B, N, V)`` logit tensor is formed.
+        Whether that function runs under a gradient checkpoint is decided per chunk by
+        ``_decode_ce_should_checkpoint`` (``decode_ce_checkpoint``; since 2026-08-07 the checkpoint is
+        not unconditional): under grad, a chunk whose activation estimate exceeds
+        ``DECODE_CE_CHECKPOINT_AUTO_BYTES`` (2 GiB; under ``"auto_aggregate"`` the estimate covers the
+        whole vocabulary) is checkpointed, and its ``(B, N, Vc)`` chunk logit is recomputed in backward;
+        below the threshold each chunk's workspace is saved for backward, so the retained memory is of
+        order ``(B, N, V)``. The fused route (``decode_ce_triton``) applies the same decision.
+        Recompute is deterministic (no RNG here), so value and gradient match the full path exactly.
 
         ``decode_unigram_prior=True`` adds the chunk slice of kappa * log pi_v to each chunk's
         logits BEFORE its logsumexp/gather, so the streamed CE equals the dense CE over the
@@ -1473,104 +1593,17 @@ class PriorBank(nn.Module):
             sigma_q = sigma_q[original_valid].unsqueeze(0) # (1, S, K[, K])
             targets = targets[original_valid].unsqueeze(0)
 
-        tau_eff = self._tau_eff(tau)
-        chunk = self.decode_chunk_size if chunk_size is None else chunk_size
-        V = self.vocab_size
-
-        sigma_v_all = bounded_variance_from_log(
-            self._decode_sigma_log_table(), eps=self.eps,
-        )                                                                             # (V, K)
-        mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
-        c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
-        u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
-
-        mc_q = mu_q - c                                                     # (B, N, K) centered query means
-        lhs = _decode_av_lhs(sigma_q, mc_q)                                 # (B, N, 2K) expanded-form left factor
+        # One eps-clamped query variance serves the trace term (lhs) and the per-position log-determinant, as
+        # DiagonalGaussian.renyi_closed_form clamps it: a raw trace beside a clamped log-det let the zero clamp of
+        # 0.5 (a_v - per_pos) tie the nearest tokens once a variance fell below eps (audit 2026-10-31
+        # prior-bank-decode-2). It is the identity where sigma_q >= eps, as on the encode-table variances.
+        sq = sigma_q.to(self._decode_work_dtype(mu_q.dtype)).clamp(min=self.eps)   # (B, N, K)
         # Per-position, v-INDEPENDENT term of -KL/tau_eff: it cancels in the CE difference
         # (logsumexp - target_logit) but is carried so each chunk's logits equal _decode_diagonal's.
-        per_pos = self.K + torch.log(sigma_q.clamp(min=self.eps)).sum(-1, keepdim=True)  # (B, N, 1)
-
-        def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
-                             mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
-                             lsum_c:  torch.Tensor,
-                             in_chunk_f: torch.Tensor,
-                             local_idx: torch.Tensor,
-                             u_c:     Optional[torch.Tensor],
-                             sq_:     torch.Tensor,
-                             mc_q_:   torch.Tensor) -> 'tuple[Optional[torch.Tensor], ...]':
-            r"""Reduce final scores to centered LSE/target/max summaries, each (B, N).
-
-            logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk (see _decode_diagonal). The
-            full (B, N, Vc) chunk logit lives only here so checkpointing frees it after forward.
-            ``in_chunk_f`` is a 0/1 (B, N) mask selecting positions whose target falls in this chunk.
-
-            ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
-            a_v form can difference before squaring (audit 2026-08-06 F32); the default expanded
-            form uses ``lhs_`` and ignores them.
-            """
-            a_v = _decode_av(
-                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
-            logit_chunk = _decode_analytic_kl_logits(a_v, per_pos_, tau_eff, lhs_.dtype)
-            if u_c is not None:
-                logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
-            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
-
+        per_pos = self.K + torch.log(sq).sum(-1, keepdim=True)              # (B, N, 1)
         valid = targets != ignore_index                                    # (B, N) bool
-        scored_valid = original_valid
-        if self._decode_ce_triton_active(lhs, u_all):
-            ce_per_pos = self._decode_ce_triton_rows(
-                sigma_q, mc_q, lhs, per_pos, mu_v_all, sigma_v_all, c, u_all, tau_eff, targets, chunk)
-            ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
-            return _decode_ce_result(ce, scored_valid, return_stats)
-        lse_chunks = []
-        max_chunks = []
-        target_chunks = []
-        in_chunks = []
-
-        for v0 in range(0, V, chunk):
-            v1 = min(v0 + chunk, V)
-            mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
-            inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K)
-            lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,)
-            u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
-            # Target gather indices: positions whose target lands in [v0, v1). Ignored positions have
-            # target < 0 < v0, so they never match -> target_logit stays 0 for them and `valid` excludes
-            # them from the mean. local_idx is clamped to a safe range for the out-of-window rows.
-            in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
-            in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
-            local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            grad_active = torch.is_grad_enabled() and any(
-                value is not None and value.requires_grad for value in
-                (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff))
-            activation_bytes = _decode_ce_chunk_activation_bytes(
-                lhs, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, inner=2,
-                workspace_bytes_per_scalar=(8 if self.decode_ce_checkpoint == "auto_aggregate"
-                                             and self.decode_av_precision == "fp64" else None))
-            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
-                chunk_result = _checkpoint.checkpoint(
-                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c,
-                    in_chunk_f, local_idx,
-                    u_c, sigma_q, mc_q,
-                    use_reentrant=False,
-                )
-            else:
-                chunk_result = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    sigma_q, mc_q,
-                )
-            lse_chunk, contrib, maximum = chunk_result[:3]
-            lse_chunks.append(lse_chunk)
-            max_chunks.append(maximum)
-            target_chunks.append(contrib)
-            in_chunks.append(in_chunk)
-
-        ce_per_pos = _decode_ce_combine_summaries(
-            lse_chunks, max_chunks, target_chunks, in_chunks)                           # (B, N) = -log-softmax at target
-        # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
-        # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
-        # (Matches the full path, whose F.cross_entropy mean over zero counted tokens would be NaN.)
-        ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
-        return _decode_ce_result(ce, scored_valid, return_stats)
+        return self._kl_decode_ce(mu_q, sq, per_pos, targets, valid, original_valid,
+                                  tau=tau, chunk_size=chunk_size, return_stats=return_stats)
 
     def decode_degenerate_positions(
         self,
@@ -1685,7 +1718,7 @@ class PriorBank(nn.Module):
         (K, K) Cholesky: the v-dependent trace and Mahalanobis terms are matmuls over V and the only
         (K, K) work is ONE log|Sigma_q| per position (``_full_cov_query_invariants``). This is the
         full-cov twin of ``decode_ce_diagonal_chunked`` -- same streaming logsumexp + target gather
-        inside a gradient checkpoint, same global centering offset c = mean_v(mu_v) for fp32
+        under the same per-chunk checkpoint decision, same global centering offset c = mean_v(mu_v) for fp32
         stability -- with the diagonal query variance replaced by diag(Sigma_q), the prior kept at
         its existing variance floor, and the per-position v-independent term K + sum_k log sigma_q
         replaced by K + log|Sigma_q|. Value-equal to F.cross_entropy(_decode_full(...)) to the
@@ -1705,51 +1738,17 @@ class PriorBank(nn.Module):
             spd_ok = spd_ok[original_valid].unsqueeze(0)
             targets = targets[original_valid].unsqueeze(0)
 
-        tau_eff = self._tau_eff(tau)
-        chunk = self.decode_chunk_size if chunk_size is None else chunk_size
-        V = self.vocab_size
-
-        sigma_v_all = bounded_variance_from_log(
-            self._decode_sigma_log_table(), eps=self.eps,
-        )                                                                             # (V, K)
-        mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
-        c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
-        u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
-
         diag_sq, logdet_q, spd_ok = self._full_cov_query_invariants_from_prepared(
             sigma_q, factor_q, spd_ok)
-        mc_q = mu_q - c                                                     # (B, N, K) centered query means
-        lhs = _decode_av_lhs(diag_sq, mc_q)                                 # (B, N, 2K) expanded-form left factor
+        work = self._decode_work_dtype(mu_q.dtype)
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
         # logits equal _decode_full's): K + log|Sigma_q| (the full-cov analogue of K + sum_k log sigma_q).
-        per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
+        # Under "fp64" the log-determinant of the query-dtype factor is upcast: the factorization, and with it the
+        # exclusion mask, stays the dense path's, and its rounding is a per-row constant every logit difference
+        # cancels.
+        per_pos = self.K + logdet_q.unsqueeze(-1).to(work)                 # (B, N, 1)
         final_ok = spd_ok
         _count_decode_logdet_fallback(final_ok)
-
-        def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
-                             mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
-                             lsum_c:  torch.Tensor,
-                             in_chunk_f: torch.Tensor,
-                             local_idx: torch.Tensor,
-                             u_c:     Optional[torch.Tensor],
-                             sq_:     torch.Tensor,
-                             mc_q_:   torch.Tensor) -> 'tuple[Optional[torch.Tensor], ...]':
-            r"""Reduce final scores to centered LSE/target/max summaries, each (B, N).
-
-            a_v = sum_k[(diag(Sigma_q) + (mc_q-mc_v)^2)/sigma_v] + sum_k log sigma_v
-                = trace_term + mahalanobis + log|diag(sigma_v)|, the gaussian_full KL with a
-            diagonal prior; logit = -0.5(a_v - per_pos)/tau_eff. The (B, N, Vc) chunk logit lives
-            only here so checkpointing frees it after forward.
-
-            ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
-            a_v form can difference before squaring (audit 2026-08-06 F32).
-            """
-            a_v = _decode_av(
-                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
-            logit_chunk = _decode_analytic_kl_logits(a_v, per_pos_, tau_eff, lhs_.dtype)
-            if u_c is not None:
-                logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
-            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
 
         # A position whose Sigma_q is not PD is EXCLUDED, exactly like an ignore_index token, rather
         # than scored (audit 2026-08-06 F31); it leaves both the numerator and the denominator, and
@@ -1761,11 +1760,80 @@ class PriorBank(nn.Module):
             scored_valid[original_valid] = valid.flatten()
         else:
             scored_valid = valid
-        if self._decode_ce_triton_active(lhs, u_all):
+        return self._kl_decode_ce(mu_q, diag_sq.to(work), per_pos, targets, valid, scored_valid,
+                                  tau=tau, chunk_size=chunk_size, return_stats=return_stats)
+
+    def _kl_decode_ce(
+        self,
+        mu_q:         torch.Tensor,              # (B, N, K) query means in decode coordinates (rows packed), own dtype
+        sq:           torch.Tensor,              # (B, N, K) query variances, working dtype (diag(Sigma_q) when full)
+        per_pos:      torch.Tensor,              # (B, N, 1) per-position v-independent term, working dtype
+        targets:      torch.Tensor,              # (B, N) target ids (-100 = ignore)
+        valid:        torch.Tensor,              # (B, N) bool rows that enter the mean
+        scored_valid: torch.Tensor,              # original-shape scored mask the stats report
+
+        *,
+        tau:          Optional[float],
+        chunk_size:   Optional[int],
+        return_stats: bool,
+    ) -> 'torch.Tensor | DecodeCEResult':
+        r"""The chunked KL decode cross-entropy shared by ``decode_ce_diagonal_chunked`` and ``decode_ce_full_chunked``.
+
+        Both score :math:`\ell_{iv} = -\tfrac12(a_v - \mathrm{per\_pos}_i)/\tau_{\mathrm{eff}}` with the expanded-form
+        :math:`a_v` of :func:`_decode_av` against the diagonal decode bank and differ only in the query variance
+        (:math:`\sigma_q` or :math:`\operatorname{diag}\Sigma_q`) and the per-position term
+        (:math:`K + \sum_k\log\sigma_q` or :math:`K + \log|\Sigma_q|`), which the callers form; one chunk loop serves
+        both (audit 2026-10-31 dead-code-6). Under ``decode_av_precision="fp64"`` the tables and the query mean are
+        upcast here, before c, mc_v, mc_q, 1/sigma_v and the log-sums are formed, and the callers pass ``sq`` and
+        ``per_pos`` upcast (prior-bank-decode-1). CUDA tensors run the fused Triton rows (``_decode_ce_triton_rows``),
+        everything else the torch chunk loop below.
+        """
+        tau_eff = self._tau_eff(tau)
+        chunk = self.decode_chunk_size if chunk_size is None else chunk_size
+        V = self.vocab_size
+        work = sq.dtype
+        u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
+        fused = self._decode_ce_triton_active(mu_q, u_all)
+        sigma_v_all = None
+        if not (fused and self.decode_bank_triton):                        # the fused bank reads the log table itself
+            sigma_v_all = self._decode_variance_table(work)                 # (V, K)
+        mu_v_all = self._decode_mu_table().to(work)                         # (V, K) decode table (untied if set)
+        c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
+        mc_q = mu_q.to(work) - c                                            # (B, N, K) centered query means
+        lhs = _decode_av_lhs(sq, mc_q)                                      # (B, N, 2K) expanded-form left factor
+        if fused:
             ce_per_pos = self._decode_ce_triton_rows(
-                diag_sq, mc_q, lhs, per_pos, mu_v_all, sigma_v_all, c, u_all, tau_eff, targets, chunk)
+                lhs, per_pos, mu_v_all, sigma_v_all, c, u_all, tau_eff, targets, chunk, mu_q)
             ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
             return _decode_ce_result(ce, scored_valid, return_stats)
+
+        def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
+                             mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
+                             lsum_c:  torch.Tensor,
+                             in_chunk_f: torch.Tensor,
+                             local_idx: torch.Tensor,
+                             u_c:     Optional[torch.Tensor],
+                             sq_:     torch.Tensor,
+                             mc_q_:   torch.Tensor) -> 'tuple[Optional[torch.Tensor], ...]':
+            r"""Reduce final scores to centered LSE/target/max summaries, each (B, N).
+
+            logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk, a_v = sum_k[(sq + (mc_q-mc_v)^2)/sigma_v]
+            + sum_k log sigma_v (see _decode_diagonal and _decode_full). The full (B, N, Vc) chunk logit lives
+            only here so checkpointing frees it after forward. ``in_chunk_f`` is a 0/1 (B, N) mask selecting
+            positions whose target falls in this chunk.
+
+            ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
+            a_v form can difference before squaring (audit 2026-08-06 F32); the default expanded
+            form uses ``lhs_`` and ignores them.
+            """
+            a_v = _decode_av(
+                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision,
+                ieee_backward=self.decode_backward_ieee_fp32)
+            logit_chunk = _decode_analytic_kl_logits(a_v, per_pos_, tau_eff, lhs_.dtype)
+            if u_c is not None:
+                logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
+            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
+
         lse_chunks = []
         max_chunks = []
         target_chunks = []
@@ -1777,26 +1845,33 @@ class PriorBank(nn.Module):
             inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K) = 1/sigma_v
             lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,) = sum_k log sigma_v
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
+            # Target gather indices: positions whose target lands in [v0, v1). Ignored positions have
+            # target < 0 < v0, so they never match -> target_logit stays 0 for them and `valid` excludes
+            # them from the mean. local_idx is clamped to a safe range for the out-of-window rows.
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and any(
                 value is not None and value.requires_grad for value in
                 (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff))
+            # The workspace accounting keeps the query's own dtype (mu_q), as before the fp64 island moved to the
+            # inputs; auto_aggregate counts fp64 scores at 8 bytes.
             activation_bytes = _decode_ce_chunk_activation_bytes(
-                lhs, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, inner=2,
+                mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, inner=2,
                 workspace_bytes_per_scalar=(8 if self.decode_ce_checkpoint == "auto_aggregate"
                                              and self.decode_av_precision == "fp64" else None))
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
+                # The closure draws no random numbers, so no RNG state is stashed or restored (audit 2026-10-31
+                # gap-checkpoint-recompute-semantics-4).
                 chunk_result = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c,
-                    in_chunk_f, local_idx, u_c, diag_sq, mc_q,
-                    use_reentrant=False,
+                    in_chunk_f, local_idx, u_c, sq, mc_q,
+                    use_reentrant=False, preserve_rng_state=False,
                 )
             else:
                 chunk_result = _chunk_summaries(
                     lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    diag_sq, mc_q,
+                    sq, mc_q,
                 )
             lse_chunk, contrib, maximum = chunk_result[:3]
             lse_chunks.append(lse_chunk)
@@ -1805,9 +1880,10 @@ class PriorBank(nn.Module):
             in_chunks.append(in_chunk)
 
         ce_per_pos = _decode_ce_combine_summaries(
-            lse_chunks, max_chunks, target_chunks, in_chunks)                            # (B, N) = -log-softmax at target
+            lse_chunks, max_chunks, target_chunks, in_chunks)                           # (B, N) = -log-softmax at target
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
+        # (Matches the full path, whose F.cross_entropy mean over zero counted tokens would be NaN.)
         ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
         return _decode_ce_result(ce, scored_valid, return_stats)
 
@@ -1829,9 +1905,10 @@ class PriorBank(nn.Module):
         the (B, N, V) logit tensor (plus cross_entropy's same-size log-softmax copy, both retained
         for backward on the dense path; the dominant decode VRAM at large B, vram audit 2026-06-10).
         Same streaming contract as ``decode_ce_diagonal_chunked``: each vocab chunk's logits are
-        born and die inside a gradient-checkpointed reduction that returns only the (B, N) chunk
-        logsumexp and target-logit summaries; recompute is deterministic, so value and gradient (to
-        mu_q, W, and b) match the dense path exactly. The unigram-prior chunk-slice add follows
+        reduced to the (B, N) chunk logsumexp and target-logit summaries, under a gradient checkpoint
+        when ``_decode_ce_should_checkpoint`` decides so (otherwise the chunk's workspace is saved for
+        backward); recompute is deterministic, so value and gradient (to mu_q, W, and b) match the
+        dense path exactly. The unigram-prior chunk-slice add follows
         ``decode_ce_diagonal_chunked``. Ignored positions are gathered out before projection;
         the original mask still supplies scored and excluded token counts. Under
         ``decode_coordinates='reference'`` the logits read :math:`\xi_i = U_i^{-1}\mu_i` through
@@ -1853,12 +1930,13 @@ class PriorBank(nn.Module):
             \mathrm{CE}(\mu) + \tfrac12 \Big[\sum_v p_v \big((W \circ W)\sigma\big)_v
             - \sum_k \sigma_k (W^\top p)_k^2\Big].
 
-        Each chunk returns, besides its summaries, the chunk-normalized moments
-        :math:`\sum_{v \in c} e^{\ell_v - \mathrm{lse}_c} [w_v, w_v \circ w_v]` from one
-        :math:`(B, N, V_c) \times (V_c, 2K)` GEMM in the caller's precision (outside the
-        ``decode_logits_amp`` autocast); the chunks are recombined with weights
-        :math:`e^{\mathrm{lse}_c - \mathrm{LSE}}`. No (B, N, V, K) tensor is formed, and gradients reach
-        :math:`\mu`, :math:`\sigma`, :math:`W` and the bias. The full-covariance analogue
+        Each chunk returns, besides its summaries, the mean and the variance of :math:`w` under its normalized
+        softmax as centered moments about the chunk's most probable row (``_chunk_summaries_second_order``), from
+        one :math:`(B, N, V_c) \times (V_c, 2K)` GEMM at IEEE fp32 (outside the ``decode_logits_amp`` autocast);
+        the chunks are recombined by the law of total variance with weights :math:`e^{\mathrm{lse}_c - \mathrm{LSE}}`,
+        a sum of nonnegative terms. The uncentered :math:`\mathbb{E}_p[w \circ w] - \mathbb{E}_p[w]^2` cancelled to
+        rounding residue of either sign at a confident softmax (audit 2026-10-31 numerics-3). No (B, N, V, K)
+        tensor is formed, and gradients reach :math:`\mu`, :math:`\sigma`, :math:`W` and the bias. The full-covariance analogue
         :math:`\tfrac12\mathrm{tr}(\Sigma W^\top \mathrm{diag}(p) W) - \tfrac12 (W^\top p)^\top \Sigma (W^\top p)`
         needs a per-position :math:`(K, K)` moment (K times the logits GEMM) and is not implemented.
         """
@@ -1921,13 +1999,36 @@ class PriorBank(nn.Module):
                 in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
                 b_c:     Optional[torch.Tensor],
                 u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
-            r"""As ``_chunk_summaries`` plus the chunk-normalized moments
-            :math:`\sum_{v \in c} e^{\ell_v - \mathrm{lse}_c} [w_v, w_v \circ w_v]`, (B, N, 2K)."""
+            r"""As ``_chunk_summaries`` plus :math:`[\mathbb{E}_{p^c}w, \mathrm{Var}_{p^c}w]`, (B, N, 2K), under the
+            chunk-normalized softmax :math:`p^c`.
+
+            With :math:`r` the row of the chunk's most probable class and :math:`p'` the chunk softmax without it,
+            one GEMM forms :math:`M_1 = \sum_v p'_v w_v` and :math:`M_2 = \sum_v p'_v\,w_v \circ w_v`, and
+            :math:`m_0 = \sum_v p'_v`. Then
+
+            .. math::
+                \mathbb{E}_{p^c}w = r + (M_1 - m_0 r), \qquad
+                \mathrm{Var}_{p^c}w = \big(M_2 - 2r \circ M_1 + m_0\,r \circ r\big) - (M_1 - m_0 r)^{\circ 2},
+
+            exact for any :math:`r` (the removed class contributes :math:`w - r = 0`). Each term is of order
+            :math:`m_0 = 1 - p^c_{\max}` or its square, so nothing cancels as the softmax concentrates; the variance
+            is clamped at zero against rounding.
+            """
             logit_chunk = _chunk_logits(mu_, w_c, b_c, u_c)                # (B, N, Vc)
             lse_chunk, contrib = _chunk_reduce(logit_chunk, in_chunk_f, local_idx)
-            p_c = torch.exp(logit_chunk - lse_chunk.unsqueeze(-1))         # (B, N, Vc) chunk-normalized
-            w_moments = torch.cat((w_c, w_c * w_c), dim=-1).to(p_c.dtype)  # (Vc, 2K) [w_v, w_v o w_v]
-            return lse_chunk, contrib, p_c @ w_moments                     # (B, N, 2K)
+            top = logit_chunk.argmax(dim=-1, keepdim=True)                 # (B, N, 1) most probable class
+            rest = logit_chunk.scatter(-1, top, float("-inf"))             # (B, N, Vc) without it
+            p_rest = torch.exp(rest - lse_chunk.unsqueeze(-1))             # (B, N, Vc) p', zero at the top class
+            w_moments = torch.cat((w_c, w_c * w_c), dim=-1).to(p_rest.dtype)   # (Vc, 2K) [w_v, w_v o w_v]
+            with ieee_fp32_matmul():
+                moments = p_rest @ w_moments                               # (B, N, 2K) [M_1, M_2]
+            k = w_c.shape[-1]
+            m1, m2 = moments[..., :k], moments[..., k:]                    # (B, N, K) each
+            m0 = p_rest.sum(-1, keepdim=True)                              # (B, N, 1) 1 - p_max, summed directly
+            ref = w_c.to(p_rest.dtype)[top.squeeze(-1)]                    # (B, N, K) r
+            offset = m1 - m0 * ref                                         # (B, N, K) E_{p^c} w - r
+            variance = ((m2 - 2.0 * ref * m1 + m0 * ref * ref) - offset * offset).clamp(min=0.0)
+            return lse_chunk, contrib, torch.cat((ref + offset, variance), dim=-1)   # (B, N, 2K)
 
         valid = targets != ignore_index                                    # (B, N) bool
         second_order = sigma_q is not None
@@ -1945,14 +2046,14 @@ class PriorBank(nn.Module):
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad)
             # The second-order closure keeps two (B, N, Vc) tensors for backward, the logits and the chunk
-            # probabilities p_c (audit 2026-10-12 round 2, item 16), so it counts twice the first-order workspace.
+            # probabilities p' (audit 2026-10-12 round 2, item 16), so it counts twice the first-order workspace.
             activation_bytes = _decode_ce_chunk_activation_bytes(
                 mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, 2 if second_order else 1)
             summaries = _chunk_summaries_second_order if second_order else _chunk_summaries
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 chunk_result = _checkpoint.checkpoint(
                     summaries, mu_q, w_c, in_chunk_f, local_idx, b_c, u_c,
-                    use_reentrant=False,
+                    use_reentrant=False, preserve_rng_state=False,   # no random draws in the closure
                 )
             else:
                 chunk_result = summaries(mu_q, w_c, in_chunk_f, local_idx, b_c, u_c)
@@ -1971,13 +2072,16 @@ class PriorBank(nn.Module):
         ce = (ce_per_pos * valid).sum() / n_valid
         if not second_order:
             return _decode_ce_result(ce, original_valid, return_stats)
-        # Global moments E_p[w], E_p[w o w]: chunk weights exp(lse_c - LSE) sum to 1 per position.
-        chunk_weight = torch.exp(lse_stack - logsumexp_v)                  # (C, B, N)
-        moments = (chunk_weight.unsqueeze(-1) * torch.stack(moment_chunks, dim=0)).sum(0)  # (B, N, 2K)
+        # Var_p(w) by the law of total variance over the chunks, weights exp(lse_c - LSE) summing to 1 per position:
+        # every term is a chunk variance or a squared chunk offset, nonnegative, so the combination cancels nothing.
+        chunk_weight = torch.exp(lse_stack - logsumexp_v).unsqueeze(-1)   # (C, B, N, 1)
+        stats = torch.stack(moment_chunks, dim=0)                          # (C, B, N, 2K)
         K = mu_q.shape[-1]
-        mean_w, mean_w_sq = moments[..., :K], moments[..., K:]             # (B, N, K) each
+        chunk_mean, chunk_var = stats[..., :K], stats[..., K:]             # (C, B, N, K) each
+        mean_w = (chunk_weight * chunk_mean).sum(0)                        # (B, N, K) E_p[w]
+        var_w = (chunk_weight * (chunk_var + (chunk_mean - mean_w) ** 2)).sum(0)   # (B, N, K) Var_p(w)
         # 1/2 sum_k sigma_k Var_p(w_k) = 1/2 tr(Sigma Cov_p(w)), the delta-method term.
-        delta_term = 0.5 * (sigma_q * (mean_w_sq - mean_w * mean_w)).sum(-1)  # (B, N)
+        delta_term = 0.5 * (sigma_q * var_w).sum(-1)                       # (B, N)
         objective = ((ce_per_pos + delta_term) * valid).sum() / n_valid
         # The plug-in CE is reported, the second-order objective is trained on (audit 2026-10-12 round 2,
         # item 12): the plug-in value is the one validation scores.
@@ -1999,11 +2103,12 @@ class PriorBank(nn.Module):
 
         The fused-CE twin of ``decode_mode='expected_likelihood_chunked'`` (see
         ``_decode_expected_likelihood_chunked`` for the scoring math): the same streaming contract
-        as ``decode_ce_diagonal_chunked`` -- each chunk's (B, N, Vc) logits are born and die inside
-        a gradient-checkpointed reduction returning only the (B, N) chunk logsumexp and target
-        summaries, so the (B, N, V) tensor is never materialized. The couplings sigma_q + sigma_v
-        block the diagonal kernel's single-matmul trick, so each chunk broadcasts a (B, N, Vc, K)
-        workspace instead (bounded by the chunk width; freed by the checkpoint). The unigram-prior
+        as ``decode_ce_diagonal_chunked`` -- each chunk's (B, N, Vc) logits are reduced to the (B, N)
+        chunk logsumexp and target summaries, so the (B, N, V) tensor is never materialized, under a
+        gradient checkpoint when ``_decode_ce_should_checkpoint`` decides so. The couplings
+        sigma_q + sigma_v block the diagonal kernel's single-matmul trick, so each chunk broadcasts a
+        (B, N, Vc, K) workspace instead (bounded by the chunk width; recomputed in backward when the
+        chunk is checkpointed and saved for backward otherwise). The unigram-prior
         chunk-slice add follows ``decode_ce_diagonal_chunked``.
         """
         has_ignored = self._validate_fused_ce_targets(
@@ -2077,7 +2182,7 @@ class PriorBank(nn.Module):
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib, maximum = _checkpoint.checkpoint(
                     _chunk_summaries, mu_q, sigma_q, mu_v_c, sigma_v_c, in_chunk_f, local_idx,
-                    u_c, use_reentrant=False,
+                    u_c, use_reentrant=False, preserve_rng_state=False,   # no random draws in the closure
                 )
             else:
                 lse_chunk, contrib, maximum = _chunk_summaries(
@@ -2142,18 +2247,25 @@ class FrameAwareGeometricFusedCECallable(Protocol):
 
 
 class LinearFusedCECallable(Protocol):
-    """Fused CE contract for the mean-only linear decoder."""
+    """Fused CE contract for the mean-only linear decoder.
+
+    ``VFEModel.forward`` passes ``canonical_frame`` under ``decode_coordinates='reference'`` and ``sigma_q`` (the
+    diagonal variances) under ``decode_second_order`` in training, as ``PriorBank.decode_ce_linear_chunked`` accepts
+    them (audit 2026-10-31 type-contracts-4).
+    """
 
     def __call__(
         self,
-        pb:            PriorBank,
-        mu_q:          torch.Tensor,
-        targets:       torch.Tensor,
+        pb:              PriorBank,
+        mu_q:            torch.Tensor,
+        targets:         torch.Tensor,
 
         *,
-        chunk_size:    Optional[int] = None,
-        ignore_index:  int           = -100,
-        return_stats:  bool          = False,
+        chunk_size:      Optional[int]                   = None,
+        ignore_index:    int                             = -100,
+        return_stats:    bool                            = False,
+        canonical_frame: Optional[CanonicalFrameContext] = None,
+        sigma_q:         Optional[torch.Tensor]          = None,
     ) -> 'torch.Tensor | DecodeCEResult':
         ...
 
@@ -2182,7 +2294,7 @@ def _encode_prior_sigma(
     return torch.diag_embed(variance)
 
 
-@register_encode("per_token", can_omit_base_mean=True, can_omit_base_variance=True)
+@register_encode("per_token")
 def _encode_per_token(
     pb:        PriorBank,
     token_ids: torch.Tensor,             # (B, N) integer token ids
@@ -2227,7 +2339,7 @@ def phi_type_keep_mask(pb: PriorBank, token_ids: torch.Tensor) -> torch.Tensor: 
     return torch.gather(keep_types, 1, token_ids.reshape(b, -1)).reshape(token_ids.shape)
 
 
-@register_encode("per_token_additive", can_omit_base_mean=True, can_omit_base_variance=True)
+@register_encode("per_token_additive")
 def _encode_per_token_additive(
     pb:        PriorBank,
     token_ids: torch.Tensor,             # (B, N) integer token ids
@@ -2279,12 +2391,17 @@ def _decode_diagonal(
     """
     factors = pb._decode_bank_factors()
     c, mc_v, inv_v = factors["c"], factors["mc_v"], factors["inv_v"]
-    mc_q = mu_q - c
+    # The query joins the island before mc_q and per_pos are formed (float64 under decode_av_precision="fp64", as
+    # the bank factors are; audit 2026-10-31 prior-bank-decode-1), and one eps-clamped variance serves the trace and
+    # log-det terms (prior-bank-decode-2; the identity where sigma_q >= eps).
+    work = pb._decode_work_dtype(mu_q.dtype)
+    sq = sigma_q.to(work).clamp(min=pb.eps)                              # (B, N, K)
+    mc_q = mu_q.to(work) - c
     ranking_guard = pb.decode_ranking_fp64_escalation
     a_result = _decode_av(
-        sigma_q, mc_q, mc_v, inv_v, factors["lsum"],
+        sq, mc_q, mc_v, inv_v, factors["lsum"],
         return_error_bound=ranking_guard, precision=pb.decode_av_precision,
-        bank_factors=(factors["rhs"], factors["bias"]))
+        bank_factors=(factors["rhs"], factors["bias"]), ieee_backward=pb.decode_backward_ieee_fp32)
     if ranking_guard:
         a_v, a_bound = a_result
     else:
@@ -2293,7 +2410,7 @@ def _decode_diagonal(
     # under the default expanded form; see _decode_av for the "exact" alternative (F32).
     # a_v == sum_k(sigma_q/sigma_v + (mc_q-mc_v)^2/sigma_v) + sum_k log sigma_v
     #     == sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) + sum_k log sigma_v = 2 KL + K + sum_k log sigma_q
-    per_pos = pb.K + torch.log(sigma_q.clamp(min=pb.eps)).sum(-1, keepdim=True)   # (B, N, 1) = K + sum_k log sigma_q
+    per_pos = pb.K + torch.log(sq).sum(-1, keepdim=True)                # (B, N, 1) = K + sum_k log sigma_q
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
     if ranking_guard:
@@ -2314,8 +2431,6 @@ def _decode_diagonal(
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_diagonal_chunked,
     fused_ce_supports_stats=True,
-    can_omit_base_mean=True,
-    can_omit_base_variance=True,
 )
 def _decode_diagonal_chunked(
     pb:      PriorBank,
@@ -2384,8 +2499,6 @@ def _decode_full(
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_full_chunked,
     fused_ce_supports_stats=True,
-    can_omit_base_mean=True,
-    can_omit_base_variance=True,
 )
 def _decode_full_chunked(
     pb:      PriorBank,
@@ -2407,17 +2520,20 @@ def _decode_full_chunked(
     c, mc_v, inv_v = factors["c"], factors["mc_v"], factors["inv_v"]
     diag_sq, logdet_q, spd_ok = pb._full_cov_query_invariants_from_prepared(
         sigma_q, factor_q, spd_ok)
-    mc_q = mu_q - c
+    # The query joins the island before mc_q is formed (audit 2026-10-31 prior-bank-decode-1); the log-determinant
+    # of the query-dtype factor is a per-row constant, upcast after it is formed.
+    work = pb._decode_work_dtype(mu_q.dtype)
+    mc_q = mu_q.to(work) - c
     ranking_guard = pb.decode_ranking_fp64_escalation
     a_result = _decode_av(
-        diag_sq, mc_q, mc_v, inv_v, factors["lsum"],
+        diag_sq.to(work), mc_q, mc_v, inv_v, factors["lsum"],
         return_error_bound=ranking_guard, precision=pb.decode_av_precision,
-        bank_factors=(factors["rhs"], factors["bias"]))
+        bank_factors=(factors["rhs"], factors["bias"]), ieee_backward=pb.decode_backward_ieee_fp32)
     if ranking_guard:
         a_v, a_bound = a_result
     else:
         a_v, a_bound = a_result, None
-    per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
+    per_pos = pb.K + logdet_q.unsqueeze(-1).to(work)                     # (B, N, 1) = K + log|Sigma_q|
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
     final_ok = spd_ok
@@ -2509,13 +2625,16 @@ def _decode_family(
     return _family_logits(pb, mu_q, sigma_q, tau_eff)
 
 
+# Bytes of one (rows, Vc, K) workspace of the expected-likelihood logits path (_decode_expected_likelihood_chunked),
+# which tiles its query rows to stay under it; about four such workspaces are alive at once.
+EXPECTED_LIKELIHOOD_TILE_BYTES: int = 256 * 1024 ** 2
+
+
 @register_decode(
     "expected_likelihood_chunked",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_expected_likelihood_chunked,
     fused_ce_supports_stats=True,
-    can_omit_base_mean=True,
-    can_omit_base_variance=True,
 )
 def _decode_expected_likelihood_chunked(
     pb:      PriorBank,
@@ -2549,14 +2668,26 @@ def _decode_expected_likelihood_chunked(
     mu_v_all = pb._decode_mu_table()                                     # (V, K) decode table (untied if set)
     chunk = pb.decode_chunk_size
     V = pb.vocab_size
+    mu_b, sigma_b = torch.broadcast_tensors(mu_q, sigma_q)
+    lead, K = mu_b.shape[:-1], mu_b.shape[-1]
+    mu_rows, sigma_rows = mu_b.reshape(-1, K), sigma_b.reshape(-1, K)    # (R, K) query rows
+    R = mu_rows.shape[0]
 
     logit_chunks = []
     for v0 in range(0, V, chunk):
         v1 = min(v0 + chunk, V)
-        d = mu_q.unsqueeze(-2) - mu_v_all[v0:v1]                         # (B, N, Vc, K)
-        s = sigma_q.unsqueeze(-2) + sigma_v_all[v0:v1]                   # (B, N, Vc, K) convolved variances
-        logit_chunks.append(-0.5 * (d ** 2 / s + torch.log(s)).sum(-1) / tau_eff)  # (B, N, Vc)
-    return torch.cat(logit_chunks, dim=-1)                               # (B, N, V)
+        # Rows per tile so that each (rows, Vc, K) workspace (d, s, d^2/s, log s) stays under the byte budget: a
+        # launcher-shaped batch (4096 rows, Vc = 8192, K = 192) formed 25.8 GB per transient (audit 2026-10-31
+        # prior-bank-decode-4). Each logit is the same elementwise expression and k-sum of its own row (bitwise the
+        # untiled values on the CPU; a CUDA reduction may group the k-sum differently at another row count).
+        rows = max(1, EXPECTED_LIKELIHOOD_TILE_BYTES // max(1, (v1 - v0) * K * mu_rows.element_size()))
+        tiles = []
+        for r0 in range(0, max(R, 1), rows):
+            d = mu_rows[r0:r0 + rows].unsqueeze(-2) - mu_v_all[v0:v1]           # (Rt, Vc, K)
+            s = sigma_rows[r0:r0 + rows].unsqueeze(-2) + sigma_v_all[v0:v1]     # (Rt, Vc, K) convolved variances
+            tiles.append(-0.5 * (d ** 2 / s + torch.log(s)).sum(-1) / tau_eff)   # (Rt, Vc)
+        logit_chunks.append(tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0))   # (R, Vc)
+    return torch.cat(logit_chunks, dim=-1).reshape(*lead, V)             # (B, N, V)
 
 
 def _linear_logits(
@@ -2566,12 +2697,19 @@ def _linear_logits(
 ) -> torch.Tensor:                       # (..., V) logits x W^T, fp32 dtype when autocast ran
     r"""The linear decode's logits matmul :math:`x W^\top`.
 
-    With ``pb.decode_logits_amp_dtype`` set it runs under that autocast dtype (low-precision
-    operands, fp32 accumulation) and is cast to fp32, so the bias, logsumexp and cross-entropy
-    that follow run in fp32; otherwise it is the plain matmul in the caller's precision. The
-    autocast GEMM stores its output in the autocast dtype, so the returned logits carry that dtype's
-    precision (bf16: unit roundoff :math:`2^{-8}`, a rounding error up to 0.125 for logits between 32 and 64); the fp32 cast
-    restores no bits, and per-token cross-entropy and ranking metrics see the rounded values.
+    With ``pb.decode_logits_amp_dtype`` set it runs under that autocast dtype and is cast to fp32, so the bias,
+    logsumexp and cross-entropy that follow run in fp32; otherwise it is the plain matmul in the caller's precision.
+    Autocast rounds both operands to the low-precision dtype before the GEMM (fp32 accumulation) and stores the output
+    in that dtype, so with its unit roundoff :math:`u` (:math:`2^{-8}` for bf16, :math:`2^{-11}` for fp16) each logit
+    carries, to first order in :math:`u`,
+
+    .. math::
+        |\delta z| \le u\Big(2\sum_k |x_k w_k| + |z|\Big),
+
+    the two operand casts and the output rounding. Where :math:`z` arises from cancellation the operand term
+    dominates: under bf16 at V = 50257 the error reached 0.31 to 0.41 for logits between 32 and 64 (output rounding
+    alone gives 0.125) and 0.05 to 0.25 for logits between 1 and 2 (audit 2026-10-31 gap-mixed-precision-routes-4).
+    The fp32 cast restores no bits: the cross-entropy, its gradient and ranking metrics read the rounded logits.
     """
     dtype = getattr(pb, "decode_logits_amp_dtype", None)
     if dtype is None:
@@ -2586,8 +2724,6 @@ def _linear_logits(
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_linear_chunked,
     fused_ce_supports_stats=True,
-    can_omit_base_mean=True,
-    can_omit_base_variance=True,
 )
 def _decode_linear(
     pb:      PriorBank,

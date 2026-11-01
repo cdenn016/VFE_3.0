@@ -120,12 +120,19 @@ def _check_max_log(
     host_check(_max_log_exceeded(log_sigma, max_log), _verdict)
 
 
+# Exponent cap of bounded_variance_from_log: exp(80) = 5.5e34 is finite in float32.
+BOUNDED_VARIANCE_MAX_LOG: float = 80.0
+
+# Margin of the projected log-variance floor above log(eps), in nats (see log_variance_floor).
+LOG_VARIANCE_FLOOR_MARGIN: float = 2.0 ** -16
+
+
 def bounded_variance_from_log(
     log_sigma: torch.Tensor,
 
     *,
     eps:     float = 1e-6,
-    max_log: float = 80.0,
+    max_log: float = BOUNDED_VARIANCE_MAX_LOG,
     index:   Optional[torch.Tensor] = None,   # integer ids: exponentiate only rows log_sigma[index]
 ) -> torch.Tensor:
     r"""Exponentiate a trainable log-variance without overflowing float32.
@@ -138,11 +145,60 @@ def bounded_variance_from_log(
     stays above ``max_log`` (from the cached host bool). With ``index`` the check runs on the whole
     (cached) table and only the gathered rows are exponentiated, so a per-forward gather does not
     defeat the cache (audit 2026-10-07 F03/F61); the values equal those for ``log_sigma[index]``.
+
+    Both bounds have a zero derivative beyond them: an entry below :math:`\log\varepsilon` reads
+    :math:`\varepsilon` with :math:`\partial\sigma/\partial\ell = 0`, so no gradient optimizer moves a table entry
+    that has crossed the floor, and without decay it stays there whatever the loss prefers (audit 2026-10-31,
+    numerics-2). ``VFE3Config.sigma_log_floor_mode='projected'`` projects the tables back after each step
+    (:func:`project_log_variance_floor_`); :func:`log_variance_clamped` counts the entries at either bound.
     """
     _check_max_log(log_sigma, max_log)
     if index is not None:
         log_sigma = log_sigma[index]
     return torch.exp(log_sigma.clamp(max=max_log)).clamp(min=eps)
+
+
+def log_variance_floor(eps: float) -> float:
+    r"""The value :func:`project_log_variance_floor_` raises a table entry to: :math:`\log\varepsilon + 2^{-16}`.
+
+    :func:`bounded_variance_from_log` reads :math:`\max(e^{\ell}, \varepsilon)`, whose derivative in :math:`\ell`
+    is :math:`e^{\ell}` where :math:`e^{\ell} \ge \varepsilon` and zero below. The margin of :math:`2^{-16}` nats, a
+    relative :math:`1.5\times 10^{-5}` in the variance, keeps :math:`e^{\ell} > \varepsilon` after the floor is
+    rounded to float32 (spacing :math:`9.5\times 10^{-7}` near :math:`|\log 10^{-6}| = 13.8`) and ``exp`` is
+    evaluated with an error of a few units in the last place, so an entry at the floor takes the full derivative.
+    """
+    return math.log(eps) + LOG_VARIANCE_FLOOR_MARGIN
+
+
+@torch.no_grad()
+def project_log_variance_floor_(
+    log_sigma: torch.Tensor,             # (V, K) trainable log-variance table, modified in place
+
+    *,
+    eps:       float,
+) -> None:
+    r"""Raise every entry of ``log_sigma`` below :func:`log_variance_floor` to it, in place.
+
+    The Euclidean projection onto :math:`\{\ell \ge \log\varepsilon + 2^{-16}\}`, the region on which
+    :math:`\ell \mapsto \max(e^{\ell}, \varepsilon)` is injective. Every entry below the floor reads the same
+    variance :math:`\varepsilon` (up to the margin), so the projection changes no forward value beyond that margin;
+    it restores the derivative that the absorbing floor removes. Entries at or above the floor are left bit for bit,
+    and a NaN stays NaN.
+    """
+    log_sigma.clamp_(min=log_variance_floor(eps))
+
+
+@torch.no_grad()
+def log_variance_clamped(
+    log_sigma: torch.Tensor,             # (...) log-variance table
+
+    *,
+    eps:       float,
+    max_log:   float = BOUNDED_VARIANCE_MAX_LOG,
+) -> torch.Tensor:                       # (...) bool
+    r"""Entries at which :func:`bounded_variance_from_log` has a zero derivative: :math:`e^{\ell} < \varepsilon`
+    (the floor, evaluated as the forward evaluates it) or :math:`\ell > \text{max\_log}` (the exponent cap)."""
+    return (torch.exp(log_sigma.clamp(max=max_log)) < eps) | (log_sigma > max_log)
 
 
 def _overflow_safe_norm(x: torch.Tensor) -> torch.Tensor:   # (..., K) -> (..., 1)
@@ -596,10 +652,12 @@ def validated_cholesky_solve(
         factor_residual, solve_residual)
 
 
-# Certificate tolerance for square-root (CholeskyQR2) factors, eps * kappa_1-estimate(C) <= this.
-# Shared by the projected scorer and the factored common-frame KL (optimization_plan.md WS2/WS3).
-# Set just above the observed maximum eps * kappa_1 = 1.3e-4 on the saved K=64/K=128 runs; see
-# relational_scoring._factor_status for the error model and why the P2 max-norm reading is not used.
+# Certificate tolerance for square-root (CholeskyQR2) factors, eps * kappa_1-estimate(C) <= this. Its one consumer is
+# relational_scoring._factor_status, the certificate of the projected scorer's certified factor route (the factored
+# common-frame KL backend that also read it has been removed). Set just above the observed maximum
+# eps * kappa_1 = 1.3e-4 on the saved K=64/K=128 runs (the 2026-09-24 Phase 0 measurements);
+# relational_scoring._factor_status records the measured constants, the error model and why the P2 max-norm reading
+# is not used (audit 2026-10-31, gap-certified-factorization-routes-7).
 FACTOR_CONDITION_TOL: float = 3e-4
 
 

@@ -401,14 +401,59 @@ def twonn_dimension(X: Any, rng: np.random.Generator, max_points: int = 5000, *,
 # Representation similarity
 # ----------------------------------------------------------------------------------------------
 
-def _debiased_dot(xty: float, ssr_x: np.ndarray, ssr_y: np.ndarray, sq_x: float, sq_y: float,
-                  n: int) -> float:
+def _debiased_dot(xty: float, ssr_x: Any, ssr_y: Any, sq_x: float, sq_y: float, n: int) -> float:
     r"""Unbiased HSIC numerator (Song et al. 2012) in feature space, as in Kornblith's reference code.
 
     For column-centered ``X, Y`` with ``K = X X^T``, ``L = Y Y^T`` and zeroed diagonals,
     ``n(n-3) HSIC_u = ||X^T Y||_F^2 - n/(n-2) <diag K, diag L> + ||X||_F^2 ||Y||_F^2/((n-1)(n-2))``.
+    ``ssr_x``, ``ssr_y`` are (n,) numpy arrays or torch tensors.
     """
     return float(xty - n / (n - 2.0) * float(ssr_x @ ssr_y) + sq_x * sq_y / ((n - 1.0) * (n - 2.0)))
+
+
+def cka_self_terms(Xc: Any) -> Dict[str, Any]:
+    r"""The per-representation terms linear CKA reuses across pairs, of column-centered rows ``Xc`` (n, D).
+
+    ``xtx`` :math:`= \lVert X_c^\top X_c\rVert_F^2`, ``ssr`` the row sums of squares
+    :math:`\operatorname{diag} X_cX_c^\top` (n,) and ``sq`` :math:`= \lVert X_c\rVert_F^2`, all in float64. A numpy
+    array is computed with numpy, a torch tensor with torch on its device (``ssr`` stays a tensor there), so
+    callers that hold torch tables (:mod:`vfe3.semantics.multiseed`) pair them without a host copy.
+    """
+    if isinstance(Xc, np.ndarray):
+        X = np.asarray(Xc, dtype=np.float64)
+        ssr = (X * X).sum(axis=1)                                          # (n,)
+        return {"xtx": float(np.linalg.norm(X.T @ X) ** 2), "ssr": ssr, "sq": float(ssr.sum())}
+    import torch
+
+    X = Xc.double()
+    ssr = (X * X).sum(dim=1)                                               # (n,)
+    return {"xtx": float(torch.linalg.matrix_norm(X.T @ X) ** 2), "ssr": ssr, "sq": float(ssr.sum())}
+
+
+def cka_from_terms(xty: float, terms_x: Dict[str, Any], terms_y: Dict[str, Any], n: int, *,
+                   ssr_y: Optional[Any] = None) -> Tuple[float, float]:
+    r"""``(biased, debiased)`` linear CKA from the cross term and the self terms of :func:`cka_self_terms`.
+
+    .. math::
+        \mathrm{CKA} = \frac{\lVert Y_c^\top X_c\rVert_F^2}{\lVert X_c^\top X_c\rVert_F\,\lVert Y_c^\top Y_c\rVert_F},
+        \qquad
+        \mathrm{CKA}_u = \frac{\mathrm{HSIC}_u(X, Y)}{\sqrt{\mathrm{HSIC}_u(X, X)\,\mathrm{HSIC}_u(Y, Y)}},
+
+    with ``xty`` :math:`= \lVert Y_c^\top X_c\rVert_F^2` and the unbiased HSIC of :func:`_debiased_dot` (Song et al.
+    2012). ``ssr_y`` replaces ``terms_y["ssr"]`` in the cross term, for rows of ``Y`` permuted against ``X`` (its
+    self terms do not change). A value that is undefined is NaN: the biased form when a representation has zero
+    variance, the debiased form for ``n < 4`` or a debiased self-HSIC that is not positive.
+    """
+    xtx, yty = float(terms_x["xtx"]), float(terms_y["xtx"])
+    biased = xty / math.sqrt(xtx * yty) if xtx * yty > 0.0 else float("nan")
+    if n < 4:
+        return biased, float("nan")
+    num = _debiased_dot(xty, terms_x["ssr"], terms_y["ssr"] if ssr_y is None else ssr_y,
+                        terms_x["sq"], terms_y["sq"], n)
+    den_x = _debiased_dot(xtx, terms_x["ssr"], terms_x["ssr"], terms_x["sq"], terms_x["sq"], n)
+    den_y = _debiased_dot(yty, terms_y["ssr"], terms_y["ssr"], terms_y["sq"], terms_y["sq"], n)
+    debiased = num / math.sqrt(den_x * den_y) if den_x > 0.0 and den_y > 0.0 else float("nan")
+    return biased, debiased
 
 
 def _cross_norms(X: np.ndarray, Y: np.ndarray, device: Any) -> Tuple[float, float, float]:
@@ -436,7 +481,8 @@ def linear_cka(X: Any, Y: Any, debiased: bool = False, *, device: Any = None) ->
     either side. ``debiased=True`` replaces each HSIC by the unbiased estimator of Song et al.
     (2012), which removes the upward bias of CKA when ``n`` is not much larger than the widths.
     ``device``: a torch device forms the three cross products in float32 (centering and the
-    debiasing terms stay float64).
+    debiasing terms stay float64). The arithmetic is :func:`cka_from_terms`, shared with the
+    term-reusing pairwise CKA of :mod:`vfe3.semantics.multiseed`.
     """
     X = _centered(_f64(X))
     Y = _centered(_f64(Y))
@@ -445,20 +491,19 @@ def linear_cka(X: Any, Y: Any, debiased: bool = False, *, device: Any = None) ->
         raise ValueError(f"row counts differ: {n} vs {Y.shape[0]}")
     xty, xtx, yty = _cross_norms(X, Y, device)
     if not debiased:
-        denom = math.sqrt(xtx * yty)
-        if denom <= 0.0:
+        if xtx * yty <= 0.0:
             raise ValueError("a representation has zero variance")
-        return xty / denom
-    if n < 4:
+    elif n < 4:
         raise ValueError("debiased CKA needs at least 4 rows")
     ssr_x, ssr_y = (X * X).sum(axis=1), (Y * Y).sum(axis=1)
-    sq_x, sq_y = float(ssr_x.sum()), float(ssr_y.sum())
-    num = _debiased_dot(xty, ssr_x, ssr_y, sq_x, sq_y, n)
-    den_x = _debiased_dot(xtx, ssr_x, ssr_x, sq_x, sq_x, n)
-    den_y = _debiased_dot(yty, ssr_y, ssr_y, sq_y, sq_y, n)
-    if den_x <= 0.0 or den_y <= 0.0:
+    terms_x = {"xtx": xtx, "ssr": ssr_x, "sq": float(ssr_x.sum())}
+    terms_y = {"xtx": yty, "ssr": ssr_y, "sq": float(ssr_y.sum())}
+    biased, unbiased = cka_from_terms(xty, terms_x, terms_y, n)
+    if not debiased:
+        return biased
+    if not math.isfinite(unbiased):
         raise ValueError("debiased self-HSIC is not positive (too few rows for this width)")
-    return num / math.sqrt(den_x * den_y)
+    return unbiased
 
 
 # ----------------------------------------------------------------------------------------------
@@ -640,14 +685,23 @@ def frequency_strata(log_count: Any, n_strata: int = N_FREQUENCY_STRATA) -> np.n
     return strata
 
 
-def _null_summary(null: np.ndarray, obs: float) -> Dict[str, Any]:
-    r"""Mean, sd, ``z = (obs - mean)/sd`` and one-sided ``p = (1 + #\{null >= obs\})/(1 + n)`` of null draws."""
+def _null_summary(null: np.ndarray, obs: int, n_edges: int) -> Dict[str, Any]:
+    r"""Null summary of integer agreeing-edge counts ``null`` (draws) against the observed count ``obs``.
+
+    The one-sided ``p = (1 + #\{null >= obs\})/(1 + n)`` and ``z = (obs - mean)/sd`` are formed on the
+    counts, so a draw that reproduces the observed labeling ties exactly (a mean of per-row fractions and
+    a mean over edges are different floating-point reductions of one count; audit 2026-10-31
+    semantics-stats-2). Integer counts have ``sd = 0`` exactly or ``sd >= n^{-1/2}``, so ``z`` is NaN (none)
+    exactly when every draw gives the same count. ``null_mean`` and ``null_std`` are divided by ``n_edges``
+    (purity units) for display only.
+    """
     n_perm = null.size
-    null_mean = float(null.mean()) if n_perm else float("nan")
-    null_std = float(null.std(ddof=1)) if n_perm > 1 else float("nan")
-    z = (obs - null_mean) / null_std if n_perm > 1 and null_std > 0.0 else float("nan")
-    p = float((1 + (null >= obs).sum()) / (1 + n_perm)) if n_perm else float("nan")
-    return {"null_mean": null_mean, "null_std": null_std, "z": float(z), "p": p, "n_perm": int(n_perm)}
+    counts = np.asarray(null, dtype=np.int64)
+    mean = float(counts.mean()) if n_perm else float("nan")
+    sd = float(counts.std(ddof=1)) if n_perm > 1 else float("nan")
+    z = (obs - mean) / sd if n_perm > 1 and sd > 0.0 else float("nan")
+    p = float((1 + int((counts >= obs).sum())) / (1 + n_perm)) if n_perm else float("nan")
+    return {"null_mean": mean / n_edges, "null_std": sd / n_edges, "z": float(z), "p": p, "n_perm": int(n_perm)}
 
 
 def _stratified_chance(codes: np.ndarray, idx: np.ndarray, strata: np.ndarray, n_labels: int) -> float:
@@ -680,9 +734,11 @@ def knn_label_purity(X: Any, labels: Sequence[Hashable], k: int = 10, metric: st
     r"""kNN label purity ``P@k`` with a label-permutation null and/or a frequency-stratified null.
 
     ``purity_i`` is the fraction of the ``k`` nearest neighbors of row ``i`` (self excluded) that
-    share its label; the statistic is the mean over rows. Every null keeps the neighbor graph and
-    reassigns labels ``n_perm`` times; ``z = (obs - mean_null)/std_null`` and the one-sided
-    ``p = (1 + #\{null >= obs\})/(1 + n_perm)``.
+    share its label; the statistic is the mean over rows, the count of agreeing edges over ``n k``.
+    Every null keeps the neighbor graph and reassigns labels ``n_perm`` times; ``z = (obs -
+    mean_null)/std_null`` and the one-sided ``p = (1 + #\{null >= obs\})/(1 + n_perm)`` compare integer
+    agreeing-edge counts, so a draw that reproduces the observed count is a tie, and ``z`` is NaN when
+    every draw gives the same count (:func:`_null_summary`).
 
     * ``null="permutation"`` shuffles labels over all rows. ``chance`` is its exact expectation
       ``sum_c n_c(n_c - 1) / (n(n-1))`` (approximately ``sum_c p_c^2``), and
@@ -718,28 +774,31 @@ def knn_label_purity(X: Any, labels: Sequence[Hashable], k: int = 10, metric: st
             raise ValueError(f"{strata.size} log counts for {n} rows")
     k_eff = min(k, n - 1)
     idx, _ = knn(X, k_eff, metric, device=device)
-    per_row = (codes[idx] == codes[:, None]).mean(axis=1)               # (n,)
-    obs = float(per_row.mean())
+    same = codes[idx] == codes[:, None]                                 # (n, k_eff) label agreement per edge
+    per_row = same.mean(axis=1)                                         # (n,)
+    n_edges = n * k_eff
+    obs_count = int(same.sum())                                         # agreeing edges, compared as integers
+    obs = obs_count / n_edges
     counts = np.bincount(codes, minlength=len(names)).astype(np.float64)
     chance = float((counts * (counts - 1.0)).sum() / (n * (n - 1.0)))
 
     def permutation_null() -> np.ndarray:
-        draws = np.empty(n_perm, dtype=np.float64)
+        draws = np.empty(n_perm, dtype=np.int64)
         for t in range(n_perm):
             perm = rng.permutation(codes)
-            draws[t] = (perm[idx] == perm[:, None]).mean()
+            draws[t] = int((perm[idx] == perm[:, None]).sum())
         return draws
 
     def stratified_null() -> Dict[str, Any]:
         grouped = np.argsort(strata, kind="stable")                    # positions grouped by stratum
-        draws = np.empty(n_perm, dtype=np.float64)
+        draws = np.empty(n_perm, dtype=np.int64)
         for t in range(n_perm):
             shuffled = np.lexsort((rng.random(n), strata))             # grouped by stratum, random within
             perm = np.empty_like(codes)
             perm[grouped] = codes[shuffled]
-            draws[t] = (perm[idx] == perm[:, None]).mean()
-        return {**_null_summary(draws, obs), "chance": _stratified_chance(codes, idx, strata, len(names)),
-                "n_strata": int(strata.max()) + 1}
+            draws[t] = int((perm[idx] == perm[:, None]).sum())
+        return {**_null_summary(draws, obs_count, n_edges),
+                "chance": _stratified_chance(codes, idx, strata, len(names)), "n_strata": int(strata.max()) + 1}
 
     out: Dict[str, Any] = {
         "purity":           obs,
@@ -756,7 +815,7 @@ def knn_label_purity(X: Any, labels: Sequence[Hashable], k: int = 10, metric: st
     if null == "frequency_stratified":
         out.update(stratified_null())
     else:
-        out.update(_null_summary(permutation_null(), obs))
+        out.update(_null_summary(permutation_null(), obs_count, n_edges))
         if null == "both":
             out["frequency_stratified"] = stratified_null()
     return out

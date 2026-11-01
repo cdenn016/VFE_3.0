@@ -21,19 +21,34 @@ dataset, ``eval_interval = max(1, max_steps // 20)`` (at least 20 validation poi
 once ``max_steps >= 20``; every evaluation also writes the map snapshot of Figure S1) and
 ``checkpoint_interval = max_steps`` (one training checkpoint at the end, which holds the optimizer
 groups S1 reads). The same budget fields are applied to the base and to every arm, so they never
-appear in an arm's difference.
+appear in an arm's difference. ``CONFIG["checkpoint_every"] = N`` also writes a resumable training
+checkpoint every N steps of a VFE run (``checkpoint_keep_last=1``, ``checkpoint_at_end=True``), and a
+relaunch resumes an interrupted VFE run of the plan's config from its latest checkpoint instead of
+retraining it (:func:`resumable_checkpoint`; audit 2026-10-31, paper-arms-harness-10). The cadence does
+not change the trained weights, so runs at either cadence are replicates of one arm
+(:data:`CHECKPOINT_CADENCE_FIELDS`); a resumed run's ``metrics.csv`` gets the interrupted run's rows up to
+the resume step (:func:`stitch_resumed_metrics`).
 
 ARMS. One entry per row of the table, with the exact labels ``paper_artifacts.py`` and
 :mod:`vfe3.paper` use. A VFE arm declares ``VFE3Config`` overrides (a value, or a function of the
 resolved base config) and the fields the config itself coerces as a documented consequence
 (``gauge_transport='off'`` forces the frame fields). Resolution asserts that the arm's config
 differs from the resolved base in the declared fields and the documented coercions only, and that
-every declared value survived validation. A baseline arm declares a ``vfe3.baseline`` spec; its
+every declared value survived validation. An arm whose declared values the base already has, or whose
+every change is inert on the base (:meth:`vfe3.config.VFE3Config.inactive_fields`), is inapplicable with
+that reason: it would train a replicate of the evaluated configuration (audit 2026-10-31,
+paper-arms-harness-2 and -5). A baseline arm declares a ``vfe3.baseline`` spec; its
 protocol fields (tokenizer, context, stride, budget, cadence, shape, prior, decoder) must equal the
-base's except where declared. Precision is compared by its effect (:func:`effective_precision`): a base
-recorded with ``amp_dtype='bf16'`` on a route that computes in float32 is matched by a float32 baseline,
-and a bf16 baseline against it is a declared deviation, as is a VFE arm that changes the precision (the
-linear decoder under ``decode_logits_amp``). Rules:
+base's except where declared, and its defining choices (the per-type table and the arm's overrides,
+against the plain matched transformer) are listed with them in the row's ``changes``.
+``BaselineConfig.matched_to`` refuses a base whose context-processing count the arm cannot match (a block
+MLP tied across layers or of another mode among its refusals), so every baseline row is invalid there;
+with counts, a matched-width row also compares its measured content-map and MLP counts with the base's
+and records any difference as a declared deviation. Precision is compared by its effect
+(:func:`effective_precision`): a base recorded with ``amp_dtype='bf16'`` or ``'fp16'`` on a route that
+computes in float32 is matched by a float32 baseline, and a reduced-precision baseline against it is a
+declared deviation, as is a VFE arm that changes the precision (the linear decoder under
+``decode_logits_amp``). Rules:
 
 * Stored-covariance decay. "Decayed" keeps the base's ``sigma_weight_decay``; "without decay" sets
   it to 0. For a base whose decay is already 0 (``full_K64``) the row "Learned frames, stored
@@ -54,21 +69,37 @@ linear decoder under ``decode_logits_amp``). Rules:
   the frame fields); and the covariant stack, ``gaussian_block`` with ``block_coordinates='reference'`` and
   ``decode_coordinates='reference'``, a declared three-change arm in which every consumer reads the
   reference moments (xi, C), so its frames are removable and the frame-free table arm is its equivalent.
+  On a base with positional frames (``pos_phi`` other than ``'none'``) the realized frame
+  :math:`U_i = \exp(X_v)\exp(Y_n)` makes the reference moments depend on the position, so no per-type
+  table is equivalent and the Cholesky-table arm is inapplicable (audit 2026-10-31,
+  gap-paper-arm-offlive-routes-2). The Fisher table step needs a diagonal table, so on a base with
+  ``m_table_update_mode='fisher'`` the Cholesky-table arm declares ``'adamw'``, and the covariant stack
+  declares the same wherever the Cholesky-table arm resolves, so the two rows differ in the
+  parametrization alone; both rows record the shared table optimizer as a declared deviation
+  (paper-arms-harness-7, gap-paper-arm-offlive-routes-6).
   A base the validator does not admit these on resolves them as invalid with the validator's reason.
+* Positional frames. ``gauge_transport='off'`` forces ``pos_phi='none'``, so on a base with positional
+  frames every identity-frame row (and the capacity row) also removes them; each such row records the
+  removal as a declared deviation, which names whether the frames are the base's only positional channel
+  (no RoPE and no ALiBi prior) or which channel the base keeps.
 * LayerNorm and MLP in reference coordinates: ``block_coordinates='reference'`` (the decoder stays
   local; one change). On a base without a LayerNorm it conjugates the MLP alone. On a
   ``gaussian_diagonal`` base with ``block_norm_covariance='pushforward'`` it also declares
   ``'passthrough'``: the reference-coordinate LayerNorm of the diagonal family has no covariance
   pushforward, so the validator admits only ``'passthrough'`` there (the field is read, not inert), and on
   that base the arm also gives up the base's covariance pushforward, a declared second difference.
-* Intertwiner-constrained block: ``block_mlp_mode='gauge_gate'``, the block (and final) LayerNorm
+* Intertwiner-constrained block: ``block_mlp_mode='gauge_gate'``, the block LayerNorm
   replaced by ``'mahalanobis'`` where the base has one (``'none'`` stays), and
   ``decode_coordinates='reference'``. Where it replaces the LayerNorm it also declares
   ``block_norm_covariance='passthrough'``: the LayerNorm Jacobian pushforward has no Mahalanobis
-  counterpart, so the field is inert under the replaced norm.
+  counterpart, so the field is inert under the replaced norm. The replacement also changes the scale of
+  the normalized means (unit length per coordinate in the belief metric instead of unit Euclidean scale),
+  recorded as a declared deviation with the base's ``sigma_init`` (gap-paper-arm-offlive-routes-9).
 * Word level: dataset ``wikitext-103-word-eos`` (the published stream, one ``<eos>`` per line), the
   vocabulary size from its sidecar, ``decode_ce_checkpoint='auto_aggregate'``, and the one-epoch budget over
   the word training split under either selected budget (:data:`WORD_LEVEL_BUDGET`). The conventional word arm is matched to the Gaussian word arm.
+  Their runs live under the :data:`WORD_LEVEL_BUDGET` experiment directory whichever budget launches them
+  (:func:`arm_directory`), so a base launched under both budgets trains them once.
 * Linear decoder: ``decode_mode='linear'`` (the baseline's decoder family); inapplicable on a base
   that already decodes linearly.
 * Matched measured compute: deferred until every planned seed pair of the evaluated arm has a
@@ -125,20 +156,27 @@ by every arm so replicates are paired across arms. Under the ``base_protocol`` b
 arm's replicate whose pair equals the base run's own ``(seed, data_seed)`` is the base run itself: it is
 reused (skipped in training, listed in the manifest, and read by the compute-matched rule when its
 config passes :func:`reuse_mismatch`, which ignores the base's own checkpoint cadence,
-:data:`BASE_REUSE_IGNORED_FIELDS`) rather than retrained; the plan claims the reuse only when that check
+:data:`BASE_REUSE_IGNORED_FIELDS`, and its recorded training-data identity is the current caches',
+:func:`data_identity_mismatch`) rather than retrained; the plan claims the reuse only when that check
 passes, notes the reason when it does not (the launch then refuses while the base blocks the pair), and
 notes when the base's recorded code identity is not the current tree's.
 
-LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/``. An (arm,
+LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/`` (the word-level
+rows under ``<out_root>/<base>/<WORD_LEVEL_BUDGET>/``, :func:`arm_directory`). An (arm,
 seed) pair whose run directory already holds a complete ``summary.json`` (finite ``test_ce``) and
 whose saved config, dataset and seeds are the plan's (:func:`reuse_mismatch`) is skipped; a complete
 run that differs is reported as stale, and a launch refuses to train while one blocks a pair. Several
 complete runs of one pair select none (the folder names begin with the test PPL, so their order is a
 result): each is reported as stale and blocks the launch. A finished run of the plan's config whose test
-CE is not finite (a divergence) is a recorded failure, listed under ``paper_arms.rows[label]["failed"]``
+CE is not finite (a divergence), or whose test value under the manifest's selection rule cannot be found (a
+failed best-weights test), is a recorded failure, listed under ``paper_arms.rows[label]["failed"]``
 and never retrained by a relaunch. After every run the manifest ``<out_root>/<base>/<budget>/m2_manifest.json`` is rewritten
 with every row of the table (rows without complete runs stay pending); pass it to
-``python paper_artifacts.py <manifest>``. A listed run whose recorded code identity is not the
+``python paper_artifacts.py <manifest>``. The arms a launch did not select are resolved too (without
+parameter counts, :func:`unselected_plans`) and their runs checked the same way, and the manifest lists
+the seed pairs it already records followed by the launch's others (:func:`manifest_seed_pairs`), so a
+launch of fewer arms or seed pairs adds rows instead of replacing them (audit 2026-10-31,
+paper-arms-harness-1); every row carries its plan notes. A listed run whose recorded code identity is not the
 current tree's (:func:`vfe3.paper.runs.code_identity_mismatch`) is kept, not rejected, and flagged
 under ``paper_arms.rows[label]["code_identity_mismatch"]``; the decision rule reports it beside the
 clause without changing the verdict.
@@ -147,6 +185,7 @@ clause without changing the verdict.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -170,6 +209,9 @@ CONFIG: Dict[str, Any] = {
     "out_root":          "vfe3_runs/paper_arms",
     "dry_run":           False,             # True: resolve, validate and print the plan; train nothing
     "device":            None,             # None -> cuda when available
+    "checkpoint_every":  None,             # None: one training checkpoint at the end of a run (the budget's);
+                                           # an int N > 0: also every N steps (the latest kept), and a relaunch
+                                           # resumes an interrupted VFE run from its last checkpoint
     "calibration_steps": 200,              # matched-compute baseline: steps of each width's calibration run
     "width_ladder":      (1, 1.5, 2, 3, 4, 6, 8),   # matched-compute ladder, multiples of the matched width
     "baseline_overrides": {"lr": 3e-3},    # BaselineConfig optimizer fields for every baseline arm:
@@ -340,6 +382,119 @@ def _no_ln_or_mlp(base: Any) -> Optional[str]:
     return None
 
 
+def _positional_frames(base: Any) -> Optional[str]:
+    r"""Inapplicable when the base has positional frames: no per-type table is then the covariant stack's equivalent.
+
+    The covariant stack keeps the base's frames :math:`U_i = \exp(X_v)\exp(Y_n)`, so its reference moments
+    :math:`\xi_i = U_i^{-1}\mu_v` and :math:`C_i = U_i^{-1}\Sigma_v U_i^{-T}` depend on the position :math:`n`
+    as well as the type :math:`v`; a per-type table :math:`(\xi_v, C_v)` cannot represent them, and
+    ``gauge_transport='off'`` removes the positional frames with the type frames (audit 2026-10-31,
+    gap-paper-arm-offlive-routes-2).
+    """
+    pos_phi = getattr(base, "pos_phi", "none")
+    if pos_phi != "none":
+        return (f"the base has positional frames (pos_phi={pos_phi!r}): the covariant stack's reference moments "
+                "xi_i = U_i^-1 mu_v and C_i = U_i^-1 Sigma_v U_i^-T depend on the position through "
+                "U_i = exp(X_v) exp(Y_n), so no per-type (xi_v, C_v) table is its frame-free equivalent")
+    return None
+
+
+# The frame-free (xi_v, C_v) table arm's declared changes besides its table step.
+_CHOLESKY_TABLE: Dict[str, Any] = {"family": "gaussian_block", "prior_covariance_table": "block_cholesky",
+                                   "gauge_transport": "off"}
+
+
+def _cholesky_table_update(base: Any) -> str:
+    r"""``'adamw'`` on a Fisher-table base, the base's ``m_table_update_mode`` otherwise.
+
+    The Fisher table step preconditions the diagonal ``sigma_log_embed`` rows (``vfe3.table_optim``) and the
+    validator admits it only with ``prior_covariance_table='diagonal'``, so the frame-free Cholesky-table arm
+    steps its tables by AdamW there, a declared second difference (audit 2026-10-31, paper-arms-harness-7).
+    """
+    return "adamw" if base.m_table_update_mode == "fisher" else base.m_table_update_mode
+
+
+def _covariant_stack_table_update(base: Any) -> str:
+    r"""The covariant stack's table step: the Cholesky-table arm's wherever that arm resolves, else the base's.
+
+    The two rows are registered as one function class in two parametrizations, so where the Cholesky-table
+    arm needs the AdamW table step (:func:`_cholesky_table_update`) the covariant stack takes it too and the
+    rows differ in the parametrization alone (audit 2026-10-31, gap-paper-arm-offlive-routes-6). Where the
+    Cholesky-table arm is inapplicable (:func:`_positional_frames`) or the validator rejects it, the stack
+    keeps the base's step.
+    """
+    if base.m_table_update_mode != "fisher" or _positional_frames(base) is not None:
+        return base.m_table_update_mode
+    try:
+        rebuild(base, {**_CHOLESKY_TABLE, "m_table_update_mode": _cholesky_table_update(base)},
+                "frame-free table probe")
+    except (ValueError, TypeError):
+        return base.m_table_update_mode
+    return _cholesky_table_update(base)
+
+
+def _table_update_deviation(base_cfg: Any, arm_cfg: Any) -> Optional[str]:
+    r"""The declared deviation of a head-block row whose table step is not the base's, or None."""
+    if base_cfg.m_table_update_mode == arm_cfg.m_table_update_mode:
+        return None
+    return (f"table optimizer: m_table_update_mode={arm_cfg.m_table_update_mode!r} instead of the base's "
+            f"{base_cfg.m_table_update_mode!r}, so the tables step by AdamW at m_p_mu_lr={arm_cfg.m_p_mu_lr!r} and "
+            f"m_p_sigma_lr={arm_cfg.m_p_sigma_lr!r} where the base's Fisher step uses "
+            f"m_table_fisher_lr={base_cfg.m_table_fisher_lr!r} "
+            f"(trust radius {base_cfg.m_table_fisher_trust_radius!r}); the Fisher step needs "
+            "prior_covariance_table='diagonal', which the frame-free Cholesky-table row replaces, and that row and "
+            "the covariant-stack row share this step, so they differ in the parametrization alone")
+
+
+def _mahalanobis_scale_deviation(base_cfg: Any, arm_cfg: Any) -> Optional[str]:
+    r"""The declared deviation of a row that replaces the block LayerNorm by the Mahalanobis norm, or None.
+
+    The parameter-free Mahalanobis norm sets :math:`\mu^\top \Sigma^{-1} \mu = K` (unit length per coordinate in
+    the belief metric, :class:`vfe3.geometry.norms.MahalanobisNorm`) where the LayerNorm standardizes the mean to
+    unit Euclidean scale per coordinate. At initialization the belief covariance is the prior table's
+    ``sigma_init``, so the normalized means carry a mean square of about ``sigma_init`` per coordinate instead
+    of about 1, and the squared Mahalanobis distances the routing reads are about ``sigma_init`` times larger
+    (audit 2026-10-31, gap-paper-arm-offlive-routes-9).
+    """
+    if not (base_cfg.norm_type_block == "layernorm" and arm_cfg.norm_type_block == "mahalanobis"):
+        return None
+    sigma_init = float(base_cfg.sigma_init)
+    return (f"mean scale: the Mahalanobis norm sets mu^T Sigma^-1 mu = K (unit length per coordinate in the belief "
+            "metric) where the base's LayerNorm sets unit Euclidean scale per coordinate; at initialization, where "
+            f"the belief covariance is the prior table's sigma_init={sigma_init:g}, the normalized means carry a "
+            f"mean square of about {sigma_init:g} per coordinate instead of about 1, so the squared Mahalanobis "
+            f"distances the routing reads are about {sigma_init:g} times larger and the initial routing is sharper "
+            "(the norm has no learned gain; the gate factor and the learned tables can absorb the scale in training)")
+
+
+def _other_positional_channels(cfg: Any) -> List[str]:
+    r"""The positional channels of ``cfg`` besides its positional frames: RoPE and a positional attention prior."""
+    channels: List[str] = []
+    if getattr(cfg, "rope_mode", "none") != "none":
+        channels.append(f"rope_mode={cfg.rope_mode!r}")
+    if getattr(cfg, "beta_attention_prior", "causal") not in ("causal", "causal_noself"):
+        channels.append(f"beta_attention_prior={cfg.beta_attention_prior!r}")
+    return channels
+
+
+def _positional_frames_deviation(base_cfg: Any, arm_cfg: Any, declared: Mapping[str, Any]) -> Optional[str]:
+    r"""The declared deviation of an arm that removes the base's positional frames without declaring it, or None.
+
+    ``gauge_transport='off'`` forces ``pos_phi='none'`` (``VFE3Config.__post_init__``), so on a base with
+    positional frames every identity-frame row also removes them (audit 2026-10-31,
+    gap-paper-arm-offlive-routes-2).
+    """
+    before, after = getattr(base_cfg, "pos_phi", "none"), getattr(arm_cfg, "pos_phi", "none")
+    if before == "none" or after != "none" or "pos_phi" in declared or arm_cfg.gauge_transport != "off":
+        return None
+    others = _other_positional_channels(arm_cfg)
+    kept = (f"the base keeps {', '.join(others)}" if others else
+            "they are the base's only positional channel (rope_mode='none' and no positional attention prior), so "
+            "this row also measures the loss of positional information")
+    return (f"positional frames removed: gauge_transport={arm_cfg.gauge_transport!r} forces pos_phi='none', so the "
+            f"base's positional frames (pos_phi={before!r}) go with the type frames; {kept}")
+
+
 def _word_level_base(base_dataset: str) -> Optional[str]:
     from vfe3.data.datasets import is_word_level
     return "the base is already word-level" if is_word_level(base_dataset) else None
@@ -351,6 +506,7 @@ def _word_level_base(base_dataset: str) -> Optional[str]:
 #   coerced               fields the config sets as a documented consequence of the overrides
 #   requires              VFE3Config fields the arm needs (unavailable when this build lacks one)
 #   inapplicable          function(base cfg) -> reason, or None when the arm applies
+#   deviations            functions(resolved base cfg, arm cfg) -> declared deviation, or None
 #   baseline              vfe3.baseline spec: {"per_type_table": ..., "compute_matched": bool,
 #                         "total_matched": bool, "overrides": {...}}
 #   dataset               dataset override (word level)
@@ -459,23 +615,28 @@ ARMS: Dict[str, Dict[str, Any]] = {
                 "norm_type_block": _covariant_norm("norm_type_block"),
                 "block_norm_covariance": _norm_covariance_without_layernorm,
                 "decode_coordinates": "reference"},
-        "requires": ("decode_coordinates", "block_norm_covariance"), "inapplicable": _no_mlp_or_reference_decode},
+        "requires": ("decode_coordinates", "block_norm_covariance"), "inapplicable": _no_mlp_or_reference_decode,
+        "deviations": (_mahalanobis_scale_deviation,)},
     # Audit 2026-10-09 round 2 items 4 and 12: frames are pure gauge wherever every consumer reads (xi, C),
     # so there a learned-frame model equals the frame-free per-type (xi_v, C_v) table. The head-block family
     # makes the routing projection closed under block-GL congruence; the covariant stack (three declared
     # changes) puts the LayerNorm, MLP and decoder in reference coordinates, and the frame-free table with
-    # identity frames (where reference and local coordinates coincide) is its frame-free equivalent.
+    # identity frames (where reference and local coordinates coincide) is its frame-free equivalent, on a base
+    # without positional frames. On a Fisher-table base both declare the AdamW table step (audit 2026-10-31,
+    # paper-arms-harness-7 and gap-paper-arm-offlive-routes-6).
     "Head-block family, learned frames": {
         "group": _RETRAINING, "slug": "block_family", "vfe": {"family": "gaussian_block"},
         "inapplicable": _already("family", "gaussian_block")},
     "Head-block family, frame-free Cholesky table": {
         "group": _RETRAINING, "slug": "block_family_cholesky",
-        "vfe": {"family": "gaussian_block", "prior_covariance_table": "block_cholesky", "gauge_transport": "off"},
-        "coerced": GAUGE_OFF_COERCED, "requires": ("prior_covariance_table",)},
+        "vfe": {**_CHOLESKY_TABLE, "m_table_update_mode": _cholesky_table_update},
+        "coerced": GAUGE_OFF_COERCED, "requires": ("prior_covariance_table",), "inapplicable": _positional_frames,
+        "deviations": (_table_update_deviation,)},
     "Head-block family, normalization, MLP and decoder in reference coordinates": {
         "group": _RETRAINING, "slug": "block_family_reference",
-        "vfe": {"family": "gaussian_block", "block_coordinates": "reference", "decode_coordinates": "reference"},
-        "requires": ("block_coordinates", "decode_coordinates")},
+        "vfe": {"family": "gaussian_block", "block_coordinates": "reference", "decode_coordinates": "reference",
+                "m_table_update_mode": _covariant_stack_table_update},
+        "requires": ("block_coordinates", "decode_coordinates"), "deviations": (_table_update_deviation,)},
     "MLP removed": {
         "group": _RETRAINING, "slug": "no_mlp", "vfe": {"use_block_mlp": False},
         "inapplicable": _no_mlp},
@@ -801,16 +962,19 @@ def check_vfe_arm(
 def effective_precision(cfg: Any) -> str:
     r"""The precision ``cfg`` computes in: its ``amp_dtype``, or ``"float32"`` without autocast.
 
-    A VFE config whose route runs every contraction in an autocast-disabled fp32 island marks
-    ``amp_dtype`` inert (:meth:`vfe3.config.VFE3Config.inactive_fields`; only the linear decode's logits
-    under ``decode_logits_amp`` and the CG coupling consume it), so a recorded ``'bf16'`` computes in
-    float32 there. A baseline's blocks run under any ``amp_dtype`` it sets.
+    A VFE route runs every contraction in an autocast-disabled fp32 island except the consumers
+    :func:`_amp_consumers` lists (the linear decode's logits under ``decode_logits_amp`` and the CG coupling),
+    so a VFE config without one computes in float32 under ``'bf16'`` and under ``'fp16'`` alike (audit
+    2026-10-31, gap-mixed-precision-routes-2). ``fp16`` also enables the GradScaler, which
+    :meth:`vfe3.config.VFE3Config.inactive_fields` keeps live; the scaler stays recorded through ``amp_dtype``
+    itself. A baseline's blocks run under any ``amp_dtype`` it sets.
     """
+    from vfe3.config import VFE3Config
+
     amp = getattr(cfg, "amp_dtype", None)
     if amp is None:
         return "float32"
-    inactive = getattr(cfg, "inactive_fields", None)
-    if callable(inactive) and "amp_dtype" in inactive():
+    if isinstance(cfg, VFE3Config) and not _amp_consumers(cfg):
         return "float32"
     return str(amp)
 
@@ -834,8 +998,8 @@ def check_baseline_arm(
 
     Returns ``{BaselineConfig field: (VFE value, baseline value)}`` of the declared differences.
     ``amp_dtype`` is compared by :func:`effective_precision` (audit 2026-10-16 F58): a VFE base recorded
-    with ``'bf16'`` on a route that computes in float32 is matched by a float32 baseline, and a bf16
-    baseline against it is a difference ``("float32", "bf16")``.
+    with ``'bf16'`` or ``'fp16'`` on a route that computes in float32 is matched by a float32 baseline, and a
+    bf16 baseline against it is a difference ``("float32", "bf16")``.
     """
     declared = set(declared)
     diff: Dict[str, Tuple[Any, Any]] = {}
@@ -872,6 +1036,10 @@ def check_baseline_arm(
 # ----------------------------------------------------------------------------------------------
 
 _PROBE_VOCAB: Tuple[int, int] = (64, 128)
+# Context-processing roles a baseline at the matched width has exactly as its matched VFE config: the content
+# maps (W_V, W_O) and the block MLP. The comparison maps differ by declared routing scalars (learned
+# temperatures, key noise) and the normalization by its layout (pre-LN or the shared post-norm).
+MATCHED_ROLES: Tuple[str, ...] = ("relational_content", "block_mlp")
 
 
 def _counts(model: Any, cfg: Any) -> Dict[str, int]:
@@ -881,10 +1049,13 @@ def _counts(model: Any, cfg: Any) -> Dict[str, int]:
 
     params = dict(model.named_parameters())
     breakdown = parameter_breakdown(params, cfg)
+    context = breakdown["context_processing"]
     return {"total": int(breakdown["total"]),
             "stored": sum(int(p.numel()) for p in params.values()),
             "trainable": sum(int(p.numel()) for p in params.values() if p.requires_grad),
-            "context_processing": int(breakdown["context_processing"]["total"]),
+            "context_processing": int(context["total"]),
+            # The roles a matched baseline must have exactly (MATCHED_ROLES; audit 2026-10-31, baseline-generation-1).
+            **{role: int(context.get(role, 0)) for role in MATCHED_ROLES},
             "per_type_tables": int(breakdown["per_type_tables"]["total"])}
 
 
@@ -945,6 +1116,19 @@ class ArmPlan:
     notes:        List[str] = field(default_factory=list)
     reused:       List[Tuple[int, int]] = field(default_factory=list)   # seed pairs served by the base run
     deviations:   List[str] = field(default_factory=list)   # declared differences outside the protocol fields
+    # Baseline arms: the spec's per-type table and overrides against the plain matched transformer
+    # {BaselineConfig field: (plain value, arm value)}, outside the protocol difference ``diff``.
+    defining:     Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
+    baseline_overrides: Dict[str, Any] = field(default_factory=dict)   # the ones this plan was resolved with
+
+
+def row_changes(plan: ArmPlan) -> Dict[str, Tuple[Any, Any]]:
+    r"""The changes a manifest row and the printed plan list: the defining choices, then the difference.
+
+    For a VFE arm this is ``plan.diff``; a baseline arm adds its defining choices (:attr:`ArmPlan.defining`), so
+    the row describes the arm that is trained (audit 2026-10-31, paper-arms-harness-12).
+    """
+    return {**plan.defining, **plan.diff}
 
 
 def seed_pairs(seeds: Sequence[Union[int, Sequence[int]]]) -> List[Tuple[int, int]]:
@@ -1010,7 +1194,8 @@ def resolve_arm(
 
     kind = "baseline" if "baseline" in spec else "vfe"
     plan = ArmPlan(label=label, group=spec["group"], slug=spec["slug"], kind=kind,
-                   dataset=spec.get("dataset", base.dataset), seeds=list(seeds))
+                   dataset=spec.get("dataset", base.dataset), seeds=list(seeds),
+                   baseline_overrides=dict(baseline_overrides or {}))
     known = {f.name for f in dataclasses.fields(VFE3Config)}
     missing = [name for name in spec.get("requires", ()) if name not in known]
     if missing:
@@ -1039,8 +1224,26 @@ def resolve_arm(
         except (ValueError, TypeError) as exc:
             plan.status, plan.reason = "invalid", f"config rejected: {exc}"
             return plan
+        rewritten = [key for key, value in declared.items() if getattr(plan.cfg, key) != value]
+        if declared and not rewritten and not config_difference(base_cfg, plan.cfg):
+            # Audit 2026-10-31 paper-arms-harness-5: every declared value is the base's own. An undeclared or
+            # rewritten difference is still a defect of ARMS (check_vfe_arm below).
+            plan.status = "inapplicable"
+            plan.reason = ("the base already is this row's configuration ("
+                           + ", ".join(f"{key}={value!r}" for key, value in declared.items()) + ")")
+            plan.cfg = None
+            return plan
         plan.diff = check_vfe_arm(base_cfg, plan.cfg, declared, spec.get("coerced", ()))
         inert = plan.cfg.inactive_fields()
+        if plan.diff and all(key in inert for key in plan.diff):
+            # Audit 2026-10-31 paper-arms-harness-2: no change of the row is read on this route, so its runs would
+            # replicate the evaluated arm to roundoff and read as a measured null.
+            plan.status = "inapplicable"
+            plan.reason = ("every change of this row is inert on the base, so it would train a replicate of the "
+                           "evaluated configuration: "
+                           + "; ".join(f"{key}={getattr(plan.cfg, key)!r} ({inert[key]})" for key in plan.diff))
+            plan.cfg = None
+            return plan
         plan.notes.extend(f"declared {key}={declared[key]!r} is inert here: {inert[key]}"
                           for key in declared if key in inert and key in plan.diff)
         # A base value no path read becomes live under the arm (e.g. a recorded hidden-bias rate).
@@ -1055,6 +1258,13 @@ def resolve_arm(
                          + (f"; {'; '.join(consumers)}" if consumers else "") + ")")
             plan.deviations.append(deviation)
             plan.notes.append(f"declared difference: {deviation}")
+        # Audit 2026-10-31: the positional frames gauge_transport='off' removes (gap-paper-arm-offlive-routes-2) and
+        # the arm's own declared deviations (the shared table step, the Mahalanobis mean scale).
+        for deviation in (_positional_frames_deviation(base_cfg, plan.cfg, declared),
+                          *(rule(base_cfg, plan.cfg) for rule in spec.get("deviations", ()))):
+            if deviation is not None:
+                plan.deviations.append(deviation)
+                plan.notes.append(f"declared difference: {deviation}")
         for seed, _ in seeds:
             _with_seed(plan.cfg, seed)                      # validates every seed's config
         if counts:
@@ -1164,8 +1374,14 @@ def _resolve_baseline(
     if precision[0] != precision[1]:
         # Audit 2026-10-16 F58: declared, not hidden; baseline_overrides amp_dtype=None matches a float32 base.
         declared += ("amp_dtype",)
-        recorded = (f" (its amp_dtype={matched.amp_dtype!r} is inert there)"
-                    if matched.amp_dtype is not None and precision[0] == "float32" else "")
+        recorded = ""
+        if matched.amp_dtype is not None and precision[0] == "float32":
+            # fp16 stays live through the GradScaler although no contraction runs under it (audit 2026-10-31,
+            # gap-mixed-precision-routes-2).
+            recorded = (f" (its amp_dtype={matched.amp_dtype!r} is inert there)"
+                        if "amp_dtype" in matched.inactive_fields() else
+                        f" (no contraction runs under its amp_dtype={matched.amp_dtype!r} there; it enables the "
+                        "GradScaler)")
         deviation = (f"precision: the matched VFE config computes in {precision[0]}{recorded}, this baseline's "
                      + (f"blocks under {precision[1]} autocast" if precision[1] != "float32" else "blocks in float32")
                      + (" (baseline_overrides amp_dtype=None trains it in float32)" if precision[0] == "float32"
@@ -1186,6 +1402,16 @@ def _resolve_baseline(
                      "isolates the norm placement")
         plan.deviations.append(deviation)
         plan.notes.append(f"declared difference: {deviation}")
+    # Audit 2026-10-31 paper-arms-harness-12: the per-type table and the arm's overrides define the row; against
+    # the plain matched transformer they are its changes beside the protocol difference.
+    try:
+        plain = api.BaselineConfig.matched_to(matched, per_type_table="none", **dict(baseline_overrides or {}))
+    except (ValueError, TypeError):
+        plain = None
+    if plain is not None:
+        for key in ("per_type_table", *arm_overrides):
+            if key not in plan.diff and getattr(plain, key, None) != getattr(plan.cfg, key, None):
+                plan.defining[key] = (getattr(plain, key, None), getattr(plan.cfg, key, None))
     if plan.cfg.norm_placement == "post_shared" and not plan.cfg.attention_residual:
         plan.notes.append("shared post-norm without the attention residual, LN(Attn(h)), as the matched base "
                           "(attention_residual=False) computes; BaselineConfig.attention_residual=False")
@@ -1193,6 +1419,10 @@ def _resolve_baseline(
         n_temperature = int(matched.n_heads) * int(matched.n_layers)
         plan.notes.append(f"the base learns its routing temperature: H x L = {n_temperature} context-processing "
                           "parameters the matched arm does not have")
+    if getattr(matched, "relational_routing", "gaussian_kl") == "noisy_key":
+        n_key_noise = int(matched.n_heads) * int(matched.n_layers)
+        plan.notes.append(f"the base learns its noisy-key routing noise (routing_key_log_noise): H x L = "
+                          f"{n_key_noise} context-processing parameters the matched arm does not have")
     for seed, _ in plan.seeds:
         _with_seed(plan.cfg, seed)
     if options.get("compute_matched"):
@@ -1205,6 +1435,27 @@ def _resolve_baseline(
                           f"other than {plan.cfg.embed_dim} is declared '{LR_NOT_TUNED}' when the rule is computed")
     if counts:
         plan.params = _baseline_counts(plan.cfg)
+        if not options.get("total_matched") and not options.get("compute_matched"):
+            _record_matched_roles(plan, _vfe_counts(matched))
+
+
+def _record_matched_roles(plan: ArmPlan, vfe: Mapping[str, int]) -> None:
+    r"""Compare the measured role counts of a baseline at the matched width with its matched VFE config.
+
+    The context-processing totals of both builds go into ``plan.notes``; a role of :data:`MATCHED_ROLES`
+    whose counts differ is a declared deviation (``plan.deviations``, the manifest row's
+    ``declared_deviations``), so a row labeled as matched never hides a count it does not match (audit
+    2026-10-31, baseline-generation-1 and paper-arms-harness-3).
+    """
+    arm = plan.params or {}
+    plan.notes.append(f"context-processing parameters: this baseline {arm.get('context_processing', 0):,}, the "
+                      f"matched VFE config {vfe.get('context_processing', 0):,} (measured)")
+    for role in MATCHED_ROLES:
+        if arm.get(role) != vfe.get(role):
+            deviation = (f"{role} parameters: the matched VFE config has {vfe.get(role, 0):,}, this baseline "
+                         f"{arm.get(role, 0):,}; the arm is not parameter-matched in this role")
+            plan.deviations.append(deviation)
+            plan.notes.append(f"declared difference: {deviation}")
 
 
 def build_plan(
@@ -1250,7 +1501,7 @@ def build_plan(
         # The launch's own check (completed_run's base fallback), so the plan never claims a reuse the
         # launch then rejects as stale (audit 2026-10-16 F19).
         rejected = reuse_mismatch(base.run_dir, evaluated.cfg, dataset=str(evaluated.dataset), seed=pair[0],
-                                  data_seed=pair[1], ignored=BASE_REUSE_IGNORED_FIELDS)
+                                  data_seed=pair[1], ignored=BASE_REUSE_IGNORED_FIELDS, data_identity=True)
         if rejected is None:
             evaluated.reused = [pair]
             evaluated.notes.append(f"seed pair {pair} is the base run itself and is reused, not retrained")
@@ -1302,6 +1553,43 @@ def _window_protocol_mismatch(mode: str, evidence: str) -> Optional[str]:
     return f"trained with {mode} training windows ({evidence}); every run trained now uses {CURRENT_TRAIN_WINDOW_MODE}"
 
 
+def _plan_storage(plan: ArmPlan) -> Tuple[Optional[float], Optional[float]]:
+    r"""``(state GB, disk GB)`` of one run of ``plan`` (None without parameter counts).
+
+    Static training state: fp32 parameters, gradients and two AdamW moments of every trainable parameter, the
+    frozen tables once. Disk: a training checkpoint of that state plus ``best_model.pt`` and ``final_model.pt``.
+    Estimates, activations excluded.
+    """
+    params = plan.params or {}
+    if not params.get("stored"):
+        return None, None
+    state = (16 * params["trainable"] + 4 * (params["stored"] - params["trainable"])) / 1e9
+    return state, state + 8 * params["stored"] / 1e9
+
+
+def plan_totals(plans: Sequence[ArmPlan]) -> Dict[str, float]:
+    r"""The plan's totals over its ready and deferred (arm, seed) pairs that a launch trains.
+
+    ``vfe_hours``: the estimated device-hours of the VFE arms at the base throughput; ``compute_matched_hours``:
+    the deferred compute-matched baseline's, which equal the evaluated arm's by construction and are listed apart;
+    ``disk_gb``: every trained run's checkpoint and model files. A pair the base run serves (``plan.reused``) is
+    not trained, so it counts in neither the hours nor the disk (audit 2026-10-31, paper-arms-harness-14).
+    """
+    totals = {"vfe_hours": 0.0, "compute_matched_hours": 0.0, "disk_gb": 0.0}
+    for plan in plans:
+        if plan.status not in ("ready", "deferred"):
+            continue
+        trained = len(plan.seeds) - len(plan.reused)
+        if plan.est_hours is not None:
+            key = "vfe_hours" if plan.kind == "vfe" else "compute_matched_hours" if plan.status == "deferred" else None
+            if key is not None:
+                totals[key] += plan.est_hours * trained
+        _, disk = _plan_storage(plan)
+        if disk is not None:
+            totals["disk_gb"] += disk * trained
+    return totals
+
+
 def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
     r"""The plan table for one base (plain text)."""
     cfg = base.cfg
@@ -1326,30 +1614,21 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"{'arm':56s} {'status':12s} {'total':>8s} {'train':>8s} {'context':>8s} {'steps':>7s} "
         f"{'tokens':>8s} {'est h':>6s} {'disk':>7s} {'state':>7s}",
     ]
-    total_hours = 0.0
-    total_disk = 0.0
+    totals = plan_totals(plans)
     for plan in plans:
         params = plan.params or {}
         steps = getattr(plan.cfg, "max_steps", None) if plan.cfg is not None else None
-        # Static training state: fp32 parameters, gradients and two AdamW moments of every trainable
-        # parameter, the frozen tables once. Disk: a training checkpoint of that state plus
-        # best_model.pt and final_model.pt. Estimates, activations excluded.
-        state = ((16 * params["trainable"] + 4 * (params["stored"] - params["trainable"])) / 1e9
-                 if params.get("stored") else None)
-        disk = (state + 8 * params["stored"] / 1e9) if state is not None else None
+        state, disk = _plan_storage(plan)
         hours = plan.est_hours
-        if hours is not None and plan.status in ("ready", "deferred"):
-            total_hours += hours * (len(plan.seeds) - len(plan.reused))
-        if disk is not None and plan.status in ("ready", "deferred"):
-            total_disk += disk * len(plan.seeds)
         lines.append(
             f"{plan.label[:56]:56s} {plan.status:12s} {_fmt_count(params.get('total')):>8s} "
             f"{_fmt_count(params.get('trainable')):>8s} {_fmt_count(params.get('context_processing')):>8s} "
             f"{steps if steps is not None else '-':>7} {_fmt_count(plan.tokens):>8s} "
             f"{f'{hours:.2f}' if hours is not None else '-':>6s} "
             f"{f'{disk:.1f}GB' if disk is not None else '-':>7s} {f'{state:.1f}GB' if state is not None else '-':>7s}")
-        if plan.diff:
-            shown = ", ".join(f"{key}: {a!r}->{b!r}" for key, (a, b) in plan.diff.items())
+        changes = row_changes(plan)
+        if changes:
+            shown = ", ".join(f"{key}: {a!r}->{b!r}" for key, (a, b) in changes.items())
             lines.append(f"    changes: {shown}")
         if plan.dataset != base.dataset:
             lines.append(f"    dataset: {plan.dataset}")
@@ -1357,10 +1636,14 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
             lines.append(f"    {plan.status}: {plan.reason}")
         lines.extend(f"    note: {note}" for note in plan.notes)
     lines.append("-" * 118)
-    lines.append(f"estimated VFE GPU-hours for ready arms x seeds at the base throughput: {total_hours:.1f} "
-                 "(baseline arms not estimated; per-arm cost differs from the base)")
-    lines.append(f"estimated disk for ready arms x seeds: {total_disk:.0f} GB (the compute-matched arm at the "
-                 "matched width)")
+    lines.append(f"estimated VFE GPU-hours for ready arms x seeds at the base throughput: {totals['vfe_hours']:.1f} "
+                 "(seed pairs the base run serves are reused, not counted; baseline arms not estimated; per-arm cost "
+                 "differs from the base)")
+    if totals["compute_matched_hours"]:
+        lines.append(f"compute-matched baseline: about {totals['compute_matched_hours']:.1f} GPU-hours over its seed "
+                     "pairs by construction (the evaluated arm's measured train hours per run), not included above")
+    lines.append(f"estimated disk for ready arms x seeds: {totals['disk_gb']:.0f} GB (reused seed pairs excluded; the "
+                 "compute-matched arm at the matched width)")
     return "\n".join(lines)
 
 
@@ -1370,6 +1653,11 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
 
 def run_label(slug: str, seed: int, data_seed: int) -> str:
     return f"{slug}_s{seed}_d{data_seed}"
+
+
+# The checkpoint-selection rule build_manifest declares: the table reads each run's test CE at its
+# best-validation weights (vfe3.paper.runs.select_checkpoint).
+MANIFEST_SELECTION: str = "best"
 
 
 def is_complete(run_dir: Path) -> bool:
@@ -1386,7 +1674,11 @@ def failed_run_reason(run_dir: Path) -> Optional[str]:
     r"""Why ``run_dir`` is a finished run without a test result, or None.
 
     A run that published ``summary.json`` finished; one whose ``test_ce`` is not a finite number (NaN or
-    infinity after a divergence, or null) finished and failed. A run without a readable ``summary.json``
+    infinity after a divergence, or null) finished and failed, and so did one whose finite headline exists
+    but whose test value under :data:`MANIFEST_SELECTION` cannot be found
+    (:func:`vfe3.paper.runs.select_checkpoint`: a failed best-weights test with the best step before the
+    final step and no post-hoc pass on ``best_model.pt``), the number the table and the decision rule read
+    (audit 2026-10-31, paper-claims-1 and paper-arms-harness-4). A run without a readable ``summary.json``
     failed when :func:`vfe3.experiment.run_vfe` (or ``run_baseline``) recorded a crash in ``failure.json``
     (:func:`vfe3.experiment.read_failure_record`), so a relaunch does not re-roll the pair (audit
     2026-10-17 item 28); without either file it is unfinished (interrupted, or still training) and is not
@@ -1405,9 +1697,16 @@ def failed_run_reason(run_dir: Path) -> Optional[str]:
     if not isinstance(summary, dict):
         return None
     value = summary.get("test_ce")
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+    if not (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)):
+        return f"finished without a finite test CE (summary.json test_ce={value!r})"
+    from vfe3.paper.runs import load_run, select_checkpoint
+
+    selection = select_checkpoint(load_run(run_dir), MANIFEST_SELECTION)
+    if selection["status"] == "ok":
         return None
-    return f"finished without a finite test CE (summary.json test_ce={value!r})"
+    return (f"finished without a test value under the selection rule {MANIFEST_SELECTION!r} "
+            f"({selection['reason']}; summary.json test_best_status={summary.get('test_best_status')!r}); "
+            "posthoc_eval.py on best_model.pt supplies it")
 
 
 def _label_runs(arm_dir: Path, label: str) -> List[Path]:
@@ -1427,22 +1726,28 @@ def find_complete_run(arm_dir: Path, label: str) -> Optional[Path]:
     r"""The complete run of ``label`` in ``arm_dir`` (no config check; see :func:`completed_run`).
 
     None when there is none or more than one: the folder names begin with the test PPL, so their order
-    is a result, and no run is chosen by it (audit 2026-10-16 F60).
+    is a result, and no run is chosen by it (audit 2026-10-16 F60). Test hook: referenced only by the tests.
     """
     found = complete_runs(arm_dir, label)
     return found[0] if len(found) == 1 else None
 
 
+# The training-checkpoint cadence: when a resumable checkpoint is written and how many are kept. It does not
+# change the trained weights (the best-model contract of vfe3.run_artifacts drops these fields for the same
+# reason, and vfe3.paper's homogeneity check ignores them). The base run carries its own (the 36.41 base: a
+# checkpoint every 90,000 of 120,000 steps) while every budget writes one at the end, and a launch with
+# CONFIG["checkpoint_every"] writes one every N steps (audit 2026-10-16 F19; audit 2026-10-31,
+# paper-arms-harness-10).
+CHECKPOINT_CADENCE_FIELDS: Tuple[str, ...] = ("checkpoint_interval", "checkpoint_keep_last", "checkpoint_at_end")
 # Fields a reused run may differ in from the plan: the model seed (checked against the run's recorded
-# seed instead) and a resume path, neither of which defines the arm.
-REUSE_IGNORED_FIELDS: Tuple[str, ...] = ("seed", "resume_from")
-# The base run, reused as the evaluated arm's replicate at its own seed pair, may also differ in its
-# training-checkpoint cadence: it was trained with its own checkpoint_interval (the 36.41 base: 90,000 of
-# 120,000 steps) while every budget writes one checkpoint at the end. The cadence only decides when a
-# resumable checkpoint is written, so it does not change the trained weights (the best-model contract of
-# vfe3.run_artifacts drops it for the same reason). Runs in the experiment directory, which paper_arms
-# writes at the budget's cadence, are still compared on it (audit 2026-10-16 F19).
-BASE_REUSE_IGNORED_FIELDS: Tuple[str, ...] = (*REUSE_IGNORED_FIELDS, "checkpoint_interval")
+# seed instead), the resume path and policy, and the checkpoint cadence, none of which defines the arm. run_vfe
+# clears both resume fields before it trains, as the checkpoint-resume comparison of vfe3.run_artifacts exempts
+# both, so a base recorded with trust_resume_checkpoint=True is not a different arm (audit 2026-10-31,
+# paper-arms-harness-8).
+REUSE_IGNORED_FIELDS: Tuple[str, ...] = ("seed", "resume_from", "trust_resume_checkpoint", *CHECKPOINT_CADENCE_FIELDS)
+# The base run, reused as the evaluated arm's replicate at its own seed pair: the same fields (its own checkpoint
+# cadence included); its recorded training-data identity is checked besides (data_identity_mismatch).
+BASE_REUSE_IGNORED_FIELDS: Tuple[str, ...] = REUSE_IGNORED_FIELDS
 
 
 def _serialized(cfg: Any) -> Dict[str, Any]:
@@ -1454,6 +1759,75 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
+# provenance.json key prefix -> token-cache split of the training-data identity every run records.
+_DATA_IDENTITY_SPLITS: Tuple[Tuple[str, str], ...] = (("train", "train"), ("val", "validation"), ("test", "test"))
+
+
+@functools.lru_cache(maxsize=None)
+def _cache_content_identity(dataset: str, split: str, source: Tuple[str, int, int]) -> Tuple[str, int]:
+    r"""``(sha256, n_tokens)`` of the token cache ``source`` = ``(path, size, mtime_ns)``, as provenance hashes it.
+
+    The digest is :func:`vfe3.run_artifacts._sha256_tensor_content` of the uncapped stream (int64 values in
+    bounded chunks), the one ``finalize_run`` records; ``source`` keys the cache, so a rebuilt cache is hashed
+    again.
+    """
+    from vfe3.data.datasets import load_cached_tokens
+    from vfe3.run_artifacts import _sha256_tensor_content
+
+    tokens = load_cached_tokens(dataset, split, cache_dir=Path(source[0]).parent)
+    return _sha256_tensor_content(tokens), int(tokens.numel())
+
+
+def _current_split_identity(dataset: str, split: str) -> Tuple[str, int]:
+    r"""``(sha256, n_tokens)`` of the current ``dataset``/``split`` token cache (``FileNotFoundError`` when absent)."""
+    from vfe3.data.datasets import cache_path
+
+    for suffix in ("pt", "bin"):
+        path = cache_path(dataset, split, suffix=suffix)
+        if path.exists():
+            resolved = path.resolve()
+            stat = resolved.stat()
+            return _cache_content_identity(dataset, split, (str(path), int(stat.st_size), int(stat.st_mtime_ns)))
+    raise FileNotFoundError(f"no tokenized cache for {dataset!r}/{split!r} under {cache_path(dataset, split).parent}")
+
+
+def data_identity_mismatch(provenance: Mapping[str, Any], dataset: str) -> Optional[str]:
+    r"""Why a saved run's recorded training-data identity is not what a run trained now on ``dataset`` records.
+
+    None when it is. Every run trained now reads the uncapped streams (``max_tokens=None``) of the current token
+    caches and records their tokenizer tag, content hashes and token counts in ``provenance.json``, which
+    :mod:`vfe3.paper` compares across the runs of an arm (``HOMOGENEITY_PROVENANCE_FIELDS``). A recorded
+    ``max_tokens`` is a mismatch; a recorded tag, hash or count is compared with the current caches' (hashed once
+    per cache file and process); a field the run did not record is not compared (audit 2026-10-31,
+    paper-arms-harness-9).
+    """
+    from vfe3.data.datasets import _tokenizer_tag
+
+    capped = provenance.get("max_tokens")
+    if capped is not None:
+        return (f"its training stream was capped (provenance.json max_tokens={capped!r}); every run trained now "
+                "reads the uncapped stream")
+    recorded_tag = provenance.get("tokenizer_tag")
+    if recorded_tag is not None and recorded_tag != _tokenizer_tag(dataset):
+        return (f"provenance.json tokenizer_tag={recorded_tag!r}, the current {dataset!r} caches' "
+                f"{_tokenizer_tag(dataset)!r}")
+    for key, split in _DATA_IDENTITY_SPLITS:
+        sha_key, n_key = f"{key}_data_sha256", f"{key}_data_n_tokens"
+        recorded = {name: provenance.get(name) for name in (sha_key, n_key) if provenance.get(name) is not None}
+        if not recorded:
+            continue
+        try:
+            digest, count = _current_split_identity(dataset, split)
+        except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+            return f"its recorded {split} data identity cannot be compared with the current cache ({exc})"
+        current = {sha_key: digest, n_key: count}
+        differing = [name for name, value in recorded.items() if value != current[name]]
+        if differing:
+            return "its training data is not the current caches': " + ", ".join(
+                f"provenance.json {name}={recorded[name]!r} (current {current[name]!r})" for name in differing)
+    return None
+
+
 def reuse_mismatch(
     run_dir:   Path,
     cfg:       Any,
@@ -1463,13 +1837,16 @@ def reuse_mismatch(
     seed:      int,
     data_seed: int,
     ignored:   Sequence[str] = REUSE_IGNORED_FIELDS,
+    data_identity: bool = False,
 ) -> Optional[str]:
     r"""Why the complete run ``run_dir`` is not a run of ``cfg`` at ``(seed, data_seed)`` on ``dataset``.
 
     None when it is: the run's saved config, loaded as :mod:`vfe3.paper` loads it, serializes to the
     plan's config on every field except ``ignored`` (:data:`REUSE_IGNORED_FIELDS`; the base run's
     fallback passes :data:`BASE_REUSE_IGNORED_FIELDS`), and its dataset, model seed and data-order seed
-    (when recorded) are the plan's. A label match alone never reuses a run.
+    (when recorded) are the plan's. With ``data_identity`` (the base run's fallback) its recorded training-data
+    identity must also be the current caches' (:func:`data_identity_mismatch`); a run of the experiment
+    directory was trained on them. A label match alone never reuses a run.
     """
     from vfe3.paper.runs import load_run
 
@@ -1490,6 +1867,8 @@ def reuse_mismatch(
     if differing:
         return "config differs from the plan in " + ", ".join(
             f"{key} (run {recorded.get(key)!r}, plan {planned.get(key)!r})" for key in differing)
+    if data_identity:
+        return data_identity_mismatch(record.provenance, dataset)
     return None
 
 
@@ -1518,20 +1897,32 @@ def completed_run(
     the folder names begin with the test PPL and their order is a result (audit 2026-10-16 F60). A
     finished run without a finite test CE (:func:`failed_run_reason`) whose config is the plan's (any,
     without ``cfg``) is appended to ``failed``: it is a recorded failure of the pair, not an absent
-    run (audit 2026-10-16 F61).
+    run (audit 2026-10-16 F61). So is a complete run of the plan's config without a test value under
+    :data:`MANIFEST_SELECTION`, which is not returned (audit 2026-10-31, paper-arms-harness-4).
     Otherwise, under the ``base_protocol`` budget, the evaluated arm at the base run's own
     ``(seed, data_seed)`` is the base run itself when it is complete and, with ``cfg`` given,
-    :func:`reuse_mismatch` accepts it with :data:`BASE_REUSE_IGNORED_FIELDS` (its own checkpoint cadence
-    is not a difference; a base recorded with another budget is stale).
+    :func:`reuse_mismatch` accepts it with :data:`BASE_REUSE_IGNORED_FIELDS` and its recorded training-data
+    identity (its own checkpoint cadence is not a difference; a base recorded with another budget, or on a
+    capped or other token stream, is stale). The base run is returned even without a selected test value:
+    ``load_base`` reads it, so it cannot be moved aside or retrained in place, and the decision rule reports
+    the missing value. The runs of a word-level row are searched in every directory of
+    :func:`arm_directories`.
     """
-    slug = (ARMS if arms is None else arms)[label]["slug"]
+    spec = (ARMS if arms is None else arms)[label]
+    slug = spec["slug"]
     accepted: List[Path] = []
-    for found in _label_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
+    candidates = [found for arm_dir in arm_directories(exp_dir, spec)
+                  for found in _label_runs(arm_dir, run_label(slug, seed, data_seed))]
+    for found in candidates:
         if is_complete(found):
             reason = (None if cfg is None else
                       reuse_mismatch(found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
-            if reason is None:
+            unselected = failed_run_reason(found) if reason is None else None
+            if reason is None and unselected is None:
                 accepted.append(found)
+            elif reason is None:
+                if failed is not None:
+                    failed.append({"run": str(found), "reason": unselected})
             elif stale is not None:
                 stale.append({"run": str(found), "reason": reason})
             continue
@@ -1553,7 +1944,7 @@ def completed_run(
             and is_complete(base.run_dir)):
         reason = (None if cfg is None else
                   reuse_mismatch(base.run_dir, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed,
-                                 ignored=BASE_REUSE_IGNORED_FIELDS))
+                                 ignored=BASE_REUSE_IGNORED_FIELDS, data_identity=True))
         if reason is None:
             return base.run_dir
         if stale is not None:
@@ -1566,6 +1957,98 @@ def experiment_dir(out_root: Union[str, Path], base: str, budget: str) -> Path:
     return (root if root.is_absolute() else ROOT / root) / base / budget
 
 
+def arm_directory(exp_dir: Path, spec: Mapping[str, Any]) -> Path:
+    r"""Where the runs of the arm ``spec`` are trained: ``<exp_dir>/<slug>``.
+
+    A word-level row (one with a ``dataset``) trains the one-epoch word budget whatever budget the BPE rows
+    use, so its runs live under the :data:`WORD_LEVEL_BUDGET` experiment directory of the same base
+    (``<out_root>/<base>/<WORD_LEVEL_BUDGET>/<slug>``), which every budget's launch shares (audit
+    2026-10-31, paper-arms-harness-11).
+    """
+    if "dataset" in spec:
+        return Path(exp_dir).parent / WORD_LEVEL_BUDGET / spec["slug"]
+    return Path(exp_dir) / spec["slug"]
+
+
+def arm_directories(exp_dir: Path, spec: Mapping[str, Any]) -> List[Path]:
+    r"""Every directory searched for the runs of ``spec``: :func:`arm_directory`, then ``<exp_dir>/<slug>``, where
+    a launch under another budget trained a word-level row before it moved."""
+    home, own = arm_directory(exp_dir, spec), Path(exp_dir) / spec["slug"]
+    return [home] if home == own else [home, own]
+
+
+MANIFEST_FILE = "m2_manifest.json"
+
+
+def manifest_seed_pairs(
+    exp_dir: Path,
+
+    *,
+    base:    Base,
+    budget:  str,
+    seeds:   Sequence[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    r"""The seed pairs the manifest of ``exp_dir`` lists: those it already records, then ``seeds``' others.
+
+    A launch at fewer seed pairs than an earlier one (``"REST"`` at one seed, after the decision arms at
+    three) then adds rows instead of truncating the earlier rows' runs and flipping the registered decision
+    rule (audit 2026-10-31, paper-arms-harness-1). A manifest of another base or budget, or an unreadable
+    one, contributes nothing; to shrink the experiment deliberately, move its manifest aside.
+    """
+    recorded: List[Tuple[int, int]] = []
+    try:
+        previous = json.loads((exp_dir / MANIFEST_FILE).read_text(encoding="utf-8"))
+        record = previous.get("paper_arms") or {}
+        if record.get("base") == base.name and record.get("budget") == budget:
+            recorded = seed_pairs([tuple(pair) for pair in record.get("seeds") or []])
+    except (OSError, ValueError, TypeError, AttributeError):
+        recorded = []
+    return recorded + [pair for pair in seed_pairs(seeds) if pair not in recorded]
+
+
+def unselected_plans(
+    base:   Base,
+    plans:  Sequence[ArmPlan],
+
+    *,
+    budget: str,
+    seeds:  Sequence[Tuple[int, int]],
+    arms:   Optional[Mapping[str, Mapping[str, Any]]] = None,
+    baseline_overrides: Optional[Mapping[str, Any]] = None,
+) -> List[ArmPlan]:
+    r"""Every arm of ``arms`` that ``plans`` leaves out, resolved without parameter counts for the manifest.
+
+    The manifest checks the runs of every row against its resolved config (:func:`build_manifest`), so a
+    launch of a subset of the arms keeps the other rows verified (audit 2026-10-31, paper-arms-harness-1).
+    Each arm is resolved alone; one whose resolution raises (a defect of :data:`ARMS`, which planning it
+    reports) is recorded as invalid with the reason, so its runs are listed unchecked.
+    """
+    arms = ARMS if arms is None else arms
+    chosen = {plan.label for plan in plans}
+    out: List[ArmPlan] = []
+    for label, spec in arms.items():
+        if label in chosen:
+            continue
+        try:
+            out.extend(build_plan(base, budget=budget, seeds=seeds, labels=[label], arms=arms, counts=False,
+                                  baseline_overrides=baseline_overrides))
+        except (ArmDefinitionError, ArithmeticError, LookupError, OSError, RuntimeError, TypeError,
+                ValueError) as exc:
+            out.append(ArmPlan(label=label, group=spec["group"], slug=spec["slug"],
+                               kind="baseline" if "baseline" in spec else "vfe", status="invalid",
+                               reason=f"not resolved for the manifest's run check: {type(exc).__name__}: {exc}",
+                               dataset=spec.get("dataset", base.dataset), seeds=list(seeds),
+                               baseline_overrides=dict(baseline_overrides or {})))
+    return out
+
+
+def _launch_baseline_overrides(plans: Sequence[ArmPlan], given: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    r"""``given``, else the ``baseline_overrides`` the plans were resolved with (one :func:`build_plan` call)."""
+    if given is not None:
+        return dict(given)
+    return dict(plans[0].baseline_overrides) if plans else {}
+
+
 def build_manifest(
     exp_dir: Path,
     plans:   Sequence[ArmPlan],
@@ -1575,15 +2058,21 @@ def build_manifest(
     budget:  str,
     seeds:   Sequence[Tuple[int, int]],
     arms:    Optional[Mapping[str, Mapping[str, Any]]] = None,
+    unselected: Optional[Sequence[ArmPlan]] = None,
+    baseline_overrides: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     r"""The manifest :mod:`vfe3.paper` reads: every table row, with the complete runs of the plan's seeds.
 
     A selected arm lists only runs whose saved config is the plan's (:func:`reuse_mismatch`); a
     rejected complete run is listed under ``paper_arms.rows[label]["stale"]`` with its reason, and so is
     every one of several complete runs of one seed pair (none is listed under ``runs``); a finished run
-    without a finite test CE is listed under ``paper_arms.rows[label]["failed"]`` with its reason. Runs of an
-    arm this launch did not resolve (``"not selected"``), or of the compute-matched arm before its width
-    rule exists, are listed unchecked and flagged ``reuse_verified: false``. Every listed run's code
+    without a finite test CE is listed under ``paper_arms.rows[label]["failed"]`` with its reason. An arm
+    this launch did not select (status ``"not selected"``) is resolved here (``unselected``, else
+    :func:`unselected_plans` with ``baseline_overrides``, by default the plans' own) and its runs are checked
+    the same way, its resolution under ``resolved_status`` (audit 2026-10-31, paper-arms-harness-1). Runs of
+    an arm whose config cannot be known here (one that is not ready, or the compute-matched arm before its
+    width rule exists) are listed unchecked and flagged ``reuse_verified: false``. Every row carries the
+    plan's ``changes`` (:func:`row_changes`), ``declared_deviations`` and ``notes``. Every listed run's code
     identity (:func:`vfe3.paper.runs.code_identity`) is recorded, and a run whose identity is not the
     current tree's is listed under ``code_identity_mismatch`` with the reason (kept, not rejected). Every
     listed run's training-window origin (:func:`vfe3.experiment.saved_train_window_mode`) is recorded under
@@ -1599,13 +2088,18 @@ def build_manifest(
 
     arms = ARMS if arms is None else arms
     by_label = {plan.label: plan for plan in plans}
+    if unselected is None:
+        unselected = unselected_plans(base, plans, budget=budget, seeds=seeds, arms=arms,
+                                      baseline_overrides=_launch_baseline_overrides(plans, baseline_overrides))
+    others = {plan.label: plan for plan in unselected if plan.label not in by_label}
     manifest_arms: Dict[str, Any] = {}
     rows: Dict[str, Any] = {}
     evaluated_run = None
     shown_evaluated = evaluated_label(base.cfg)
     current: Dict[str, Dict[str, Any]] = {}              # the working tree's identity, computed once per kind
     for label, spec in arms.items():
-        plan = by_label.get(label)
+        selected = label in by_label
+        plan = by_label.get(label) or others.get(label)
         expected = _expected_cfg(exp_dir, plan) if plan is not None else None
         runs: List[str] = []
         stale: List[Dict[str, str]] = []
@@ -1622,11 +2116,14 @@ def build_manifest(
                         spec["inapplicable"](base.cfg) if plan is None and spec.get("inapplicable") else None)
         if inapplicable:
             manifest_arms[shown]["inapplicable"] = inapplicable
-        rows[shown] = {"status": plan.status if plan else "not selected",
+        rows[shown] = {"status": plan.status if selected else "not selected",
+                       "resolved_status": plan.status if plan else None,
                        "reason": plan.reason if plan else None,
-                       "changes": {k: [repr(a), repr(b)] for k, (a, b) in plan.diff.items()} if plan else {},
+                       "changes": ({k: [repr(a), repr(b)] for k, (a, b) in row_changes(plan).items()}
+                                   if plan else {}),
                        "complete": len(runs),
                        "declared_deviations": list(plan.deviations) if plan else [],
+                       "notes": list(plan.notes) if plan else [],
                        "reuse_verified": expected is not None,
                        "stale": stale,
                        "failed": failed,
@@ -1648,7 +2145,7 @@ def build_manifest(
     return {
         "arms": manifest_arms,
         "evaluated_run": evaluated_run,
-        "selection": "best",
+        "selection": MANIFEST_SELECTION,
         "decision": {"evaluated": shown_evaluated, "comparator": decision_comparator(base.cfg),
                      "frozen": DECISION_FROZEN, "capacity": DECISION_CAPACITY},
         "out_dir": str(exp_dir / "paper_artifacts"),
@@ -1677,7 +2174,7 @@ def _expected_cfg(exp_dir: Path, plan: ArmPlan) -> Any:
 
 def write_manifest(exp_dir: Path, manifest: Mapping[str, Any]) -> Path:
     exp_dir.mkdir(parents=True, exist_ok=True)
-    path = exp_dir / "m2_manifest.json"
+    path = exp_dir / MANIFEST_FILE
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
     tmp.replace(path)
@@ -1865,6 +2362,140 @@ def compute_matched_config(
     return cfg
 
 
+_CHECKPOINT_FILE = re.compile(r"^step_(\d+)\.pt$")
+
+
+def _checkpoint_every(value: Any) -> Optional[int]:
+    r"""``CONFIG["checkpoint_every"]`` validated: None, or a positive int."""
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"checkpoint_every must be None or a positive int, got {value!r}")
+    return value
+
+
+def resumable_cadence(cfg: Any, every: int) -> Any:
+    r"""``cfg`` writing a resumable training checkpoint every ``every`` steps and at the end, the latest kept.
+
+    Only the cadence fields (:data:`CHECKPOINT_CADENCE_FIELDS`) change, and they do not change the trained
+    weights, so a run of the result is a replicate of ``cfg`` (audit 2026-10-31, paper-arms-harness-10).
+    """
+    every = _checkpoint_every(every)
+    return rebuild(cfg, {"checkpoint_interval": every, "checkpoint_keep_last": 1, "checkpoint_at_end": True},
+                   "resumable checkpoint cadence")
+
+
+def resumable_checkpoint(
+    exp_dir:   Path,
+    label:     str,
+    seed:      int,
+    data_seed: int,
+
+    *,
+    cfg:       Any,
+    dataset:   str,
+    arms:      Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Optional[Path]:
+    r"""The latest training checkpoint of an interrupted run of arm ``label`` at ``(seed, data_seed)``, or None.
+
+    An interrupted run holds neither ``summary.json`` nor a failure record (:func:`failed_run_reason`: it was
+    stopped or killed, not crashed), its saved config is ``cfg`` (:func:`reuse_mismatch`, which ignores the
+    checkpoint cadence), and it holds a ``checkpoints/step_<N>.pt`` with :math:`N \le` ``cfg.max_steps``. Of
+    several, the checkpoint of the largest step is returned (audit 2026-10-31, paper-arms-harness-10).
+    """
+    spec = (ARMS if arms is None else arms)[label]
+    latest: Optional[Tuple[int, Path]] = None
+    for arm_dir in arm_directories(exp_dir, spec):
+        for run in _label_runs(arm_dir, run_label(spec["slug"], seed, data_seed)):
+            if (run / "summary.json").exists() or failed_run_reason(run) is not None:
+                continue
+            steps: List[Tuple[int, Path]] = []
+            for path in (run / "checkpoints").glob("step_*.pt"):
+                match = _CHECKPOINT_FILE.match(path.name)
+                if match is not None and int(match.group(1)) <= int(cfg.max_steps):
+                    steps.append((int(match.group(1)), path))
+            if not steps or reuse_mismatch(run, cfg, dataset=dataset, seed=seed, data_seed=data_seed) is not None:
+                continue
+            candidate = max(steps)
+            if latest is None or candidate[0] > latest[0]:
+                latest = candidate
+    return None if latest is None else latest[1]
+
+
+def _metrics_rows(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+    r"""``(header, rows)`` of a ``metrics.csv`` (empty when absent or unreadable)."""
+    import csv
+
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            return list(reader.fieldnames or []), list(reader)
+    except (OSError, csv.Error):
+        return [], []
+
+
+def _row_at_or_before(row: Mapping[str, str], bound: int) -> bool:
+    r"""Whether a ``metrics.csv`` row's ``step`` is a finite number at most ``bound``."""
+    try:
+        value = float(row.get("step") or "nan")
+    except ValueError:
+        return False
+    return math.isfinite(value) and value <= bound
+
+
+def stitch_resumed_metrics(run_dir: Path) -> int:
+    r"""Prepend to a resumed run's ``metrics.csv`` the rows its interrupted source logged up to the resume step.
+
+    A resumed run's ``metrics.csv`` starts after the checkpoint step ``saved_step`` (``summary.json``
+    ``resume_source``), so the validation curve of Figure M3 and the training-time estimate behind the
+    compute-matched budget (:func:`vfe3.run_resources.throughput_summary` sums the logged mean step time over the
+    logged steps) would read the continuation alone. The source's rows up to ``saved_step`` are the same run's
+    history; a source that was itself resumed adds its own source's rows up to its resume step
+    (``resume_provenance.json``). A row the interrupted process never wrote (an interruption between a step's
+    checkpoint save and that step's row) is in neither run. Returns the number of rows prepended: 0 when the run
+    was not resumed or already holds rows at or before the resume step (audit 2026-10-31, paper-arms-harness-10).
+    """
+    import csv
+
+    try:
+        summary = json.loads((Path(run_dir) / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    source = summary.get("resume_source") if isinstance(summary, dict) else None
+    if not isinstance(source, dict) or not isinstance(source.get("saved_step"), int):
+        return 0
+    first_bound = int(source["saved_step"])
+    segments: List[Tuple[List[str], List[Dict[str, str]]]] = []
+    src, bound, visited = source.get("source_run_dir"), first_bound, set()
+    while isinstance(src, str) and isinstance(bound, int) and src not in visited:
+        visited.add(src)
+        header, rows = _metrics_rows(Path(src) / "metrics.csv")
+        segments.append((header, [row for row in rows if _row_at_or_before(row, bound)]))
+        try:
+            provenance = json.loads((Path(src) / "resume_provenance.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            break
+        checkpoint = Path(str(provenance.get("checkpoint_path") or ""))
+        src = str(checkpoint.parent.parent) if checkpoint.parent.name == "checkpoints" else None
+        bound = provenance.get("saved_step")
+    header, own = _metrics_rows(Path(run_dir) / "metrics.csv")
+    prepended = [row for _, rows in reversed(segments) for row in rows]
+    if not header or not prepended or any(_row_at_or_before(row, first_bound) for row in own):
+        return 0
+    fieldnames = list(header) + [key for segment_header, _ in reversed(segments) for key in segment_header
+                                 if key not in header]
+    fieldnames = list(dict.fromkeys(fieldnames))
+    path = Path(run_dir) / "metrics.csv"
+    tmp = path.with_suffix(".csv.stitch.tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, restval="")
+        writer.writeheader()
+        for row in (*prepended, *own):
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+    tmp.replace(path)
+    return len(prepended)
+
+
 def run_plan(
     base:     Base,
     plans:    Sequence[ArmPlan],
@@ -1877,6 +2508,8 @@ def run_plan(
     width_ladder: Sequence[float] = (1, 1.5, 2, 3, 4, 6, 8),
     logger:   Optional[logging.Logger] = None,
     arms:     Optional[Mapping[str, Mapping[str, Any]]] = None,
+    baseline_overrides: Optional[Mapping[str, Any]] = None,
+    checkpoint_every: Optional[int] = None,
 ) -> Path:
     r"""Train every ready (arm, seed) pair of ``plans`` without a complete run; return the manifest path.
 
@@ -1887,9 +2520,16 @@ def run_plan(
     plan's config, listing them, so a changed arm is neither silently reused nor silently retrained
     beside its old runs. A pair whose only run of the plan's config finished without a finite test CE
     is a recorded failure: it is logged and listed in the manifest, and never retrained by a relaunch.
+    The manifest also lists, verified, every arm the launch did not select (resolved once with
+    ``baseline_overrides``, by default the plans' own, :func:`unselected_plans`) over the seed pairs the
+    existing manifest records and the launch's (:func:`manifest_seed_pairs`); runs are trained in
+    :func:`arm_directory`. With ``checkpoint_every`` a VFE run also writes a resumable checkpoint every that
+    many steps (:func:`resumable_cadence`), and a VFE pair whose run was interrupted is resumed from its latest
+    checkpoint (:func:`resumable_checkpoint`, :func:`stitch_resumed_metrics`) instead of trained from step 0.
     """
     from vfe3.experiment import run_vfe
 
+    checkpoint_every = _checkpoint_every(checkpoint_every)
     logger = logger or logging.getLogger("paper_arms")
     invalid = [plan for plan in plans if plan.status == "invalid"]
     if invalid:
@@ -1910,7 +2550,8 @@ def run_plan(
                 blocked.extend(f"{plan.label} seed=({seed}, {data_seed}): {entry['run']}: {entry['reason']}"
                                + (" (the base run itself, which load_base reads: leave it in place; this pair "
                                   "cannot run until the plan's evaluated config matches the base run's, or "
-                                  "the pair is dropped from CONFIG['seeds'])"
+                                  "the pair is dropped from CONFIG['seeds'] and from the seed pairs an existing "
+                                  f"{MANIFEST_FILE} records, by moving that manifest aside)"
                                   if Path(entry["run"]) == base.run_dir else "")
                                for entry in stale)
     if blocked:
@@ -1918,9 +2559,14 @@ def run_plan(
                          "pair (move them aside, or restore the configuration they were trained with):\n  "
                          + "\n  ".join(blocked))
 
+    # Audit 2026-10-31 paper-arms-harness-1: the manifest keeps the seed pairs it records and verifies every row.
+    manifest_seeds = manifest_seed_pairs(exp_dir, base=base, budget=budget, seeds=seeds)
+    others = unselected_plans(base, plans, budget=budget, seeds=manifest_seeds, arms=arms,
+                              baseline_overrides=_launch_baseline_overrides(plans, baseline_overrides))
+
     def refresh() -> Path:
         return write_manifest(exp_dir, build_manifest(exp_dir, plans, base=base, budget=budget,
-                                                      seeds=seeds, arms=arms))
+                                                      seeds=manifest_seeds, arms=arms, unselected=others))
 
     refresh()
     for plan in plans:
@@ -1934,7 +2580,7 @@ def run_plan(
                                          base=base, budget=budget)
             if cfg is None:
                 continue
-        arm_dir = exp_dir / plan.slug
+        arm_dir = arm_directory(exp_dir, (ARMS if arms is None else arms)[plan.label])
         for seed, data_seed in plan.seeds:
             label = run_label(plan.slug, seed, data_seed)
             failed: List[Dict[str, str]] = []
@@ -1950,11 +2596,31 @@ def run_plan(
                                plan.label, seed, data_seed,
                                "; ".join(f"{entry['run']}: {entry['reason']}" for entry in failed))
                 continue
-            logger.info("training %s | %s | seed=%d data_seed=%d", plan.label, plan.dataset, seed, data_seed)
             if plan.kind == "vfe":
-                run_vfe(cfg, dataset=plan.dataset, out_root=arm_dir, seed=seed, data_seed=data_seed,
-                        label=label, device=device, logger=logger)
+                # Audit 2026-10-31 paper-arms-harness-10: an interrupted run continues from its last checkpoint.
+                resume = None
+                if checkpoint_every is not None:
+                    resume = resumable_checkpoint(exp_dir, plan.label, seed, data_seed, cfg=cfg,
+                                                  dataset=str(plan.dataset), arms=arms)
+                run_cfg = cfg if checkpoint_every is None else resumable_cadence(cfg, checkpoint_every)
+                if resume is None:
+                    logger.info("training %s | %s | seed=%d data_seed=%d", plan.label, plan.dataset, seed, data_seed)
+                    run_vfe(run_cfg, dataset=plan.dataset, out_root=arm_dir, seed=seed, data_seed=data_seed,
+                            label=label, device=device, logger=logger)
+                else:
+                    logger.info("resuming %s | %s | seed=%d data_seed=%d from %s", plan.label, plan.dataset, seed,
+                                data_seed, resume)
+                    trained = run_vfe(run_cfg, dataset=plan.dataset, out_root=arm_dir, seed=seed,
+                                      data_seed=data_seed, label=label, device=device, logger=logger,
+                                      resume_from=resume)
+                    try:
+                        logger.info("%s: %d metrics.csv rows of the interrupted run prepended", trained,
+                                    stitch_resumed_metrics(Path(trained)))
+                    except OSError as exc:
+                        logger.warning("%s: metrics.csv of the interrupted run not prepended (%s); the run is "
+                                       "complete and its summary.json names the source", trained, exc)
             else:
+                logger.info("training %s | %s | seed=%d data_seed=%d", plan.label, plan.dataset, seed, data_seed)
                 _run_baseline_api()(cfg, dataset=plan.dataset, out_root=arm_dir, seed=seed,
                                     data_seed=data_seed, label=label, device=device, logger=logger)
             refresh()
@@ -1970,6 +2636,10 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
     budget = config["budget"]
     if budget not in BUDGETS:
         raise SystemExit(f"budget {budget!r} is not one of {sorted(BUDGETS)}")
+    try:
+        _checkpoint_every(config.get("checkpoint_every"))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     seeds = seed_pairs(config["seeds"])
     labels = config.get("arms")
     if isinstance(labels, str):
@@ -2005,7 +2675,8 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
             path = run_plan(base, plans, budget=budget, out_root=config["out_root"], device=config.get("device"),
                             calibration_steps=int(config.get("calibration_steps", 200)),
                             width_ladder=tuple(config.get("width_ladder", (1, 1.5, 2, 3, 4, 6, 8))),
-                            logger=logger)
+                            logger=logger, baseline_overrides=dict(config.get("baseline_overrides") or {}),
+                            checkpoint_every=config.get("checkpoint_every"))
             print(f"manifest: {path}", flush=True)
     return status
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,6 +62,7 @@ _N_KL_NEIGHBORS = 10
 _MIN_PAIRS = 10                     # minimum resolved pairs for a similarity benchmark
 _MIN_ENTAILMENT = 5                 # minimum resolved (hyponym, hypernym) pairs
 _N_BOOT_CLUSTER = 2000              # cluster-bootstrap resamples (entailment, over hypernym groups)
+_BOOT_ROWS = 200                    # pair resamples per rank block (the block of stats.spearman_ci)
 _HEADLINE_SCORER = "neg_jeffreys"   # pre-registered headline Gaussian scorer (symmetric)
 _FAILED_STEP: Dict[str, Any] = {"status": "failed", "reason": "raised; see metrics['failed_steps']"}
 # Stable per-(bank, step) streams np.random.default_rng([seed, _SIGMA_STREAM, bank, step]), so each
@@ -214,7 +215,10 @@ def hellinger_sq_diag(
     mu_b: np.ndarray,                    # (..., K)
     lv_b: np.ndarray,                    # (..., K)
 ) -> np.ndarray:                         # (...) squared Hellinger distance in [0, 1]
-    r"""Squared Hellinger distance :math:`H^2 = 1 - \int\sqrt{p_a p_b} = 1 - e^{-D_B}`."""
+    r"""Squared Hellinger distance :math:`H^2 = 1 - \int\sqrt{p_a p_b} = 1 - e^{-D_B}`.
+
+    Test oracle: referenced only by the tests.
+    """
     return -np.expm1(-bhattacharyya_diag(mu_a, lv_a, mu_b, lv_b))
 
 
@@ -261,6 +265,8 @@ def log_expected_likelihood(
         \log\!\int N_a(x) N_b(x)\,dx = \log N(\mu_a;\mu_b, \Sigma_a+\Sigma_b)
         = -\tfrac12\sum_k\Big[\log(v_{ak}+v_{bk}) + \frac{\Delta\mu_k^2}{v_{ak}+v_{bk}}
         + \log 2\pi\Big].
+
+    Test oracle: referenced only by the tests.
     """
     mu_a, lv_a, mu_b, lv_b = _f64(mu_a, lv_a, mu_b, lv_b)
     log_sum = np.logaddexp(lv_a, lv_b)
@@ -346,6 +352,74 @@ def _spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
     return float(_row_pearson(rankdata(x)[None], rankdata(y)[None])[0])
 
 
+def _bootstrap_spearman_rhos(
+    scores: Mapping[str, np.ndarray],    # scorer -> (m,) scores
+    human:  np.ndarray,                  # (m,) human ratings
+    rng:    np.random.Generator,
+
+    *,
+    n_boot: int = 1000,
+) -> Dict[str, np.ndarray]:              # scorer -> (B,) bootstrap rho, NaN where a resample is constant
+    r"""Bootstrap Spearman :math:`\rho^*_{s,b}` of every scorer ``s`` with the human ratings on common resamples.
+
+    One ``(B, m)`` matrix of resampled pair indices serves every scorer: per block of :data:`_BOOT_ROWS`
+    resamples the human ratings are ranked once and each scorer once, so a benchmark with ``S`` scorers costs
+    ``S + 1`` rank passes instead of two per interval and three per paired difference (audit 2026-10-31
+    semantics-stats-7), and every paired :math:`\Delta\rho^*_b = \rho^*_{s,b} - \rho^*_{r,b}` of a Holm family
+    shares the same resamples. The blocks are drawn as :func:`vfe3.semantics.stats.spearman_ci` draws them,
+    so one scorer reproduces its interval for the same generator state. Pairs are resampled as independent,
+    although benchmark words recur across pairs.
+    """
+    from scipy.stats import rankdata
+
+    m = int(human.size)
+    out = {key: np.empty(n_boot, dtype=np.float64) for key in scores}
+    for start in range(0, n_boot, _BOOT_ROWS):
+        b = min(_BOOT_ROWS, n_boot - start)
+        idx = rng.integers(0, m, size=(b, m))                   # (b, m) resampled pair indices
+        rh = rankdata(human[idx], axis=1)                       # (b, m) human ranks, once per block
+        rh -= rh.mean(axis=1, keepdims=True)
+        ss_h = (rh * rh).sum(axis=1)                            # (b,)
+        for key, score in scores.items():
+            rs = rankdata(np.asarray(score, dtype=np.float64)[idx], axis=1)   # (b, m)
+            rs -= rs.mean(axis=1, keepdims=True)
+            den = np.sqrt((rs * rs).sum(axis=1) * ss_h)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                out[key][start:start + b] = np.where(den > 0.0, (rs * rh).sum(axis=1) / den, np.nan)
+    return out
+
+
+def _spearman_summary(score: np.ndarray, human: np.ndarray, boot: np.ndarray) -> Dict[str, Any]:
+    r"""Spearman ``rho`` and its two-sided p (scipy) with the percentile 95% interval of the bootstrap ``boot``,
+    the record :func:`vfe3.semantics.stats.spearman_ci` returns."""
+    from scipy import stats as sps
+
+    result = sps.spearmanr(score, human)
+    valid = boot[np.isfinite(boot)]
+    lo, hi = (np.percentile(valid, [2.5, 97.5]) if valid.size else (np.nan, np.nan))
+    return {"rho": float(result.statistic), "p": float(result.pvalue), "ci_lo": float(lo), "ci_hi": float(hi),
+            "n": int(score.size), "n_boot_valid": int(valid.size)}
+
+
+def _delta_summary(point: float, deltas: np.ndarray, m: int) -> Dict[str, Any]:
+    r"""Percentile 95% interval and two-sided bootstrap p of the paired differences ``deltas`` (B,),
+
+    .. math::
+        p = \min\Big(1,\ 2\min\Big(\frac{1 + \#\{\Delta^*\le 0\}}{B+1},
+        \frac{1 + \#\{\Delta^*\ge 0\}}{B+1}\Big)\Big),
+
+    which, as in :func:`_bootstrap_interval`, never reports :math:`p = 0` from :math:`B` resamples (audit
+    2026-10-31 semantics-stats-4). Non-finite differences (a constant resample) are dropped first.
+    """
+    deltas = deltas[np.isfinite(deltas)]
+    if deltas.size == 0:
+        return {"delta": point, "ci_lo": None, "ci_hi": None, "p": None, "n": m, "n_boot": 0}
+    lo, hi = np.percentile(deltas, [2.5, 97.5])
+    B = int(deltas.size)
+    p = min(1.0, 2.0 * min((1 + int((deltas <= 0).sum())) / (B + 1), (1 + int((deltas >= 0).sum())) / (B + 1)))
+    return {"delta": point, "ci_lo": float(lo), "ci_hi": float(hi), "p": p, "n": m, "n_boot": B}
+
+
 def _paired_spearman_delta(
     score: np.ndarray,                   # (m,) candidate scorer
     ref:   np.ndarray,                   # (m,) reference scorer
@@ -357,22 +431,13 @@ def _paired_spearman_delta(
 ) -> Dict[str, Any]:
     r"""Paired bootstrap of :math:`\Delta\rho = \rho_s(\mathrm{score}, h) - \rho_s(\mathrm{ref}, h)`.
 
-    Pairs are resampled jointly, so the two correlations share every resample; two-sided
-    :math:`p = 2\min(P^*(\Delta\le0), P^*(\Delta\ge0))`.
+    Pairs are resampled jointly, so the two correlations share every resample
+    (:func:`_bootstrap_spearman_rhos`); the two-sided p is that of :func:`_delta_summary`.
     """
-    from scipy.stats import rankdata
     m = int(human.size)
     point = _spearman_rho(score, human) - _spearman_rho(ref, human)
-    idx = rng.integers(0, m, size=(n_boot, m))                  # (B, m) resampled pair indices
-    rh = rankdata(human[idx], axis=1)
-    deltas = _row_pearson(rankdata(score[idx], axis=1), rh) - _row_pearson(rankdata(ref[idx], axis=1), rh)
-    deltas = deltas[np.isfinite(deltas)]
-    if deltas.size == 0:
-        return {"delta": point, "ci_lo": None, "ci_hi": None, "p": None, "n": m, "n_boot": 0}
-    lo, hi = np.percentile(deltas, [2.5, 97.5])
-    p = min(1.0, 2.0 * min(float((deltas <= 0).mean()), float((deltas >= 0).mean())))
-    return {"delta": point, "ci_lo": float(lo), "ci_hi": float(hi), "p": p, "n": m,
-            "n_boot": int(deltas.size)}
+    boot = _bootstrap_spearman_rhos({"score": score, "ref": ref}, human, rng, n_boot=n_boot)
+    return _delta_summary(point, boot["score"] - boot["ref"], m)
 
 
 def _attempt(failed: List[Dict[str, str]], notes: List[str], step: str, fn: Callable[[], Any],
@@ -716,7 +781,9 @@ def _similarity(ctx: AnalysisContext, row_of: Dict[int, int], mu: np.ndarray, mu
     the symmetric :math:`-J`); ``best_gaussian`` is the post-hoc maximum over the Sigma-using
     scorers and is labeled as not adjusted for selection. Each paired comparison also carries
     ``p_holm``, its bootstrap ``p`` Holm-adjusted over the scorers of that comparison on the same
-    benchmark (:func:`vfe3.semantics.stats.holm_adjust`).
+    benchmark (:func:`vfe3.semantics.stats.holm_adjust`). Every interval and paired difference of a
+    benchmark comes from one set of pair resamples (:func:`_bootstrap_spearman_rhos`), which treats the
+    pairs as independent although benchmark words recur across them.
     """
     out: Dict[str, Any] = {}
     for bench, triples in ctx.similarity.items():
@@ -731,16 +798,21 @@ def _similarity(ctx: AnalysisContext, row_of: Dict[int, int], mu: np.ndarray, mu
         r2 = np.array([k[1] for k in kept], dtype=np.int64)
         human = np.array([k[2] for k in kept], dtype=np.float64)
         scores = _pair_scores(r1, r2, mu, mu_d0, lv_d0)
+        if not (np.isfinite(human).all() and all(np.isfinite(v).all() for v in scores.values())):
+            raise ValueError("non-finite values in Spearman inputs")
+        m = int(human.size)
+        boot = _bootstrap_spearman_rhos(scores, human, rng)    # scorer -> (B,), common resamples
+        point = {key: _spearman_rho(scores[key], human) for key, _ in _SCORERS}
         per: Dict[str, Any] = {}
         for key, label in _SCORERS:
-            entry = _spearman(scores[key], human, rng)
+            entry = _spearman_summary(scores[key], human, boot[key])
             entry["label"] = label
             if key != "cos_mu":
-                entry["delta_vs_cos_mu"] = _paired_spearman_delta(scores[key], scores["cos_mu"],
-                                                                  human, rng=rng)
+                entry["delta_vs_cos_mu"] = _delta_summary(point[key] - point["cos_mu"],
+                                                          boot[key] - boot["cos_mu"], m)
             if key not in _REFERENCE_SCORERS:
-                entry["delta_vs_euclid_mu"] = _paired_spearman_delta(
-                    scores[key], scores["neg_euclid_mu"], human, rng=rng)
+                entry["delta_vs_euclid_mu"] = _delta_summary(point[key] - point["neg_euclid_mu"],
+                                                             boot[key] - boot["neg_euclid_mu"], m)
             per[key] = entry
         for field in ("delta_vs_cos_mu", "delta_vs_euclid_mu"):         # one family per comparison and benchmark
             keys = [k for k, _ in _SCORERS if field in per[k]]
@@ -1103,7 +1175,8 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
         ax.set_title(f"{bench} (n = {sim[bench]['n']})", fontsize=8)
         panel_label(ax, "abcdefgh"[j])
     fig.suptitle(title + "\n(filled: paired Δρ vs cos(μ) CI excludes 0 and Holm-adjusted p < 0.05 over the "
-                 "panel's scorers; half-filled: unadjusted only; bold: pre-registered headline scorer)",
+                 "panel's scorers; half-filled: unadjusted only; bold: pre-registered headline scorer;\n"
+                 "95% CIs: bootstrap over word pairs, treated as independent although benchmark words recur)",
                  fontsize=8)
     fig.tight_layout()
     return save_figure(fig, ctx, _SECTION, name)
@@ -1168,9 +1241,13 @@ def _similarity_table(sim: Dict[str, Any]) -> str:
                          "Δρ vs −‖Δμ‖": de.get("delta"),
                          "Δ' ci_lo": de.get("ci_lo"), "Δ' ci_hi": de.get("ci_hi"),
                          "Δ' p (Holm)": de.get("p_holm")})
-    return markdown_table(rows, columns=["benchmark", "scorer", "role", "n", "rho", "ci_lo", "ci_hi",
-                                         "Δρ vs cos(μ)", "Δ ci_lo", "Δ ci_hi", "Δ p (Holm)", "Δρ vs −‖Δμ‖",
-                                         "Δ' ci_lo", "Δ' ci_hi", "Δ' p (Holm)"])
+    return (markdown_table(rows, columns=["benchmark", "scorer", "role", "n", "rho", "ci_lo", "ci_hi",
+                                          "Δρ vs cos(μ)", "Δ ci_lo", "Δ ci_hi", "Δ p (Holm)", "Δρ vs −‖Δμ‖",
+                                          "Δ' ci_lo", "Δ' ci_hi", "Δ' p (Holm)"])
+            + "\nIntervals and Δ p-values: percentile bootstrap over the benchmark's word pairs, one set of resamples "
+              "shared by every scorer, which treats the pairs as independent although benchmark words recur across "
+              "pairs; Δ p is two-sided with the (1 + count)/(B + 1) correction, Holm-adjusted over the scorers of "
+              "each comparison.\n")
 
 
 # ----------------------------------------------------------------------------------------------

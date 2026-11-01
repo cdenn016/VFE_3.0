@@ -2,8 +2,9 @@ r"""Click-to-run local-learner test (design: docs/research/2026-10-21-local-lear
 
 Edit CONFIG and run. Stage "timing" measures one chunk per arm; "A" is the synthetic identifiability check;
 "B" is WikiText-103 bytes. Results append to ``<out_dir>/results_<stage>.jsonl``; each record stores its effective
-arm settings, data protocol and source hash, and a completed run is skipped on relaunch only when these match the
-current ones (a mismatch stops with the differing fields; records without them are reused with a warning). Stage W
+arm settings, data protocol and source hash (which covers the stage's runner), and a completed run is skipped on
+relaunch only when these match the current ones (a mismatch stops with the differing fields; records without them are
+reused with a warning). Stage W
 records carry the same identity (both arms, its pass and point counts, its data protocol, and a source hash that
 includes its runner) and the stage is skipped once its final row exists for every seed. The
 seeds of one (arm, d) train as one stacked batch, so each kernel launch serves all of them; stacked runs never
@@ -117,7 +118,7 @@ os.environ.setdefault("MKL_NUM_THREADS", str(CONFIG["threads"]))
 import numpy as np   # noqa: E402
 import torch         # noqa: E402
 
-from vfe3.local_learner import (TreeSensor, evaluate_filter, init_runs, ngram_nll,   # noqa: E402
+from vfe3.local_learner import (TreeSensor, evaluate_filter, init_runs, ngram_nll, ngram_nll_grid,   # noqa: E402
                                 particle_filter_nll, sample_sequences, train_backprop, train_local)
 from vfe3.local_learner.core import Params   # noqa: E402
 
@@ -219,7 +220,8 @@ def protocol(stage: str, streams: int | None = None) -> dict:
 def source_identity(extra: tuple = ()) -> str:
     r"""SHA-256 of the local-learner package source and of this script's training, scoring and data-loading
     functions (line endings normalized), so a result is not reused across a change of the code that made it.
-    ``extra`` adds stage-specific functions (stage W adds its runner, which holds its training and scoring loop)."""
+    ``extra`` adds stage-specific functions: every stage adds its runner, which holds its training and scoring loop
+    (:func:`run_stage` for A, B and C, :func:`run_scaling` for S, :func:`run_warm` for W, :func:`run_accel` for X)."""
     import hashlib
     import inspect
     import vfe3.local_learner as pkg
@@ -231,10 +233,10 @@ def source_identity(extra: tuple = ()) -> str:
     return h.hexdigest()
 
 
-def identity(arm_cfg: dict | None, proto: dict) -> dict:
+def identity(arm_cfg: dict | None, proto: dict, extra: tuple = ()) -> dict:
     r"""The identity stored in a result record and compared before reuse (JSON round-tripped so it compares
-    equal to the stored copy)."""
-    return json.loads(json.dumps({"arm_settings": arm_cfg, "protocol": proto, "source": source_identity()}))
+    equal to the stored copy). ``extra`` is the stage's runner, hashed into the source (:func:`source_identity`)."""
+    return json.loads(json.dumps({"arm_settings": arm_cfg, "protocol": proto, "source": source_identity(extra)}))
 
 
 def scores(prm: Params, val: torch.Tensor, pf: torch.Tensor, tree: TreeSensor, seed: int) -> list[dict]:
@@ -364,7 +366,7 @@ def run_scaling(tree: TreeSensor) -> None:
         arm, d, chunk, streams = spec["arm"], spec["d"], spec["chunk"], spec["streams"]
         label = f"{arm}_c{chunk}"
         train = as_streams(xtrain, streams).to(DEVICE)
-        ident = identity(arm_settings(arm, chunk), protocol("S", streams))
+        ident = identity(arm_settings(arm, chunk), protocol("S", streams), extra=(run_scaling,))
         todo = pending(done, label, d, c["B_seeds"], ident)
         for i in range(0, len(todo), spec["stack"]):
             group = todo[i:i + spec["stack"]]
@@ -463,7 +465,7 @@ def run_accel(tree: TreeSensor) -> None:
     final = sum(-(-(cuts[i + 1] - cuts[i]) // c["chunk"]) for i in range(P)) * c["X_passes"]
     proto = {**protocol("B"), "stage": "X", "X_passes": c["X_passes"], "W_points": P}
     for arm in c["X_arms"]:
-        ident = identity(arm_settings(arm), proto)
+        ident = identity(arm_settings(arm), proto, extra=(run_accel,))
         last = [recorded.get((arm, d, s, final)) for s in seeds]
         if all(r is not None for r in last):
             if any(r.get("identity") != ident for r in last):
@@ -506,12 +508,12 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
         pf = sample_sequences(truth, tree, c["pf_streams"], c["pf_len"], seed=3).to(DEVICE)
         truth = truth.to(DEVICE)
         dims, seeds = [d], c["A_seeds"]
-        ident = identity({"rule": "truth"}, proto)
+        ident = identity({"rule": "truth"}, proto, extra=(run_stage,))
         if pending(done, "truth", d, [-1], ident):
             append(path, {"stage": "A", "arm": "truth", "d": d, "seed": -1, **scores(truth, val, pf, tree, 0)[0],
                           "identity": ident})
         uni, n = ngram_nll(train_cpu.reshape(-1).numpy(), val_cpu.numpy(), tree.V, 1, 1.0)
-        ident = identity({"rule": "ngram", "order": 1, "k": 1.0}, proto)
+        ident = identity({"rule": "ngram", "order": 1, "k": 1.0}, proto, extra=(run_stage,))
         if pending(done, "unigram", 0, [0], ident):
             append(path, {"stage": "A", "arm": "unigram", "d": 0, "seed": 0, "val_bits": uni / n / LN2,
                           "identity": ident})
@@ -524,17 +526,18 @@ def run_stage(stage: str, tree: TreeSensor) -> None:
         pf = as_streams(xval[:c["pf_streams"] * c["pf_len"]], c["pf_streams"]).to(DEVICE)
         for order in ((1, 2, 3) if stage == "B" else ()):    # stage C reuses stage B's n-gram references
             key = (f"{order}-gram", 0, 0)
-            ident = identity({"rule": "ngram", "order": order, "k_grid": c["ngram_k_grid"]}, proto)
+            ident = identity({"rule": "ngram", "order": order, "k_grid": c["ngram_k_grid"]}, proto, extra=(run_stage,))
             if not pending(done, key[0], 0, [0], ident):
                 continue
-            best = min((ngram_nll(xtrain, val_cpu.numpy(), tree.V, order, k), k) for k in c["ngram_k_grid"])
-            (nll, n), k = best
+            # One set of tables per order, every smoothing constant scored from the same lookups.
+            grid = ngram_nll_grid(xtrain, val_cpu.numpy(), tree.V, order, c["ngram_k_grid"])
+            (nll, n), k = min(zip(grid, c["ngram_k_grid"]))
             append(path, {"stage": "B", "arm": key[0], "d": 0, "seed": 0, "val_bits": nll / n / LN2, "k": k,
                           "identity": ident})
         dims, seeds = (c["C_dims"] if stage == "C" else c["B_dims"]), c["B_seeds"]
     for d in dims:
         for arm in {"A": c["A_arms"], "C": c.get("C_arms", [])}.get(stage, c["arms"]):
-            ident = identity(arm_settings(arm), proto)
+            ident = identity(arm_settings(arm), proto, extra=(run_stage,))
             todo = pending(done, arm, d, seeds, ident)
             if not todo:
                 continue

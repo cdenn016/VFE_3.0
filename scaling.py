@@ -34,11 +34,13 @@ if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import copy
+import dataclasses
 import gc
 from vfe3.artifact_utils import canonical_json_sha256 as _canonical_json_sha256
 import json
 import logging
 import math
+import shutil
 import stat
 import time
 import warnings
@@ -58,20 +60,38 @@ from vfe3.data.datasets import (
     tokens_per_char as _tokens_per_char,
 )
 from vfe3.metric_contracts import perplexity_matches_ce
-from vfe3.model.block_mlp import get_block_mlp_registration
 from vfe3.model.model import VFEModel, build_group
 from vfe3.path_utils import portable_path_component_key
-from vfe3.run_artifacts import RunArtifacts, _git_code_identity, _write_json_atomic, finalize_run
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    _git_code_identity,
+    _package_code_identity,
+    _write_json_atomic,
+    finalize_run,
+)
 from vfe3.runtime import restored_fp32_matmul_precision, seed_everything
-from vfe3.train import train
+# The scaling cell contract is declared once, in vfe3.scaling_contract, for this writer and its reader
+# scaling_analysis.py (audit 2026-10-31, A356); the private names below are kept for existing callers.
+from vfe3.scaling_contract import (
+    PACKAGE_CODE_FIELD as _PACKAGE_CODE_FIELD,
+    REUSE_DIGEST_FIELD as _SCALING_REUSE_DIGEST_FIELD,
+    SCALING_CELL_SCHEMA_VERSION as _SCALING_CELL_SCHEMA_VERSION,
+    SOURCE_SPLITS as _SCALING_SOURCE_SPLITS,
+    SUMMARY_DIGEST_FIELD as _SCALING_SUMMARY_DIGEST_FIELD,
+    accepted_config_sha256 as _accepted_config_sha256,
+    config_sha256 as _scaling_config_sha256,
+    digest_binding_failure as _digest_binding_failure,
+    package_code_binding_failure as _package_code_binding_failure,
+    reuse_contract_sha256 as _scaling_reuse_contract_sha256,
+    validated_code_identity as _validated_scaling_code_identity,
+    validated_data_source_identities as _validated_data_source_identities,
+)
+from vfe3.train import evaluate, train
 
 logger = logging.getLogger("scaling")
 
-_SCALING_CELL_SCHEMA_VERSION = 2
-_SCALING_REUSE_DIGEST_FIELD = "reuse_contract_sha256"
 _SCALING_OWNER_SCHEMA_VERSION = 1
 _SCALING_OWNER_FILENAME = "scaling_cell_owner.json"
-_SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
 
 
 # =============================================================================
@@ -478,16 +498,32 @@ def route_grow_k_mup(embed_dims: List[int], n_heads: int = 4, anchor_k: int = 20
     :math:`2/(K+V)`, against muP's :math:`1/\mathrm{fan\_in}^2`) and the attention temperature
     :math:`\tau = \kappa \sqrt{d_\mathrm{head}}` (Transformer muP uses :math:`1/d`; whether the KL score
     needs the analogue is open) are unchanged. BOTH arms run at kl_max = 8*K per cell (BASELINE's
-    kl_max=None), which avoids the frozen-kl_max width confound. Anchored at K=anchor_k, where the factor
-    is 1 and the two arms coincide. Scoped to this route so the other routes are untouched. The fitted
-    exponent should be compared against embed_dim, not n_params (which is K^2-dominated by phi_embed)."""
+    kl_max=None), which avoids the frozen-kl_max width confound. Scoped to this route so the other routes
+    are untouched. The fitted exponent should be compared against embed_dim, not n_params (which is
+    K^2-dominated by phi_embed).
+
+    Deviation from Table 3: each scaled rate drives a whole optimizer group, so the arm also scales rates that are
+    not hidden or output weight matrices. ``m_decode_mu_lr`` also drives the linear readout bias
+    ``output_proj_bias``, ``m_block_mlp_lr`` the ``fc1``/``fc2`` biases of the block MLP, and
+    ``m_relational_score_lr`` the per-head scalars ``routing_key_log_noise``, ``routing_log_temperature`` and
+    ``channel_log_noise`` when they exist (``vfe3.train.build_optimizer``), all of which Table 3 keeps
+    width-independent (audit 2026-10-31, A373). Separate bias groups would need new optimizer rates, so the
+    deviation is stated rather than removed.
+
+    At ``K = anchor_k`` the factor is 1, so the two arms are one experiment: the ``_mup`` anchor carries the
+    ``_fixed`` anchor's overrides and ``twin_of`` naming it, and ``main`` publishes the trained fixed anchor as its
+    twin instead of training it again (A373)."""
     base_rates = {key: _baseline_value(key) for key in _MUP_HIDDEN_OUTPUT_RATES}
     cells: List[Dict[str, Any]] = []
     for k in embed_dims:
         common = {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}
         cells.append({"label": f"K{k}_fixed", "route": "grow_K_mup", "scale_knob": "embed_dim",
                       "overrides": dict(common)})
-        w = anchor_k / k                                     # muP width ratio K_0/K (1 at the anchor)
+        if k == anchor_k:                                    # factor 1: the fixed anchor's experiment
+            cells.append({"label": f"K{k}_mup", "route": "grow_K_mup", "scale_knob": "embed_dim",
+                          "overrides": dict(common), "twin_of": f"K{k}_fixed"})
+            continue
+        w = anchor_k / k                                     # muP width ratio K_0/K
         cells.append({"label": f"K{k}_mup", "route": "grow_K_mup", "scale_knob": "embed_dim",
                       "overrides": {**common, **{key: rate * w for key, rate in base_rates.items()}}})
     return cells
@@ -555,7 +591,11 @@ def route_vary_block_fixed_k(
 
 def route_inference_t(n_e_steps_list: List[int]) -> List[Dict[str, Any]]:
     r"""FLAT-N inference-compute axis: more E-step inner iterations T at constant params. route tagged
-    'inference' so the analyzer plots it on the inference-capacity figure, NEVER the L(N) curve."""
+    'inference' so the analyzer plots it on the inference-capacity figure, NEVER the L(N) curve.
+
+    Requires ``attention_mode="projected_gradient"`` in the scaling ``config``: the projected_predictive envelope
+    admits only ``n_e_steps == 1``, so on the shipped projected_predictive baseline every cell with T > 1 is refused
+    at startup (audit 2026-10-31, A302)."""
     return [{"label": f"T{t}", "route": "inference", "scale_knob": "n_e_steps",
              "overrides": {"n_e_steps": t}} for t in n_e_steps_list]
 
@@ -577,11 +617,14 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #                   (bigger block = FEWER heads = MORE params -- e.g. GL(48) is the largest model here).
 #     grow_K        grow K at FIXED n_heads=4 (so the block grows with K; n_gen ~ K^2/4, quadratic).
 #     grow_K_mup    grow_K + a twin per K with the muP Adam rate rule K_0/K on the hidden and output
-#                   matrices (Yang et al. 2022, Table 3; F1/EXP-6 width-stability), kl_max=8*K.
+#                   matrices (Yang et al. 2022, Table 3; F1/EXP-6 width-stability), kl_max=8*K. The scaled
+#                   groups also hold the readout and block-MLP biases and per-head scalars (a stated deviation),
+#                   and the anchor pair is trained once.
 #     blocksize     FIXED K=64, vary n_heads in {8,4,2} (= block GL(8),GL(16),GL(32)); same idea as
 #                   blocks_K48 but parameterized by n_heads instead of GL(b).
 #   INFERENCE routes (FLAT N -- plotted on a SEPARATE inference-capacity figure, NEVER on L(N)):
-#     infer_T       n_e_steps in {1,2,4,8} at constant params.
+#     infer_T       n_e_steps in {1,2,4,8} at constant params; needs attention_mode="projected_gradient" in
+#                   `config` (projected_predictive admits only n_e_steps=1).
 #     infer_L       legacy depth alias; now tagged depth because per-layer modules add parameters.
 #
 # To add your own: call a route builder with a new grid and give it a key; add that key to CONFIG["routes"].
@@ -636,38 +679,38 @@ def _scaling_knob_report(cfg: VFE3Config, name: str) -> Dict[str, object]:
     }
 
 
+_COUNT_VOCAB_SIZES: Tuple[int, int] = (2, 3)                 # v_0 and v_0 + 1 of predict_n_params
+
+
 def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
-    r"""Predicted total ``n_params`` and ``n_gen`` for ``cfg``, by building only the (cheap) gauge group
-    and summing the prior-table sizes per ``PriorBank`` (prior_bank.py). Exact on the pure path; CG / learnable-scalar tables remain outside this sizing model."""
-    group = build_group(cfg)
-    n_gen = int(group.generators.shape[0])
-    V, K = int(cfg.vocab_size), int(cfg.embed_dim)
-    n = V * n_gen + 1                                        # phi_embed, decode_log_scale
-    n += V * K                                               # token-prior mean table
-    n += V * K                                               # token-prior variance table
-    if cfg.decode_mode == "linear":
-        n += V * K                                          # output_proj_weight
-        n += V                                              # output_proj_bias
-    elif cfg.untie_decode_bank:
-        n += 2 * V * K                                      # independent routed decode tables
-    if cfg.pos_phi == "learned":
-        n += int(cfg.max_seq_len) * n_gen                   # pos_phi_free
-    if cfg.use_block_mlp:
-        registration = get_block_mlp_registration(cfg.block_mlp_mode)
-        n += registration.parameter_count(
-            embed_dim=K,
-            irrep_dims=group.irrep_dims,
-            expansion=int(cfg.block_mlp_expansion),
-            n_layers=1 if getattr(cfg, "block_mlp_tie_layers", False) else int(cfg.n_layers),   # tied: counted once
-            regression_rank=getattr(cfg, "block_memory_regression_rank", None),    # cue_result_memory only
-            regime_transition=getattr(cfg, "block_memory_regime_transition", "off"),   # cue_result_memory only
-        )
-    if getattr(cfg, "per_type_hidden_bias", False):
-        n += V * n_gen                                       # per_type_hidden_bias (V, n_gen), split over layers
-    if cfg.layernorm_affine and cfg.norm_type_block == "layernorm":
-        n += 2 * K
-    n += int(cfg.n_layers) * 4 * K * K                       # full-width Q/K/T/O maps
-    return n, n_gen
+    r"""Total ``n_params`` and ``n_gen`` of ``cfg``, exact, without building its vocabulary-sized tables.
+
+    Every parameter of :class:`~vfe3.model.model.VFEModel` is either independent of the vocabulary size V or carries
+    exactly one V axis (the prior mean, variance and frame tables, the linear readout and its bias, the untied decode
+    tables, the per-type hidden bias), so the count is affine in V,
+
+    .. math::
+        N(V) = N(v_0) + (V - v_0) \bigl(N(v_0 + 1) - N(v_0)\bigr),
+
+    and both counts on the right come from models built at the tiny vocabularies :data:`_COUNT_VOCAB_SIZES`, whose
+    relational operators, block MLPs, norms and positional tables are the configured ones. The former closed form
+    added four K by K maps per layer, which miscounts noisy-key and learned-temperature routing, tied comparison
+    maps, low-rank content edges and the minimal agent of the exact route (audit 2026-10-31, A372). The builds run
+    under a forked CPU RNG and a restored fp32 matmul policy, so the caller's random stream and matmul policy are
+    unchanged; at the scaling widths each build takes a fraction of a second.
+    """
+    from vfe3.model.model import VFEModel as _CountedModel   # the package class, never a stub bound to this module
+
+    n_gen = int(build_group(cfg).generator_shape[0])
+    counts: List[int] = []
+    with restored_fp32_matmul_precision(), torch.random.fork_rng(devices=[]), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for vocab_size in _COUNT_VOCAB_SIZES:
+            model = _CountedModel(dataclasses.replace(cfg, vocab_size=vocab_size))
+            counts.append(int(sum(p.numel() for p in model.parameters())))
+            del model
+    per_token = counts[1] - counts[0]                        # parameters per vocabulary entry
+    return counts[0] + (int(cfg.vocab_size) - _COUNT_VOCAB_SIZES[0]) * per_token, n_gen
 
 
 # =============================================================================
@@ -819,48 +862,15 @@ def _current_code_identity() -> Dict[str, object]:
     return _git_code_identity(Path(__file__).resolve().parent)
 
 
-def _validated_scaling_code_identity(value: object) -> Dict[str, object]:
-    """Return one detached, usable Git identity for a scaling invocation."""
-    if not isinstance(value, Mapping):
-        raise TypeError("scaling code identity must be a mapping")
-    detached = json.loads(json.dumps(
-        dict(value), sort_keys=True, ensure_ascii=False, allow_nan=False))
-    git_sha = detached.get("git_sha")
-    git_dirty = detached.get("git_dirty")
-    fingerprint = detached.get("git_dirty_fingerprint")
-    if not isinstance(git_sha, str) or not git_sha or type(git_dirty) is not bool:
-        raise ValueError("scaling code identity is unavailable")
-    if ((git_dirty and (not isinstance(fingerprint, str) or not fingerprint))
-            or (not git_dirty and fingerprint is not None)):
-        raise ValueError("scaling code identity has an inconsistent dirty-tree fingerprint")
-    return detached
+def _current_package_code_identity() -> str:
+    r"""The executable-source digest of the package and the root drivers now on disk.
 
-
-_SCALING_SOURCE_SPLITS = ("train", "validation", "test")
-
-
-def _validated_data_source_identities(value: object) -> Dict[str, Dict[str, object]]:
-    """Return a detached, JSON-safe identity for exactly the splits scaling consumes."""
-    if not isinstance(value, Mapping) or set(value) != set(_SCALING_SOURCE_SPLITS):
-        raise ValueError(
-            "scaling data source identities must contain exactly train, validation, and test")
-    normalized: Dict[str, Dict[str, object]] = {}
-    for split in _SCALING_SOURCE_SPLITS:
-        source = value[split]
-        if not isinstance(source, Mapping):
-            raise TypeError(f"{split} source identity must be a mapping")
-        detached = json.loads(json.dumps(
-            dict(source), sort_keys=True, ensure_ascii=False, allow_nan=False))
-        if (not isinstance(detached, dict)
-                or not isinstance(detached.get("format"), str)
-                or not detached["format"]
-                or type(detached.get("size_bytes")) is not int
-                or detached["size_bytes"] < 0
-                or not isinstance(detached.get("sha256"), str)
-                or not detached["sha256"]):
-            raise ValueError(f"{split} source identity is incomplete")
-        normalized[split] = detached
-    return normalized
+    :func:`vfe3.run_artifacts._package_code_identity`, which every cell's ``provenance.json`` publishes as
+    ``code_identity_sha256``. Reuse of a completed cell and the drift of an invocation are judged by it rather than
+    by the whole-tree Git fingerprint, which also hashes notes and untracked files that no cell executes (audit
+    2026-10-31, A050).
+    """
+    return _package_code_identity()
 
 
 def _data_source_identities(dataset: str) -> Dict[str, Dict[str, object]]:
@@ -898,13 +908,6 @@ def _loader_data_source_identities(
     return _validated_data_source_identities(sources)
 
 
-def _scaling_reuse_contract_sha256(cellmeta: Mapping[str, object]) -> str:
-    """Digest a scaling-cell reuse contract without its self-referential digest field."""
-    contract = dict(cellmeta)
-    contract.pop(_SCALING_REUSE_DIGEST_FIELD, None)
-    return _canonical_json_sha256(contract)
-
-
 def _cached_scaling_metrics(summary: Mapping[str, object]) -> Dict[str, object]:
     """Return the internally consistent metric payload served by the cached-cell path."""
     scaling_point = summary.get("scaling_point")
@@ -926,8 +929,9 @@ def _cell_resume_status(
     max_tokens: Optional[int] = None,
 
     *,
-    source_identities: Optional[Mapping[str, object]] = None,
-    code_identity:     Optional[Mapping[str, object]] = None,
+    source_identities:   Optional[Mapping[str, object]] = None,
+    code_identity:       Optional[Mapping[str, object]] = None,
+    package_code_sha256: Optional[str]                  = None,
 ) -> Optional[str]:
     r"""Classify one verified completed cell for restart handling.
 
@@ -937,7 +941,12 @@ def _cell_resume_status(
     while downstream analysis retains the saved provenance and can reject mixed-code aggregation.
     ``None`` means the cell is missing, partial, corrupt, or belongs to another effective experiment.
     Historical configs are compared only after the repository's strict serialized-config migration,
-    so retired inert fields do not force a completed cell to be overwritten."""
+    so retired inert fields do not force a completed cell to be overwritten.
+
+    ``scaling_cell.json`` and ``provenance.json`` must describe one snapshot: the same Git identity and, for a
+    cell that records it, the same package code digest. Such a cell's code is judged by that digest against
+    ``package_code_sha256`` (:func:`_current_package_code_identity` when None), a cell written before
+    October 31, 2026 by its Git identity against ``code_identity`` (audit 2026-10-31, A050)."""
     if (not (run_dir / "summary.json").exists()
             or not (run_dir / "config.json").exists()
             or (run_dir / "scaling_failure.json").exists()):
@@ -982,15 +991,10 @@ def _cell_resume_status(
         # The cell binds the config.json it wrote. A cell written before a schema migration (a retired
         # field or value the loader migrates) hashed the saved form, so either the saved bytes or their
         # migrated form may carry the digest; equality of effective configs is checked above.
-        saved_config_sha256 = {_canonical_json_sha256(saved_effective),
-                               _canonical_json_sha256(raw_saved_config)}
+        saved_config_sha256 = _accepted_config_sha256(raw_saved_config, migrated)
     except (TypeError, ValueError):
         return None
-    saved_contract_sha256 = cellmeta.get(_SCALING_REUSE_DIGEST_FIELD)
-    if (not isinstance(saved_contract_sha256, str)
-            or len(saved_contract_sha256) != 64
-            or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_contract_sha256
-            or cellmeta.get("config_sha256") not in saved_config_sha256):
+    if _digest_binding_failure(cellmeta, summary, saved_config_sha256) is not None:
         return None
     if _scaling_result_status(_cached_scaling_metrics(summary)) != "complete":
         return None
@@ -1017,6 +1021,15 @@ def _cell_resume_status(
         return None
     if any(provenance.get(key) != value for key, value in recorded.items()):
         return None
+    if _package_code_binding_failure(cellmeta, provenance) is not None:
+        return None
+    if _PACKAGE_CODE_FIELD in cellmeta:
+        try:
+            current_package = (_current_package_code_identity() if package_code_sha256 is None
+                               else package_code_sha256)
+        except (OSError, RuntimeError):
+            return None
+        return "current" if cellmeta[_PACKAGE_CODE_FIELD] == current_package else "recorded_prior_code"
     return "current" if recorded == current else "recorded_prior_code"
 
 
@@ -1028,8 +1041,9 @@ def _cell_is_current(
     max_tokens: Optional[int] = None,
 
     *,
-    source_identities: Optional[Mapping[str, object]] = None,
-    code_identity:     Optional[Mapping[str, object]] = None,
+    source_identities:   Optional[Mapping[str, object]] = None,
+    code_identity:       Optional[Mapping[str, object]] = None,
+    package_code_sha256: Optional[str]                  = None,
 ) -> bool:
     """Return whether a completed cell matches the current effective experiment and code."""
     return _cell_resume_status(
@@ -1039,6 +1053,7 @@ def _cell_is_current(
         max_tokens=max_tokens,
         source_identities=source_identities,
         code_identity=code_identity,
+        package_code_sha256=package_code_sha256,
     ) == "current"
 
 
@@ -1252,6 +1267,76 @@ def _archive_scaling_attempt(
 _SCALING_TERMINAL_FAILURE_KINDS = frozenset({"train", "nonfinite"})
 
 
+def _scaling_attempt_contract(
+    cfg: VFE3Config,
+
+    *,
+    dataset:             str,
+    max_tokens:          Optional[int],
+    source_identities:   Mapping[str, object],
+    package_code_sha256: str,
+) -> Dict[str, object]:
+    r"""The experiment one cell attempt runs, which a recorded failure must match to be served as terminal.
+
+    The effective config digest, the corpus (``dataset``, the training ``data_seed``, ``max_tokens`` and the
+    per-split source identities) and the executed code (the package code digest of
+    :func:`_current_package_code_identity`). ``main`` writes it into ``scaling_failure.json`` as
+    ``attempt_contract`` (audit 2026-10-31, A051).
+    """
+    return {
+        "config_sha256":       _scaling_config_sha256(cfg),
+        "dataset":             dataset,
+        "data_seed":           _effective_data_seed(cfg.seed),
+        "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
+        "data_sources":        _validated_data_source_identities(source_identities),
+        "package_code_sha256": str(package_code_sha256),
+    }
+
+
+def _expected_attempt_contract(
+    cfg: VFE3Config,
+
+    *,
+    dataset:             str,
+    max_tokens:          Optional[int],
+    source_identities:   Optional[Mapping[str, object]],
+    package_code_sha256: Optional[str],
+) -> Optional[Dict[str, object]]:
+    r"""This attempt's :func:`_scaling_attempt_contract`, taking a fresh corpus or code snapshot for a direct
+    caller that passes none; None when a snapshot is unavailable (no recorded failure is then served)."""
+    try:
+        sources = _data_source_identities(dataset) if source_identities is None else source_identities
+        package = _current_package_code_identity() if package_code_sha256 is None else package_code_sha256
+        return _scaling_attempt_contract(cfg, dataset=dataset, max_tokens=max_tokens,
+                                         source_identities=sources, package_code_sha256=package)
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _cell_attempt_contract(
+    cell: Mapping[str, Any],
+    seed: int,
+
+    *,
+    dataset:             str,
+    max_tokens:          Optional[int],
+    max_steps:           Optional[int],
+    source_identities:   Mapping[str, object],
+    package_code_sha256: str,
+) -> Optional[Dict[str, object]]:
+    r"""The :func:`_scaling_attempt_contract` of one design cell, built as ``run_cell`` builds its config; None when
+    that config does not construct (a configuration failure, which is never terminal)."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cfg = VFE3Config(**_cell_cfg_dict(cell["overrides"], seed, max_steps))
+        return _scaling_attempt_contract(cfg, dataset=dataset, max_tokens=max_tokens,
+                                         source_identities=source_identities,
+                                         package_code_sha256=package_code_sha256)
+    except (NotImplementedError, TypeError, ValueError):
+        return None
+
+
 def _terminal_scaling_failure(
     run_dir: Path,
     cfg:     VFE3Config,
@@ -1260,13 +1345,21 @@ def _terminal_scaling_failure(
     route:   str,
     label:   str,
     seed:    int,
+    contract:             Optional[Mapping[str, object]],
+    legacy_code_identity: Optional[Mapping[str, object]] = None,
 ) -> Optional[Dict[str, Any]]:
-    r"""The recorded run failure of this exact cell, or None.
+    r"""The recorded run failure of this exact cell and experiment, or None.
 
-    The cell's ``scaling_failure.json`` must name the route, label and seed and carry a run-produced
-    ``error_kind`` (:data:`_SCALING_TERMINAL_FAILURE_KINDS`); when the attempt wrote ``scaling_cell.json``,
-    its ``config_sha256`` must equal ``cfg``'s, so a changed cell is retrained rather than reported.
+    The cell's ``scaling_failure.json`` must name the cell's directory route (its ROUTES key), label and seed
+    and carry a run-produced ``error_kind`` (:data:`_SCALING_TERMINAL_FAILURE_KINDS`), and the experiment it
+    failed in must be this attempt's ``contract`` (:func:`_scaling_attempt_contract`): the record's
+    ``attempt_contract``, or, for a record written before October 31, 2026, the attempt's ``scaling_cell.json``
+    (its config digest and corpus fields, and its Git identity against ``legacy_code_identity``). A record that
+    shows neither, such as a crash before the cell record was written, is not served, so the cell is archived
+    and retried rather than reported with another experiment's outcome (audit 2026-10-31, A051).
     """
+    if contract is None:
+        return None
     try:
         failure = json.loads((run_dir / "scaling_failure.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1276,14 +1369,25 @@ def _terminal_scaling_failure(
             or failure.get("route") != route or failure.get("label") != label
             or failure.get("seed") != int(seed)):
         return None
+    recorded = failure.get("attempt_contract")
+    if isinstance(recorded, Mapping):
+        return failure if dict(recorded) == dict(contract) else None
     try:
         cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        cellmeta = None
-    if isinstance(cellmeta, Mapping):
-        current = _canonical_json_sha256(json.loads(json.dumps(serialize_config(cfg), default=str)))
-        if cellmeta.get("config_sha256") != current:
-            return None
+        return None
+    if not isinstance(cellmeta, Mapping) or legacy_code_identity is None:
+        return None
+    legacy = {
+        "config_sha256": cellmeta.get("config_sha256"),
+        "dataset":       cellmeta.get("dataset"),
+        "data_seed":     cellmeta.get("data_seed", cfg.seed),
+        "max_tokens":    cellmeta.get("max_tokens"),
+        "data_sources":  cellmeta.get("data_sources"),
+    }
+    if (any(legacy[key] != contract.get(key) for key in legacy)
+            or cellmeta.get("code_identity") != dict(legacy_code_identity)):
+        return None
     return failure
 
 
@@ -1327,6 +1431,71 @@ def _scaling_cell_has_payload(run_dir: Path) -> bool:
     )
 
 
+def _link_or_copy(source: str, target: str) -> str:
+    """Hard-link ``source`` to ``target`` (no extra disk on one volume), else copy it."""
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+    return target
+
+
+# Records of a cell that its twin rewrites or that main writes per attempt, so a twin never shares them.
+_TWIN_OWN_RECORDS = frozenset({
+    _SCALING_OWNER_FILENAME, "scaling_cell.json", "summary.json", "scaling_result.json", "scaling_failure.json"})
+
+
+def _publish_scaling_twin(
+    source:  Path,
+    run_dir: Path,
+    cell:    Mapping[str, Any],
+    cfg:     VFE3Config,
+
+    *,
+    seed:    int,
+) -> Dict[str, Any]:
+    r"""Publish the completed result of ``source`` as this cell's own bound generation, without training.
+
+    ``source`` is a completed cell of the same route and seed whose effective experiment
+    :func:`_cell_resume_status` has just verified to be this cell's: the muP anchor pair, where the rate rule
+    is the identity (``twin_of`` in :func:`route_grow_k_mup`; audit 2026-10-31, A373). Every artifact except the
+    records in :data:`_TWIN_OWN_RECORDS` is hard-linked (copied across volumes) into ``run_dir``.
+    ``scaling_cell.json`` is the source's record with this cell's label, overrides and ``reused_from`` under a new
+    reuse digest, to which ``summary.json`` is rebound, so resume and ``scaling_analysis`` accept the cell as a
+    generation of its own; the analysis counts the pair once in its pooled estimators, since the two share one
+    effective run identity.
+    """
+    for child in sorted(source.iterdir()):
+        if child.name in _TWIN_OWN_RECORDS or _path_is_reparse_point(child):
+            continue
+        if child.is_dir():
+            shutil.copytree(child, run_dir / child.name, copy_function=_link_or_copy)
+        elif child.is_file():
+            _link_or_copy(str(child), str(run_dir / child.name))
+    cellmeta = json.loads((source / "scaling_cell.json").read_text(encoding="utf-8"))
+    serialized = serialize_config(cfg)
+    cellmeta.update({
+        "label":             cell["label"],
+        "scale_knob":        cell["scale_knob"],
+        "scale_knob_report": _scaling_knob_report(cfg, cell["scale_knob"]),
+        "overrides":         {key: serialized[key] for key in cell["overrides"]},
+        "reused_from":       f"{source.parent.parent.name}/{source.parent.name}/{source.name}",
+    })
+    cellmeta.pop(_SCALING_REUSE_DIGEST_FIELD, None)
+    reuse_contract_sha256 = _scaling_reuse_contract_sha256(cellmeta)
+    cellmeta[_SCALING_REUSE_DIGEST_FIELD] = reuse_contract_sha256
+    _write_json_atomic(run_dir / "scaling_cell.json", cellmeta)
+    summary = json.loads((source / "summary.json").read_text(encoding="utf-8"))
+    summary[_SCALING_SUMMARY_DIGEST_FIELD] = reuse_contract_sha256
+    _write_json_atomic(run_dir / "summary.json", summary)
+    metrics = _cached_scaling_metrics(summary)
+    print(f"    [REUSED] {cell['label']} s{seed}  identical to {cellmeta['reused_from']}  "
+          f"test_ce={metrics.get('test_ce')}  N={metrics.get('n_params')}")
+    return {"label": cell["label"], "route": cell["route"], "scale_knob": cell["scale_knob"],
+            "error_kind": None, "seed": seed, "cached": False, "reused_from": cellmeta["reused_from"],
+            "kl_max": float(cfg.kl_max), "router_dead_heads": _dead_router_heads(run_dir), **metrics}
+
+
 @restored_fp32_matmul_precision()         # a None cell must not inherit the previous cell's pinned matmul policy
 def run_cell(
     cell:       Dict[str, Any],
@@ -1340,10 +1509,22 @@ def run_cell(
     max_steps:          Optional[int]                  = None,
     source_identities:  Optional[Mapping[str, object]] = None,
     code_identity:      Optional[Mapping[str, object]] = None,
+    route_key:           Optional[str]                  = None,
+    package_code_sha256: Optional[str]                  = None,
+    twin_run_dir:        Optional[Path]                 = None,
 ) -> Dict[str, Any]:
     r"""Build a fresh model from baseline+overrides, train it, score the held-out TEST split via
     ``finalize_run``, and return a harvest dict. A cross-field config violation is caught and returned
-    as ``error_kind='config'`` (not raised), keeping it distinct from a training crash."""
+    as ``error_kind='config'`` (not raised), keeping it distinct from a training crash.
+
+    ``route_key`` is the ROUTES key that names the cell's directory (``main`` passes it): the ownership
+    sentinel, the terminal-failure match and the attempt archive use it, while ``cell["route"]`` stays the
+    analysis tag (audit 2026-10-31, A049; a direct call without it keeps the tag). ``package_code_sha256`` is
+    the invocation's package code digest (:func:`_current_package_code_identity` when None). ``twin_run_dir``
+    names a completed cell of the same route and seed that the route builder marks as this cell's twin; when
+    :func:`_cell_resume_status` verifies it for this cell's experiment, its result is published here
+    (:func:`_publish_scaling_twin`) instead of training it again (A373). The final weights are always
+    validated and offered to the best-model record (A124)."""
     seed = _require_scaling_seed(seed)
     invocation_sources = (
         None if source_identities is None
@@ -1353,6 +1534,7 @@ def run_cell(
         None if code_identity is None
         else _validated_scaling_code_identity(code_identity)
     )
+    owner_route = cell["route"] if route_key is None else route_key
     label = cell["label"]
     cfg_dict = _cell_cfg_dict(cell["overrides"], seed, max_steps)
     try:
@@ -1373,6 +1555,7 @@ def run_cell(
             run_dir, cfg, dataset, max_tokens=max_tokens,
             source_identities=invocation_sources,
             code_identity=invocation_code_identity,
+            package_code_sha256=package_code_sha256,
         ):
             resume_status = "current"
         else:
@@ -1380,6 +1563,7 @@ def run_cell(
                 run_dir, cfg, dataset, max_tokens=max_tokens,
                 source_identities=invocation_sources,
                 code_identity=invocation_code_identity,
+                package_code_sha256=package_code_sha256,
             )
     if resume_status is not None:
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -1397,8 +1581,21 @@ def run_cell(
                 "cache_status": resume_status, "kl_max": float(cfg.kl_max),
                 "router_dead_heads": _dead_router_heads(run_dir),
                 **metrics}
-    terminal = (None if not CONFIG["resume"] or CONFIG.get("retry_failed", False) else
-                _terminal_scaling_failure(run_dir, cfg, route=cell["route"], label=label, seed=seed))
+    terminal = None
+    if (CONFIG["resume"] and not CONFIG.get("retry_failed", False)
+            and (run_dir / "scaling_failure.json").exists()):
+        try:
+            legacy_code_identity: Optional[Dict[str, object]] = (
+                _validated_scaling_code_identity(_current_code_identity())
+                if invocation_code_identity is None else invocation_code_identity)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            legacy_code_identity = None
+        terminal = _terminal_scaling_failure(
+            run_dir, cfg, route=owner_route, label=label, seed=seed,
+            contract=_expected_attempt_contract(cfg, dataset=dataset, max_tokens=max_tokens,
+                                                source_identities=invocation_sources,
+                                                package_code_sha256=package_code_sha256),
+            legacy_code_identity=legacy_code_identity)
     if terminal is not None:
         print(f"    [FAILED earlier, not retried] {label} s{seed}  {terminal.get('error_kind')}: "
               f"{terminal.get('error')}  (set retry_failed=True to retrain)")
@@ -1411,13 +1608,21 @@ def run_cell(
     if _scaling_cell_has_payload(run_dir):
         archived = _archive_scaling_attempt(
             run_dir,
-            route=cell["route"],
+            route=owner_route,
             label=label,
             seed=seed,
         )
         print(f"    [ARCHIVED] {label} s{seed} previous attempt preserved at {archived}")
         run_dir.mkdir()
-        _authorize_scaling_cell(run_dir, cell["route"], label, seed)
+        _authorize_scaling_cell(run_dir, owner_route, label, seed)
+
+    if twin_run_dir is not None and _cell_resume_status(
+            twin_run_dir, cfg, dataset, max_tokens=max_tokens,
+            source_identities=invocation_sources,
+            code_identity=invocation_code_identity,
+            package_code_sha256=package_code_sha256,
+    ) is not None:
+        return _publish_scaling_twin(twin_run_dir, run_dir, cell, cfg, seed=seed)
 
     pred_n, n_gen = predict_n_params(cfg)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
@@ -1450,10 +1655,6 @@ def run_cell(
         # Direct API callers retain the historical behavior: take one fresh source snapshot for this
         # standalone cell. ``main`` always supplies its invocation-owned shared snapshot instead.
         loaded_sources = _data_source_identities(dataset)
-    cell_code_identity = (
-        _validated_scaling_code_identity(_current_code_identity())
-        if invocation_code_identity is None else invocation_code_identity
-    )
 
     # Order-INDEPENDENT data stream: model build consumed config-dependent RNG, so reseed AFTER it and
     # re-seed each loader's generator so every cell sees the same batch sequence regardless of grid
@@ -1467,6 +1668,19 @@ def run_cell(
     from datetime import datetime
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device,
                              timestamp=datetime.now().isoformat(timespec="seconds"))
+    # scaling_cell.json and provenance.json describe one snapshot: provenance.json publishes the Git identity
+    # RunArtifacts took as this cell started, so the cell records that identity rather than the invocation's,
+    # beside the package code digest both records carry (audit 2026-10-31, A050). A failed cell-start probe
+    # falls back to the invocation snapshot, and the cell then fails its binding check on reuse.
+    try:
+        cell_code_identity = _validated_scaling_code_identity(artifacts.run_start_git_identity)
+    except (TypeError, ValueError):
+        logger.warning("  [%s s%d] the cell-start Git identity is unavailable; recording the invocation "
+                       "snapshot", label, seed)
+        cell_code_identity = (
+            _validated_scaling_code_identity(_current_code_identity())
+            if invocation_code_identity is None else invocation_code_identity
+        )
     # Cell provenance the per-run config.json does not carry: which ROUTE / scale knob produced this N.
     cellmeta: Dict[str, object] = {
         "schema_version": _SCALING_CELL_SCHEMA_VERSION,
@@ -1477,9 +1691,9 @@ def run_cell(
         "max_tokens": (int(max_tokens) if max_tokens is not None else None),
         "dataset": dataset,
         "data_seed": data_seed,
-        "config_sha256": _canonical_json_sha256(
-            json.loads(json.dumps(serialize_config(cfg), default=str))),
+        "config_sha256": _scaling_config_sha256(cfg),
         "code_identity": cell_code_identity,
+        _PACKAGE_CODE_FIELD: artifacts.code_identity_sha256,
         "data_sources": loaded_sources,
     }
     reuse_contract_sha256 = _scaling_reuse_contract_sha256(cellmeta)
@@ -1489,16 +1703,28 @@ def run_cell(
     val_tpc = _tokens_per_char(dataset, "validation")
     test_tpc = _tokens_per_char(dataset, "test")
     t0 = time.perf_counter()
+    final_validation: Dict[str, Optional[float]] = {}
     losses = train(model, train_loader, cfg, n_steps=cfg.max_steps,
                    grad_clip=cfg.grad_clip,
                    log_interval=cfg.log_interval, eval_interval=cfg.eval_interval,
                    val_loader=val_loader, tokens_per_char=val_tpc, device=device,
-                   logger=logger, artifacts=artifacts, generate_samples=False)
+                   logger=logger, artifacts=artifacts, _final_validation_out=final_validation,
+                   generate_samples=False)
     wall = time.perf_counter() - t0
+    # Validate the final weights, as train_vfe3.py does: the loop validates only on its eval_interval grid, so a
+    # max_steps off that grid left best_val_ppl, best_model.pt and the test-at-best fields on earlier weights, or
+    # empty (audit 2026-10-31, A124). When the loop's last evaluation was of the final weights its metrics are
+    # reused, and only the omitted pass's iterator construction is repeated to keep train_vfe3.py's CPU RNG stream.
+    if final_validation:
+        iter(val_loader)
+        final_metrics: Dict[str, Optional[float]] = dict(final_validation)
+    else:
+        final_metrics = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
     results = finalize_run(
         model,
         artifacts,
         cfg,
+        final_validation=final_metrics,
         tokens_per_char=test_tpc,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1576,9 +1802,10 @@ def validate_routes(route_names: Optional[List[str]] = None) -> None:
 
 
 def preview_routes(route_names: List[str], seeds: List[int]) -> None:
-    """Print effective dimensions, estimated parameters, and token exposure without models/data."""
-    print("Scaling plan (parameter estimates; exact counts are saved during training)")
-    print("route / cell | K | heads | layers | steps | est. params | tokens/run")
+    """Print effective dimensions, parameter counts, and token exposure without the cells' models or data
+    (:func:`predict_n_params` counts on tiny-vocabulary copies)."""
+    print("Scaling plan (parameter counts from predict_n_params; training saves the realized count)")
+    print("route / cell | K | heads | layers | steps | params | tokens/run")
     runs = 0
     for name in route_names:
         for cell in ROUTES[name]:
@@ -1722,6 +1949,11 @@ def main() -> int:
         logger.error("scaling code identity snapshot failed before execution: %s", exc)
         return 1
     try:
+        invocation_package_code = _current_package_code_identity()
+    except (OSError, RuntimeError) as exc:
+        logger.error("scaling package code identity snapshot failed before execution: %s", exc)
+        return 1
+    try:
         invocation_sources = _validated_data_source_identities(
             _data_source_identities(CONFIG["dataset"]))
     except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -1750,6 +1982,8 @@ def main() -> int:
         for cell in design["cells"]
     }
     incomplete = False
+    # Cells that completed in this invocation, by (route key, label, seed): the source a twin cell publishes.
+    completed_dirs: Dict[Tuple[str, str, int], Path] = {}
     n_cells = sum(len(ROUTES[n]) for n in route_names)
     print(f"\nVFE_3.0 parameter-scaling suite\n  device:  {device}\n  dataset: {CONFIG['dataset']}"
           f"\n  output:  {output_dir}\n  seeds:   {seeds}\n  routes:  {', '.join(route_names)}"
@@ -1760,6 +1994,7 @@ def main() -> int:
         print(f"\n{'=' * 70}\nROUTE: {name}  ({len(cells)} cells x {len(seeds)} seeds)\n{'=' * 70}")
         for cell in cells:
             for seed in seeds:
+                twin_label = cell.get("twin_of")
                 try:
                     run_dir = _trusted_scaling_run_dir(
                         output_dir, name, cell["label"], int(seed)
@@ -1767,7 +2002,10 @@ def main() -> int:
                     res = run_cell(cell, run_dir, int(seed), dataset=CONFIG["dataset"], device=device,
                                    max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"],
                                    source_identities=invocation_sources,
-                                   code_identity=invocation_code_identity)
+                                   code_identity=invocation_code_identity,
+                                   route_key=name, package_code_sha256=invocation_package_code,
+                                   twin_run_dir=(None if twin_label is None
+                                                 else completed_dirs.get((name, twin_label, int(seed)))))
                 except Exception as exc:                     # a training crash must not kill the suite
                     logger.exception("route %s / %s s%d crashed", name, cell["label"], seed)
                     res = {"label": cell["label"], "route": name, "error_kind": "train",
@@ -1779,12 +2017,23 @@ def main() -> int:
                 status = _scaling_result_status(res)
                 published = dict(res)
                 published["status"] = status
+                # The record names the ROUTES key that owns the cell directory, which the terminal-failure match
+                # reads, and keeps the cells' analysis tag beside it (audit 2026-10-31, A049).
+                published["route"] = name
+                published["route_tag"] = cell["route"]
                 if status == "nonfinite":
                     if published.get("error_kind") is None:
                         published["error_kind"] = "nonfinite"
                     if published.get("error") is None:
                         published["error"] = (
                             "scaling result is incomplete, non-finite, non-positive, or inconsistent")
+                if status != "complete":
+                    # The experiment this attempt ran, so a later invocation serves the failure only to the
+                    # same experiment (audit 2026-10-31, A051).
+                    published["attempt_contract"] = _cell_attempt_contract(
+                        cell, int(seed), dataset=CONFIG["dataset"], max_tokens=CONFIG["max_tokens"],
+                        max_steps=CONFIG["max_steps"], source_identities=invocation_sources,
+                        package_code_sha256=invocation_package_code)
                 persist_result = not res.get("cached") and not res.get("preserve_existing")
                 if persist_result:
                     try:
@@ -1812,11 +2061,15 @@ def main() -> int:
                         _trusted_scaling_run_dir(output_dir, name, cell["label"], int(seed)), int(seed))
                 except (OSError, ValueError):
                     history = {"n_attempts": None, "n_failed": None, "attempts": []}
+                if status == "complete":
+                    completed_dirs[(name, cell["label"], int(seed))] = _trusted_scaling_run_dir(
+                        output_dir, name, cell["label"], int(seed))
                 manifest_cell.update({
                     "status": status,
                     "error_kind": published.get("error_kind"),
                     "error": published.get("error"),
                     "cache_status": published.get("cache_status"),
+                    "reused_from": published.get("reused_from"),
                     "terminal_failure": bool(published.get("terminal_failure")),
                     "kl_max": published.get("kl_max"),
                     "router_dead_heads": published.get("router_dead_heads"),
@@ -1844,11 +2097,24 @@ def main() -> int:
                 "data source identities drifted during the scaling invocation")
     except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
         invocation_errors.append(f"terminal data source identity snapshot failed: {exc}")
+    # Drift of the invocation is judged by the package code digest: an edit to a note or an untracked file
+    # changes the Git fingerprint but no executed byte, so it is recorded in the design, not an error
+    # (audit 2026-10-31, A050).
+    package_drifted = False
+    try:
+        package_drifted = _current_package_code_identity() != invocation_package_code
+        if package_drifted:
+            invocation_errors.append(
+                "code identity drifted during the scaling invocation")
+    except (OSError, RuntimeError) as exc:
+        invocation_errors.append(f"terminal package code identity snapshot failed: {exc}")
     try:
         terminal_code_identity = _validated_scaling_code_identity(_current_code_identity())
         if terminal_code_identity != invocation_code_identity:
-            invocation_errors.append(
-                "code identity drifted during the scaling invocation")
+            design["git_identity_drift"] = True
+            if not package_drifted:
+                print("\n  note: the Git working tree changed during the invocation outside the executable "
+                      "sources; the package code digest is unchanged (git_identity_drift in the design)")
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         invocation_errors.append(f"terminal code identity snapshot failed: {exc}")
     if invocation_errors:
@@ -1865,8 +2131,10 @@ def main() -> int:
     if incomplete:
         print(f"\nROUTES INCOMPLETE. Inspect {design_path} and per-cell scaling_failure.json files.")
         return 1
-    print(f"\nALL ROUTES COMPLETE. Aggregate + fit + plot with:  python scaling_analysis.py"
-          f"  (reads {output_dir}/)")
+    # scaling_analysis.py finds this design from its CONFIG['input_dir'] when that is this directory or its
+    # parent, which is how the two shipped defaults pair (audit 2026-10-31, A109).
+    print(f"\nALL ROUTES COMPLETE. Aggregate + fit + plot with:  python scaling_analysis.py, with its "
+          f"CONFIG['input_dir'] set to {output_dir} or to that directory's parent")
     return 0
 
 

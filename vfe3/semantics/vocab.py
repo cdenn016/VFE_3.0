@@ -38,6 +38,14 @@ FUNCTION_WORDS = frozenset((
     "s t re ve ll d m"
 ).split())
 
+# Contractions as WikiText-103 writes them, after the Penn Treebank convention: "do n't", "ca n't", "wo n't",
+# "it 's". GPT-2 encodes the stems as " n", " ca", " wo" and the suffix as "'t"; a word-level vocabulary holds
+# "ca", "wo", "n't", "'s", ... as tokens. The stems are not words, so an English vocabulary's whole-word mask
+# drops them, and every contraction piece is a function word (audit 2026-10-31 semantics-vectors-5). The bare
+# pieces "s", "re", "ve", "m" that follow GPT-2's " '" are also ordinary continuation subwords and stay so.
+CONTRACTION_STEMS = frozenset(("n", "ca", "wo"))
+CONTRACTION_SUFFIXES = frozenset(("'s", "'t", "'re", "'ve", "'m", "'ll", "'d", "n't"))
+
 # Datasets whose text is not English: English word resources and token classes do not apply.
 NON_ENGLISH_DATASETS = frozenset(("wiki-ja", "wiki-ar"))
 
@@ -119,13 +127,17 @@ class Vocab:
         r"""(V,) bool: whole-word alphabetic tokens.
 
         BPE: the string starts with a space and the rest is non-empty and alphabetic (ASCII or
-        Unicode letters). Word / custom: the string is alphabetic. Invalid-text ids are excluded.
+        Unicode letters). Word / custom: the string is alphabetic. Invalid-text ids are excluded, and
+        so, for an English vocabulary, are the contraction stems :data:`CONTRACTION_STEMS` (``" n"``,
+        ``" ca"``, ``" wo"`` of WikiText's ``"n't"``, ``"ca n't"``, ``"wo n't"``), which look like whole words
+        but are not.
         """
         if self._word_mask is None:
+            stems = CONTRACTION_STEMS if self.english else frozenset()
             if self.is_bpe:
-                mask = [len(s) > 1 and s[0] == " " and s[1:].isalpha() for s in self.strings]
+                mask = [len(s) > 1 and s[0] == " " and s[1:].isalpha() and s[1:] not in stems for s in self.strings]
             else:
-                mask = [s.isalpha() for s in self.strings]
+                mask = [s.isalpha() and s not in stems for s in self.strings]
             self._word_mask = np.asarray(mask, dtype=bool) & self.valid_text
         return self._word_mask
 
@@ -137,6 +149,8 @@ class Vocab:
             return "number"
         if not any(ch.isalnum() for ch in core):
             return "punctuation"
+        if core.lower() in CONTRACTION_SUFFIXES:
+            return "function word"                          # "'t", "'s", "n't", ...: a contraction piece
         if self.is_bpe:
             if text[0] == " " and text[1:].isalpha():
                 word = text[1:]
@@ -148,7 +162,7 @@ class Vocab:
             if not text.isalpha():
                 return "other"
             word = text
-        if word.lower() in FUNCTION_WORDS:
+        if word.lower() in FUNCTION_WORDS or word in CONTRACTION_STEMS:
             return "function word"
         if word[0].isupper():
             return "capitalized word"
@@ -269,7 +283,8 @@ def vocab_for_run(
 def custom_vocab(strings: Sequence[str], *, english: bool = True) -> Vocab:
     r"""A ``"custom"`` vocabulary over explicit per-id strings (tests, non-standard runs).
 
-    Words resolve by exact lookup (first occurrence wins); ``"<unk>"`` is invalid text.
+    Words resolve by exact lookup (first occurrence wins); ``"<unk>"`` is invalid text. A library helper for
+    non-standard runs; within the repository it is referenced only by the tests.
     """
     strings = [str(s) for s in strings]
     valid = np.asarray([s != _WORD_UNK for s in strings], dtype=bool)

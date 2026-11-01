@@ -2,8 +2,9 @@ r"""Click-to-run: score checkpoints of several runs under ONE shared evaluation 
 
 Edit ``CONFIG`` below and run ``python rescore_protocol.py``; there is no command-line configuration.
 
-Each run's recorded perplexity uses its own window length N and stride s, so a scored target sees at least N - s
-tokens of context (96 for the 30.37 run at N=128, s=32; 192 for the 29.83 run at N=256, s=64). This script scores
+Each run's recorded perplexity uses its own window length N and stride s, so a target scored after a split's first
+window sees at least N - s + 1 tokens of context (97 for the 30.37 run at N=128, s=32; 193 for the 29.83 run at N=256,
+s=64), and the first window scores N - s targets with fewer. This script scores
 every listed checkpoint on the same validation and test windows at the chosen (N, s) with ``vfe3.train.evaluate``
 (:mod:`vfe3.protocol_rescore`), so the remaining differences are the models'. Every protocol scores each target of a
 split once, so the target set is identical; only the context differs.
@@ -22,13 +23,13 @@ CONFIG = {
         ("30.37_wikitext-103_K160_5-epochs_6-layer", "final_model.pt"),
     ),
     "seq_len":                    128,               # N, the window length of the shared protocol
-    "eval_stride":                32,                # s, targets scored per window (min context N - s)
+    "eval_stride":                32,                # s, targets scored per window (min context N - s + 1 past window 0)
     "splits":                     ("validation", "test"),
     "device":                     "auto",            # "auto" -> cuda when available, else cpu
     "precision":                  "run",             # "run": each run's amp dtype on CUDA (fp32 on CPU); "fp32"
     "threads":                    None,              # CPU threads; None -> cpu_count - 2
     "batch_size":                 None,              # None -> each run's cfg.batch_size
-    "max_windows":                None,              # None -> full splits; an int -> evenly spaced subset
+    "max_windows":                None,              # None -> full splits; an int -> evenly spaced subset (no window 0)
     "allow_stream_mismatch":      False,
     "drop_unknown_config_fields": True,
     "cache_dir":                  None,              # None -> ~/.cache/tokenized_cache (the runs' loaders)
@@ -57,7 +58,7 @@ def main() -> None:
                                                          if k not in ("entries", "threads", "out_name")})
     out_path = base / "vfe3_runs" / "protocol_rescores" / CONFIG["out_name"]
     print(f"\nvfe3 protocol re-score at N={options.seq_len}, stride={options.eval_stride} "
-          f"(min context {options.seq_len - options.eval_stride})", flush=True)
+          f"(min context {options.seq_len - options.eval_stride + 1} after the first window)", flush=True)
     report = run_protocol_rescore(out_path, options=options, log=lambda message: print(message, flush=True))
     print("\n" + comparison_table(report))
     for entry in report["results"]:

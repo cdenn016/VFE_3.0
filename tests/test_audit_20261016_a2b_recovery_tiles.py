@@ -72,16 +72,27 @@ def test_recovery_tiles_read_only_the_recovered_slices(monkeypatch: pytest.Monke
 
 
 def test_recovery_tile_size_follows_the_gathered_slice_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""A budget of one slice's full pair grid is one tile; one slice's row of pairs is N tiles."""
-    shapes = _factor_tile_spy(monkeypatch)
+    r"""The factor tiles score only the recovered entry's query row and key column, 2N - 1 pairs (audit 2026-10-31
+    gap-certified-factorization-routes-5), in tiles sized by the pair budget over the gathered slice count: a budget of
+    one slice's full pair grid holds the row and the remaining column in one tile each; a budget of one pair gives one
+    tile per pair."""
+    shapes: List[Tuple[int, int, int]] = []
+    real = scoring._projected_kl_tile
+
+    def spy(*args: Any) -> torch.Tensor:
+        if args[-1]:
+            shapes.append((args[0].shape[0], args[0].shape[-2], args[1].shape[-2]))    # (slices, rows, columns)
+        return real(*args)
+
+    monkeypatch.setattr(scoring, "_projected_kl_tile", spy)
     element = torch.finfo(torch.float32).bits // 8
     monkeypatch.setattr(scoring, "_RECOVERY_PAIR_TILE_BYTES", element * R * R * N * N, raising=False)
     _score(_sources(), recovery=True)
-    assert len(shapes) == 1
+    assert shapes == [(1, 1, N), (1, N - 1, 1)], shapes
     shapes.clear()
-    monkeypatch.setattr(scoring, "_RECOVERY_PAIR_TILE_BYTES", element * R * R * N, raising=False)
+    monkeypatch.setattr(scoring, "_RECOVERY_PAIR_TILE_BYTES", element * R * R, raising=False)
     _score(_sources(), recovery=True)
-    assert len(shapes) == N and all(shape[-2] == N for shape in shapes), shapes
+    assert len(shapes) == 2 * N - 1 and all(shape == (1, 1, 1) for shape in shapes), shapes
 
 
 def test_healthy_pairs_keep_the_gemm_and_recovered_pairs_match_float64() -> None:

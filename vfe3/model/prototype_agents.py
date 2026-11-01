@@ -76,7 +76,7 @@ from vfe3.runtime import ieee_fp32_matmul
 PROTOTYPE_TILE_BYTES: int = 32 * 1024 ** 2
 PROTOTYPE_INFERENCE_MODES: Tuple[str, ...] = ("mean_field", "exact")
 PROTOTYPE_COVARIANCE_CONTRACTS: Tuple[str, ...] = ("passthrough", "posterior")
-COVARIANCE_LAYOUTS: Tuple[str, ...] = ("diagonal", "dense", "blocks")
+COVARIANCE_LAYOUTS: Tuple[str, ...] = ("diagonal", "dense", "blocks")     # referenced only by the tests
 
 
 class ExactPrototypePosterior(NamedTuple):

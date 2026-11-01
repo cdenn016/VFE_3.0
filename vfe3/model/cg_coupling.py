@@ -1,8 +1,8 @@
 r"""Clebsch-Gordan between-block coupling for irrep towers (opt-in; default off).
 
-The only exactly-equivariant cross-type information flow: linear equivariant maps between
-inequivalent irreps are zero (Schur), so the coupling is BILINEAR through the numerically
-solved CG intertwiners,
+The lowest-order exactly equivariant cross-type coupling (linear maps vanish by Schur): an
+equivariant linear map between inequivalent irreps is zero, so the coupling is BILINEAR
+through the numerically solved CG intertwiners,
 
     mu'^(c,r) = mu^(c,r) + sum_p w_p C_p( mu^(a,i), mu^(b,j) ),
 
@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from vfe3.geometry.cg import cg_intertwiners, cg_selection
+from vfe3.runtime import ieee_fp32_matmul
 
 
 class CGMomentResult(NamedTuple):
@@ -65,6 +66,63 @@ def cg_moment_energy_rows(
     )
 
 
+class CGPaths(NamedTuple):
+    r"""The admissible CG triples of a labeled tower, their intertwiners and the coupling paths they span."""
+    triples:      List[Tuple[str, str, str, int]]                  # (a, b, c, n_mult), a <= b
+    intertwiners: List[torch.Tensor]                               # per triple (n_mult, d_c, d_a * d_b) float64
+    paths:        List[Tuple[int, int, int, int, int, int, int, int]]   # (s_a, d_a, s_b, d_b, s_c, d_c, triple, slot)
+    path_types:   List[Tuple[str, str, str]]                       # (a, b, c) per path
+
+
+def cg_coupling_paths(
+    group_n:      int,                       # N of SO(N) or SU(N)
+    algebra:      str,                       # 'so' | 'su'
+    irrep_dims:   List[int],                 # per-block dims
+    irrep_labels: List[str],                 # per-block labels
+
+    *,
+    atol:         float = 1e-8,              # CG null-space solve tolerance (shared with the prune)
+) -> CGPaths:
+    r"""Enumerate the coupling paths of :class:`CGCoupling` (an empty ``paths`` when the labels admit none).
+
+    One path per source copy pair (unordered for equal labels), target copy and multiplicity slot of every admissible
+    triple :math:`V_a\otimes V_b\to V_c`. A self pair (one source copy twice) through a swap-antisymmetric slot is
+    pruned: :math:`C_m(x, x) = 0` for every :math:`x`, so its weight would never receive a gradient (audit 2026-06-09
+    overnight F10/F13/F20). The prune threshold follows the solve's ``atol`` (audit 2026-06-13 L20). The intertwiners
+    are cached by :func:`vfe3.geometry.cg.cg_intertwiners`, so ``VFE3Config`` validation and the module build share
+    one solve.
+    """
+    starts = [0]
+    for d in irrep_dims:
+        starts.append(starts[-1] + d)
+    blocks = list(zip(irrep_labels, starts[:-1], irrep_dims))     # (label, start, d)
+    triples = cg_selection(group_n, algebra=algebra, labels=list(irrep_labels), atol=atol)
+    intertwiners = [cg_intertwiners(group_n, algebra=algebra, label_a=a, label_b=b, label_c=c, atol=atol)
+                    for (a, b, c, _n) in triples]                  # (n_mult, dc, da*db) each
+    paths: List[Tuple[int, int, int, int, int, int, int, int]] = []
+    path_types: List[Tuple[str, str, str]] = []
+    for t, ((a, b, c, n_mult), C64) in enumerate(zip(triples, intertwiners)):
+        srcs_a = [(s, d) for lab, s, d in blocks if lab == a]
+        srcs_b = [(s, d) for lab, s, d in blocks if lab == b]
+        tgts_c = [(s, d) for lab, s, d in blocks if lab == c]
+        for ia, (sa, da) in enumerate(srcs_a):
+            for jb, (sb, db) in enumerate(srcs_b):
+                if a == b and jb < ia:                            # unordered copies
+                    continue
+                for (sc, dc) in tgts_c:
+                    for m in range(n_mult):
+                        # Slots that are symmetric or mixed under copy swap stay (mixed can only arise from an eigh
+                        # basis rotation inside an n_mult > 1 null space and is live). For the shipped towers the
+                        # split is clean (antisymmetric ~1e-12 in float64 vs symmetric ~O(1)).
+                        if sa == sb:
+                            Cm = C64[m].reshape(dc, da, db)
+                            if (Cm + Cm.transpose(-1, -2)).abs().max() < max(1e-10, 10.0 * atol):
+                                continue
+                        paths.append((sa, da, sb, db, sc, dc, t, m))
+                        path_types.append((a, b, c))
+    return CGPaths(triples, intertwiners, paths, path_types)
+
+
 class CGCoupling(nn.Module):
     r"""Bilinear CG coupling over the blocks of a labeled irrep tower."""
 
@@ -91,60 +149,24 @@ class CGCoupling(nn.Module):
             raise ValueError(
                 "CGCoupling requires a labeled irrep tower (gauge_group 'so_n' or 'su_n')"
             )
-        starts = [0]
-        for d in irrep_dims:
-            starts.append(starts[-1] + d)
-        blocks = list(zip(irrep_labels, starts[:-1], irrep_dims))     # (label, start, d)
 
         # one stacked intertwiner buffer per admissible type triple
         self._group_n, self._algebra, self._atol = group_n, algebra, atol
-        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels, atol=atol)
+        enumerated = cg_coupling_paths(group_n, algebra, list(irrep_dims), list(irrep_labels), atol=atol)
         self._triple_index = {}
-        for t, (a, b, c, _n) in enumerate(triples):
-            C = cg_intertwiners(group_n, algebra=algebra,
-                                label_a=a, label_b=b, label_c=c,
-                                atol=atol)                            # (n_mult, dc, da*db)
+        for t, ((a, b, c, _n), C) in enumerate(zip(enumerated.triples, enumerated.intertwiners)):
             # Stored float64 (the solver's construction precision). A model-wide .float()/
             # .double() converts buffers like everything else; forward re-casts to mu's dtype
             # from the cast cache either way, so numerics follow the RUNTIME dtype -- float64
             # storage just avoids a lossy fp32 round-trip before the cast.
-            self.register_buffer(f"cg_{t}", C)
+            self.register_buffer(f"cg_{t}", C)                        # (n_mult, dc, da*db)
             self._triple_index[(a, b, c)] = t
 
-        # paths: source copy pair (i <= j for equal labels) x target copy x multiplicity slot.
-        # path_types mirrors paths 1:1 (introspection/debug only; no production consumer).
-        self.paths: List[Tuple[int, int, int, int, int, int, int, int]] = []
-        self.path_types: List[Tuple[str, str, str]] = []
-        for (a, b, c, n_mult) in triples:
-            t = self._triple_index[(a, b, c)]
-            C64 = getattr(self, f"cg_{t}")                            # (n_mult, dc, da*db) float64
-            srcs_a = [(s, d) for lab, s, d in blocks if lab == a]
-            srcs_b = [(s, d) for lab, s, d in blocks if lab == b]
-            tgts_c = [(s, d) for lab, s, d in blocks if lab == c]
-            for ia, (sa, da) in enumerate(srcs_a):
-                for jb, (sb, db) in enumerate(srcs_b):
-                    if a == b and jb < ia:                            # unordered copies
-                        continue
-                    for (sc, dc) in tgts_c:
-                        for m in range(n_mult):
-                            # A SELF-pair (the same source copy twice) through a swap-ANTI-
-                            # symmetric slot is identically zero -- C_m(x, x) = 0 for all x --
-                            # so its weight would be a structurally dead parameter with zero
-                            # gradient forever (audit 2026-06-09 overnight F10/F13/F20).
-                            # Prune it at enumeration. Slots that are symmetric or mixed
-                            # under copy swap stay (mixed can only arise from an eigh basis
-                            # rotation inside an n_mult > 1 null space and is live). The prune
-                            # threshold is tied to the CG solve's null-space atol (audit 2026-06-13
-                            # L20): a slot antisymmetric only to ~10*atol from a thin-gap/loosened
-                            # solve must still be pruned, not kept as a near-dead live parameter.
-                            # For the shipped towers the split is clean (antisymmetric ~1e-12 in
-                            # float64 vs symmetric ~O(1)), so this is byte-identical at the default.
-                            if sa == sb:
-                                Cm = C64[m].reshape(dc, da, db)
-                                if (Cm + Cm.transpose(-1, -2)).abs().max() < max(1e-10, 10.0 * atol):
-                                    continue
-                            self.paths.append((sa, da, sb, db, sc, dc, t, m))
-                            self.path_types.append((a, b, c))
+        # paths: source copy pair (i <= j for equal labels) x target copy x multiplicity slot, with the
+        # swap-antisymmetric self pairs pruned (cg_coupling_paths). path_types mirrors paths 1:1
+        # (introspection/debug only; no production consumer).
+        self.paths: List[Tuple[int, int, int, int, int, int, int, int]] = enumerated.paths
+        self.path_types: List[Tuple[str, str, str]] = enumerated.path_types
         if not self.paths:
             raise ValueError(
                 f"CGCoupling found no admissible CG paths for labels {irrep_labels} "
@@ -168,6 +190,8 @@ class CGCoupling(nn.Module):
         for (t, m, sc, dc), idxs in grouped.items():
             srcs = [self.paths[p][:4] for p in idxs]                  # (sa, da, sb, db) per path
             self._groups.append((t, m, sc, dc, idxs, srcs))
+        # The path indices of every group as device tensors, built once per device (_group_indices).
+        self._index_cache: Dict[torch.device, List[torch.Tensor]] = {}
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs) -> None:
@@ -209,9 +233,26 @@ class CGCoupling(nn.Module):
                     break
 
     def _apply(self, fn, recurse=True):
-        # .to()/.float()/.cuda() move or convert the buffers; drop the stale cast cache.
+        # .to()/.float()/.cuda() move or convert the buffers; drop the stale cast and index caches.
         self._cast_cache.clear()
+        self._index_cache.clear()
         return super()._apply(fn, recurse)
+
+    def _group_indices(self, device: torch.device) -> List[torch.Tensor]:
+        r"""The path indices of every forward group as long tensors on ``device``, cached outside inference mode.
+
+        Indexing the weights with a Python list builds a host index tensor and copies it to the device on every
+        group of every call (audit 2026-10-31 A191); these are built once per device, as the intertwiner casts
+        are (:meth:`_cast_buffers`). Built under ``torch.inference_mode()`` they are returned uncached, since a later
+        gradient-enabled call cannot save an inference tensor for backward.
+        """
+        cached = self._index_cache.get(device)
+        if cached is None:
+            cached = [torch.tensor(idxs, dtype=torch.long, device=device)
+                      for (_t, _m, _sc, _dc, idxs, _srcs) in self._groups]
+            if not torch.is_inference_mode_enabled():
+                self._index_cache[device] = cached
+        return cached
 
     def _cast_buffers(self, dtype: torch.dtype, device: torch.device) -> List[torch.Tensor]:
         r"""The intertwiner buffers cast to ``(dtype, device)``, cached outside inference mode.
@@ -255,12 +296,12 @@ class CGCoupling(nn.Module):
         cg = self._cast_buffers(mu.dtype, mu.device)              # per-(dtype, device), cached
         w = self.path_weights.to(dtype=mu.dtype)                  # one cast, differentiable
         delta = torch.zeros_like(mu)
-        for (t, m, sc, dc, idxs, srcs) in self._groups:
+        for (t, m, sc, dc, idxs, srcs), path_index in zip(self._groups, self._group_indices(mu.device)):
             x = torch.stack([mu[..., sa:sa + da] for (sa, da, _sb, _db) in srcs], dim=0)
             y = torch.stack([mu[..., sb:sb + db] for (_sa, _da, sb, db) in srcs], dim=0)
             xy = (x.unsqueeze(-1) * y.unsqueeze(-2)) \
                 .reshape(len(srcs), *x.shape[1:-1], -1)           # (P, ..., da*db)
-            wsum = torch.einsum("p,p...d->...d", w[idxs], xy)     # weighted source moment
+            wsum = torch.einsum("p,p...d->...d", w.index_select(0, path_index), xy)   # weighted source moment
             delta[..., sc:sc + dc] = delta[..., sc:sc + dc] \
                 + torch.einsum("cd,...d->...c", cg[t][m], wsum)
         return mu + delta, sigma
@@ -281,43 +322,54 @@ class CGCoupling(nn.Module):
         preserves input covariance directions even when J is singular. This is a FIRST-ORDER
         Gaussian moment closure, explicitly not an exact distributional pushforward. Covariance is
         passed through untouched under 'passthrough'.
+
+        Precision: the mean delta keeps the ambient autocast (the coupling's amp_dtype consumer), while the
+        Jacobian and the covariance pushforward run with autocast off and IEEE fp32 GEMMs at
+        promote_types(mu, sigma, float32), as every other covariance pushforward does. Under bf16 autocast the
+        rounding of J Sigma J^T (about 2^-8 of its entries) exceeded the floor's margin floor * lambda_min(Sigma)
+        and returned indefinite covariances (audit 2026-10-31 A016).
         """
         cg = self._cast_buffers(mu.dtype, mu.device)              # per-(dtype, device), cached
         w = self.path_weights.to(dtype=mu.dtype)                  # one cast, differentiable
+        dtype = torch.promote_types(torch.promote_types(mu.dtype, sigma.dtype), torch.float32)
+        cg_work = cg if dtype == mu.dtype else self._cast_buffers(dtype, mu.device)
+        w_work = w if dtype == mu.dtype else self.path_weights.to(dtype=dtype)
         K = mu.shape[-1]
         delta = torch.zeros_like(mu)
-        eye = torch.eye(K, dtype=mu.dtype, device=mu.device)
+        eye = torch.eye(K, dtype=dtype, device=mu.device)
         jac = eye.expand(*mu.shape[:-1], K, K).clone()            # (..., K, K), starts at identity
-        for (t, m, sc, dc, idxs, srcs) in self._groups:
-            sa0, da0, sb0, db0 = srcs[0]                          # da/db/dc constant within a group (fixed triple)
-            Cm = cg[t][m].reshape(dc, da0, db0)                   # (dc, da, db)
+        for (t, m, sc, dc, idxs, srcs), path_index in zip(self._groups, self._group_indices(mu.device)):
+            _sa0, da0, _sb0, db0 = srcs[0]                        # da/db/dc constant within a group (fixed triple)
             # Mean delta (same grouped arithmetic as forward).
             x = torch.stack([mu[..., sa:sa + da] for (sa, da, _sb, _db) in srcs], dim=0)   # (P, ..., da)
             y = torch.stack([mu[..., sb:sb + db] for (_sa, _da, sb, db) in srcs], dim=0)   # (P, ..., db)
             xy = (x.unsqueeze(-1) * y.unsqueeze(-2)) \
                 .reshape(len(srcs), *x.shape[1:-1], -1)           # (P, ..., da*db)
-            wsum = torch.einsum("p,p...d->...d", w[idxs], xy)     # (..., da*db)
+            wsum = torch.einsum("p,p...d->...d", w.index_select(0, path_index), xy)   # (..., da*db)
             delta[..., sc:sc + dc] = delta[..., sc:sc + dc] \
-                + torch.einsum("cd,...d->...c", Cm.reshape(dc, -1), wsum)
-            # Analytic Jacobian: accumulate the two bilinear contractions per path (source copies
-            # differ within the group; the target block sc is shared). A self-pair (sa == sb) adds
-            # BOTH contractions into the same source columns -- the derivative of C(x (x) x).
-            for local_p, (sa, da, sb, db) in enumerate(srcs):
-                wp = w[idxs[local_p]]
-                xp = mu[..., sa:sa + da]                          # (..., da)
-                yp = mu[..., sb:sb + db]                          # (..., db)
-                j_dx = wp * torch.einsum("cij,...j->...ci", Cm, yp)   # (..., dc, da) = C(. (x) y)
-                jac[..., sc:sc + dc, sa:sa + da] = \
-                    jac[..., sc:sc + dc, sa:sa + da] + j_dx
-                j_dy = wp * torch.einsum("cij,...i->...cj", Cm, xp)   # (..., dc, db) = C(x (x) .)
-                jac[..., sc:sc + dc, sb:sb + db] = \
-                    jac[..., sc:sc + dc, sb:sb + db] + j_dy
+                + torch.einsum("cd,...d->...c", cg[t][m], wsum)
+            # Analytic Jacobian: the two bilinear contractions of every path of the group in one stacked einsum
+            # each, then accumulated path by path (source copies differ within the group; the target block sc is
+            # shared). A self-pair (sa == sb) adds BOTH contractions into the same source columns, the
+            # derivative of C(x (x) x).
+            with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
+                Cm = cg_work[t][m].reshape(dc, da0, db0)          # (dc, da, db)
+                wp = w_work.index_select(0, path_index).reshape(-1, *([1] * (mu.dim() + 1)))   # (P, 1, ..., 1)
+                j_dx = wp * torch.einsum("cij,p...j->p...ci", Cm, y.to(dtype))   # (P, ..., dc, da) = C(. (x) y_p)
+                j_dy = wp * torch.einsum("cij,p...i->p...cj", Cm, x.to(dtype))   # (P, ..., dc, db) = C(x_p (x) .)
+                for local_p, (sa, da, sb, db) in enumerate(srcs):
+                    jac[..., sc:sc + dc, sa:sa + da] = \
+                        jac[..., sc:sc + dc, sa:sa + da] + j_dx[local_p]
+                    jac[..., sc:sc + dc, sb:sb + db] = \
+                        jac[..., sc:sc + dc, sb:sb + db] + j_dy[local_p]
         mu_out = mu + delta
         if self.cg_covariance_mode == "delta_full":
-            js = torch.einsum("...ij,...jk->...ik", jac, sigma)      # J Sigma
-            jsj = torch.einsum("...ik,...lk->...il", js, jac)        # (J Sigma) J^T
-            sigma_out = (0.5 * (jsj + jsj.transpose(-1, -2))
-                         + self.cg_covariance_floor * sigma)
+            with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
+                work = sigma.to(dtype)                                   # (..., K, K)
+                js = torch.einsum("...ij,...jk->...ik", jac, work)       # J Sigma
+                jsj = torch.einsum("...ik,...lk->...il", js, jac)        # (J Sigma) J^T
+                sigma_out = (0.5 * (jsj + jsj.transpose(-1, -2))
+                             + self.cg_covariance_floor * work)
         else:
             sigma_out = sigma
         return CGMomentResult(mu_out, sigma_out, jac)

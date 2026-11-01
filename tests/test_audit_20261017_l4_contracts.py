@@ -13,7 +13,6 @@ import csv
 import json
 import logging
 import math
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Sequence
@@ -411,12 +410,12 @@ def test_make_figures_passes_an_absolute_run_dir(tmp_path: Path, monkeypatch: py
     monkeypatch.chdir(tmp_path)
     seen: Dict[str, object] = {}
 
-    def fake_run(command: object, **kwargs: object) -> subprocess.CompletedProcess:
+    def fake_run(command: object, **kwargs: object) -> tuple:
         request = json.loads(Path(kwargs["env"]["VFE3_FIGURE_REQUEST"]).read_text(encoding="utf-8"))
         seen.update(request)
-        return subprocess.CompletedProcess(command, 1, "", "stop")
+        return 1, "stop"                                     # (exit code, output tail) of the streamed worker
 
-    monkeypatch.setattr(make_figures, "run_process_tree", fake_run)
+    monkeypatch.setattr(make_figures, "_run_figure_worker", fake_run)
     with pytest.raises(RuntimeError, match="exited with code 1"):
         make_figures._generate_figures_isolated(
             Path("runs") / "r", device="cpu", split="test", max_sequences=None, n_e_steps=None,

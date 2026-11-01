@@ -1,11 +1,15 @@
 r"""Score checkpoints of several runs under one shared evaluation protocol (2026-10-21).
 
 Each run records perplexity under its own protocol: windows of its ``max_seq_len`` :math:`N`, advanced by its
-``eval_stride`` :math:`s`, each window scoring its last :math:`s` targets, so every scored target sees at least
-:math:`N - s` tokens of context. Two runs trained at different :math:`(N, s)` therefore report numbers that differ by
-the context they were scored with as well as by the model. This module re-scores any number of checkpoints on the
+``eval_stride`` :math:`s`. Every window after a split's first scores its last :math:`s` targets, each with at least
+:math:`N - s + 1` tokens of context; the first window scores all :math:`N` of its targets, the first :math:`N - s` of
+them with fewer (from one token up). Two runs trained at different :math:`(N, s)` therefore report numbers that differ
+by the context they were scored with as well as by the model. This module re-scores any number of checkpoints on the
 same validation and test windows at one chosen :math:`(N, s)`, with :func:`vfe3.train.evaluate` on the identity-checked
-streams (:mod:`vfe3.posthoc.streams`), so the differences that remain are the models'.
+streams (:mod:`vfe3.posthoc.streams`), so the differences that remain are the models', provided the entries scored the
+same targets of the same streams: each entry records its streams (dataset, content SHA-256, token count), its scored
+targets and its realized precision per split, and :func:`comparison_table` omits the difference of an entry whose
+streams or scored targets differ from the first entry's.
 
 Every protocol scores each target of a split exactly once (the padded final window covers the tail), so the target
 set is the same for every :math:`(N, s)`; only the context changes. Shorter windows than a model was trained at are
@@ -48,6 +52,25 @@ def check_protocol(seq_len: int, eval_stride: int) -> None:
         raise ValueError(f"need seq_len >= 2 and 1 <= eval_stride <= seq_len, got N={seq_len}, s={eval_stride}")
 
 
+# Fields of an entry's split record that must agree with the first entry's for their CE difference to compare models.
+COMPARABLE_FIELDS: Tuple[str, ...] = ("dataset", "content_sha256", "n_tokens", "scored_targets")
+# Stream fields of vfe3.posthoc.streams.resolve_stream copied into each entry's split record.
+_STREAM_FIELDS: Tuple[str, ...] = ("dataset", "format", "file_sha256", "content_sha256", "n_tokens",
+                                   "tokenizer_provenance_status")
+
+
+def protocol_context(seq_len: int, eval_stride: int) -> Dict[str, int]:
+    r"""The context the padded protocol windows give their scored targets.
+
+    Window :math:`i \ge 1` scores the targets at window positions :math:`N - s, \dots, N - 1`, whose contexts are
+    :math:`N - s + 1, \dots, N` tokens, so every target scored after the first window has at least
+    :math:`N - s + 1`. Window 0 scores all :math:`N` of its targets, with contexts :math:`1, \dots, N`, so
+    :math:`N - s` of them fall below that minimum.
+    """
+    N, s = int(seq_len), int(eval_stride)
+    return {"min_context_after_first_window": N - s + 1, "first_window_targets_below_min_context": N - s}
+
+
 def run_protocol_rescore(
     out_path: "str | Path",
 
@@ -74,7 +97,7 @@ def run_protocol_rescore(
     N, s = int(options.seq_len), int(options.eval_stride)
     report: Dict[str, Any] = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "protocol": {"seq_len": N, "eval_stride": s, "min_context": N - s, "max_windows": options.max_windows},
+        "protocol": {"seq_len": N, "eval_stride": s, **protocol_context(N, s), "max_windows": options.max_windows},
         "device": str(device), "precision": options.precision, "results": [],
     }
     for run_dir, checkpoint in options.entries:
@@ -91,6 +114,10 @@ def run_protocol_rescore(
             "run_dir": str(run_dir), "run": run_dir.name, "checkpoint": checkpoint,
             "trained_protocol": {"seq_len": trained_N, "eval_stride": int(info.eval_stride)},
             "batch_size": batch_size, "notes": list(loaded.notes), "splits": {},
+            # The arithmetic this entry was scored in: the autocast dtype applied, and the process fp32 matmul
+            # policy the model constructor pinned.
+            "realized_amp_dtype": loaded.amp_dtype,
+            "fp32_matmul_precision": torch.get_float32_matmul_precision(),
             "recorded": {key: info.summary.get(key) for key in (
                 "best_val_ppl", "best_step", "final_val_ppl", "test_ppl", "test_ce", "test_best_ppl",
                 "test_best_step") if key in info.summary},
@@ -106,6 +133,7 @@ def run_protocol_rescore(
                 **{k: (float(v) if isinstance(v, (int, float)) else v) for k, v in result.items()},
                 "n_windows": len(dataset), "n_scored_windows": int(indices.size),
                 "stream_status": record.get("status"),
+                **{key: record.get(key) for key in _STREAM_FIELDS},
             }
             log(f"[rescore] {run_dir.name}/{checkpoint} {split} at N={N}, stride={s}: "
                 f"CE {result['ce']:.4f} | PPL {result['ppl']:.3f}")
@@ -122,16 +150,28 @@ def run_protocol_rescore(
 
 
 def comparison_table(report: Dict[str, Any]) -> str:
-    r"""Plain-text table of every entry's CE and PPL per split, with the CE difference to the first entry."""
+    r"""Plain-text table of every entry's CE and PPL per split, with the CE difference to the first entry.
+
+    The difference is printed as ``n/a`` when any of :data:`COMPARABLE_FIELDS` (the stream's dataset, content
+    SHA-256 and token count, and the scored targets) differs from the first entry's for that split; a note under
+    the table names the fields.
+    """
     results: List[Dict[str, Any]] = report["results"]
     splits = list(results[0]["splits"]) if results else []
     header = f"{'run / checkpoint':<58}" + "".join(f"{sp + ' CE':>15}{'PPL':>9}{'dCE':>9}" for sp in splits)
     lines = [header]
+    notes: List[str] = []
     for entry in results:
         cells = ""
+        name = entry["run"] + " / " + entry["checkpoint"]
         for sp in splits:
             ce = entry["splits"][sp]["ce"]
             ref = results[0]["splits"][sp]["ce"]
-            cells += f"{ce:>15.4f}{entry['splits'][sp]['ppl']:>9.3f}{ce - ref:>9.4f}"
-        lines.append(f"{(entry['run'] + ' / ' + entry['checkpoint'])[:57]:<58}{cells}")
-    return "\n".join(lines)
+            differing = [key for key in COMPARABLE_FIELDS
+                         if entry["splits"][sp].get(key) != results[0]["splits"][sp].get(key)]
+            delta = f"{'n/a':>9}" if differing else f"{ce - ref:>9.4f}"
+            cells += f"{ce:>15.4f}{entry['splits'][sp]['ppl']:>9.3f}{delta}"
+            if differing:
+                notes.append(f"  {name} {sp}: dCE omitted, {', '.join(differing)} differ from the first entry")
+        lines.append(f"{name[:57]:<58}{cells}")
+    return "\n".join(lines + notes)

@@ -134,6 +134,14 @@ def el_fwd_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, CE, S, V,
 def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMQ, GSQ, GE, S, V,
                        K: tl.constexpr, KP: tl.constexpr, BI: tl.constexpr, BV: tl.constexpr,
                        HAS_U: tl.constexpr, FAST_LOG: tl.constexpr):
+    r"""dCE/dmu_q, dCE/dsigma_q and sum_v w E for BI rows.
+
+    For KP above 32, each feature's column sum over the tile is placed at two levels: a one-hot into a (BI, 16) block
+    accumulator, and the block into the (BI, KP) accumulator, held as (BI, KP/16, 16), once per 16 features. That is
+    about BI (16 K + KP K/16) placement work per tile instead of BI KP K (8-fold less at K = 192), and every (i, k) sum
+    over v keeps its order (each placement adds the one tile sum to exact zeros), so the result is bitwise the
+    one-level placement's (audit 2026-10-31 A206). At KP <= 32 (at most two blocks) the one-level placement stays: the
+    saving is small there and the block accumulators raised the sm_120a spills at K = 20 from 460 to 612 bytes."""
     pid = tl.program_id(0)
     offs_i = pid * BI + tl.arange(0, BI)
     mi = offs_i < S
@@ -142,10 +150,16 @@ def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMQ, GSQ, 
     t = tl.load(TGT + offs_i, mask=mi, other=-1)
     m = tl.load(M + offs_i, mask=mi, other=0.0)                     # lse = m + log_l, kept apart
     log_l = tl.load(LOGL + offs_i, mask=mi, other=0.0)
-    kk = tl.arange(0, KP)
     dt = MQ.dtype.element_ty
-    acc_m = tl.zeros([BI, KP], dt)                                   # sum_v w r
-    acc_s = tl.zeros([BI, KP], dt)                                   # sum_v w (r^2 - 1/s)
+    if KP > 2 * _KB:
+        kb = tl.arange(0, KP // _KB)                                 # (KP/16,) feature blocks
+        kj = tl.arange(0, _KB)                                       # (16,) features within a block
+        acc_m = tl.zeros([BI, KP // _KB, _KB], dt)                   # sum_v w r at [i, k // 16, k % 16]
+        acc_s = tl.zeros([BI, KP // _KB, _KB], dt)                   # sum_v w (r^2 - 1/s)
+    else:
+        kk = tl.arange(0, KP)
+        acc_m = tl.zeros([BI, KP], dt)                               # sum_v w r
+        acc_s = tl.zeros([BI, KP], dt)                               # sum_v w (r^2 - 1/s)
     acc_e = tl.zeros([BI], dt)                                       # sum_v w E
     for v0 in range(0, V, BV):
         offs_v = v0 + tl.arange(0, BV)
@@ -153,18 +167,41 @@ def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMQ, GSQ, 
         E = _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, K, BI, BV, FAST_LOG)
         w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, m, log_l, scale, HAS_U)
         acc_e += tl.sum(w * E, 1)
-        for k in range(K):
-            a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
-            b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)
-            mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)
-            sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)
-            inv = 1.0 / (b[:, None] + sv[None, :])
-            r = (a[:, None] - mv[None, :]) * inv
-            acc_m += tl.where(kk[None, :] == k, tl.sum(w * r, 1)[:, None], 0.0)
-            acc_s += tl.where(kk[None, :] == k, tl.sum(w * (r * r - inv), 1)[:, None], 0.0)
-    km = mi[:, None] & (kk[None, :] < K)
-    tl.store(GMQ + offs_i[:, None] * K + kk[None, :], -2.0 * c * acc_m, mask=km)
-    tl.store(GSQ + offs_i[:, None] * K + kk[None, :], c * acc_s, mask=km)
+        if KP > 2 * _KB:
+            for k0 in range(0, K, _KB):                              # blocks of 16 features
+                blk_m = tl.zeros([BI, _KB], dt)
+                blk_s = tl.zeros([BI, _KB], dt)
+                for k in range(k0, tl.minimum(k0 + _KB, K)):
+                    a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
+                    b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)
+                    mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)
+                    sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)
+                    inv = 1.0 / (b[:, None] + sv[None, :])
+                    r = (a[:, None] - mv[None, :]) * inv
+                    blk_m += tl.where(kj[None, :] == k - k0, tl.sum(w * r, 1)[:, None], 0.0)
+                    blk_s += tl.where(kj[None, :] == k - k0, tl.sum(w * (r * r - inv), 1)[:, None], 0.0)
+                sel = (kb == k0 // _KB)[None, :, None]
+                acc_m += tl.where(sel, blk_m[:, None, :], 0.0)
+                acc_s += tl.where(sel, blk_s[:, None, :], 0.0)
+        else:
+            for k in range(K):
+                a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
+                b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)
+                mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)
+                sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)
+                inv = 1.0 / (b[:, None] + sv[None, :])
+                r = (a[:, None] - mv[None, :]) * inv
+                acc_m += tl.where(kk[None, :] == k, tl.sum(w * r, 1)[:, None], 0.0)
+                acc_s += tl.where(kk[None, :] == k, tl.sum(w * (r * r - inv), 1)[:, None], 0.0)
+    if KP > 2 * _KB:
+        kk3 = kb[:, None] * _KB + kj[None, :]                        # (KP/16, 16) feature index
+        km = mi[:, None, None] & (kk3[None, :, :] < K)
+        tl.store(GMQ + offs_i[:, None, None] * K + kk3[None, :, :], -2.0 * c * acc_m, mask=km)
+        tl.store(GSQ + offs_i[:, None, None] * K + kk3[None, :, :], c * acc_s, mask=km)
+    else:
+        km = mi[:, None] & (kk[None, :] < K)
+        tl.store(GMQ + offs_i[:, None] * K + kk[None, :], -2.0 * c * acc_m, mask=km)
+        tl.store(GSQ + offs_i[:, None] * K + kk[None, :], c * acc_s, mask=km)
     tl.store(GE + offs_i, acc_e, mask=mi)
 
 
@@ -172,15 +209,24 @@ def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMQ, GSQ, 
 def el_bwd_cols_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMV, GSV, GU, S, V,
                        K: tl.constexpr, KP: tl.constexpr, BI: tl.constexpr, BV: tl.constexpr,
                        HAS_U: tl.constexpr, FAST_LOG: tl.constexpr):
+    r"""dCE/dmu_v, dCE/dsigma_v and dCE/du for BV vocabulary entries, with the placement of the rows kernel: two
+    levels over (KP/16, 16, BV) accumulators for KP above 32, one level otherwise (bitwise the one-level placement's
+    either way; audit 2026-10-31 A206)."""
     pid = tl.program_id(0)
     offs_v = pid * BV + tl.arange(0, BV)
     mv_ok = offs_v < V
     c = 0.5 / tl.load(TAU)
     scale = tl.load(SCALE)
-    kk = tl.arange(0, KP)
     dt = MQ.dtype.element_ty
-    acc_m = tl.zeros([KP, BV], dt)                                   # sum_i w r
-    acc_s = tl.zeros([KP, BV], dt)                                   # sum_i w (r^2 - 1/s)
+    if KP > 2 * _KB:
+        kb = tl.arange(0, KP // _KB)                                 # (KP/16,) feature blocks
+        kj = tl.arange(0, _KB)                                       # (16,) features within a block
+        acc_m = tl.zeros([KP // _KB, _KB, BV], dt)                   # sum_i w r at [k // 16, k % 16, v]
+        acc_s = tl.zeros([KP // _KB, _KB, BV], dt)                   # sum_i w (r^2 - 1/s)
+    else:
+        kk = tl.arange(0, KP)
+        acc_m = tl.zeros([KP, BV], dt)                               # sum_i w r
+        acc_s = tl.zeros([KP, BV], dt)                               # sum_i w (r^2 - 1/s)
     acc_u = tl.zeros([BV], dt)                                       # sum_i w
     for i0 in range(0, S, BI):
         offs_i = i0 + tl.arange(0, BI)
@@ -193,18 +239,41 @@ def el_bwd_cols_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMV, GSV, 
         log_l = tl.load(LOGL + offs_i, mask=mi, other=0.0)
         w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, m, log_l, scale, HAS_U)
         acc_u += tl.sum(w, 0)
-        for k in range(K):
-            a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
-            b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)
-            mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)
-            sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)
-            inv = 1.0 / (b[:, None] + sv[None, :])
-            r = (a[:, None] - mv[None, :]) * inv
-            acc_m += tl.where(kk[:, None] == k, tl.sum(w * r, 0)[None, :], 0.0)
-            acc_s += tl.where(kk[:, None] == k, tl.sum(w * (r * r - inv), 0)[None, :], 0.0)
-    km = (kk[:, None] < K) & mv_ok[None, :]
-    tl.store(GMV + offs_v[None, :] * K + kk[:, None], 2.0 * c * acc_m, mask=km)
-    tl.store(GSV + offs_v[None, :] * K + kk[:, None], c * acc_s, mask=km)
+        if KP > 2 * _KB:
+            for k0 in range(0, K, _KB):                              # blocks of 16 features
+                blk_m = tl.zeros([_KB, BV], dt)
+                blk_s = tl.zeros([_KB, BV], dt)
+                for k in range(k0, tl.minimum(k0 + _KB, K)):
+                    a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
+                    b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)
+                    mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)
+                    sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)
+                    inv = 1.0 / (b[:, None] + sv[None, :])
+                    r = (a[:, None] - mv[None, :]) * inv
+                    blk_m += tl.where(kj[:, None] == k - k0, tl.sum(w * r, 0)[None, :], 0.0)
+                    blk_s += tl.where(kj[:, None] == k - k0, tl.sum(w * (r * r - inv), 0)[None, :], 0.0)
+                sel = (kb == k0 // _KB)[:, None, None]
+                acc_m += tl.where(sel, blk_m[None, :, :], 0.0)
+                acc_s += tl.where(sel, blk_s[None, :, :], 0.0)
+        else:
+            for k in range(K):
+                a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
+                b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)
+                mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)
+                sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)
+                inv = 1.0 / (b[:, None] + sv[None, :])
+                r = (a[:, None] - mv[None, :]) * inv
+                acc_m += tl.where(kk[:, None] == k, tl.sum(w * r, 0)[None, :], 0.0)
+                acc_s += tl.where(kk[:, None] == k, tl.sum(w * (r * r - inv), 0)[None, :], 0.0)
+    if KP > 2 * _KB:
+        kk3 = kb[:, None] * _KB + kj[None, :]                        # (KP/16, 16) feature index
+        km = (kk3[:, :, None] < K) & mv_ok[None, None, :]
+        tl.store(GMV + offs_v[None, None, :] * K + kk3[:, :, None], 2.0 * c * acc_m, mask=km)
+        tl.store(GSV + offs_v[None, None, :] * K + kk3[:, :, None], c * acc_s, mask=km)
+    else:
+        km = (kk[:, None] < K) & mv_ok[None, :]
+        tl.store(GMV + offs_v[None, :] * K + kk[:, None], 2.0 * c * acc_m, mask=km)
+        tl.store(GSV + offs_v[None, :] * K + kk[:, None], c * acc_s, mask=km)
     tl.store(GU + offs_v, acc_u, mask=mv_ok)
 
 

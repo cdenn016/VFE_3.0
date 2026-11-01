@@ -160,7 +160,9 @@ def collect_inference_bank(
     stack output, and optional decode logits. Complete CPU offload bounds accelerator residency to
     the current inference or consumer batch. Report callers omit logits and stream decode consumers
     from the retained converged belief, avoiding both E-step replay and population-wide
-    full-vocabulary retention.
+    full-vocabulary retention. The belief and the stack output keep their means and covariances
+    only (``phi = right_phi = None``): no bank consumer reads a frame, and phi, ``n_gen`` values per
+    token, was about 94 percent of a record at the live shape (audit 2026-10-31 viz-pipeline-7).
     """
     device = device or _model_device(model)
     was_training = model.training
@@ -184,7 +186,7 @@ def collect_inference_bank(
             )
             out = capture["out"]
             canonical_frame = capture.get("canonical_frame")
-            out_cpu = _cpu_bank_value(out)
+            out_cpu = _cpu_bank_value(out._replace(phi=None, right_phi=None))        # mean and covariance only
             belief_mu_cpu = (
                 out_cpu.mu
                 if beliefs.mu is out.mu
@@ -324,10 +326,12 @@ def belief_ce_bank(
     r"""The Sigma_q <-> CE JOIN for the calibration probe (B1/EXP-3): per-token belief-covariance
     trace tr(Sigma_q) aligned with the decode cross-entropy that same belief produced.
 
-    For each ``(tokens, targets)`` batch this captures the stack output ``out.sigma`` of
-    ``model.forward_beliefs`` and runs the inference forward ``model(tokens)`` for the decode logits,
-    then reduces the cross-entropy with ``reduction='none'``, so the traced Sigma_q IS the belief
-    whose mean produced the logits. The belief at
+    For each ``(tokens, targets)`` batch one captured inference forward,
+    ``model.forward_beliefs(tokens, return_logits=True, capture=...)``, yields both the decode logits
+    and the stack output ``out.sigma`` (``model(tokens)`` is that call's logits, so a second forward
+    for the covariance only repeated the stack; audit 2026-10-31 viz-pipeline-8), and the
+    cross-entropy is reduced with ``reduction='none'``, so the traced Sigma_q IS the belief whose mean
+    produced the logits. The belief at
     position n is the one whose mean produced the logits predicting target n, so tr(Sigma_q)[n] and
     CE[n] are aligned position-by-position; only valid targets (``targets != -100``) are kept.
     Returns the flattened per-token ``tr_sigma`` (M,), ``ce`` (M,) nats, the predicted-token
@@ -392,16 +396,16 @@ def belief_ce_bank(
         for i, (tokens, targets) in enumerate(loader):
             tokens = tokens.to(device)
             targets = targets.to(device)
-            logits = model(tokens)                                # (B, N, V) inference path
+            # The logits and the traced covariance come from the same captured inference forward.
+            conditional_capture: dict = {}
+            _, logits = model.forward_beliefs(
+                tokens, return_logits=True, capture=conditional_capture)       # (B, N, V) inference path
+            out = conditional_capture["out"]
+            del conditional_capture
             flat_logits = logits.reshape(-1, logits.shape[-1]).float()           # (B*N, V)
             per = F.cross_entropy(flat_logits, targets.reshape(-1),
                                   ignore_index=-100, reduction="none")            # (B*N,)
             conf_flat, pred_flat = flat_logits.softmax(dim=-1).max(dim=-1)        # (B*N,) confidence, argmax
-            # The traced covariance is the stack output of the same inference forward.
-            conditional_capture: dict = {}
-            model.forward_beliefs(tokens, capture=conditional_capture)
-            out = conditional_capture["out"]
-            del conditional_capture
             trs = metrics.sigma_trace(
                 out.sigma,
                 diagonal=cfg.diagonal_covariance,
@@ -691,7 +695,11 @@ def readout_state(
         for head in range(h):
             exp_phi[:, head*d:(head+1)*d, head*d:(head+1)*d] = blocks[:, head]
     else:
-        exp_phi = omega.exp_phi
+        # A group without equal compact head blocks (an so_n tower of unequal blocks, a CG-coupling tower) returns
+        # dense vertex factors; the holonomy metrics read a dense (N, N, K, K) operator or a compact transport, so
+        # the dense operator U_i U_j^{-1} is formed here, for this one replayed sequence (audit 2026-10-31 A053).
+        exp_phi = omega.exp_phi                                            # (N, K, K)
+        omega = omega.to_dense_omega()                                     # (N, N, K, K)
     state.update(omega=omega, exp_phi=exp_phi, frame_scope="receiver_same_frame")
     return state
 
@@ -735,8 +743,17 @@ def _act_on_frame(
 
 
 def _relative_deviation(reference: torch.Tensor, transformed: torch.Tensor) -> float:
-    r"""``max |x' - x| / max |x|`` over entries finite in both (masked routing entries are skipped)."""
-    finite = torch.isfinite(reference) & torch.isfinite(transformed)
+    r"""``max |x' - x| / max |x|`` over entries finite in both; masked routing entries, non-finite in both, are
+    skipped.
+
+    An entry finite in exactly one argument is an infinite deviation: the frame action turned a finite value
+    non-finite, or the reverse, which the earlier both-finite mask dropped, so a failed moved evaluation read as
+    roundoff (audit 2026-10-31 viz-pipeline-3). NaN when no entry is finite in both.
+    """
+    finite_ref, finite_moved = torch.isfinite(reference), torch.isfinite(transformed)
+    if bool((finite_ref ^ finite_moved).any()):
+        return float("inf")
+    finite = finite_ref & finite_moved
     if not bool(finite.any()):
         return float("nan")
     scale = reference[finite].abs().max()
@@ -781,11 +798,17 @@ def projected_gauge_equivariance(
     (``diagnose_canonical_free_energy``) reads the self term, ``self_coupling`` is its per-token value
     :math:`\sum_k\alpha_i^{(k)}D_i^{(k)} + R(\alpha_i)` (one term for the per-position forms) against an
     independent fixed prior :math:`p_i`, a random draw moved with the belief,
-    :math:`(\mu_{p,i},\Sigma_{p,i})\mapsto(g_i\mu_{p,i},g_i\Sigma_{p,i}g_i^\top)`. The summed
+    :math:`(\mu_{p,i},\Sigma_{p,i})\mapsto(g_i\mu_{p,i},g_i\Sigma_{p,i}g_i^\top)`, clamped as the M-step
+    term clamps it (``self_kl_max``, else ``kl_max``). The summed
     :math:`D(q_i\|p_i)` is invariant, so a constant or per-position :math:`\alpha` sits at roundoff, while
     the ordered conditional KLs :math:`D_i^{(k)}` of ``state_dependent_per_coord`` move with the frame.
+    On ``gaussian_frame_diagonal`` the term is the one the M-step trains: the diagonal divergences of the
+    reference moments :math:`(U_i^{-1}\mu_i, c_i)` against a prior of the family form
+    :math:`(U_i^{-1}\mu_{p,i}, c_{p,i})` in the shared frame, which the action leaves fixed, so every
+    :math:`\alpha` form sits at roundoff.
 
-    Everything runs in float64 with the covariance lifted to a full matrix, because the diagonal
+    Everything runs in float64 with the covariance lifted to a full matrix (the frame-diagonal family
+    keeps its reference variances), because the diagonal
     family is closed only under diagonal :math:`g_i`; the residual certifies the
     reference-coordinate construction, not the diagonal family's local projection (on the lifted
     covariances the per-coordinate self term is the full family's ordered form). Each entry of
@@ -796,11 +819,13 @@ def projected_gauge_equivariance(
     from dataclasses import replace
 
     from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
+    from vfe3.families.frame_gaussian import FrameDiagonalGaussian
     from vfe3.families.gaussian import FullGaussian
     from vfe3.free_energy import self_divergence_for_alpha
     from vfe3.gradients.full_link import (
         build_full_link_context, full_link_cost, full_link_gradients, full_link_minimizer)
     from vfe3.gradients.relational import relational_predictive_readout
+    from vfe3.model.frame_actions import frame_matvec
 
     cfg = model.cfg
     tokens = token_ids[:1]
@@ -833,38 +858,55 @@ def projected_gauge_equivariance(
     mu = beliefs.mu.double()                                                   # (1, N, K)
     sigma = beliefs.sigma.double()
     # gaussian_frame_diagonal stores c_i = diag(U_i^-1 Sigma_i U_i^-T), which the action leaves fixed: the operators
-    # read c unchanged in every draw, and the self term reads the lifted local Sigma_i = U_i diag(c_i) U_i^T.
+    # and the self term read c unchanged in every draw.
     frame_diagonal = bool(getattr(model.prior_bank, "frame_diagonal", False))
     reference_c = sigma if frame_diagonal else None                            # (1, N, K) or None
-    if frame_diagonal:
-        from vfe3.model.frame_actions import frame_diagonal_local_covariance
-        sigma = frame_diagonal_local_covariance(sigma, frame, diagonal=False)  # (1, N, K, K)
-    sigma = torch.diag_embed(sigma) if sigma.dim() == mu.dim() else sigma      # (1, N, K, K)
+    if not frame_diagonal:
+        sigma = torch.diag_embed(sigma) if sigma.dim() == mu.dim() else sigma  # (1, N, K, K)
     H, d = len(model.group.irrep_dims), model.group.irrep_dims[0]
 
-    # The self term against an independent prior: mu_p = mu + N(0, I) and Sigma_p = B Sigma B^T with B = I + A/4
-    # block-diagonal over the irrep blocks (so a head-block family keeps its layout), from its own generator so
-    # the frame draws below are unchanged.
+    # The self term against an independent prior, from its own generator so the frame draws below are unchanged:
+    # mu_p = mu + N(0, I), and Sigma_p = B Sigma B^T with B = I + A/4 block-diagonal over the irrep blocks (so a
+    # head-block family keeps its layout), or on gaussian_frame_diagonal a prior of the family form, the reference
+    # variances c_p = c exp(Z/4) in the frame U_i the prior shares with the belief.
     self_coupling_live = cfg.mstep_self_coupling_weight > 0.0 or bool(cfg.diagnose_canonical_free_energy)
     if self_coupling_live:
         prior_generator = torch.Generator().manual_seed(int(seed) + 1)
-        mixing = torch.zeros_like(sigma)                                       # (1, N, K, K)
-        offset = 0
-        for k in model.group.irrep_dims:
-            block = torch.randn(1, n, k, k, generator=prior_generator, dtype=torch.float64).to(mu.device)
-            mixing[..., offset:offset + k, offset:offset + k] = (
-                torch.eye(k, dtype=torch.float64, device=mu.device) + 0.25 * block)
-            offset += k
-        mu_p = mu + torch.randn(mu.shape, generator=prior_generator, dtype=torch.float64).to(mu.device)
-        sigma_p = mixing @ sigma @ mixing.transpose(-1, -2)                    # (1, N, K, K)
+        if frame_diagonal:
+            mu_p = mu + torch.randn(mu.shape, generator=prior_generator, dtype=torch.float64).to(mu.device)
+            sigma_p = reference_c * torch.exp(0.25 * torch.randn(
+                reference_c.shape, generator=prior_generator, dtype=torch.float64)).to(mu.device)   # (1, N, K) c_p
+        else:
+            mixing = torch.zeros_like(sigma)                                   # (1, N, K, K)
+            offset = 0
+            for k in model.group.irrep_dims:
+                block = torch.randn(1, n, k, k, generator=prior_generator, dtype=torch.float64).to(mu.device)
+                mixing[..., offset:offset + k, offset:offset + k] = (
+                    torch.eye(k, dtype=torch.float64, device=mu.device) + 0.25 * block)
+                offset += k
+            mu_p = mu + torch.randn(mu.shape, generator=prior_generator, dtype=torch.float64).to(mu.device)
+            sigma_p = mixing @ sigma @ mixing.transpose(-1, -2)                # (1, N, K, K)
         b0, c0 = (torch.as_tensor(v, dtype=torch.float64, device=mu.device) if isinstance(v, (list, tuple))
                   else v for v in (cfg.b0, cfg.c0))
+        self_kl_max = cfg.kl_max if cfg.self_kl_max is None else cfg.self_kl_max   # the M-step term's clamp
 
-    def self_coupling(mu: torch.Tensor, sigma: torch.Tensor, mu_p: torch.Tensor,
-                      sigma_p: torch.Tensor) -> torch.Tensor:                 # (1, N)
+    def self_coupling(G: Optional[torch.Tensor], frame_g: CanonicalFrameContext) -> torch.Tensor:   # (1, N)
+        r"""The self term of the belief and its prior after the passive action by ``G`` (``None``: no action)."""
+        act = (lambda x: x) if G is None else (lambda x: (G @ x.unsqueeze(-1)).squeeze(-1))
+        if frame_diagonal:
+            # The family's M-step term reads the reference moments (U_i^-1 mu_i, c_i) of q* and of its prior, which
+            # share the frame U_i: a diagonal KL of FrameDiagonalGaussian that the action leaves fixed. On the lifted
+            # local covariance U_i diag(c_i) U_i^T the per-coordinate form was the full family's ordered conditional
+            # KLs, which move with the frame and are not the trained term (audit 2026-10-31
+            # gap-mstep-self-coupling-handoff-5).
+            q = FrameDiagonalGaussian(frame_matvec(frame_g.inverse, act(mu), frame_g.block_diagonal), reference_c)
+            p = FrameDiagonalGaussian(frame_matvec(frame_g.inverse, act(mu_p), frame_g.block_diagonal), sigma_p)
+        else:
+            congruence = (lambda S: S) if G is None else (lambda S: G @ S @ G.transpose(-1, -2))
+            q = FullGaussian(act(mu), congruence(sigma))
+            p = FullGaussian(act(mu_p), congruence(sigma_p))
         div = self_divergence_for_alpha(                                       # (1, N) or (1, N, K)
-            FullGaussian(mu, sigma), FullGaussian(mu_p, sigma_p),
-            kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
+            q, p, kl_max=self_kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
         alpha_i, regularizer = self_coupling_alpha(
             div, mode=cfg.lambda_alpha_mode, b0=b0, c0=c0)
         term = alpha_i * div + regularizer
@@ -912,7 +954,7 @@ def projected_gauge_equivariance(
     loops = any(getattr(ops, "content_link_loop_weight", 0.0) > 0.0 for ops in layers)
     previous_links = None
     links = lambda: (None if not loops else {} if previous_links is None else {"previous": previous_links})
-    base_self_coupling = self_coupling(mu, sigma, mu_p, sigma_p) if self_coupling_live else None
+    base_self_coupling = self_coupling(None, frame) if self_coupling_live else None
     for layer_index, ops in enumerate(layers):
         base_links = links()
         base = evaluate(ops, mu, reference_c if frame_diagonal else sigma, frame, value_frame, base_links)
@@ -940,22 +982,25 @@ def projected_gauge_equivariance(
                 g = torch.linalg.matrix_exp(
                     float(scale) * torch.einsum("...a,akl->...kl", a, gens)).to(mu.device)   # (1, N, K, K)
             G = _dense_frame(g, True) if g.dim() == mu.dim() + 2 else g        # (1, N, K, K)
+            moved_frame = _act_on_frame(g, frame)
             moved = evaluate(
                 ops, (G @ mu.unsqueeze(-1)).squeeze(-1),
                 reference_c if frame_diagonal else G @ sigma @ G.transpose(-1, -2),
-                _act_on_frame(g, frame), _act_on_frame(g, value_frame), links())
+                moved_frame, _act_on_frame(g, value_frame), links())
             if "receiver_energy" in base:
                 # -c_i/2 log det(g Sigma g^T) = -c_i/2 log det Sigma - c_i log|det g_i|.
                 shift = (base["_c"] * torch.linalg.slogdet(G)[1]).sum()
                 moved["receiver_energy"] = moved["receiver_energy"] + shift
                 log_det_shift = max(log_det_shift, abs(float(shift)))
             if self_coupling_live:
-                moved["self_coupling"] = self_coupling(
-                    (G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
-                    (G @ mu_p.unsqueeze(-1)).squeeze(-1), G @ sigma_p @ G.transpose(-1, -2))
+                moved["self_coupling"] = self_coupling(G, moved_frame)
             for key, value in base.items():
                 if not key.startswith("_"):
-                    worst[key] = max(worst.get(key, 0.0), _relative_deviation(value, moved[key]))
+                    # A NaN-propagating maximum: max(0.0, nan) returned 0.0 and reported a draw with no
+                    # comparable entry as an exact zero (audit 2026-10-31 viz-figures-6).
+                    deviation, previous = _relative_deviation(value, moved[key]), worst.get(key, 0.0)
+                    worst[key] = (math.nan if math.isnan(deviation) or math.isnan(previous)
+                                  else max(previous, deviation))
         for key, value in worst.items():
             residuals.setdefault(key, [float("nan")] * len(layers))[layer_index] = value
         if loops:

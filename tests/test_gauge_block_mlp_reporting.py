@@ -96,8 +96,8 @@ def test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity(
         4.0 * cfg.n_layers * cfg.block_mlp_expansion * width * width
     )
     if mode == "gauge_gate":
-        expected_flops += cfg.n_layers * sum(
-            2.0 * dim ** 3 + 2.0 * dim ** 2
+        expected_flops += cfg.n_layers * sum(             # the solve and its certificate (audit 2026-10-31 A186)
+            2.0 * dim ** 3 + 2.0 * dim ** 2 + (10.0 / 3.0) * dim ** 3 + 12.0 * dim ** 2
             for dim in model.group.irrep_dims
         )
     elif mode == "canonical_frame":
@@ -117,7 +117,7 @@ def test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity(
     assert realized_params == expected_params
     assert model.executable_build.block_mlp.parameter_count == expected_params
     assert cost["block_mlp_params"] == expected_params
-    assert cost["flops_per_token_block_mlp"] == expected_flops
+    assert cost["flops_per_token_block_mlp"] == pytest.approx(expected_flops, rel=1e-14)
 
 
 @torch.no_grad()

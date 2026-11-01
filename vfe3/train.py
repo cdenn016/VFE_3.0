@@ -47,6 +47,7 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.free_energy import attention_tau
 from vfe3.gauge_optim import (
     FISHER_DIAGNOSTIC_KEYS,
+    FRAME_BOUND_STAT_KEYS,
     FRAME_CONDITION_GROUPS,
     GROUP_LOG_DIAGNOSTIC_KEYS,
     GaugeManifoldAdamW,
@@ -56,20 +57,20 @@ from vfe3.gauge_optim import (
     project_phi_parameter_rows_,
 )
 from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments
-from vfe3.table_optim import (TABLE_FISHER_DIAGNOSTIC_KEYS, TableFisherAdamW, TableFisherGaugeManifoldAdamW,
-                              TableFisherStatistics)
+from vfe3.table_optim import (DECODE_FISHER_DIAGNOSTIC_KEYS, TABLE_FISHER_DIAGNOSTIC_KEYS, TableFisherAdamW,
+                              TableFisherGaugeManifoldAdamW, TableFisherStatistics)
 from vfe3.sparse_row_optim import RowLazyAdamW, RowLazyTableFisherAdamW
 from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
-from vfe3.model.block_mlp import CueResultMemoryBlockMLP, PrototypeAgentBlockMLP
+from vfe3.model.block_mlp import CueResultMemoryBlockMLP, GaussianTemplateBlockMLP, PrototypeAgentBlockMLP
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS, MINIMAL_AGENT_IS_SAMPLES
 from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
 from vfe3.runtime import disable_fill_uninitialized_memory, seed_everything
-from vfe3.timing import TrainingTimer
+from vfe3.timing import STEP_TAIL_PHASE, TrainingTimer
 from vfe3.weight_ema import WeightEMA
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
@@ -85,6 +86,8 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     reset_decode_logdet_fallback_elements,
     reset_mu_trust_fallback_elements,
     bounded_variance_from_log,
+    log_variance_clamped,
+    project_log_variance_floor_,
 )
 from vfe3.relational_scoring import (                                # projected float64 source-factor recovery count
     gemm_fallback_slices, reset_gemm_fallback_slices,                   # ... and pair-KL GEMM fallback slices
@@ -155,12 +158,12 @@ class PhiFisherStatisticsProvider:
     :math:`p` it returns the middle-fiber moments :math:`E_{v}^{-1}\cdot q_{v}` of the distinct column
     types and the gather index of each batch column ``tokens[:, p]``, from which the consumer forms the
     pooled operators a row chunk at a time (:func:`~vfe3.geometry.phi_fisher.pooled_operator_chunks`),
-    and :math:`B_{\rm tot}`. Everything is float64, detached, on the table's device.
+    and :math:`B_{\rm tot}`. Everything is float64, detached, on the table's device. The rotation weight of the
+    metric is the optimizer's own ``phi_fisher_rotation_weight``; the provider supplies statistics only.
     """
 
-    def __init__(self, model: VFEModel, rotation_weight: float) -> None:
+    def __init__(self, model: VFEModel) -> None:
         self._model = model
-        self._rotation_weight = float(rotation_weight)
         self._blocks = group_log_block_shape(model.group)                     # (H, d)
         self._tokens: Optional[torch.Tensor] = None
         self._scored: Optional[torch.Tensor] = None
@@ -199,8 +202,11 @@ class PhiFisherStatisticsProvider:
         total = self._scored.to(device=rows.device, dtype=torch.float64).clamp_min(1.0)
         pb = self._model.prior_bank
         if param is pb.phi_embed:
+            from vfe3.table_optim import type_counts
+
             mu, s = self._type_moments(rows)
-            count = torch.bincount(tokens.reshape(-1), minlength=param.shape[0])[rows]
+            # n_v without bincount, which sizes its output from the data (a host read on CUDA).
+            count = type_counts(tokens, param.shape[0], rows.device)[rows]                    # (R,) int64
             return FisherRowStatistics(kind="type", count=count.to(dtype=torch.float64),
                                        total=total, local_mean=mu, local_var=s)
         if param is getattr(self._model, "pos_phi_free", None):
@@ -236,9 +242,7 @@ def build_optimizer(
     ``output_proj_weight`` and bias (decode_mode='linear') at ``m_decode_mu_lr`` (``m_p_mu_lr`` when None).
     A final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
     parameter that is forgotten here would otherwise silently never receive a gradient.
-    Registry-owned trainable transport state is grouped at ``m_phi_lr`` (a gauge-connection scale),
-    so a newly registered stateful transport trains without a parameter-name branch while the exact
-    model-parameter coverage guard remains fail-closed.
+    Every optimizer takes ``betas=(adam_beta1, adam_beta2)`` and ``eps=adam_eps`` (torch's defaults unless set).
 
     The per-type block-MLP hidden bias (``per_type_hidden_bias``, the capacity-bearing per-type table
     of the identity-frame arm) takes the frame table's hyperparameters, the step size
@@ -336,20 +340,30 @@ def build_optimizer(
         groups.append({"params": [pb.output_proj_bias], "lr": decode_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "block_mlps", None) is not None:         # use_block_mlp=True coordinate MLPs
         block_mlp_lr = cfg.resolved_hyperparameter("m_block_mlp_lr")
-        # weight_decay=0 on the prototype_agents template log-variances log(lambda) and log-weights log(pi):
-        # decaying them pulls lambda toward 1 and pi toward uniform, a prior on the templates rather than a
-        # capacity penalty. The template means nu keep the global decay.
-        # cue_result_memory adds its result-noise log variances log(q) to the same undecayed group. A module
-        # shared across layers (block_mlp_tie_layers) is listed once.
+        # weight_decay=0 on the template log-variances log(lambda) and log-weights log(pi) of prototype_agents and
+        # gaussian_template: decaying them pulls lambda toward 1 and pi toward uniform, a prior on the templates
+        # rather than a capacity penalty (audit 2026-10-31, block-mlp-norm-9). The template means nu keep the
+        # global decay. cue_result_memory adds its result-noise log variances log(q) to the same undecayed group.
+        # A module shared across layers (block_mlp_tie_layers) is listed once.
         unique_mlps = list({id(mlp): mlp for mlp in model.block_mlps}.values())
-        template_priors = [p for mlp in unique_mlps if isinstance(mlp, PrototypeAgentBlockMLP)
+        template_priors = [p for mlp in unique_mlps
+                           if isinstance(mlp, (PrototypeAgentBlockMLP, GaussianTemplateBlockMLP))
                            for p in (mlp.log_lambda, mlp.log_pi)]
         template_priors += [p for mlp in unique_mlps if isinstance(mlp, CueResultMemoryBlockMLP)
                             for p in mlp.undecayed_parameters()]
-        exempt = {id(p) for p in template_priors}
+        # block_mlp_bias_weight_decay (audit 2026-10-31, train-step-6): None leaves the nn.Linear biases in the one
+        # block-MLP group at weight_decay, so optimizer state from earlier runs loads unchanged; a value moves them
+        # to a group of their own at that decay.
+        bias_decay = cfg.block_mlp_bias_weight_decay
+        biases = ([] if bias_decay is None else
+                  [module.bias for mlp in unique_mlps for module in mlp.modules()
+                   if isinstance(module, torch.nn.Linear) and module.bias is not None])
+        exempt = {id(p) for p in (*template_priors, *biases)}
         groups.append({"params": [p for p in model.block_mlps.parameters() if id(p) not in exempt],
                        "lr": block_mlp_lr, "weight_decay": cfg.weight_decay,
                        "role": "mu", "lr_aux_role": "block_mlp"})
+        if biases:
+            groups.append({"params": biases, "lr": block_mlp_lr, "weight_decay": float(bias_decay), "role": "mu"})
         if template_priors:
             groups.append({"params": template_priors, "lr": block_mlp_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "relational_operators", None) is not None:
@@ -368,19 +382,22 @@ def build_optimizer(
                 parameters += [p for ops in layers for p in getattr(ops, "edge_parameters", list)()]
             parameters = [p for p in parameters if p.requires_grad]
             lr = cfg.resolved_hyperparameter(f"m_relational_{role}_lr")
-            map_decay = float(getattr(cfg, "relational_score_weight_decay", 0.0))
-            if role == "score" and map_decay > 0.0:
+            map_decay = float(getattr(cfg, f"relational_{role}_weight_decay", 0.0))
+            if map_decay > 0.0:
                 # relational_score_weight_decay (audit 2026-10-20 item 9): the comparison maps take the decay, the
                 # noise and temperature scalars stay undecayed in a second group of the same rate without the
                 # auxiliary role (one group per role), so grad_norm_relational_score then reads the maps alone.
-                # At 0 the single group below is kept, so optimizer state from earlier runs loads unchanged.
-                maps = {id(p) for ops in layers for name in ("raw_score_q", "raw_score_k")
+                # relational_content_weight_decay (audit 2026-10-31, train-step-7) does the same for the content
+                # maps T and O, the edge-link maps staying undecayed. At 0 the single group below is kept, so
+                # optimizer state from earlier runs loads unchanged.
+                map_names = ("raw_score_q", "raw_score_k") if role == "score" else ("T", "O")
+                maps = {id(p) for ops in layers for name in map_names
                         for p in (ops._stored_runs(name) if getattr(ops, name, None) is not None else [])}
                 decayed = [p for p in parameters if id(p) in maps]
                 scalars = [p for p in parameters if id(p) not in maps]
                 if decayed:
                     groups.append({"params": decayed, "lr": lr, "weight_decay": map_decay, "role": "mu",
-                                   "lr_aux_role": "relational_score"})
+                                   "lr_aux_role": f"relational_{role}"})
                 if scalars:
                     groups.append({"params": scalars, "lr": lr, "weight_decay": 0.0, "role": "mu"})
             elif parameters:
@@ -464,6 +481,9 @@ def build_optimizer(
                             table_fisher_lr=cfg.m_table_fisher_lr,
                             table_fisher_trust_radius=cfg.m_table_fisher_trust_radius)
     table_fisher = table_fisher or decode_fisher                # either bank selects the table Fisher optimizer
+    # AdamW moment rates and denominator eps of every group (audit 2026-10-31, train-step-8); the defaults are torch's,
+    # so passing them changes no step. The table Fisher and manifold phi steps keep no Adam moments.
+    adam_kwargs = dict(betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)), eps=float(cfg.adam_eps))
     if phi_update_policy.requires_manifold_optimizer:
         # Stored phi factors use one mixed optimizer; every other group remains standard AdamW.
         #
@@ -472,7 +492,7 @@ def build_optimizer(
         # `foreach` unresolved `adam()` selects the FOREACH multi-tensor path -- 9 kernel launches
         # per parameter group per step against 1 for the fused kernel. So choosing the manifold
         # route silently deoptimized every OTHER group (mu_embed, sigma_log_embed,
-        # transport_state, LayerNorm affine), none of which the manifold logic
+        # LayerNorm affine), none of which the manifold logic
         # touches. `step()` sets `p.grad = None` on every pullback_group parameter BEFORE
         # the trailing `super().step()`, so base AdamW skips exactly those and the fused kernel only
         # ever sees the standard groups.
@@ -491,7 +511,7 @@ def build_optimizer(
             ),
             phi_group_retraction=cfg.m_phi_group_retraction,
             phi_statistics_provider=(
-                PhiFisherStatisticsProvider(model, cfg.m_phi_fisher_rotation_weight)
+                PhiFisherStatisticsProvider(model)
                 if phi_update_policy.requires_fisher_statistics else None
             ),
             phi_fisher_rotation_weight=cfg.m_phi_fisher_rotation_weight,
@@ -502,6 +522,7 @@ def build_optimizer(
             phi_fisher_completion=cfg.m_phi_fisher_completion,
             weight_decay=cfg.weight_decay,
             fused=next(model.parameters()).is_cuda,
+            **adam_kwargs,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
@@ -510,12 +531,13 @@ def build_optimizer(
         # Row-lazy phi_embed (validated adamw-only): the occurrence mask reads the step's tokens from the statistics
         # train_step fills; the base AdamW (fused on CUDA) never sees the frame table's gradient.
         if table_fisher:
-            return RowLazyTableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
+            return RowLazyTableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs,
+                                           **adam_kwargs)
         return RowLazyAdamW(groups, statistics=TableFisherStatistics(pb), weight_decay=cfg.weight_decay,
-                            fused=use_fused)
+                            fused=use_fused, **adam_kwargs)
     if table_fisher:
-        return TableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
-    return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused)
+        return TableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs, **adam_kwargs)
+    return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **adam_kwargs)
 
 
 def _learning_rates_by_role(
@@ -708,12 +730,16 @@ def _periodic_generation(
 
 
 def _excluded_token_count(decode_stats: object, expected: int) -> torch.Tensor:
-    """Resolve the optional legacy exclusion channel without a host synchronization."""
+    """Resolve the optional legacy exclusion channel without a host synchronization.
+
+    The fallback subtracts the device count from the host integer, so no host value is copied to the device (a
+    ``new_tensor`` of it is a blocking pageable copy on CUDA; audit 2026-10-31, train-step-4).
+    """
     scored = decode_stats.scored_tokens
     excluded = decode_stats.excluded_tokens
     if excluded is not None:
         return excluded
-    return scored.new_tensor(expected, dtype=torch.int64) - scored
+    return expected - scored
 
 
 def _gradient_isfinite(gradient: torch.Tensor) -> torch.Tensor:
@@ -734,21 +760,33 @@ def _gradients_finite(gradients: Sequence[torch.Tensor]) -> torch.Tensor:
 
     The real strided floating gradients share one ``torch._foreach_norm(ord=inf)`` call instead of one infinity-norm
     launch per parameter (audit 2026-10-17 item 70); the verdict equals :func:`_gradient_isfinite` on each tensor,
-    which the remaining (complex, empty or non-strided) gradients still use.
+    which the remaining (complex, empty or non-strided) gradients still use. The norms are stacked in float64, which
+    holds every value of every real floating dtype exactly, so a finite float64 entry above the float32 maximum stays
+    finite (audit 2026-10-31, train-step-1).
     """
     fast = [g.detach() for g in gradients
             if g.layout == torch.strided and g.is_floating_point() and g.numel() > 0]
     flags: List[torch.Tensor] = []
     if fast:
         norms = torch._foreach_norm(fast, float("inf"))
-        flags.append(torch.isfinite(torch.stack([norm.to(torch.float32) for norm in norms])).all())
+        flags.append(torch.isfinite(torch.stack([norm.to(torch.float64) for norm in norms])).all())
     flags.extend(_gradient_isfinite(g) for g in gradients
                  if not (g.layout == torch.strided and g.is_floating_point() and g.numel() > 0))
     return torch.stack(flags).all() if len(flags) > 1 else flags[0]
 
 
-_FLOAT32_MAX: float = float(torch.finfo(torch.float32).max)   # the range of the exact finiteness check
 CLIP_COEFFICIENT_EPS: float = 1e-6        # clip_grads_with_norm_ scales by c / (||g|| + 1e-6), at most 1
+
+
+def _transfer_tail(
+    values:      Sequence[float],                     # host copies of train_step's optional transfer tail, in order
+    ce_tail:     Sequence[torch.Tensor],              # () or (pre-step CE,)
+    spread_tail: Sequence[torch.Tensor],              # () or (microbatch scored-count spread,)
+) -> Tuple[float, Optional[float]]:
+    r"""``(pre-step CE or NaN, microbatch count spread or None)`` from the optional tail of a fused host transfer."""
+    ce = float(values[0]) if ce_tail else float("nan")
+    spread = float(values[len(ce_tail)]) if spread_tail else None
+    return ce, spread
 
 
 def _role_norms_and_clip_coefficients(
@@ -794,6 +832,90 @@ def _parameter_clip_scales(
     return scales
 
 
+def _token_frame_rows(
+    model:  torch.nn.Module,
+    tokens: torch.Tensor,                             # (B, N) the step's input ids
+) -> Optional[Tuple[torch.nn.Parameter, torch.Tensor]]:
+    r"""``(phi_embed, ids)`` when the frame table's gradient is supported on the step's input rows, else None.
+
+    The built-in per-token encoders read the frame table only as ``phi_embed[token_ids]`` with the step's input ids
+    (:func:`vfe3.model.prior_bank._encode_per_token`, ``_encode_per_token_additive``), so on a :class:`VFEModel` whose
+    forward and encoder are the built-in ones every other row of its gradient is exactly zero (audit 2026-10-31,
+    train-step-3). ``ids`` is ``tokens`` flattened, repeats included; None when the table is frozen, when the step
+    has at least as many input positions as the table has rows (the dense multiply then reads no more), or on any
+    other model, prior bank or encoder.
+    """
+    from vfe3.model.prior_bank import _encode_per_token, _encode_per_token_additive, get_encode
+
+    pb = getattr(model, "prior_bank", None)
+    if (type(model) is not VFEModel or type(pb) is not PriorBank
+            or getattr(model.forward, "__func__", None) is not VFEModel.forward
+            or getattr(pb.encode, "__func__", None) is not PriorBank.encode
+            or get_encode(pb.encode_mode) not in (_encode_per_token, _encode_per_token_additive)):
+        return None
+    table = pb.phi_embed
+    ids = tokens.reshape(-1)
+    if table is None or not table.requires_grad or ids.numel() >= table.shape[0]:
+        return None
+    return table, ids.to(device=table.device, dtype=torch.int64)
+
+
+@torch.no_grad()
+def _clip_grads_with_norm_rows_(
+    parameters: Sequence[torch.Tensor],               # one clip set, containing ``table``
+    max_norm:   float,                                # the clip threshold c
+    total_norm: torch.Tensor,                         # () the set's pre-clip L2 norm
+    table:      torch.Tensor,                         # (V, n_gen) frame table, gradient zero outside ``rows``
+    rows:       torch.Tensor,                         # (R,) int64 row ids, repeats allowed
+) -> None:
+    r"""``clip_grads_with_norm_`` of one clip set that scales only the rows ``rows`` of ``table.grad``.
+
+    Every gradient of the set is multiplied by :math:`\min(1, c/(\|g\| + 10^{-6}))`, formed as
+    ``clip_grads_with_norm_`` forms it. The rows of ``table.grad`` outside ``rows`` are zero
+    (:func:`_token_frame_rows`), and a positive finite coefficient leaves a zero of either sign unchanged, so the result
+    equals the dense multiply bit for bit while reading and writing :math:`R` rows of the table instead of :math:`V`
+    (audit 2026-10-31, train-step-3). A repeated id rewrites the same scaled row. A nonfinite norm, whose coefficient
+    is 0 or NaN, makes ``train_step`` drop every gradient of the step, so the rows it leaves unscaled are never read.
+    """
+    coefficient = torch.clamp(float(max_norm) / (total_norm + CLIP_COEFFICIENT_EPS), max=1.0)   # () as torch forms it
+    for parameter in parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        factor = coefficient.to(gradient.device)
+        if parameter is table:
+            gradient.index_copy_(0, rows, gradient.index_select(0, rows).mul_(factor))            # (R, n_gen) rows
+        else:
+            gradient.mul_(factor)
+
+
+def _host_validated_decoder(model: torch.nn.Module) -> Optional[torch.nn.Module]:
+    r"""The built-in fused decoder whose training CE consumes a host target validation record, or None.
+
+    A :class:`VFEModel` with its own :class:`PriorBank` and a built-in fused decoder returns the prior bank; the
+    conventional baseline returns its :class:`vfe3.baseline.LinearUnigramDecoder`, whose CE is
+    :meth:`PriorBank.decode_ce_linear_chunked` itself (audit 2026-10-31, baseline-generation-8).
+    """
+    decode_mode = getattr(getattr(model, "cfg", None), "decode_mode", None)
+    if type(model) is VFEModel:
+        if (type(model.prior_bank) is PriorBank
+                and decode_mode in ("linear", "diagonal_chunked", "full_chunked", "expected_likelihood_chunked")
+                and get_decode_registration(decode_mode).fused_ce is getattr(
+                    PriorBank, "decode_ce_linear_chunked" if decode_mode == "linear"
+                    else f"decode_ce_{decode_mode}")):
+            return model.prior_bank
+        return None
+    if is_vfe_model(model):
+        return None
+    from vfe3.baseline import BaselineTransformer, LinearUnigramDecoder
+
+    decoder = getattr(model, "decoder", None)
+    if (type(model) is BaselineTransformer and decode_mode == "linear" and type(decoder) is LinearUnigramDecoder
+            and LinearUnigramDecoder.decode_ce_linear_chunked is PriorBank.decode_ce_linear_chunked):
+        return decoder
+    return None
+
+
 def _transfer_targets(
     targets: torch.Tensor,             # (B, N) CPU-loader labels or public/custom input
     model:   VFEModel,
@@ -801,25 +923,22 @@ def _transfer_targets(
 ) -> torch.Tensor:
     """Validate an owned CPU batch before transfer for each built-in fused decoder.
 
-    Public/custom decoders and device-origin loaders retain their normal validation. Views made
+    The decoders are those of :func:`_host_validated_decoder`, the conventional baseline's linear decoder among
+    them. Public/custom decoders and device-origin loaders retain their normal validation. Views made
     later (accumulation or grouped padding) do not inherit the one-use record and revalidate.
     """
-    decode_mode = getattr(getattr(model, "cfg", None), "decode_mode", None)
-    if (type(model) is VFEModel and type(model.prior_bank) is PriorBank
-            and decode_mode in ("linear", "diagonal_chunked", "full_chunked",
-                                "expected_likelihood_chunked")
-            and get_decode_registration(decode_mode).fused_ce is getattr(
-                PriorBank, "decode_ce_linear_chunked" if decode_mode == "linear"
-                else f"decode_ce_{decode_mode}")
-            and type(targets) is torch.Tensor and targets.device.type == "cpu"
+    decoder = None
+    if (type(targets) is torch.Tensor and targets.device.type == "cpu"
             and targets.dtype == torch.long and targets.layout == torch.strided
             and not torch.is_inference_mode_enabled()):
+        decoder = _host_validated_decoder(model)
+    if decoder is not None:
         # Isolate both mutable loader aliases and the source of an asynchronous device copy.
         owned = torch.empty_like(targets, pin_memory=targets.is_pinned()).copy_(targets)
-        has_ignored = model.prior_bank._validate_fused_ce_targets(owned)
+        has_ignored = decoder._validate_fused_ce_targets(owned)
         transferred = owned.to(device, non_blocking=True)
         transferred._vfe3_host_target_validation = (
-            id(transferred), transferred._version, model.prior_bank.vocab_size, -100, has_ignored)
+            id(transferred), transferred._version, decoder.vocab_size, -100, has_ignored)
         return transferred
     return targets.to(device, non_blocking=True)
 
@@ -840,6 +959,7 @@ def train_step(
     status_out:       Optional[dict]                     = None,
     frame_projection_out: Optional[torch.Tensor]         = None,   # (2,) int64 device counter
     loss_skip_threshold:  Optional[float]                = None,   # reject the update when the loss exceeds it
+    phase_mark:           Optional[Callable[[str], None]] = None,  # TrainingTimer.mark of the loop's step timer
 ) -> float:
     r"""One M-step (one optimizer step) on the cross-entropy of a batch; returns the loss.
 
@@ -849,7 +969,8 @@ def train_step(
     ``grad_clip`` of ``None`` or ``0.0`` disables clipping entirely (the optimizer and
     scheduler still step on the raw gradient). After accumulation and unscale, a positive
     threshold is applied once independently to each clip set: each optimizer role
-    (mu/sigma/phi/other) under ``grad_clip_scope='role'``, each optimizer group under ``'group'``.
+    (mu/sigma/phi/other) under ``grad_clip_scope='role'``, each optimizer group under ``'group'`` (groups that
+    name one ``clip_set``, all of one role, form one set).
     A set whose pre-clip norm is :math:`\|g\|` is scaled by :math:`\min(1, c/(\|g\| + 10^{-6}))`
     (``clip_grads_with_norm_``). Groups marked ``table_fisher`` are never clipped: their per-row
     Fisher trust radius bounds the step (audit 2026-10-10 round 2, items 8 and 9).
@@ -865,8 +986,9 @@ def train_step(
     clip threshold is not rescaled by ``K``. The returned loss is the same scored-token-weighted
     accumulation-boundary objective. A zero-scored accumulation skips every update-side effect.
     ``K == 1`` keeps the single-backward path (no chunking or gradient renormalization). Exact
-    target counts stay on-device on silent steps; partition-validity and zero-scored flags ride
-    the existing host transfer. Requires ``B % K == 0``.
+    target counts stay on-device on silent steps; partition-validity and zero-scored flags, and under
+    accumulation the spread of the microbatch scored-token counts, ride the existing host transfer.
+    Requires ``B % K == 0``.
 
     ``scaler`` is an optional :class:`torch.amp.GradScaler` for fp16 training (prevents
     gradient underflow through the unrolled E-step). A disabled scaler (``enabled=False``)
@@ -879,7 +1001,8 @@ def train_step(
     GradScaler decreases its scale after ``update()``, which signals an overflow-skipped step.
     ``status_out`` also receives, from host values the step already transfers (no additional
     synchronization): ``"nonfinite_skip"`` (the update was rejected for a non-finite loss, gradient
-    or clip norm), ``"ce"`` (the pre-step CE), ``"role_grad_norms"`` (pre-clip L2 norm per role,
+    or clip norm, including an overflow an enabled GradScaler found inside ``step()`` and answered by lowering its
+    scale), ``"ce"`` (the pre-step CE), ``"role_grad_norms"`` (pre-clip L2 norm per role,
     the clip sets of a role combined in quadrature; empty when no norm was transferred) and
     ``"clip_coefs"`` (per role, the smallest realized clip coefficient of its clipped sets; empty
     when no clip was applied). Asking for ``status_out`` also computes the set norms when clipping
@@ -904,6 +1027,12 @@ def train_step(
 
     A clipped set whose host pre-clip norm :math:`v` satisfies :math:`v + 10^{-6} \le c(1 - 10^{-6})` has the clip
     coefficient exactly 1, so its multiply is skipped (bit-identical; audit 2026-10-17 item 70).
+
+    ``phase_mark`` (audit 2026-10-31 perf-live-path-5): when given, it is called with ``"forward"`` after each
+    forward, ``"backward"`` after each backward, ``"optimizer"`` after the gradient gate, clip and optimizer update
+    (or the rejection), and ``"post_update"`` after the post-update projection, frame condition bound and scheduler
+    step; the training loop passes :meth:`vfe3.timing.TrainingTimer.mark`, which records a stream event and reads
+    nothing, so the step's numbers and synchronizations are unchanged. ``None`` makes no call.
     """
     # A disabled scaler is a documented no-op (scale -> identity, unscale_ -> nothing,
     # step -> optimizer.step()), so scaler=None keeps this path byte-identical to the unscaled loop.
@@ -912,7 +1041,7 @@ def train_step(
 
     successful_updates = _successful_update_count(optimizer)
     optimizer.zero_grad(set_to_none=True)
-    _mb_tok: List[int] = []                                     # per-microbatch counted-token spread (accum only)
+    _counts: Optional[torch.Tensor] = None                      # (K,) per-microbatch scored-token counts (accum only)
     # E-step belief-gradient capture: a dict the forward fills with the raw ||grad_mu/sigma/phi|| of F
     # (the inference analogue of the M-step per-role grad norms). Created ONLY when metrics are being
     # logged this step; None -> the forward skips the capture entirely (zero overhead, byte-identical).
@@ -925,6 +1054,8 @@ def train_step(
         with deferred_host_checks():
             _, loss, decode_stats = model(
                 tokens, targets, estep_grad_out=_egrad, return_decode_stats=True)
+        if phase_mark is not None:
+            phase_mark("forward")
         ce = decode_stats.ce
         _step_ce_det = ce.detach() if ce is not None else None   # () pre-step CE, read at the existing barrier
         _scored_det = decode_stats.scored_tokens.detach()
@@ -932,6 +1063,8 @@ def train_step(
         # A device fill, not a pageable host-to-device copy (which synchronizes the stream).
         _expected_det = torch.full((), targets.numel(), dtype=torch.int64, device=targets.device)
         _scaler.scale(loss).backward()
+        if phase_mark is not None:
+            phase_mark("backward")
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
         step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
         # CE is synced to a Python float only when a metrics dict is being filled this step (it feeds
@@ -960,6 +1093,8 @@ def train_step(
             with deferred_host_checks():
                 _, loss_mb, decode_stats_mb = model(
                     tok_mb, tgt_mb, estep_grad_out=_egrad_mb, return_decode_stats=True)
+            if phase_mark is not None:
+                phase_mark("forward")
             ce_mb = decode_stats_mb.ce
             count_mb = decode_stats_mb.scored_tokens.detach()
             count_tensors.append(count_mb)
@@ -974,6 +1109,8 @@ def train_step(
                         _egrad_counts[_name] = _egrad_counts.get(_name, 0) + 1
             count_weight = count_mb.to(dtype=loss_mb.dtype)
             _scaler.scale(loss_mb * count_weight).backward()
+            if phase_mark is not None:
+                phase_mark("backward")
             loss_numerator = loss_numerator + (
                 loss_mb.detach().to(dtype=torch.float64) * count_mb)
             ce_numerator = ce_numerator + (
@@ -993,44 +1130,44 @@ def train_step(
         step_ce = float(_ce_det) if metrics_out is not None else float("nan")
         step_objective = (float(objective_numerator / _denominator)
                           if (objective_numerator is not None and metrics_out is not None) else None)
-        _mb_tok[:] = [int(value) for value in _counts.cpu().tolist()]
-        # Decoder exclusions, not merely ignore_index, define the CE denominator. Weighting the
-        # non-CE regularizers by that same count remains approximate when microbatch counts differ.
-        if _mb_tok and max(_mb_tok) != min(_mb_tok):
-            import warnings
-            warnings.warn(
-                "grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers "
-                "(mstep_self_coupling) are token-weighted by n_mb/n_tot "
-                "rather than by their own reduction, so their accumulated gradient is an "
-                "approximation. Use an unpadded/equal-token loader or grad_accum_steps=1 for the "
-                "exact objective.",
-                RuntimeWarning, stacklevel=2,
-            )
     _target_partition_valid_det = _target_partition_valid_from_device(
         _expected_det, _scored_det, _excluded_det)
     _zero_scored_det = _scored_det == 0
     _scaler_enabled = scaler is not None and scaler.is_enabled()
     target_partition_valid = None
     zero_scored_targets = None
-    # The pre-step CE rides whichever transfer resolves the loss below (audit 2026-10-10 round 2, item 1).
+    # The pre-step CE rides whichever transfer resolves the loss below (audit 2026-10-10 round 2, item 1), and so
+    # does the spread max - min of the microbatch scored-token counts under accumulation, so those exact counts stay
+    # on the device on a silent step (audit 2026-10-31, train-step-4). The tail is empty on the default K = 1 path.
     _ce_tail = (_step_ce_det.to(dtype=torch.float64),) if _step_ce_det is not None else ()
+    _spread_tail = ((_counts.max() - _counts.min()).to(dtype=torch.float64),) if _counts is not None else ()
+    _tail = (*_ce_tail, *_spread_tail)
     step_ce_value = float("nan")
+    token_spread: Optional[float] = None
+    scale_before: Optional[float] = None
     # The enabled scaler's ordinary finite-loss path delegates overflow detection to GradScaler.
     # Resolve the scalar loss first so the rare nonfinite-loss branch can explicitly inspect gradients
     # and distinguish scale backoff (nonfinite gradients) from scale hold (finite gradients).
     if _scaler_enabled:
         if step_loss is None:
+            # The pre-update loss scale rides this transfer, so did_step compares it with the one post-update read
+            # instead of reading the scale twice (audit 2026-10-31, gap-mixed-precision-routes-3).
+            _scale_det = _scaler._get_scale_async()
+            _scale_tail = (() if _scale_det is None else
+                           (_scale_det.reshape(()).to(device=_loss_det.device, dtype=torch.float64),))
             _loss_flags = torch.stack((
                 _loss_det.to(dtype=torch.float64),
                 _target_partition_valid_det.to(dtype=torch.float64),
                 _zero_scored_det.to(dtype=torch.float64),
-                *_ce_tail,
+                *_tail,
+                *_scale_tail,
             )).tolist()
             step_loss = _loss_flags[0]
             target_partition_valid = bool(_loss_flags[1])
             zero_scored_targets = bool(_loss_flags[2])
-            if _ce_tail:
-                step_ce_value = _loss_flags[3]
+            step_ce_value, token_spread = _transfer_tail(_loss_flags[3:3 + len(_tail)], _ce_tail, _spread_tail)
+            if _scale_tail:
+                scale_before = _loss_flags[3 + len(_tail)]
         loss_finite = math.isfinite(step_loss)
     else:
         loss_finite = True                                  # resolved with the fused default-path scan below
@@ -1076,8 +1213,10 @@ def train_step(
                    if explicit_grad_check else [])
     # Clip sets (audit 2026-10-10 round 2, items 8 and 9). Under grad_clip_scope='role' the optimizer
     # groups partition parameters into roles and each role gets one L2 bound (the historical sets, in
-    # the same order); under 'group' each optimizer group gets its own. Groups marked table_fisher are
-    # never clipped; their norm is still taken, after the clipped sets, for the per-role report.
+    # the same order); under 'group' each optimizer group gets its own, except that groups naming one
+    # "clip_set" share one bound at the position of the first (audit 2026-10-31, baseline-generation-2; no
+    # VFE group names one). Groups marked table_fisher are never clipped; their norm is still taken, after
+    # the clipped sets, for the per-role report.
     if grad_clip_scope not in ("role", "group"):
         raise ValueError(f"grad_clip_scope must be 'role' or 'group', got {grad_clip_scope!r}")
     clip_on = grad_clip is not None and grad_clip > 0
@@ -1090,8 +1229,21 @@ def train_step(
                 role_params.setdefault(group.get("role", "other"), []).extend(group["params"])
             norm_sets = [(role, parameters, clip_on) for role, parameters in role_params.items() if parameters]
         else:
-            norm_sets = [(group.get("role", "other"), list(group["params"]), clip_on)
-                         for group in clipped_groups if group["params"]]
+            shared_sets: dict = {}                               # clip_set -> (role, parameters)
+            for group in clipped_groups:
+                if not group["params"]:
+                    continue
+                key = group.get("clip_set")
+                if key is None:
+                    norm_sets.append((group.get("role", "other"), list(group["params"]), clip_on))
+                elif key in shared_sets:
+                    if shared_sets[key][0] != group.get("role", "other"):
+                        raise ValueError(f"clip_set {key!r} spans the roles {shared_sets[key][0]!r} and "
+                                         f"{group.get('role', 'other')!r}; a shared clip set has one role")
+                    shared_sets[key][1].extend(group["params"])
+                else:
+                    shared_sets[key] = (group.get("role", "other"), list(group["params"]))
+                    norm_sets.append((shared_sets[key][0], shared_sets[key][1], clip_on))
         norm_sets += [(group.get("role", "other"), list(group["params"]), False)
                       for group in optimizer.param_groups if group.get("table_fisher") and group["params"]]
     clip_roles: List[list] = [parameters for _, parameters, clipped in norm_sets if clipped]
@@ -1126,21 +1278,20 @@ def train_step(
              else _loss_det.new_ones((), dtype=torch.float64)),         # read from the set norms below
             _target_partition_valid_det.to(dtype=torch.float64),
             _zero_scored_det.to(dtype=torch.float64),
-            *_ce_tail,
+            *_tail,
             *(norm.to(device=tokens.device, dtype=torch.float64) for norm in (set_norms or ())),
         )).tolist()
         step_loss = _values[0]
         grad_finite = bool(_values[1])
         target_partition_valid = bool(_values[2])
         zero_scored_targets = bool(_values[3])
-        if _ce_tail:
-            step_ce_value = _values[4]
+        step_ce_value, token_spread = _transfer_tail(_values[4:4 + len(_tail)], _ce_tail, _spread_tail)
         if set_norms is not None:
-            set_norm_values = _values[4 + len(_ce_tail):]
-            # The exact check reads each infinity norm in float32, so a set norm above the float32 maximum (finite in
-            # float64) also defers to it; an L2 norm bounds the infinity norm, so the two verdicts then agree.
-            if _verdict_from_norms and not all(math.isfinite(value) and abs(value) <= _FLOAT32_MAX
-                                               for value in set_norm_values):
+            set_norm_values = _values[4 + len(_tail):]
+            # A finite L2 set norm certifies every entry of its set finite, whatever the dtype; a nonfinite one (a
+            # nonfinite entry, or finite entries whose sum of squares overflows) defers to the exact check, which
+            # reads its infinity norms in float64, so the two verdicts agree (audit 2026-10-31, train-step-1).
+            if _verdict_from_norms and not all(math.isfinite(value) for value in set_norm_values):
                 grad_finite = bool(_gradients_finite(_live_grads))   # rare: the exact verdict decides
             if clip_roles:
                 clip_norms = [norm for norm, (_, _, clipped) in zip(set_norms, norm_sets) if clipped]
@@ -1153,13 +1304,24 @@ def train_step(
             _loss_det.to(dtype=torch.float64),
             _target_partition_valid_det.to(dtype=torch.float64),
             _zero_scored_det.to(dtype=torch.float64),
-            *_ce_tail,
+            *_tail,
         )).tolist()
         step_loss = _loss_flags[0]
         target_partition_valid = bool(_loss_flags[1])
         zero_scored_targets = bool(_loss_flags[2])
-        if _ce_tail:
-            step_ce_value = _loss_flags[3]
+        step_ce_value, token_spread = _transfer_tail(_loss_flags[3:3 + len(_tail)], _ce_tail, _spread_tail)
+    # Decoder exclusions, not merely ignore_index, define the CE denominator. Weighting the
+    # non-CE regularizers by that same count remains approximate when microbatch counts differ.
+    if token_spread is not None and token_spread != 0.0:
+        import warnings
+        warnings.warn(
+            "grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers "
+            "(mstep_self_coupling) are token-weighted by n_mb/n_tot "
+            "rather than by their own reduction, so their accumulated gradient is an "
+            "approximation. Use an unpadded/equal-token loader or grad_accum_steps=1 for the "
+            "exact objective.",
+            RuntimeWarning, stacklevel=2,
+        )
     if target_partition_valid is None or zero_scored_targets is None:
         raise RuntimeError("target-accounting gate was not resolved at the host-transfer barrier")
     if not target_partition_valid:
@@ -1226,10 +1388,10 @@ def train_step(
         if _target_partition is None:
             raise RuntimeError("target accounting metrics were not materialized")
         metrics_out.update(_target_partition)
-        if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
-            metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
+        if token_spread is not None:                            # grad_accum_steps>1: token-spread bias check
+            metrics_out["grad_accum_tok_spread"] = token_spread
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
-            metrics_out["grad_scale"] = float(scaler.get_scale())
+            metrics_out["grad_scale"] = (scale_before if scale_before is not None else float(scaler.get_scale()))
     # A nonfinite scalar loss independently rejects every route. A finite loss does not imply finite
     # gradients, so the disabled-scaler path additionally applies the explicit gradient gate. The
     # enabled scaler performs its own gradient found_inf check inside step().
@@ -1262,10 +1424,16 @@ def train_step(
         # host norm gives a coefficient of exactly 1 (clamp(c/(v + 1e-6), max=1) = 1 with margin over fp32 rounding)
         # skips the multiply by 1, which is bit-identical (audit 2026-10-17 item 70).
         clip_values = [value for value, (_, _, clipped) in zip(set_norm_values or (), norm_sets) if clipped]
+        frame_rows = _token_frame_rows(model, tokens) if clip_roles else None
         for index, (parameters, norm) in enumerate(zip(clip_roles, clip_norms)):
             value = clip_values[index] if index < len(clip_values) else None
             if (value is not None and math.isfinite(value)
                     and value + CLIP_COEFFICIENT_EPS <= float(grad_clip) * (1.0 - 1e-6)):
+                continue
+            if frame_rows is not None and any(p is frame_rows[0] for p in parameters):
+                # The token-gathered frame table's gradient is zero outside the step's input rows, so only those
+                # rows are scaled, bit for bit the dense multiply (audit 2026-10-31, train-step-3).
+                _clip_grads_with_norm_rows_(parameters, grad_clip, norm, *frame_rows)
                 continue
             torch.nn.utils.clip_grads_with_norm_(parameters, grad_clip, norm)
         clip_applied = True
@@ -1277,7 +1445,8 @@ def train_step(
         # Resolve it before zero_grad so true overflow triggers scaler backoff.
         live = [p.grad for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
         grad_finite = bool(_gradients_finite(live)) if live else True
-    scale_before = float(_scaler.get_scale()) if _scaler_enabled else None
+    if _scaler_enabled and scale_before is None:              # no scale tensor rode the loss transfer
+        scale_before = float(_scaler.get_scale())
     if skip_step:
         optimizer.zero_grad(set_to_none=True)                # drop poisoned grads; do NOT step AdamW
         if _scaler_enabled and not grad_finite:
@@ -1308,12 +1477,17 @@ def train_step(
             _fisher_provider.set_batch(None, None)
         if _table_provider is not None:
             _table_provider.set_batch(None, None)
+    if phase_mark is not None:
+        phase_mark("optimizer")
     did_step = not skip_step
     if scale_before is not None and float(_scaler.get_scale()) < scale_before:
         did_step = False
     if status_out is not None:
         status_out["did_step"] = did_step
-        status_out["nonfinite_skip"] = bool(skip_step and not zero_scored_targets and not loss_spike_skip)
+        # An overflow that an enabled GradScaler found inside step(), answered by lowering its scale, is a non-finite
+        # skip as well (audit 2026-10-31, gap-mixed-precision-routes-8).
+        status_out["nonfinite_skip"] = bool((skip_step and not zero_scored_targets and not loss_spike_skip)
+                                            or (not skip_step and not did_step))
         status_out["loss_spike_skip"] = loss_spike_skip
         status_out["ce"] = step_ce_value
         role_norms, clip_coefs = _role_norms_and_clip_coefficients(
@@ -1372,15 +1546,23 @@ def train_step(
             )
     # Opt-in frame condition bound (audit 2026-10-12 T4); validation admits it only under adamw and
     # per_token, and the orthogonal/conformal groups have cond_2 = 1, so nothing runs for them. Its changed
-    # and checked rows join the S1 panel D frame-projection counter on the device (round 2, item 14).
+    # and checked rows join the S1 panel D frame-projection counter on the device (round 2, item 14); on a
+    # metrics step its flagged and decomposed row counts (host integers) join metrics_out (audit 2026-10-31).
     if (did_step and getattr(_cfg, "phi_frame_condition_max", None) is not None
             and model.group.name in FRAME_CONDITION_GROUPS):
         bound_phi_frame_condition_(model, _cfg.phi_frame_condition_max,
-                                   **({} if frame_projection_out is None else {"count_out": frame_projection_out}))
+                                   **({} if frame_projection_out is None else {"count_out": frame_projection_out}),
+                                   **({} if metrics_out is None else {"stats_out": metrics_out}))
+    # Opt-in projection of the log-variance tables onto their eps floor, where an entry takes gradient again
+    # (audit 2026-10-31, numerics-2); the absorbing default runs nothing here.
+    if did_step and getattr(_cfg, "sigma_log_floor_mode", "absorbing") == "projected":
+        project_log_variance_tables_(model)
     if did_step:
         successful_updates += 1
         scheduler.step()                   # accepted optimizer updates are the scheduler's clock
     _set_successful_update_count(optimizer, successful_updates)
+    if phase_mark is not None:
+        phase_mark("post_update")
     return step_loss
 
 
@@ -1726,6 +1908,8 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "parameter_count", "content_max_singular_value", "content_effective_rank",
     "content_T_min_singular_value",
     "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count",
+    # the full-link receiving-law float64 retries of the episode (audit 2026-10-31 A334)
+    "receiver_law_retry_count",
     "projected_cov_max_condition_layer_max",
     # covariance scale, the scale-free Gram-normalized lambda_min and the rank-one residual of the last layer,
     # and their layer extremes (VFEModel._covariance_scale_statistics; audit 2026-10-10 round 2, items 3, 4, 13),
@@ -1851,7 +2035,9 @@ ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
 # vfe3.gradients.relational.relational_score: query constant c_i, key log-determinant ell_j, trace, Mahalanobis), the
 # per-head split of the pooled relational_score_term_*_median columns, so a fully clamped head can be attributed to
 # one term (audit 2026-10-20 item 38). Each value is the mean over the diagnostic chunks of the chunk's median (the
-# median itself when the fixed windows fit one chunk); no rows on the dense route, which does not form the terms.
+# median itself when the fixed windows fit one chunk). Under relational_routing='noisy_key' the terms are those of the
+# Gaussian KL against the broadened key law g_j + n_h; no rows on the dense route, which does not form the terms, or
+# under 'noisy_query' and 'mean_distance', which are not Gaussian KLs (audit 2026-10-31 A255).
 SCORE_TERM_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "query_constant", "key_logdet", "trace", "mahalanobis", "n_chunks")
 ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
@@ -2121,7 +2307,11 @@ def _warn_covariance_collapse(
 # Eigenvalue-collapse alarms (audit 2026-10-17 item 14). 41.53's belief_lam_min fell from 4.3e-6 to 2.0e-14 between
 # steps 500 and 1000 while the trace-median ratio of _warn_covariance_collapse never crossed its threshold.
 EIGENVALUE_COLLAPSE_RATIO:    float = 1e3 * float(torch.finfo(torch.float32).eps)   # lam_min / lam_max below this
-TABLE_STEP_COLLAPSE_FACTOR:   float = 100.0      # table_fisher_step_norm_mean falling by more within one log interval
+TABLE_STEP_COLLAPSE_FACTOR:   float = 100.0      # TABLE_STEP_COLLAPSE_KEY falling by more within one log interval
+# The column the table-step alarm compares: the trust-scaled step before the schedule factor. The scheduled
+# table_fisher_step_norm_mean carries lr_t/lr_0, which falls by 1e6 between the last two log rows of the live cosine
+# schedule to zero, so every run ended on a false alarm (audit 2026-10-31, tables-families-2).
+TABLE_STEP_COLLAPSE_KEY:      str   = "table_fisher_unscheduled_step_norm_mean"
 
 
 def _covariance_floor_reference(
@@ -2168,30 +2358,38 @@ def _warn_eigenvalue_collapse(
 ) -> None:
     r"""Warn once per layer on an eigenvalue collapse that a trace ratio cannot see (audit 2026-10-17 item 14).
 
-    ``belief_eigenvalue_ratio``: :math:`\lambda_{\min}/\lambda_{\max}` of the converged belief covariances below
-    :data:`EIGENVALUE_COLLAPSE_RATIO` :math:`= 10^3\epsilon_{32}`, where float32 arithmetic on that covariance has lost
-    all but about three digits of its smallest direction. With ``layer_extremes`` (``{"lam_min": [...], "lam_max":
-    [...]}``, one entry per layer) every layer is tested (audit 2026-10-20 item 14: an early layer at 3.5e-5 was never
-    warned because only the last layer was read); without it the unsuffixed ``belief_lam_min`` / ``belief_lam_max``
-    are read as layer ``belief_layer``.
+    ``belief_eigenvalue_ratio``: the smallest per-token :math:`\lambda_{\min}(\Sigma_i)/\lambda_{\max}(\Sigma_i) =
+    1/\max_i\kappa(\Sigma_i)` of the converged belief covariances below :data:`EIGENVALUE_COLLAPSE_RATIO`
+    :math:`= 10^3\epsilon_{32}`, where float32 arithmetic on that covariance has lost all but about three digits of its
+    smallest direction (a covariance that is not positive definite has :math:`\kappa = \infty` and reads 0). The ratio
+    is taken within each covariance: a minimum and a maximum over different tokens measure a spread of scale across
+    tokens, which warned for two well-conditioned beliefs of different scale (audit 2026-10-31
+    training-diagnostics-2). With ``layer_extremes`` (:attr:`VFEModel.last_belief_layer_extremes`, one ``cond_max``
+    entry per layer, beside the layer's ``lam_min`` and ``lam_max`` over tokens that the message quotes) every layer is
+    tested (audit 2026-10-20 item 14: an early layer at 3.5e-5 was never warned because only the last layer was read);
+    without its ``cond_max`` the unsuffixed ``belief_cond_max`` is read as layer ``belief_layer``.
     ``projected_floor``: ``relational_projected_cov_min_eigenvalue_layer_min`` below ``floor_reference``
     (:func:`_covariance_floor_reference`), at its ``_argmin_layer``.
     """
-    if layer_extremes is not None:
-        pairs = list(enumerate(zip(layer_extremes.get("lam_min", ()), layer_extremes.get("lam_max", ()))))
+    if layer_extremes is not None and "cond_max" in layer_extremes:
+        conditions = list(enumerate(layer_extremes["cond_max"]))
     else:
-        pairs = [(int(belief_layer), (diagnostics.get("belief_lam_min"), diagnostics.get("belief_lam_max")))]
-    for layer, (low, high) in pairs:
-        lam_min, lam_max = _finite_or_none(low), _finite_or_none(high)
-        if lam_min is None or lam_max is None or lam_max <= 0.0:
+        conditions = [(int(belief_layer), diagnostics.get("belief_cond_max"))]
+    spans = (list(zip(layer_extremes.get("lam_min", ()), layer_extremes.get("lam_max", ())))
+             if layer_extremes is not None else [])                          # per layer, over tokens
+    for layer, value in conditions:
+        condition = None if value is None else float(value)
+        if condition is None or math.isnan(condition) or condition <= 0.0:
             continue
-        ratio = lam_min / lam_max
+        ratio = 1.0 / condition                                              # 0.0 when kappa is infinite
         key = ("belief_eigenvalue_ratio", int(layer), -1)
         if ratio < EIGENVALUE_COLLAPSE_RATIO and key not in warned:
             warned.add(key)
-            message = (" covariance layer %d: converged belief lambda_min / lambda_max = %.3g (lambda_min %.3g, "
-                       "lambda_max %.3g) is below 1e3 eps32 = %.3g; the smallest covariance direction has collapsed"
-                       % (layer, ratio, lam_min, lam_max, EIGENVALUE_COLLAPSE_RATIO))
+            span = ("" if int(layer) >= len(spans) else "; over the layer's tokens lambda_min %.3g, lambda_max %.3g"
+                    % tuple(float(v) for v in spans[int(layer)]))
+            message = (" covariance layer %d: a converged belief covariance has lambda_min / lambda_max = %.3g "
+                       "(largest per-token condition %.3g) below 1e3 eps32 = %.3g; that covariance's smallest "
+                       "direction has collapsed%s" % (layer, ratio, condition, EIGENVALUE_COLLAPSE_RATIO, span))
             _emit_warning(logger, sink, "belief_eigenvalue_ratio", message, layer=int(layer), value=ratio,
                           threshold=EIGENVALUE_COLLAPSE_RATIO)
     projected = _finite_or_none(diagnostics.get("relational_projected_cov_min_eigenvalue_layer_min"))
@@ -2209,7 +2407,7 @@ def _warn_eigenvalue_collapse(
 
 
 def _warn_table_step_collapse(
-    previous: Optional[float],                    # table_fisher_step_norm_mean of the previous log row
+    previous: Optional[float],                    # TABLE_STEP_COLLAPSE_KEY of the previous log row
     current:  Optional[float],                    # ... of this row
     logger:   logging.Logger,
 
@@ -2217,17 +2415,19 @@ def _warn_table_step_collapse(
     step:     int,
     sink:     Optional[WarningSink] = None,
 ) -> bool:
-    r"""Warn when the realized table Fisher step norm fell by more than :data:`TABLE_STEP_COLLAPSE_FACTOR` within one
-    log interval (41.53: 0.136 to 7.2e-6 while the covariance collapsed; audit 2026-10-17 item 14). Returns
-    whether it warned."""
+    r"""Warn when the table Fisher step norm fell by more than :data:`TABLE_STEP_COLLAPSE_FACTOR` within one log
+    interval (41.53: 0.136 to 7.2e-6 while the covariance collapsed; audit 2026-10-17 item 14). The training loop
+    passes :data:`TABLE_STEP_COLLAPSE_KEY`, the mean of :math:`\min(\lVert d\rVert, r)` before the schedule factor,
+    so the decay of the learning-rate schedule is not read as a collapse (audit 2026-10-31, tables-families-2).
+    Returns whether it warned."""
     previous, current = _finite_or_none(previous), _finite_or_none(current)
     if previous is None or current is None or previous <= 0.0 or current < 0.0:
         return False
     if current * TABLE_STEP_COLLAPSE_FACTOR >= previous:
         return False
-    message = (" step %d: table_fisher_step_norm_mean fell from %.3g to %.3g (more than %.0fx) within one log "
-               "interval; the type-prior tables have nearly stopped moving" % (
-                   step, previous, current, TABLE_STEP_COLLAPSE_FACTOR))
+    message = (" step %d: %s fell from %.3g to %.3g (more than %.0fx) within one log interval, independently of "
+               "the learning-rate schedule; the type-prior tables have nearly stopped moving" % (
+                   step, TABLE_STEP_COLLAPSE_KEY, previous, current, TABLE_STEP_COLLAPSE_FACTOR))
     _emit_warning(logger, sink, "table_step_collapse", message, previous=previous, value=current,
                   factor=TABLE_STEP_COLLAPSE_FACTOR)
     return True
@@ -2258,7 +2458,10 @@ def _numerics_counter_skip_reasons(
     and ``factorization`` (``factorization_fallback_count``, ``factorization_count``) are measured on
     both supported projected routes, whose pre-update router records its capped costs and reduced
     covariances in the diagnostic capture. The full-link gradient episode keeps that router fixed
-    across its receiver iterations.
+    across its receiver iterations. ``factorization`` is undefined when no layer's router factors a reduced
+    covariance (:func:`vfe3.gradients.relational.factorizes_projected_covariances`: the diagonal comparison route at
+    every comparison block, or the covariance-blind ``mean_distance`` cost); both of its columns then hold 0, so the
+    S1 panel D lists the pair as absent (audit 2026-10-31 training-diagnostics-1).
     ``frame_projection`` (``frame_projection_count``, ``frame_projection_total``) is measured when
     :func:`train_step` runs a post-update frame projection, i.e. ``m_phi_update_mode='adamw'`` with
     ``phi_mstep_max_matrix_norm`` set, or ``phi_frame_condition_max`` set on a group the condition bound acts
@@ -2274,6 +2477,14 @@ def _numerics_counter_skip_reasons(
         }
     reasons: Dict[str, Optional[str]] = {
         "cap_activation": None, "factorization": None, "frame_projection": None}
+    from vfe3.gradients.relational import factorizes_projected_covariances   # the router's own route decisions
+    layers = tuple(getattr(model, "relational_operators_by_layer", None) or ())
+    if layers and not any(factorizes_projected_covariances(ops) for ops in layers):
+        reasons["factorization"] = (
+            ("relational_routing='mean_distance': the cost reads no covariance"
+             if all(getattr(ops, "routing", None) == "mean_distance" for ops in layers)
+             else "diagonal comparison route at every comparison block: only diag P(G) is formed")
+            + ", so no reduced covariance is factorized (factorization_count stays 0)")
     mode = getattr(cfg, "m_phi_update_mode", "adamw")
     if get_phi_update_policy(mode).requires_manifold_optimizer:
         reasons["frame_projection"] = (
@@ -2317,9 +2528,13 @@ def _capture_numerics_counts(
     ``(clamped_rows, rows)`` per head is appended to it, with ``rows`` the number of query rows with
     :math:`|S_i| \ge 2` (audit 2026-10-08 critic-gapfill-2#3). The entry counts above are unchanged.
 
-    Factorizations. Each layer factors its reduced query and key covariances
+    Factorizations. On its dense route each layer factors its reduced query and key covariances
     :math:`G = L \Sigma L^\top` (:math:`L = S U^{-1}`, comparison rank :math:`r`) once per (window,
-    token, head) and role, so the layer's denominator is
+    token, head) and role. The layer's denominator is the number of entries the router passed to a factorization
+    (``projected_factorized_entries_pre`` of :func:`vfe3.gradients.relational.relational_score`): zero on the
+    diagonal comparison route, which forms only :math:`\operatorname{diag}P(G)`, and under the covariance-blind
+    ``mean_distance`` cost (audit 2026-10-31 training-diagnostics-1). A capture without that record (the minimal
+    agent's) counts every recorded entry,
     :math:`\mathrm{numel}(G_q)/r^2 + \mathrm{numel}(G_k)/r^2`. The factorization uses zero jitter and
     no spectral repair; its only fallback is the source-factor recovery of
     :func:`vfe3.relational_scoring._strict_cholesky` (float32 shifted CholeskyQR3 of the source root
@@ -2332,8 +2547,7 @@ def _capture_numerics_counts(
     not counted. The minimal agent's fallback is the float64 recomputation of a whole float32 layer call
     whose factorizations failed (or whose ADF query covariance failed the certificate under
     a certified ``projected_factorization``); it counts every recorded query and key entry of that call, so
-    there the ratio is the share of recomputed layer calls (plus, for the mean field under the certificate,
-    the KL factors it refactors in calls that were not recomputed).
+    there the ratio is the share of recomputed layer calls.
 
     Returns ``(cap, factorization)`` with ``cap[l][h] = (capped, entries)`` and
     ``factorization[l] = (recovered, attempted)``, all Python ints, after one host transfer.
@@ -2360,10 +2574,13 @@ def _capture_numerics_counts(
         capped = entries & (score >= cap_level)                             # (B, H, N, N)
         rows_h = rows.squeeze(-1)                                           # (B, H, N)
         clamped_rows = rows_h & (capped.sum(dim=-1) == entries.sum(dim=-1))  # (B, H, N) every entry capped
-        G_q = capture["projected_covariance_pre"]                           # (B, N, H, r, r); per run if mixed
-        G_k = capture["projected_key_covariance_pre"]                       # (B, N, H, r, r); per run if mixed
-        attempted.append(sum(int(G.numel() // (G.shape[-1] ** 2))
-                             for G in ([G_q, G_k] if torch.is_tensor(G_q) else [*G_q, *G_k])))
+        if "projected_factorized_entries_pre" in capture:                   # the kernel router's own count
+            attempted.append(int(capture["projected_factorized_entries_pre"]))
+        else:                                                               # minimal agent: every recorded entry
+            G_q = capture["projected_covariance_pre"]                       # (B, N, H, r, r); per run if mixed
+            G_k = capture["projected_key_covariance_pre"]                   # (B, N, H, r, r); per run if mixed
+            attempted.append(sum(int(G.numel() // (G.shape[-1] ** 2))
+                                 for G in ([G_q, G_k] if torch.is_tensor(G_q) else [*G_q, *G_k])))
         recovered = torch.as_tensor(capture["relational_covariance_repair_count"]).reshape(1)
         heads.append(int(beta.shape[1]))
         device_counts.append(torch.cat((
@@ -2793,31 +3010,64 @@ def _group_update_statistics(
 
 
 @torch.no_grad()
+def project_log_variance_tables_(
+    model: torch.nn.Module,
+) -> None:
+    r"""Raise the log-variance tables' entries below their eps floor back to it (``sigma_log_floor_mode='projected'``).
+
+    The encoder table ``sigma_log_embed`` and the untied decode table ``decode_sigma_log_embed``, each through
+    :func:`vfe3.numerics.project_log_variance_floor_` at the bank's ``eps``. An entry that a step left below
+    :math:`\log\varepsilon` reads :math:`\varepsilon` with a zero derivative, so without the projection no later
+    step can move it (audit 2026-10-31, numerics-2). A model without a prior bank (the baseline) has no such table.
+    """
+    bank = getattr(model, "prior_bank", None)
+    for name in ("sigma_log_embed", "decode_sigma_log_embed"):
+        table = getattr(bank, name, None)
+        if isinstance(table, torch.Tensor):
+            project_log_variance_floor_(table, eps=float(bank.eps))
+
+
+# Encoder log-variance columns of every metrics row: the population moments and, beside them, the extremes and the
+# count of entries at a zero-derivative bound of bounded_variance_from_log (audit 2026-10-31, tables-families-7).
+SIGMA_LOG_COLUMNS: Tuple[str, ...] = (
+    "sigma_log_mean", "sigma_log_sd", "sigma_log_min", "sigma_log_max", "sigma_log_clamped")
+
+
+@torch.no_grad()
 def _sigma_log_statistics(
     model: torch.nn.Module,
 ) -> Dict[str, float]:
-    r"""Mean and standard deviation of the whole prior log-variance table ``sigma_log_embed``.
+    r"""Mean, standard deviation, extremes and clamped count of the whole prior log-variance table ``sigma_log_embed``.
 
     Reported instead of its norm: the norm decays toward 0 under weight decay, so a
     gradient-to-weight ratio built on it rises for a trivial reason. Population statistics
     (``correction=0``) in the table's own precision, with no full-size float64 copy on the device.
+    ``sigma_log_min`` and ``sigma_log_max`` are the table's extremes and ``sigma_log_clamped`` counts the entries
+    at which :func:`vfe3.numerics.bounded_variance_from_log` has a zero derivative, below the ``eps`` floor or above
+    its exponent cap ``max_log``: such an entry stays where it is under ``sigma_log_floor_mode='absorbing'`` and
+    zero decay, and the batch-level belief statistics see only the types present in the logged batch (audit
+    2026-10-31, tables-families-7). The five values are read in one transfer.
 
     Under ``prior_covariance_table='block_cholesky'`` (no ``sigma_log_embed``) the same statistics are
     taken over the prior log-variances :math:`\log (C_v)_{kk}`, read through the
     ``PriorBank._prior_covariance_blocks`` accessor in vocabulary chunks, so they do not depend on how
-    the Cholesky table is parameterized (audit 2026-10-09 round 2, item 25).
+    the Cholesky table is parameterized (audit 2026-10-09 round 2, item 25); that table has no log-variance clamp,
+    so its ``sigma_log_clamped`` is NaN.
     """
     bank = getattr(model, "prior_bank", None)
     table = getattr(bank, "sigma_log_embed", None)
     if table is None and isinstance(getattr(bank, "sigma_chol_embed", None), torch.Tensor):
         return _block_cholesky_log_variance_statistics(bank)
     if not isinstance(table, torch.Tensor) or table.numel() == 0:
-        return {"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")}
+        return {column: float("nan") for column in SIGMA_LOG_COLUMNS}
     values = table.detach()
     if not values.is_floating_point() or values.element_size() < 4:
         values = values.float()
     sd, mean = torch.std_mean(values, correction=0)
-    return {"sigma_log_mean": float(mean), "sigma_log_sd": float(sd)}
+    low, high = torch.aminmax(values)
+    clamped = log_variance_clamped(values, eps=float(bank.eps)).sum()
+    host = torch.stack([value.double() for value in (mean, sd, low, high, clamped)]).tolist()   # exact widening
+    return dict(zip(SIGMA_LOG_COLUMNS, host))
 
 
 # Decode-table variance columns of every metrics row (audit 2026-10-16 F12); NaN under the linear readout.
@@ -2861,11 +3111,14 @@ SIGMA_LOG_CHUNK_TYPES: int = 4096          # vocabulary rows per block_cholesky 
 def _block_cholesky_log_variance_statistics(
     bank: torch.nn.Module,                 # PriorBank with prior_covariance_table='block_cholesky'
 ) -> Dict[str, float]:
-    r"""Population mean and standard deviation of :math:`\log (C_v)_{kk}` over every type :math:`v` and
-    coordinate :math:`k` of the per-head prior blocks, accumulated in float64 over vocabulary chunks."""
+    r"""Population mean, standard deviation and extremes of :math:`\log (C_v)_{kk}` over every type :math:`v` and
+    coordinate :math:`k` of the per-head prior blocks, accumulated in float64 over vocabulary chunks; the clamped
+    count is NaN, since the Cholesky table has no log-variance clamp."""
     n_types = int(bank.sigma_chol_embed.shape[0])
     total = torch.zeros((), dtype=torch.float64, device=bank.sigma_chol_embed.device)
     square = torch.zeros_like(total)
+    low = torch.full_like(total, math.inf)
+    high = torch.full_like(total, -math.inf)
     count = 0
     with torch.autocast(device_type=bank.sigma_chol_embed.device.type, enabled=False):
         for start in range(0, n_types, SIGMA_LOG_CHUNK_TYPES):
@@ -2875,12 +3128,15 @@ def _block_cholesky_log_variance_statistics(
             log_variance = blocks.diagonal(dim1=-2, dim2=-1).double().log()   # (V_c, H, d)
             total += log_variance.sum()
             square += log_variance.square().sum()
+            low = torch.minimum(low, log_variance.min())
+            high = torch.maximum(high, log_variance.max())
             count += log_variance.numel()
     if count == 0:
-        return {"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")}
+        return {column: float("nan") for column in SIGMA_LOG_COLUMNS}
     mean = total / count
     return {"sigma_log_mean": float(mean),
-            "sigma_log_sd": float((square / count - mean.square()).clamp(min=0.0).sqrt())}
+            "sigma_log_sd": float((square / count - mean.square()).clamp(min=0.0).sqrt()),
+            "sigma_log_min": float(low), "sigma_log_max": float(high), "sigma_log_clamped": float("nan")}
 
 
 def _record_diagnostic_failure(
@@ -3038,6 +3294,17 @@ def _residual_update_is_additive(
                 and not getattr(cfg, "attention_residual", False))
 
 
+def _prior_triangle_defect_sums(
+    prior:   torch.Tensor,                   # (B, H, N, N) attention prior pi = softmax_j(log prior)
+    support: torch.Tensor,                   # (B, H, N, N) bool admissible keys
+) -> torch.Tensor:                           # (H, 3) float64 [path mass, sum w x, sum w x^2]
+    r"""The routing-holonomy reference: :func:`vfe3.metrics.routing_triangle_defect_sums` of the attention prior
+    renormalized on its support, :math:`\pi_{ij}/\sum_{j'\in\mathcal S_i}\pi_{ij'}`, summed over the ``B`` windows."""
+    baseline = torch.where(support, prior, torch.zeros_like(prior))
+    baseline = baseline / baseline.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+    return routing_triangle_defect_sums(baseline, support)
+
+
 @torch.no_grad()
 def _residual_and_attention_rows(
     model:   VFEModel,
@@ -3070,8 +3337,10 @@ def _residual_and_attention_rows(
     ``holonomy_out``: when a dict is given, per (layer, head) the path-weighted triangle-defect sums
     of :func:`vfe3.metrics.routing_triangle_defect_sums` for the router and for its prior are
     accumulated into it (``[mass, sum x, sum x^2, prior mass, prior sum x, prior sum x^2, rows]``),
-    for :func:`_routing_holonomy_rows`. An error is stored under ``"error"`` and stops the
-    accumulation without disturbing the other rows.
+    for :func:`_routing_holonomy_rows`. The prior's sums depend on neither the layer nor the window, so for the
+    model's batch-free log-prior they are formed once per call, for one window, and scaled by each chunk's window
+    count (:func:`_prior_triangle_defect_sums`; audit 2026-10-31 training-diagnostics-9). An error is stored under
+    ``"error"`` and stops the accumulation without disturbing the other rows.
 
     ``counters_out`` (projected routes): when a dict is given, the S1 panel D per-evaluation counts
     of the same captures (:func:`_capture_numerics_counts`) are accumulated into it, so the counters
@@ -3104,15 +3373,20 @@ def _residual_and_attention_rows(
     ratios: Dict[int, List[torch.Tensor]] = {}
     ln_changes: Dict[int, List[torch.Tensor]] = {}
     sums: Dict[Tuple[int, int], List[float]] = {}          # (layer, head) -> [H_norm, dist, self, overlap, n]
+    # The attention prior's own defect sums per window, keyed by (H, N, N): the prior is the model's fixed, batch-free
+    # log-prior, the same for every layer, chunk and window of the call (audit 2026-10-31 training-diagnostics-9).
+    prior_defects: Dict[Tuple[int, ...], torch.Tensor] = {}
     modes = [(module, module.training) for module in model.modules()]
     model.eval()
-    wrapped = (_wrap_prototype_blocks(model, features_out,
-                                      elbo=bool(getattr(model.cfg, "diagnose_agent_elbo", False)))
-               if features_out is not None else [])
+    wrapped, begin_pass = (_wrap_prototype_blocks(model, features_out,
+                                                  elbo=bool(getattr(model.cfg, "diagnose_agent_elbo", False)))
+                           if features_out is not None else ([], None))
     try:
         for chunk in windows.split(max(1, DIAGNOSTIC_CHUNK_WINDOWS)):
             ids = chunk.to(device)                                              # (B, N)
             capture: dict = {"diagnostic": {}}
+            if begin_pass is not None:
+                begin_pass()                                                    # one forward pass per chunk
             model.forward_beliefs(ids, capture=capture)
             diagnostic = capture["diagnostic"]
             if features_out is not None:
@@ -3196,10 +3470,15 @@ def _residual_and_attention_rows(
                         total[slot] += value
                 if holonomy_out is not None and "error" not in holonomy_out:
                     try:
-                        baseline = torch.where(support, prior, torch.zeros_like(prior))
-                        baseline = baseline / baseline.sum(dim=-1, keepdim=True).clamp_min(1e-30)
                         learned = routing_triangle_defect_sums(beta, support)           # (H, 3)
-                        reference = routing_triangle_defect_sums(baseline, support)     # (H, 3)
+                        if isinstance(log_prior, torch.Tensor) and prior_logits.shape[0] == 1:
+                            # Batch-free prior: one window's sums, formed once per call, times the window count.
+                            key = tuple(beta.shape[1:])                                 # (H, N, N)
+                            if key not in prior_defects:
+                                prior_defects[key] = _prior_triangle_defect_sums(prior[:1], support[:1])   # (H, 3)
+                            reference = prior_defects[key] * beta.shape[0]
+                        else:
+                            reference = _prior_triangle_defect_sums(prior, support)     # (H, 3)
                         n_rows = float(beta.shape[0] * n)
                         for head in range(learned.shape[0]):
                             values = learned[head].tolist() + reference[head].tolist() + [n_rows]
@@ -3330,7 +3609,9 @@ def _append_block_variance(
     device:    torch.device,
 ) -> None:
     r"""Write ``block_variance.csv`` rows of the current weights from a variance-only capture of ``windows``
-    (``block_variance_at_log``; audit 2026-10-17 item 35). Eval mode with module modes restored, RNG streams forked."""
+    (``block_variance_at_log``; audit 2026-10-17 item 35). Eval mode with module modes restored, RNG streams forked.
+    The rows read only the stage beliefs of the diagnostic capture, so the router internals (labels, costs, projected
+    covariances) are not captured (``_relational_capture=False``; audit 2026-10-31 training-diagnostics-8)."""
     variances: Dict[Tuple[int, str], List[Any]] = {}
     modes = [(module, module.training) for module in model.modules()]
     rng_devices = [device] if device.type == "cuda" else []
@@ -3339,7 +3620,7 @@ def _append_block_variance(
         try:
             for chunk in windows.split(max(1, DIAGNOSTIC_CHUNK_WINDOWS)):
                 capture: dict = {"diagnostic": {}}
-                model.forward_beliefs(chunk.to(device), capture=capture)
+                model.forward_beliefs(chunk.to(device), capture=capture, _relational_capture=False)
                 _collect_block_variances(capture["diagnostic"], variances)
         finally:
             for module, was_training in modes:
@@ -3377,24 +3658,47 @@ def _wrap_prototype_blocks(
 
     *,
     elbo:         bool = False,
-) -> List[torch.nn.Module]:
+) -> Tuple[List[torch.nn.Module], Callable[[], None]]:
     r"""Wrap ``forward_moments`` of every ``prototype_agents`` block on the instance so the eval pass sums, per
     layer, the template weights ``(M,)``, the weight entropy, the removed variance, the label staleness and the token
-    count of its inputs into ``features_out["prototype"][layer]``; returns the wrapped blocks (the caller deletes the
-    wrappers). With ``elbo`` (``diagnose_agent_elbo``) it also sums the block's evidence lower bound and log evidence
-    (:meth:`PrototypeAgentBlockMLP.elbo_and_evidence`) into ``features_out["prototype_elbo"][layer]``."""
+    count of its inputs into ``features_out["prototype"][layer]``. With ``elbo`` (``diagnose_agent_elbo``) it also sums
+    the block's evidence lower bound and log evidence (:meth:`PrototypeAgentBlockMLP.elbo_and_evidence`) into
+    ``features_out["prototype_elbo"][layer]``.
+
+    A bank shared across layers (``block_mlp_tie_layers=True``) is one object listed at every layer. It gets one
+    wrapper, and each forward pass calls it once per layer in layer order (:mod:`vfe3.model.stack`), so its
+    :math:`k`-th call of a pass is attributed to the :math:`k`-th layer that holds it, as in
+    :func:`vfe3.posthoc.feature_probes.prototype_probe` (audit 2026-10-31 block-mlp-norm-1). Returns the distinct
+    wrapped banks, each once (the caller deletes each wrapper once), and ``begin_pass``, which the caller calls
+    before every forward pass to restart the call counts; a bank called more often in one pass than layers hold it
+    raises instead of mislabeling a layer."""
     blocks = getattr(model, "block_mlps", None)
-    wrapped: List[torch.nn.Module] = []
+    # Distinct banks, each with the layers that call it in order (one layer each when untied).
+    banks: Dict[int, Tuple[PrototypeAgentBlockMLP, List[int]]] = {}
+    for layer, mlp in enumerate(blocks if blocks is not None else ()):
+        if isinstance(mlp, PrototypeAgentBlockMLP):
+            banks.setdefault(id(mlp), (mlp, []))[1].append(layer)
+    calls: Dict[int, int] = dict.fromkeys(banks, 0)                  # calls of each bank in the current pass
+
+    def begin_pass() -> None:
+        for key in calls:
+            calls[key] = 0
+
     if blocks is None:
-        return wrapped
+        return [], begin_pass
     sums = features_out.setdefault("prototype", {})
     sums_elbo = features_out.setdefault("prototype_elbo", {}) if elbo else {}
-    for layer, mlp in enumerate(blocks):
-        if not isinstance(mlp, PrototypeAgentBlockMLP):
-            continue
+    for key, (mlp, layers) in banks.items():
         original = mlp.forward_moments
 
-        def recording(mu, sigma, *args, _layer=layer, _mlp=mlp, _original=original, **kwargs):
+        def recording(mu, sigma, *args, _key=key, _layers=tuple(layers), _mlp=mlp, _original=original, **kwargs):
+            call = calls[_key]
+            if call >= len(_layers):
+                raise RuntimeError(
+                    f"the prototype block MLP of layers {list(_layers)} was called {call + 1} times in one forward "
+                    "pass; its calls cannot be attributed to layers")
+            calls[_key] = call + 1
+            _layer = _layers[call]
             weights, gain, staleness = _mlp.weights_gain_and_staleness(mu, sigma)   # (..., M), (...), (...)
             weights = weights.double().reshape(-1, weights.shape[-1])            # (T, M)
             entry = sums.setdefault(_layer, {"weights": torch.zeros_like(weights[0]), "entropy": 0.0,
@@ -3414,8 +3718,7 @@ def _wrap_prototype_blocks(
             return _original(mu, sigma, *args, **kwargs)
 
         mlp.forward_moments = recording
-        wrapped.append(mlp)
-    return wrapped
+    return [mlp for mlp, _ in banks.values()], begin_pass
 
 
 def _accumulate_minimal_agent(
@@ -3697,6 +4000,11 @@ class ValidationDiagnostics(NamedTuple):
     snapshot:  DiagnosticSnapshot
 
 
+# Held-out columns that name where an extreme sits (a layer, head or token index), not a magnitude.
+_VAL_LOCATION_SUFFIXES: Tuple[str, ...] = (
+    "_argmax_layer", "_argmin_layer", "_argmax_head", "_argmin_head", "_argmax_position", "_argmin_position")
+
+
 @torch.no_grad()
 def _val_diagnostics(
     model:      VFEModel,
@@ -3718,7 +4026,11 @@ def _val_diagnostics(
 
     ``batches=1`` (the default) is the historical behavior EXACTLY -- one batch, one worker call, no
     averaging -- so runs on disk stay reproducible. Above 1, each batch contributes its own first
-    sequence and the numeric columns are averaged.
+    sequence and the numeric columns are averaged, so an extreme (``*_layer_max``, ``*_head_max``,
+    ``*_layer_min``, ...) is the mean of the per-batch extremes. A location column (``*_argmax_layer``,
+    ``*_argmin_layer``, ``*_argmax_head``, ``*_argmin_position``, ...) names the layer, head or position of one
+    batch's extreme, which a mean of indices does not, so it keeps the value of the first batch that measured it
+    (audit 2026-10-31 training-diagnostics-4).
 
     The token_ids and snapshot come from the FIRST batch regardless, because they feed the attention
     figures, which are a picture of one sequence and would be meaningless averaged. Later batches'
@@ -3735,6 +4047,7 @@ def _val_diagnostics(
     first: Optional[ValidationDiagnostics] = None
     sums:   Dict[str, float] = {}
     counts: Dict[str, int]   = {}
+    located: Dict[str, float] = {}       # location columns: the first finite value
     for index, batch in enumerate(val_loader):
         if index >= batches:
             break
@@ -3743,6 +4056,8 @@ def _val_diagnostics(
             if math.isfinite(value):
                 sums[key]   = sums.get(key, 0.0) + value
                 counts[key] = counts.get(key, 0) + 1
+                if key.endswith(_VAL_LOCATION_SUFFIXES):
+                    located.setdefault(key, value)
         if first is None:
             first = one
         else:
@@ -3750,13 +4065,13 @@ def _val_diagnostics(
     if first is None:                    # empty loader: preserve the old failure mode
         return _val_diagnostics_one(model, next(iter(val_loader)), device, failures=failures)
     averaged = {
-        key: (sums[key] / counts[key]) if counts.get(key) else float("nan")
+        key: (located.get(key, float("nan")) if key.endswith(_VAL_LOCATION_SUFFIXES)
+              else (sums[key] / counts[key]) if counts.get(key) else float("nan"))
         for key in first.metrics
     }
     if "pos_loss_ratio" in averaged:
         # The ratio of the averaged quarters, not the average of per-batch ratios, so the three columns agree
-        # (a sliding-window batch whose first quarter is masked contributes to last_q alone; audit 2026-10-12
-        # round 2, item 16).
+        # (audit 2026-10-12 round 2, item 16).
         averaged["pos_loss_ratio"] = averaged["pos_loss_last_q"] / max(averaged["pos_loss_first_q"], 1e-9)
     return ValidationDiagnostics(averaged, first.token_ids, first.snapshot)
 
@@ -4082,6 +4397,7 @@ def _save_eval_attention_maps(
 
     *,
     step:      int,
+    snapshot:  Optional[DiagnosticSnapshot] = None,   # the held-out snapshot of token_ids (_val_diagnostics)
 ) -> None:
     r"""Save beta maps from one post-step evaluation batch.
 
@@ -4090,13 +4406,15 @@ def _save_eval_attention_maps(
     path moved to ``"entry"`` on 2026-08-05 the same run directory published a figure and a column
     that measured DIFFERENT objects under the same name. Entry is the beta the forward actually used
     (measured TV(forward, converged) up to 0.96 per row, TV(forward, entry) == 0.0), so the figure
-    follows the metric rather than the other way round. Scoring at entry cannot come from a snapshot,
-    hence the replay.
+    follows the metric rather than the other way round. On the projected routes the snapshot stores exactly that
+    pre-update router (``snapshot.beta_maps``, which :meth:`VFEModel.attention_maps` returns for ``"entry"``), so the
+    held-out ``snapshot`` of ``token_ids`` is read directly; without one the maps are replayed from ``token_ids``,
+    a second snapshot forward with its logits decode (audit 2026-10-31 training-diagnostics-7).
     """
     # The maps are computed here; their isolated figure child runs on a background thread when the artifacts object
     # offers one, so training does not wait for it (audit 2026-10-17 item 68); the run reaps it before finalizing.
     submit = getattr(artifacts, "submit_figure_work", None)
-    entry_maps = model.attention_maps(token_ids, score_at="entry")
+    entry_maps = model.attention_maps(token_ids, score_at="entry", snapshot=snapshot)
     if callable(submit):
         entry_cpu = entry_maps.detach().cpu()
         submit("attention", lambda: artifacts.save_attention_maps(step, entry_cpu, logger=logger))
@@ -4111,7 +4429,8 @@ class TrainingTerminalState(NamedTuple):
     scaler, and data cursor, plus host (CPU) copies of the last-iterate ``state_dict`` and clones of
     the CPU/CUDA global RNG states. A validation-only finalizer scores validation,
     restores the captured model/RNG state, and writes a resumable checkpoint whose weights and
-    optimizer moments describe the same iterate.
+    optimizer moments describe the same iterate. The callback owns that terminal checkpoint: with a
+    callback, ``checkpoint_at_end`` writes none from the loop (audit 2026-10-31 train-loop-lifecycle-6).
     """
     step:                 int
     optimizer:            torch.optim.Optimizer
@@ -4285,6 +4604,59 @@ def _training_cursor_fields(
 
 
 _MATMUL_PRECISION_LADDER: Tuple[str, ...] = ("medium", "high", "highest")
+# The CUDA matmul flag each fp32 matmul policy sets on this torch build, read back once per policy.
+_CUDA_MATMUL_FLAGS: Dict[str, str] = {}
+
+
+def _cuda_matmul_flag(policy: str) -> str:
+    r"""The cuBLAS fp32 matmul flag (``torch.backends.cuda.matmul.fp32_precision``) that ``policy`` sets.
+
+    Read back by setting the policy and restoring the previous one, since the mapping belongs to the torch build: on
+    torch 2.9 ``"high"`` and ``"medium"`` both give ``'tf32'`` (``"medium"`` reaches bf16 only through oneDNN on the
+    CPU). Raises ``AttributeError`` on a build without the per-backend flag.
+    """
+    if policy not in _CUDA_MATMUL_FLAGS:
+        with _float32_matmul_precision(policy):
+            _CUDA_MATMUL_FLAGS[policy] = str(torch.backends.cuda.matmul.fp32_precision)
+    return _CUDA_MATMUL_FLAGS[policy]
+
+
+def _replay_policies(
+    current: str,                        # the policy of the first attempt
+    device:  Optional[torch.device],     # the device of the step's tensors; None when unknown
+) -> Tuple[str, ...]:
+    r"""The stricter rungs of the replay ladder after ``current``, without a rung that repeats the arithmetic of the
+    attempt before it.
+
+    On a CUDA device a rung whose cuBLAS flag equals that of the preceding attempt computes the same GEMMs, so its
+    replay could not differ and is skipped (``"medium"`` then ``"high"`` are both TF32 there). On any other device, or
+    on a build without the per-backend flag, every rung is kept.
+    """
+    rungs = _MATMUL_PRECISION_LADDER[_MATMUL_PRECISION_LADDER.index(current) + 1:]
+    if device is None or device.type != "cuda":
+        return rungs
+    try:
+        kept, previous = [], _cuda_matmul_flag(current)
+        for policy in rungs:
+            flag = _cuda_matmul_flag(policy)
+            if flag != previous or policy == "highest":
+                kept.append(policy)
+                previous = flag
+        return tuple(kept)
+    except AttributeError:
+        return rungs
+
+
+def _tensor_device(*candidates: Any) -> Optional[torch.device]:
+    r"""The device of the first tensor among ``candidates``, or of the first parameter of a module; None otherwise."""
+    for candidate in candidates:
+        if isinstance(candidate, torch.Tensor):
+            return candidate.device
+        if isinstance(candidate, torch.nn.Module):
+            parameter = next(iter(candidate.parameters()), None)
+            if parameter is not None:
+                return parameter.device
+    return None
 
 
 class ConsecutiveSkipAbort(RuntimeError):
@@ -4328,6 +4700,18 @@ LOG_TIMING_COLUMNS: Tuple[str, ...] = (
     "eval_validation_ms", "eval_sample_ms", "eval_val_diagnostics_ms", "eval_best_and_maps_ms",
     "eval_cadence_ms", "eval_gap_train_ms",
 )
+# The split of train_step_ms_mean by the phase marks of train_step (audit 2026-10-31 perf-live-path-5): mean
+# milliseconds per timed step from the step start to the end of the forward, then of the backward, of the gradient gate,
+# clip and optimizer update, of the post-update projection, frame bound and scheduler step, and from there to the step
+# end (the replay ladder and the loop's post-step work until the timer stops). Under gradient accumulation the forward
+# and backward columns sum their microbatches, and a replayed attempt's time lands in the segment its next mark
+# closes. The five sum to train_step_ms_mean; on CUDA they are read from stream events at the row's existing
+# synchronization, so a silent step gains no host synchronization.
+TRAIN_STEP_PHASE_COLUMNS: Dict[str, str] = {
+    "forward": "train_forward_ms_mean", "backward": "train_backward_ms_mean",
+    "optimizer": "train_optimizer_ms_mean", "post_update": "train_post_update_ms_mean",
+    STEP_TAIL_PHASE: "train_step_other_ms_mean",
+}
 
 
 def _synced_ms(device: torch.device) -> float:
@@ -4360,7 +4744,8 @@ def _no_update_call_with_precision_retry(
 
     A call that raises at a reduced ``fp32_matmul_precision`` (a fail-closed certificate tripped by TF32 or
     bf16 GEMM rounding) is run again one rung stricter,
-    ``"medium" -> "high" -> "highest"``, as :func:`_train_step_with_precision_retry` does for the train
+    ``"medium" -> "high" -> "highest"`` (on CUDA without the ``"high"`` rung after ``"medium"``, which sets the same
+    TF32 cuBLAS flag; :func:`_replay_policies`), as :func:`_train_step_with_precision_retry` does for the train
     step (audit 2026-10-08 P0-1). A no-update call changes no parameter, so a replay needs no gradient
     or optimizer rollback; ``restore_rng`` also rewinds the CPU and CUDA RNG streams before each replay,
     so a replay draws what the first attempt drew. A failure that persists at ``"highest"`` is raised
@@ -4373,7 +4758,7 @@ def _no_update_call_with_precision_retry(
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
                 if restore_rng and torch.cuda.is_available() and torch.cuda.is_initialized() else None)
     failures: List[str] = []
-    for policy in (current, *_MATMUL_PRECISION_LADDER[_MATMUL_PRECISION_LADDER.index(current) + 1:]):
+    for policy in (current, *_replay_policies(current, _tensor_device(model))):
         if failures and cpu_rng is not None:
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
@@ -4422,12 +4807,30 @@ def _diagnostics_with_precision_retry(
     before_attempt: Optional[Callable[[], None]] = None,   # clears per-attempt captures (prototype sums)
 ) -> Dict[str, Any]:
     r"""``model.diagnostics(tokens)`` on the replay ladder that :func:`evaluate` uses (audit 2026-10-10 round 2,
-    item 10), with the RNG streams rewound before a replay so the training stream after it is unchanged."""
+    item 10). The RNG streams are rewound before a replay, so a replay draws what the first attempt drew, and the CPU
+    and device streams are restored when the call returns or raises, so the training stream after it is unchanged
+    whatever the diagnostic draws (audit 2026-10-31, evaluation-metrics-1)."""
     def attempt() -> Dict[str, Any]:
         if before_attempt is not None:
             before_attempt()
         return model.diagnostics(tokens)
-    return _no_update_call_with_precision_retry(model, attempt, "training diagnostics", restore_rng=True)
+    rng_devices = [tokens.device] if tokens.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=rng_devices):
+        return _no_update_call_with_precision_retry(model, attempt, "training diagnostics", restore_rng=True)
+
+
+def _cuda_rng_states() -> Optional[List[torch.Tensor]]:
+    r"""Clones of every CUDA generator's state, or ``None`` while CUDA is uninitialized (the read never initializes
+    it). A state is the generator's seed and offset, held on the host, so the read does not synchronize the device."""
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return None
+    return [state.clone() for state in torch.cuda.get_rng_state_all()]
+
+
+def _set_cuda_rng_states(states: Optional[List[torch.Tensor]]) -> None:
+    r"""Hand every CUDA generator back the state :func:`_cuda_rng_states` captured (``None``: nothing to restore)."""
+    if states is not None:
+        torch.cuda.set_rng_state_all(states)
 
 
 def _train_step_with_precision_retry(
@@ -4446,16 +4849,18 @@ def _train_step_with_precision_retry(
 ) -> Tuple[float, int]:                  # (loss, number of escalated replays the step needed)
     r"""Run :func:`train_step`; under a reduced fp32 matmul policy replay a failed step at a stricter one.
 
-    Under a reduced ``fp32_matmul_precision`` the GEMM rounding is about :math:`2^{-10}` (TF32,
-    ``"high"``) or :math:`2^{-7}` (bf16, ``"medium"``) instead of :math:`2^{-23}`, enough to trip a
-    fail-closed certificate (frame-pair inverse residual, positive source variance, factorization)
+    Under a reduced ``fp32_matmul_precision`` the GEMM rounding is about :math:`2^{-10}` (TF32: ``"high"``, and on
+    CUDA ``"medium"`` too) or :math:`2^{-7}` (bf16, ``"medium"`` on oneDNN CPU GEMMs) instead of :math:`2^{-23}`,
+    enough to trip a fail-closed certificate (frame-pair inverse residual, positive source variance, factorization)
     on an ill-conditioned frame. When the step raises before the optimizer has updated (a step
     pre-hook records any update), the gradients are dropped, the CPU and CUDA RNG states are
     restored, and the same step runs again, forward and backward, one rung stricter on the ladder
-    ``"medium" -> "high" -> "highest"``. A failure that persists at ``"highest"`` is raised with the
+    ``"medium" -> "high" -> "highest"``; on a CUDA device a rung that sets the same cuBLAS flag as the attempt before
+    it (``"high"`` after ``"medium"``) is skipped, since its replay could not differ (:func:`_replay_policies`). A
+    failure that persists at ``"highest"`` is raised with the
     earlier failures attached as notes, so a genuine defect still stops the run. Out-of-memory errors
-    and failures after an update are never replayed. Not used with an enabled GradScaler (fp16),
-    whose per-step unscale state a replay would violate. Module-level numerics counters may count
+    and failures after an update are never replayed. Under an enabled GradScaler (fp16) a raised step
+    is replayed after its per-optimizer unscale state is cleared. Module-level numerics counters may count
     the abandoned attempts. Each failed attempt that is replayed appends ``{step, policy, replay_policy,
     exception, message, amp_dtype, autocast_active}`` to ``replay_log`` when given, so the reasons survive
     the DEBUG-level logging of later replays (audit 2026-10-08 critic-gapfill-1#4). ``autocast_active``
@@ -4468,16 +4873,22 @@ def _train_step_with_precision_retry(
     replay is as safe as for a raised step (audit 2026-10-10 round 2, item 58). Its record names the
     exception ``NonFiniteStepSkipped``. A skip that persists at ``"highest"`` is returned as a skipped
     step, as before.
+
+    Under an enabled GradScaler (audit 2026-10-31 gap-mixed-precision-routes-6) a step that raised before any update
+    left at most an ``unscale_`` without ``update`` in the scaler, which :func:`_reset_scaler_step_state` clears before
+    the replay, as the failed-step skip of the training loop does; the scale itself is unchanged. A non-finite skip is
+    returned as it is: it is a loss-scale event that the scaler's own ``update`` has already answered.
     """
     scaler = step_kwargs.get("scaler")
     current = torch.get_float32_matmul_precision()
-    if current == "highest" or (scaler is not None and scaler.is_enabled()):
+    if current == "highest":
         return train_step(model, optimizer, scheduler, tokens, targets, **step_kwargs), 0
+    scaler_enabled = scaler is not None and scaler.is_enabled()
     status = step_kwargs.get("status_out")
     if status is None:                                  # the skip verdict is read from the step's status
         status = {}
         step_kwargs = {**step_kwargs, "status_out": status}
-    rungs = _MATMUL_PRECISION_LADDER[_MATMUL_PRECISION_LADDER.index(current) + 1:]
+    rungs = _replay_policies(current, _tensor_device(tokens, model))
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
                 if torch.cuda.is_available() and torch.cuda.is_initialized() else None)
@@ -4487,6 +4898,7 @@ def _train_step_with_precision_retry(
     for replays, policy in enumerate((current, *rungs)):
         if replays:
             optimizer.zero_grad(set_to_none=True)
+            _reset_scaler_step_state(scaler, optimizer)          # a no-op without an enabled GradScaler
             for out in (step_kwargs.get("metrics_out"), step_kwargs.get("status_out")):
                 if out is not None:
                     out.clear()
@@ -4503,7 +4915,7 @@ def _train_step_with_precision_retry(
         try:
             with _float32_matmul_precision(policy):
                 loss = train_step(model, optimizer, scheduler, tokens, targets, **step_kwargs)
-            if policy != "highest" and not updated and status.get("nonfinite_skip"):
+            if policy != "highest" and not updated and not scaler_enabled and status.get("nonfinite_skip"):
                 raise NonFiniteStepSkipped(
                     f"update rejected for a non-finite loss, gradient or clip norm (loss {loss!r})")
             return loss, replays
@@ -4560,7 +4972,8 @@ DIVERGENCE_SPIKE_COOLDOWN:    int   = 100      # steps between reported spikes (
 DIVERGENCE_SPIKE_ESCALATION:  float = 10.0     # an event this many times the last reported severity is reported anyway
 DIVERGENCE_ROLES: Tuple[str, ...] = ("mu", "sigma", "phi")
 # Columns on every metrics row: statistics over the steps since the previous log/eval row, the realized clip
-# coefficients of the row's own step, and whether the row was forced by a spike.
+# coefficients of the row's own step, and whether the row was forced by a spike. The tuple documents them and is
+# referenced only by the tests, which check the rows against it.
 DIVERGENCE_COLUMNS: Tuple[str, ...] = (
     "interval_steps", "train_loss_interval_mean", "train_loss_interval_max", "train_ce_interval_mean",
     "train_loss_interval_median", "train_ce_interval_median",
@@ -4606,13 +5019,20 @@ class _RunningStat:
 DIVERGENCE_SPIKE_LOG = "divergence_spikes.jsonl"          # run_dir/diagnostics: one record per reported spike
 _SPIKE_TOP_PARAMETERS = 5
 _SPIKE_TOP_ROWS = 3
-_SPIKE_TABLE_INDEX = {"mu_embed": "token", "sigma_log_embed": "token", "phi_embed": "token", "pos_phi": "position"}
+# per_type_table: the per-type block-MLP hidden bias (V, n_gen) and the baseline's read table (V, H, d, d), both read at
+# the input tokens (audit 2026-10-31 baseline-generation-6).
+_SPIKE_TABLE_INDEX = {"mu_embed": "token", "sigma_log_embed": "token", "phi_embed": "token", "pos_phi": "position",
+                      "per_type_table": "token"}
 # Decode-side tables (untied decode bank) are read at the step's targets, so their rows are counted over targets.
 _SPIKE_DECODE_TABLES = ("decode_mu_embed", "decode_sigma_log_embed")
 _SPIKE_ROW_OCCURRENCES = 8          # (batch, position) pairs listed per top row
 # A reported spike re-runs the spike batch without gradients, row by row, to record the largest final belief
 # variance and the per-position CE maximum (audit 2026-10-20 item 11). It costs about one forward per reported spike.
 DIVERGENCE_SPIKE_FORWARD_PROBE: bool = True
+# loss_spike_skip_nats: after this many consecutive rejected updates the next update is accepted without the threshold
+# and its loss becomes the loss EMA, so a level shift left by an accepted update cannot reject every later update
+# (audit 2026-10-31 train-loop-lifecycle-1). The bound is the spike cooldown.
+LOSS_SPIKE_REBASELINE_REJECTIONS: int = 100
 
 
 def _phi_row_head_conditions(
@@ -4659,47 +5079,70 @@ def _spike_forward_state(
     values describe the batch under the updated model. The variance is the largest diagonal entry of the final
     ``belief.sigma`` (the diagonal of a matrix covariance), with its (batch, position) and the CE at that position; the
     CE is the plug-in cross-entropy :math:`-\log p(y_{bn}\mid q_{bn})` at each scored position, and its maximum is
-    reported with its (batch, position) and the variance there.
+    reported with its (batch, position) and the variance there. A model without a belief state (the conventional
+    baseline, whose ``forward_beliefs`` returns ``(None, logits)``) reports the CE fields alone, with every variance
+    field None (audit 2026-10-31 baseline-generation-6).
     """
     import torch.nn.functional as F
 
     was_training = model.training
     rng_devices = [tokens.device] if tokens.device.type == "cuda" else []
-    variance_rows: List[torch.Tensor] = []                           # per sequence (N,)
+    variance_rows: List[torch.Tensor] = []                           # per sequence (N,); empty without beliefs
     ce_rows: List[torch.Tensor] = []                                 # per sequence (N,)
     with torch.random.fork_rng(devices=rng_devices):
         model.eval()
         try:
             for b in range(tokens.shape[0]):
                 belief, logits = model.forward_beliefs(tokens[b:b + 1], return_logits=True)
-                sigma = belief.sigma.detach()
-                if sigma.dim() == 4:                                 # (1, N, K, K) matrix covariance
-                    sigma = sigma.diagonal(dim1=-2, dim2=-1)
-                variance_rows.append(sigma.float().reshape(sigma.shape[1], -1).amax(dim=-1))       # (N,)
+                if belief is not None:
+                    sigma = belief.sigma.detach()
+                    if sigma.dim() == 4:                             # (1, N, K, K) matrix covariance
+                        sigma = sigma.diagonal(dim1=-2, dim2=-1)
+                    variance_rows.append(sigma.float().reshape(sigma.shape[1], -1).amax(dim=-1))   # (N,)
                 ce = F.cross_entropy(logits[0].float(), targets[b], ignore_index=-100, reduction="none")  # (N,)
                 ce_rows.append(torch.where(targets[b] == -100, torch.full_like(ce, float("nan")), ce))
         finally:
             model.train(was_training)
-    variance = torch.stack(variance_rows).cpu()                      # (B, N)
     ce = torch.stack(ce_rows).cpu()                                  # (B, N)
-    n = variance.shape[1]
+    variance = torch.stack(variance_rows).cpu() if variance_rows else None   # (B, N)
+    n = ce.shape[1]
     out: Dict[str, Any] = {"parameters": "after the spike step's update", "mode": "eval, one sequence at a time"}
-    finite_variance = torch.where(torch.isfinite(variance), variance, torch.full_like(variance, -math.inf))
-    flat = int(finite_variance.reshape(-1).argmax())
-    out["sigma_q_max"] = float(variance.reshape(-1)[flat])
-    out["sigma_q_max_at"] = [flat // n, flat % n]
-    out["sigma_q_nonfinite"] = int((~torch.isfinite(variance)).sum())
-    out["ce_at_sigma_q_max"] = float(ce.reshape(-1)[flat])
+    if variance is not None:
+        finite_variance = torch.where(torch.isfinite(variance), variance, torch.full_like(variance, -math.inf))
+        flat = int(finite_variance.reshape(-1).argmax())
+        out["sigma_q_max"] = float(variance.reshape(-1)[flat])
+        out["sigma_q_max_at"] = [flat // n, flat % n]
+        out["sigma_q_nonfinite"] = int((~torch.isfinite(variance)).sum())
+        out["ce_at_sigma_q_max"] = float(ce.reshape(-1)[flat])
+    else:
+        out["sigma_q_max"], out["sigma_q_max_at"], out["sigma_q_nonfinite"], out["ce_at_sigma_q_max"] = (
+            None, None, None, None)
     finite_ce = torch.where(torch.isnan(ce), torch.full_like(ce, -math.inf), ce)
     if torch.isfinite(finite_ce).any() or torch.isposinf(finite_ce).any():
         flat_ce = int(finite_ce.reshape(-1).argmax())
         out["ce_max"] = float(ce.reshape(-1)[flat_ce])
         out["ce_max_at"] = [flat_ce // n, flat_ce % n]
-        out["sigma_q_at_ce_max"] = float(variance.reshape(-1)[flat_ce])
+        out["sigma_q_at_ce_max"] = float(variance.reshape(-1)[flat_ce]) if variance is not None else None
         out["ce_mean"] = float(ce[~torch.isnan(ce)].mean())
     else:
         out["ce_max"], out["ce_max_at"], out["sigma_q_at_ce_max"], out["ce_mean"] = None, None, None, None
     return out
+
+
+def _row_square_sums(
+    grad: torch.Tensor,                    # (R, ...) a table gradient, rows along dim 0
+) -> torch.Tensor:                         # (R,) float64
+    r"""Per-row :math:`\sum_j g_{rj}^2` in float64, formed over blocks of at most ``UPDATE_NORM_CHUNK_ELEMENTS`` entries.
+
+    The float64 temporaries are one row block, about 32 MB, instead of two copies of the whole table (4.9 GB for the
+    live frame table; audit 2026-10-31 train-loop-lifecycle-5).
+    """
+    flat = grad.detach().flatten(1)                                          # (R, C)
+    if flat.shape[0] == 0:
+        return flat.new_zeros((0,), dtype=torch.float64)
+    rows_per_block = max(1, UPDATE_NORM_CHUNK_ELEMENTS // max(1, flat.shape[1]))
+    return torch.cat([flat[start:start + rows_per_block].to(torch.float64).square().sum(dim=1)
+                      for start in range(0, flat.shape[0], rows_per_block)])   # (R,)
 
 
 def _spike_attribution(
@@ -4779,7 +5222,7 @@ def _spike_attribution(
         if index is None or grad.dim() < 2:
             continue
         with torch.no_grad():
-            rows = grad.detach().flatten(1).to(torch.float64).square().sum(dim=1)              # (rows,)
+            rows = _row_square_sums(grad)                                                   # (rows,)
             k = min(_SPIKE_TOP_ROWS, rows.numel())
             top_sq, top_rows = rows.topk(k)
             entry: Dict[str, Any] = {"indexed_by": index, "rows": top_rows.cpu().tolist(),
@@ -4853,12 +5296,14 @@ def _spike_summary(report: Mapping[str, Any]) -> str:
     causes = "; ".join(report["causes"]) or "none identified"
     forward = report.get("forward_state")
     state = ""
-    if isinstance(forward, Mapping) and "sigma_q_max" in forward:
+    if isinstance(forward, Mapping) and forward.get("sigma_q_max") is not None:
         state = (f"; post-update forward: max sigma_q {forward['sigma_q_max']:.4g} at (batch, position) "
                  f"{tuple(forward['sigma_q_max_at'])}")
-        if forward.get("ce_max") is not None:
-            state += (f", max per-position CE {forward['ce_max']:.4g} at {tuple(forward['ce_max_at'])} "
-                      f"(batch mean {forward['ce_mean']:.4g})")
+    if isinstance(forward, Mapping) and forward.get("ce_max") is not None:
+        # A model without beliefs (the baseline) reports the CE part alone.
+        state += ((", " if state else "; post-update forward: ")
+                  + f"max per-position CE {forward['ce_max']:.4g} at {tuple(forward['ce_max_at'])} "
+                    f"(batch mean {forward['ce_mean']:.4g})")
     return f"{' | '.join(parts)}; top: {top}; coincident: {causes}{state}"
 
 
@@ -4902,7 +5347,13 @@ class _DivergenceMonitor:
     a spike has severity above 1. An event is *reported* (console line and forced metrics row; the return value of
     :meth:`observe`) at most once per ``DIVERGENCE_SPIKE_COOLDOWN`` steps, except that an event inside the cooldown
     whose severity exceeds ``DIVERGENCE_SPIKE_ESCALATION`` times that of the last reported one is reported too, so
-    the worst spike of a burst is never the one dropped.
+    the worst spike of a burst is never the one dropped. An event is *due an attribution* (:attr:`event_attributed`;
+    the caller attributes it when the step's update was accepted) when it is reported or when its severity exceeds that
+    of every event due one since the last report, so the worst event of a burst is attributed while a sustained shift,
+    an event on every step, attributes only its record-breaking steps (audit 2026-10-31 train-loop-lifecycle-5).
+
+    :meth:`rebaseline_loss` sets the loss EMA to a given loss; the training loop calls it on the update it accepts after
+    a run of ``loss_spike_skip_nats`` rejections (audit 2026-10-31 train-loop-lifecycle-1).
     """
 
     def __init__(self) -> None:
@@ -4912,11 +5363,22 @@ class _DivergenceMonitor:
         self._norm_seen: Dict[str, int] = {}
         self._last_spike: Optional[int] = None
         self._last_severity: Optional[float] = None
+        self._attributed_peak: Optional[float] = None  # largest severity due an attribution since the last report
         self.spike_roles: Tuple[str, ...] = ()
         self.spike_loss = False
         self.event: Optional[str] = None               # this step's spike description, reported or not
         self.event_severity: float = float("nan")
+        self.event_attributed = False                  # this step's event is due an attribution
         self.reset_interval()
+
+    def rebaseline_loss(
+        self,
+        loss: float,                       # the loss of the update accepted after the rejections
+    ) -> None:
+        r"""Set the loss EMA to ``loss`` (a finite value), :math:`\bar\ell \leftarrow \ell`, ending the frozen state a
+        level shift leaves; the warmup count is unchanged."""
+        if math.isfinite(loss):
+            self._loss_ema = float(loss)
 
     def loss_skip_threshold(
         self,
@@ -4987,6 +5449,7 @@ class _DivergenceMonitor:
             self._loss_seen += 1
         self.event = "; ".join(reasons) if reasons else None
         self.event_severity = severity if reasons else float("nan")
+        self.event_attributed = False
         if not reasons:
             return None
         # Read by the spike attribution: the roles over their EMA, and whether the loss spiked too.
@@ -4995,7 +5458,11 @@ class _DivergenceMonitor:
         outside_cooldown = self._last_spike is None or step - self._last_spike >= DIVERGENCE_SPIKE_COOLDOWN
         escalated = (self._last_severity is not None
                      and severity > DIVERGENCE_SPIKE_ESCALATION * self._last_severity)
-        if outside_cooldown or escalated:
+        reported = outside_cooldown or escalated
+        if reported or self._attributed_peak is None or severity > self._attributed_peak:
+            self.event_attributed = True
+            self._attributed_peak = severity
+        if reported:
             self._last_spike = step
             self._last_severity = severity
             return self.event
@@ -5050,6 +5517,7 @@ class _DivergenceMonitor:
             "norm_seen":  dict(self._norm_seen),
             "last_spike": self._last_spike,
             "last_severity": self._last_severity,
+            "attributed_peak": self._attributed_peak,   # absent before audit 2026-10-31 (train-loop-lifecycle-5)
             "interval": {
                 "steps":   source.steps,
                 "loss":    stat(source._loss),
@@ -5083,6 +5551,7 @@ class _DivergenceMonitor:
         self._norm_ema, self._norm_seen = dict(monitor["norm_ema"]), dict(monitor["norm_seen"])
         self._last_spike = monitor["last_spike"]
         self._last_severity = monitor.get("last_severity")
+        self._attributed_peak = monitor.get("attributed_peak")
         self.steps = interval["steps"]
         self._loss = stat(interval["loss"], interval["loss_values"], keep=True)
         self._ce = stat(interval["ce"], interval["ce_values"], keep=True)
@@ -5140,6 +5609,11 @@ def _divergence_monitor_state(
             or (last_spike is not None and out["last_spike"] is None)
             or (last_severity is not None and out["last_severity"] is None) or not isinstance(interval, Mapping)):
         return None
+    # Absent before audit 2026-10-31 (train-loop-lifecycle-5): the burst peak restarts at the last reported severity.
+    attributed_peak = value.get("attributed_peak")
+    out["attributed_peak"] = out["last_severity"] if attributed_peak is None else _real(attributed_peak)
+    if attributed_peak is not None and out["attributed_peak"] is None:
+        return None
     norms = interval.get("norms")
     if not isinstance(norms, Mapping):
         return None
@@ -5178,13 +5652,15 @@ def _divergence_checkpoint_record(
     last_group_norms:  Mapping[str, float],      # pre-clip group norms of the last logged step
     failed_step_skips: int = 0,                  # steps skipped under max_failed_step_skips (whole run)
     loss_spike_rejections: int = 0,              # updates rejected under loss_spike_skip_nats (whole run)
+    consecutive_loss_spike_rejections: int = 0,  # the current run of them (audit 2026-10-31 train-loop-lifecycle-1)
 ) -> Dict[str, Any]:
     r"""The checkpoint's ``divergence_monitor`` entry: the monitor state plus the host counters beside it."""
     return {"schema": DIVERGENCE_STATE_SCHEMA,
             "monitor": divergence.state_dict(interval_ends=interval_ends),
             "skipped_steps": int(skipped_steps), "consecutive_skips": int(consecutive_skips),
             "last_group_norms": {str(key): float(norm) for key, norm in last_group_norms.items()},
-            "failed_step_skips": int(failed_step_skips), "loss_spike_rejections": int(loss_spike_rejections)}
+            "failed_step_skips": int(failed_step_skips), "loss_spike_rejections": int(loss_spike_rejections),
+            "consecutive_loss_spike_rejections": int(consecutive_loss_spike_rejections)}
 
 
 def _checkpoint_divergence_state(
@@ -5205,8 +5681,10 @@ def _checkpoint_divergence_state(
     group_norms = {key: _real(norm) for key, norm in norms.items()}
     if not all(isinstance(key, str) and norm is not None for key, norm in group_norms.items()):
         return None
-    # Counters added by audit 2026-10-17 items 16 and 17; an older record carries none (0).
-    extras = {key: _count(value.get(key, 0)) for key in ("failed_step_skips", "loss_spike_rejections")}
+    # Counters added by audit 2026-10-17 items 16 and 17 and audit 2026-10-31 (the current run of loss-spike
+    # rejections); an older record carries none (0).
+    extras = {key: _count(value.get(key, 0)) for key in ("failed_step_skips", "loss_spike_rejections",
+                                                          "consecutive_loss_spike_rejections")}
     return {"schema": DIVERGENCE_STATE_SCHEMA, "monitor": monitor, "skipped_steps": skipped,
             "consecutive_skips": consecutive, "last_group_norms": group_norms,
             **{key: (count if count is not None else 0) for key, count in extras.items()}}
@@ -5596,12 +6074,9 @@ def _train_loop(
     # CONFIGURED per-group LRs, captured before any scheduler multiplier or resume-load mutates group['lr'].
     base_lrs = [g["lr"] for g in optimizer.param_groups]
     if artifacts is not None:
-        artifacts.scheduler_base_lrs = [float(value) for value in base_lrs]
-        artifacts.scheduler_group_roles = [
-            str(group.get("lr_report_role") or group.get("lr_aux_role")
-                or group.get("role") or f"group_{index}")
-            for index, group in enumerate(optimizer.param_groups)
-        ]
+        # Bases, role labels (the decode bank named apart) and table Fisher markers for summary.json's scheduler block.
+        from vfe3.run_artifacts import record_scheduler_groups
+        record_scheduler_groups(artifacts, model, optimizer, base_lrs)
     # Opt-in RESUME (PL8): an explicit resume_from arg, else cfg.resume_from, else from scratch. When set,
     # restore model weights + AdamW momentum + RNG from the checkpoint and rebuild the cosine LambdaLR at
     # the persisted successful-update count so a rejected update does not consume schedule progress.
@@ -5682,8 +6157,8 @@ def _train_loop(
     # (audit 2026-06-09 IE3).
     scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))
     # Train steps can replay on the precision ladder (_train_step_with_precision_retry): a reduced fp32 matmul
-    # policy without the fp16 GradScaler.
-    precision_ladder = torch.get_float32_matmul_precision() != "highest" and not scaler.is_enabled()
+    # policy, with or without the fp16 GradScaler (audit 2026-10-31 gap-mixed-precision-routes-6).
+    precision_ladder = torch.get_float32_matmul_precision() != "highest"
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
@@ -5797,9 +6272,15 @@ def _train_loop(
     }
     failed_step_skips = 0            # strictest-rung failures skipped under max_failed_step_skips (item 16)
     loss_spike_rejections = 0         # updates rejected under loss_spike_skip_nats (item 17)
+    loss_spike_run = 0                # consecutive updates loss_spike_skip_nats rejected; an accepted update resets it
     max_failed_skips: Optional[int] = getattr(cfg, "max_failed_step_skips", None)
     max_consecutive: Optional[int] = getattr(cfg, "max_consecutive_skips", None)
     loss_spike_margin: Optional[float] = getattr(cfg, "loss_spike_skip_nats", None)
+    # The run length after which the next update is accepted and re-baselines the loss EMA (audit 2026-10-31
+    # train-loop-lifecycle-1). A smaller max_consecutive_skips aborts at that length first; a resume from its
+    # checkpoint, which carries the run, then makes the re-baselining update.
+    loss_spike_rebaseline_after = (LOSS_SPIKE_REBASELINE_REJECTIONS if max_consecutive is None
+                                   else min(LOSS_SPIKE_REBASELINE_REJECTIONS, max_consecutive))
     # A resumed run continues the monitor, the skip counters and the last logged group norms from the
     # checkpoint, so its spikes and divergence columns match the uninterrupted run (audit 2026-10-16 F77).
     # An older checkpoint carries none: the monitor restarts and spikes wait for DIVERGENCE_EMA_WARMUP steps.
@@ -5813,6 +6294,7 @@ def _train_loop(
         last_group_norms.update(resumed_divergence["last_group_norms"])
         failed_step_skips = int(resumed_divergence.get("failed_step_skips", 0))
         loss_spike_rejections = int(resumed_divergence.get("loss_spike_rejections", 0))
+        loss_spike_run = int(resumed_divergence.get("consecutive_loss_spike_rejections", 0))
     elif start_step > 0:
         logger.info(" resume: the checkpoint carries no divergence-monitor state; spike detection restarts "
                     "and waits %d finite steps", DIVERGENCE_EMA_WARMUP)
@@ -6087,7 +6569,8 @@ def _train_loop(
         artifacts.divergence_state = _divergence_checkpoint_record(
             divergence, interval_ends=interval_ends, skipped_steps=skipped_steps,
             consecutive_skips=consecutive_skips, last_group_norms=last_group_norms,
-            failed_step_skips=failed_step_skips, loss_spike_rejections=loss_spike_rejections)
+            failed_step_skips=failed_step_skips, loss_spike_rejections=loss_spike_rejections,
+            consecutive_loss_spike_rejections=loss_spike_run)
 
     def _emergency_checkpoint(record: Dict[str, Any]) -> None:
         r"""Write a resumable checkpoint of the crashed loop when its state is a step boundary (item 4)."""
@@ -6103,7 +6586,7 @@ def _train_loop(
         elif phase == "post_step":
             saved_step, batches, rng = int(index) + 1, batches_consumed, None
             if crash_state["eval_rng"] is not None:
-                rng = {"cpu": crash_state["eval_rng"], "cuda": None}   # the stream the eval block hands back
+                rng = crash_state["eval_rng"]                # the streams the eval block hands back
         else:
             record["checkpoint_reason"] = ("the optimizer update of the failing step had started and the step did "
                                            "not return, so the in-memory state is not a step boundary")
@@ -6284,6 +6767,7 @@ def _train_loop(
                     # As for _gauge_diag below: a skipped step never reaches the table step, so the previous
                     # row's values must not be reported for it (audit 2026-10-10 round 2, item 37).
                     optimizer._table_diag = {}
+                    optimizer._decode_diag = {}
             if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: sparse log/eval diagnostics
                 optimizer._collect_gauge_diag = bool(do_log or do_csv or do_eval)
                 if optimizer._collect_gauge_diag:
@@ -6293,18 +6777,26 @@ def _train_loop(
             if do_log or do_csv:                                 # off the hot path (audit 2026-07-05 m8)
                 # m7: diagnostics on the PRE-step weights so the logged F-decomposition shares the pre-step
                 # provenance of train_loss/train_ce (train_ce is captured pre-step inside train_step). Under
-                # no_grad, so no weight change,
-                # leaving the train_step RNG stream and weights byte-identical.
+                # no_grad (no weight change), on the evaluation-mode model (no dropout or frame-drop mask is drawn),
+                # and with the CPU and device RNG streams restored by _diagnostics_with_precision_retry, so the
+                # train_step RNG stream and weights stay byte-identical (audit 2026-10-31, evaluation-metrics-1).
                 peak_memory.begin_other()
                 _t0 = _synced_ms(device)
                 # Prototype-template statistics of the same diagnostic forward on the training batch
                 # (diagnostics/prototype_templates_train.csv); the eval-cadence file alone missed a collapse
                 # that finished inside the first eval interval (docs/experiments/2026-10-09).
                 train_features: Optional[Dict[str, Any]] = {} if do_csv else None
-                wrapped_templates = (_wrap_prototype_blocks(model, train_features)
-                                     if train_features is not None else [])
+                wrapped_templates, begin_templates = (_wrap_prototype_blocks(model, train_features)
+                                                      if train_features is not None else ([], None))
                 diag_failed = False
                 prototype_sums = (train_features or {}).get("prototype")
+
+                def _restart_templates() -> None:                # every attempt is one forward pass
+                    if prototype_sums is not None:
+                        prototype_sums.clear()
+                    if begin_templates is not None:
+                        begin_templates()
+
                 try:
                     # The precision ladder of evaluate (audit 2026-10-10 round 2, item 10); a replay restarts the
                     # prototype sums so a failed attempt is not counted.
@@ -6312,8 +6804,7 @@ def _train_loop(
                         model.last_router_head_tables = None
                     if hasattr(model, "last_belief_layer_extremes"):
                         model.last_belief_layer_extremes = None
-                    d = _diagnostics_with_precision_retry(
-                        model, tokens, before_attempt=(prototype_sums.clear if prototype_sums is not None else None))
+                    d = _diagnostics_with_precision_retry(model, tokens, before_attempt=_restart_templates)
                     router_head_tables = getattr(model, "last_router_head_tables", None)
                     belief_layer_extremes = getattr(model, "last_belief_layer_extremes", None)
                 except Exception as exc:                         # optional probes cannot stop training
@@ -6349,7 +6840,13 @@ def _train_loop(
                     and cfg.eval_stride < cfg.max_seq_len):
                 peak_memory.begin_other()
                 _t0 = _synced_ms(device)
-                gap_train_ce = _eval_protocol_train_ce(model, tokens, targets, cfg.eval_stride)
+                try:
+                    gap_train_ce = _eval_protocol_train_ce(model, tokens, targets, cfg.eval_stride)
+                except Exception as exc:                         # optional probes cannot stop training
+                    # Counted like every other diagnostic (audit 2026-10-31 train-loop-lifecycle-4); the row's gap is
+                    # then NaN, not the disjoint-window train_ce of another protocol.
+                    _record_diagnostic_failure(diagnostics_failures, "eval_protocol_train_ce", exc, logger)
+                    gap_train_ce = float("nan")
                 phase_ms["eval_gap_train_ms"] = _synced_ms(device) - _t0
                 peak_memory.end_other()
             # Named-group update ratios (audit 2026-09-28): host copies of the pre-step parameters on a
@@ -6376,9 +6873,14 @@ def _train_loop(
             step_raw_lrs = scheduler.get_last_lr()
             step_table_fisher_lrs = _table_fisher_learning_rates(optimizer)
             # loss_spike_skip_nats (audit 2026-10-17 item 17): the threshold is the monitor's loss EMA before this step
-            # plus the margin, a host float, so the step reads it against the loss it already transfers.
+            # plus the margin, a host float, so the step reads it against the loss it already transfers. After
+            # loss_spike_rebaseline_after consecutive rejections the step runs without it and its loss re-baselines the
+            # EMA, so a level shift left by an accepted update cannot reject every later update (audit 2026-10-31
+            # train-loop-lifecycle-1).
+            rebaseline_run = (loss_spike_run if loss_spike_margin is not None
+                              and loss_spike_run >= loss_spike_rebaseline_after else 0)
             loss_threshold = (divergence.loss_skip_threshold(loss_spike_margin)
-                              if loss_spike_margin is not None else None)
+                              if loss_spike_margin is not None and not rebaseline_run else None)
             failed_skip = False
             try:
                 step_loss, replays = _train_step_with_precision_retry(
@@ -6389,7 +6891,8 @@ def _train_loop(
                     scaler=scaler, metrics_out=step_metrics, status_out=step_status,
                     **({"frame_projection_out": frame_projection_counter}
                        if frame_projection_counter is not None else {}),
-                    **({"loss_skip_threshold": loss_threshold} if loss_threshold is not None else {}))
+                    **({"loss_skip_threshold": loss_threshold} if loss_threshold is not None else {}),
+                    **({"phase_mark": timer.mark} if timer is not None else {}))
             except Exception as exc:
                 # max_failed_step_skips (audit 2026-10-17 item 16): a failure that persisted to the strictest rung
                 # before any optimizer update is skipped like a rejected update, up to the configured count.
@@ -6403,7 +6906,7 @@ def _train_loop(
                 for out in (step_metrics, step_status):
                     if out is not None:
                         out.clear()
-                for name in ("_table_diag", "_gauge_diag"):
+                for name in ("_table_diag", "_decode_diag", "_gauge_diag"):
                     if hasattr(optimizer, name):
                         setattr(optimizer, name, {})
                 step_status.update(did_step=False, nonfinite_skip=False, failed_step_skip=True, ce=float("nan"),
@@ -6432,10 +6935,13 @@ def _train_loop(
             precision_replays += int(replays > 0)
             if step_status.get("loss_spike_skip"):
                 loss_spike_rejections += 1
+                loss_spike_run += 1
                 if loss_spike_rejections == 1:
                     logger.warning("step %d: update rejected by loss_spike_skip_nats=%g (loss %.4f above the "
                                    "threshold %.4f); further rejections are counted in loss_spike_rejected_updates",
                                    step + 1, loss_spike_margin, step_loss, loss_threshold)
+            elif step_status.get("did_step"):
+                loss_spike_run = 0                                # other rejections leave the run as it stands
             if replay_records and artifacts is not None:
                 try:
                     _append_replay_records(artifacts.run_dir, replay_records)
@@ -6467,6 +6973,7 @@ def _train_loop(
             # of one sweep are compared at different effective budgets and different points on the LR
             # schedule (the scheduler clocks on accepted updates). Free: status_out["did_step"] is
             # already returned every step.
+            consecutive_abort: Optional[str] = None
             if step_status["did_step"]:
                 consecutive_skips = 0
             else:
@@ -6483,24 +6990,33 @@ def _train_loop(
                         step + 1, consecutive_skips, skipped_steps, step + 1)
                 if max_consecutive is not None and consecutive_skips >= max_consecutive:
                     # Audit 2026-10-17 item 16: abort through the crash path, which records the failure and writes a
-                    # resumable checkpoint of this (post-step) state.
-                    raise ConsecutiveSkipAbort(
+                    # resumable checkpoint of this (post-step) state. Raised below, once the monitor, its spike record
+                    # and the occurrence table have taken this step, so the checkpoint's monitor and skip counters
+                    # describe the same S + 1 steps (audit 2026-10-31 train-loop-lifecycle-3).
+                    consecutive_abort = (
                         f"{consecutive_skips} consecutive rejected updates at step {step + 1} reached "
                         f"max_consecutive_skips={max_consecutive} ({skipped_steps} rejected of {step + 1} so far)")
             # Divergence monitor (audit 2026-10-10 round 2, item 1), on host values only. A spike is logged and
             # forces a metrics row at this step.
             spike = divergence.observe(step + 1, step_loss, step_status)
+            if rebaseline_run and step_status["did_step"]:
+                divergence.rebaseline_loss(step_loss)
+                logger.warning("step %d: %d consecutive updates were rejected by loss_spike_skip_nats=%g; this update "
+                               "was accepted without the threshold and the loss EMA re-baselined to its loss %.4f",
+                               step + 1, rebaseline_run, loss_spike_margin, step_loss)
             spike_groups: Dict[str, float] = {}
             if divergence.event is not None:
-                # Every event is attributed and recorded in divergence_spikes.jsonl; only a reported one (outside the
-                # cooldown, or 10x the last reported severity) logs to the console and forces a row (item 15).
+                # Every event is recorded in divergence_spikes.jsonl; only a reported one (outside the cooldown, or 10x
+                # the last reported severity) logs to the console and forces a row (item 15). A reported event, or one
+                # above the severity of every event due an attribution since the last report, is attributed; the others
+                # of a sustained shift are recorded without it (audit 2026-10-31 train-loop-lifecycle-5).
                 reported = spike is not None
                 event_record = {"step": step + 1, "spike": divergence.event, "reported": reported,
                                 "severity": divergence.event_severity,
                                 "spiking_roles": list(divergence.spike_roles), "loss": step_loss}
                 if reported:
                     logger.warning("step %d: divergence spike: %s \n\n", step + 1, spike)
-                if step_status["did_step"]:                      # a rejected update dropped its gradients
+                if step_status["did_step"] and divergence.event_attributed:   # a rejected update dropped its gradients
                     try:
                         report = _spike_attribution(
                             model, optimizer, step_status, tokens,
@@ -6528,8 +7044,10 @@ def _train_loop(
                     if artifacts is not None:
                         try:
                             _append_spike_record(artifacts.run_dir, {
-                                **event_record, "attribution": "unavailable: the update was rejected and its "
-                                                               "gradients dropped"})
+                                **event_record, "attribution": (
+                                    "unavailable: the update was rejected and its gradients dropped"
+                                    if not step_status["did_step"] else
+                                    "skipped: unreported and not above the largest severity since the last report")})
                         except Exception as exc:
                             _record_diagnostic_failure(diagnostics_failures, "divergence_spike_attribution", exc,
                                                        logger)
@@ -6540,6 +7058,8 @@ def _train_loop(
             if step_metrics is not None:                         # the reference for "x its last logged norm"
                 last_group_norms.update({column[len("grad_norm_group_"):]: float(step_metrics[column])
                                          for column in _GRAD_GROUP_COLUMNS if column in step_metrics})
+            if consecutive_abort is not None:
+                raise ConsecutiveSkipAbort(consecutive_abort)
             forced_row = (not do_csv and artifacts is not None and timer is not None and spike is not None)
             if forced_row:
                 # Nothing was collected before the step: the pre-step diagnostics are blank on this row.
@@ -6592,19 +7112,20 @@ def _train_loop(
             if do_eval:
                 # RNG ISOLATION (audit 2026-08-06 F30). Everything in this block that builds a DataLoader
                 # iterator -- ``evaluate`` below and ``_val_diagnostics`` further down -- draws a
-                # base_seed from the GLOBAL CPU RNG, and the TRAIN loader's RandomSampler draws every
-                # epoch permutation from that same stream (datasets.py:686-687). So without this, two
-                # runs with the same seed but different eval cadences see different data orders from the
-                # first epoch boundary onward, and eval_interval silently becomes a training
-                # hyperparameter. Sampling and figure generation are inside the guard for the same
-                # reason. The resume path already applies exactly this snapshot/restore (:1612).
+                # base_seed from the GLOBAL CPU RNG, and a train loader whose RandomSampler has no generator
+                # of its own (make_dataloader(generator=None)) draws every epoch permutation from that same
+                # stream. So without this, two runs with the same seed but different eval cadences would see
+                # different data orders from the first epoch boundary onward, and eval_interval would silently
+                # become a training hyperparameter. The launchers' train loaders shuffle with their own
+                # generator, which this block never draws from. Sampling and figure generation are inside the
+                # guard for the same reason. The resume path applies the same snapshot/restore.
                 #
-                # CPU only, matching that precedent: the permutation is a CPU draw, and reading the CUDA
-                # state costs a host sync per eval. INERT on every run currently on disk -- at
-                # max_steps=10000 on wikitext-103 the run covers 0.26 epochs, so no boundary is reached
-                # and no permutation is ever redrawn.
+                # The CUDA generators are handed back as well (audit 2026-10-31, train-loop-lifecycle-8): a device
+                # draw in this block would otherwise move every later device draw of training. Reading their
+                # state copies a host-held seed and offset, as the per-step crash-state capture does.
                 eval_cpu_rng = torch.get_rng_state().clone()
-                crash_state["eval_rng"] = eval_cpu_rng
+                eval_cuda_rng = _cuda_rng_states()
+                crash_state["eval_rng"] = {"cpu": eval_cpu_rng, "cuda": eval_cuda_rng}
                 peak_memory.begin_other()
                 last_ema_val = None
                 if weight_ema is not None and weight_ema.active:
@@ -6725,8 +7246,9 @@ def _train_loop(
                             diagnostics_failures["best_model_save"] = (
                                 diagnostics_failures.get("best_model_save", 0) + 1)
                         # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0
-                        # of the held-out batch). Kept at EVAL cadence (one grid per eval, not per log),
-                        # and guarded so replay errors remain nonfatal (audit 2026-07-01 F11).
+                        # of the held-out batch, read from its snapshot; audit 2026-10-31 training-diagnostics-7).
+                        # Kept at EVAL cadence (one grid per eval, not per log), and guarded so errors remain
+                        # nonfatal (audit 2026-07-01 F11).
                         if validation_diagnostics is not None:
                             try:
                                 _save_eval_attention_maps(
@@ -6735,10 +7257,11 @@ def _train_loop(
                                     artifacts,
                                     logger,
                                     step=step + 1,
+                                    snapshot=validation_diagnostics.snapshot,
                                 )
                             except Exception as exc:
                                 terminal_validation_signature = None
-                                logger.warning("       (attention-map replay failed: %s); continuing", exc)
+                                logger.warning("       (attention maps failed: %s); continuing", exc)
                     finally:
                         # This loop-local otherwise retains the dense held-out logits and frozen clone
                         # until the next evaluation overwrites it. Release after the final consumer on
@@ -6772,6 +7295,7 @@ def _train_loop(
                                     "generalization gap (val CE - train sample CE): %.4f nats",
                                     sample_ppl, gap_fixed)
                 torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
+                _set_cuda_rng_states(eval_cuda_rng)          # and the device streams
                 crash_state["eval_rng"] = None
                 peak_memory.end_other()
 
@@ -6805,6 +7329,8 @@ def _train_loop(
                 except Exception as exc:
                     logger.warning("       (checkpoint save at step %d failed: %s); training "
                                    "continues, next checkpoint retries", step + 1, exc)
+                    # Counted for summary.json, beside last_checkpoint_step (audit 2026-10-31 artifacts-resume-4).
+                    diagnostics_failures["checkpoint_save"] = diagnostics_failures.get("checkpoint_save", 0) + 1
                 checkpoint_ms_pending.append((time.perf_counter() - _t0) * 1000.0)
 
             # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
@@ -6877,8 +7403,9 @@ def _train_loop(
                                   head_tables=router_head_tables, sink=warning_sink)
                 _warn_covariance_collapse(d, dead_router_warned, logger, sink=warning_sink)
                 if do_csv and vfe_model:
-                    if floor_reference is None:
-                        floor_reference = _covariance_floor_reference(model)
+                    # Read at every row: the prior variance table is trained, so its floor moves (audit 2026-10-31
+                    # training-diagnostics-3).
+                    floor_reference = _covariance_floor_reference(model)
                     _warn_eigenvalue_collapse(d, dead_router_warned, logger,
                                               belief_layer=int(getattr(cfg, "n_layers", 1)) - 1,
                                               floor_reference=floor_reference, sink=warning_sink,
@@ -6996,6 +7523,13 @@ def _train_loop(
                             if step_metrics is not None
                             else float("nan")
                         )
+                if (getattr(cfg, "phi_frame_condition_max", None) is not None
+                        and getattr(getattr(model, "group", None), "name", None) in FRAME_CONDITION_GROUPS):
+                    # The frame bound's load on this step: rows the screen flagged and rows it decomposed (audit
+                    # 2026-10-31, frame-optimizers-2); NaN on a step that made no update.
+                    for _pk in FRAME_BOUND_STAT_KEYS:
+                        row[_pk] = float(step_metrics.get(_pk, float("nan")) if step_metrics is not None
+                                         else float("nan"))
                 # Pullback-group M-step diagnostics use a fixed key set from the first logged row. The
                 # optimizer computes and host-reduces them only on this gated log/eval attempt; missing
                 # active rows emit NaN placeholders so metrics.csv remains rectangular. Plain AdamW has
@@ -7005,12 +7539,18 @@ def _train_loop(
                     for _pk in TABLE_FISHER_DIAGNOSTIC_KEYS:
                         row[_pk] = _td.get(_pk, float("nan"))
                     if not forced_row:
-                        # Second collapse alarm: the realized table step norm falling 100x in one interval (item 14).
-                        current = _finite_or_none(row.get("table_fisher_step_norm_mean"))
+                        # Second collapse alarm: the unscheduled table step norm falling 100x in one interval (item 14).
+                        current = _finite_or_none(row.get(TABLE_STEP_COLLAPSE_KEY))
                         _warn_table_step_collapse(last_table_step_norm, current, logger, step=step + 1,
                                                   sink=warning_sink)
                         if current is not None:
                             last_table_step_norm = current
+                if hasattr(optimizer, "_decode_diag") and any(
+                        group is not None for group in optimizer._decode_fisher_groups()):
+                    # m_decode_update_mode='fisher': the decode bank's step health (audit 2026-10-31, tables-families-6).
+                    _dd = {} if forced_row else (optimizer._decode_diag or {})
+                    for _pk in DECODE_FISHER_DIAGNOSTIC_KEYS:
+                        row[_pk] = _dd.get(_pk, float("nan"))
                 if hasattr(optimizer, "_gauge_diag"):
                     _gd = {} if forced_row else (optimizer._gauge_diag or {})
                     if any(group.get("pullback_group", False) for group in optimizer.param_groups):
@@ -7065,7 +7605,7 @@ def _train_loop(
                     row.update(_sigma_log_statistics(model))
                 except Exception as exc:
                     _record_diagnostic_failure(diagnostics_failures, "sigma_log_statistics", exc, logger)
-                    row.update({"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")})
+                    row.update({column: float("nan") for column in SIGMA_LOG_COLUMNS})
                 # The decode table's variance margin (decode_av_precision's gauge; NaN under the linear readout).
                 try:
                     row.update(_decode_variance_statistics(model))
@@ -7126,6 +7666,9 @@ def _train_loop(
                 row["pipeline_tokens_per_s"]   = pipeline_timing.pipeline_tokens_per_s
                 row["tokens_per_s"]            = pipeline_timing.pipeline_tokens_per_s
                 row["wall_clock_s"]            = pipeline_timing.wall_clock_s
+                # TRAIN_STEP_PHASE_COLUMNS: a phase no step of the window marked took no time (0.0).
+                row.update({column: train_timing.phase_ms_mean.get(phase, 0.0)
+                            for phase, column in TRAIN_STEP_PHASE_COLUMNS.items()})
                 phase_ms["log_row_ms"] = _synced_ms(device) - _row_t0
                 row.update({column: phase_ms.get(column, float("nan")) for column in LOG_TIMING_COLUMNS})
                 row.update(divergence.columns(step_status, flagged=spike is not None))
@@ -7171,7 +7714,8 @@ def _train_loop(
         artifacts.divergence_state = _divergence_checkpoint_record(
             divergence, interval_ends=False, skipped_steps=skipped_steps,
             consecutive_skips=consecutive_skips, last_group_norms=last_group_norms,
-            failed_step_skips=failed_step_skips, loss_spike_rejections=loss_spike_rejections)
+            failed_step_skips=failed_step_skips, loss_spike_rejections=loss_spike_rejections,
+            consecutive_loss_spike_rejections=loss_spike_run)
         try:
             artifacts.numerics_counters_state = {
                 **(_frame_projection_state(frame_projection_counter, frame_projection_base,
@@ -7186,9 +7730,11 @@ def _train_loop(
         # checkpoint_at_end (audit 2026-10-17 item 48): a resumable checkpoint of the final iterate, unless the periodic
         # cadence just wrote this step. Off by default, since each checkpoint holds the optimizer moments (several GB
         # at the live scale). A failed periodic save of the final step does not count as written: the end save
-        # retries it (audit 2026-10-28 F02).
+        # retries it (audit 2026-10-28 F02). A terminal callback publishes the terminal checkpoint itself (PB-02; the
+        # validation-only finalizer writes it after validation with the best bundle it selected), so the loop does not
+        # write the same step_<n>.pt first (audit 2026-10-31 train-loop-lifecycle-6).
         if (getattr(cfg, "checkpoint_at_end", False) and getattr(artifacts, "save_model_artifacts", False)
-                and n_steps > start_step and last_checkpoint_step != n_steps):
+                and n_steps > start_step and last_checkpoint_step != n_steps and terminal_callback is None):
             _t0 = time.perf_counter()
             try:
                 artifacts.save_checkpoint(n_steps, model, optimizer, cfg, scaler=scaler,
@@ -7198,6 +7744,7 @@ def _train_loop(
                             (time.perf_counter() - _t0) * 1000.0)
             except Exception as exc:
                 logger.warning(" end-of-run checkpoint at step %d failed: %s", n_steps, exc)
+                diagnostics_failures["checkpoint_save"] = diagnostics_failures.get("checkpoint_save", 0) + 1
     # Realized-vs-configured update accounting (audit 2026-08-06 F5), handed to finalize_run through
     # the artifacts object because train() returns only `losses`. Built before the terminal callback,
     # so the ablation finalizer (finalize_validation_run) publishes it too (audit 2026-10-12 round 2,
@@ -7255,8 +7802,8 @@ def _train_loop(
     # the parameters, gradients and AdamW moments are still resident doubles the parameter footprint
     # at the end of the run (a likely OOM for vocabulary-sized tables); load_state_dict copies it back.
     if terminal_callback is not None:
-        raw_model_state = {name: tensor.detach().to("cpu", copy=True)
-                           for name, tensor in model.state_dict().items()}
+        from vfe3.run_artifacts import _host_state_copy          # a tied block MLP's aliases share one host copy
+        raw_model_state = _host_state_copy(model.state_dict())
         rng_state: Dict[str, object] = {
             "cpu":  torch.get_rng_state().clone(),
             "cuda": ([s.clone() for s in torch.cuda.get_rng_state_all()]

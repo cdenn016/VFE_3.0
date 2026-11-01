@@ -16,7 +16,10 @@ The averaged weights are scored with :func:`vfe3.train.evaluate` on the run's id
 streams (:func:`vfe3.posthoc.streams.resolve_stream`), at the run's ``max_seq_len`` and ``eval_stride`` with the
 padded final window, as the run's loaders score them (:func:`vfe3.posthoc.evaluate.protocol_evaluate`). The result is
 written to ``<run_dir>/averaged_eval.json`` (or another new file); no existing artifact of the run is modified. On
-the CPU every batched LU-family call runs under one thread (:mod:`vfe3.cpu_linalg`, audit 2026-10-20 item 28).
+the CPU every batched LU-family call runs under one thread (:mod:`vfe3.cpu_linalg`, audit 2026-10-20 item 28). The
+report names the step of every input (a step checkpoint's own; for ``best_model.pt`` and ``final_model.pt``, which
+carry none, the ``best_step`` and ``evaluated_step`` of ``summary.json``) and lists the inputs whose states are bitwise
+equal, which a uniform average counts more than once (audit 2026-10-31 A382).
 
 Polyak and Juditsky (1992) and Izmailov et al. (UAI 2018) give the rationale: a uniform average of late iterates
 cancels the zero-mean noise of a learning-rate-dominated tail while keeping its drift.
@@ -28,7 +31,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -102,6 +105,54 @@ def check_compatible(
                                  f"{names[0]} has {tuple(tensor.shape)} {tensor.dtype}")
 
 
+def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    r"""Whether two tensors hold the same bytes (so NaN equals the same NaN and -0.0 differs from 0.0)."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    return torch.equal(a.detach().cpu().contiguous().reshape(-1).view(torch.uint8),
+                       b.detach().cpu().contiguous().reshape(-1).view(torch.uint8))
+
+
+def bitwise_equal_groups(
+    states: Sequence[Mapping[str, torch.Tensor]],
+    names:  Sequence[str],
+) -> list[list[str]]:                            # groups of two or more names, in listed order
+    r"""Groups of the listed checkpoints whose state dicts are bitwise equal, tensor by tensor (the same key set).
+
+    A uniform average weights each group's iterate by its size, and a single group of all inputs averages one
+    iterate with itself; for example ``best_model.pt`` equals ``final_model.pt`` when the best validation is the last.
+    """
+    groups: list[list[str]] = []
+    representatives: list[Mapping[str, torch.Tensor]] = []
+    for name, state in zip(names, states):
+        for group, representative in zip(groups, representatives):
+            if set(state) == set(representative) and all(_bitwise_equal(state[key], representative[key])
+                                                         for key in representative):
+                group.append(str(name))
+                break
+        else:
+            groups.append([str(name)])
+            representatives.append(state)
+    return [group for group in groups if len(group) > 1]
+
+
+def _summary_steps(run_dir: Path) -> Dict[str, Tuple[Optional[int], str]]:
+    r"""The steps ``summary.json`` records for the bundles that carry none: ``best_step`` for ``best_model.pt`` and
+    ``evaluated_step`` for ``final_model.pt`` (empty when the summary is absent or unreadable)."""
+    try:
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(summary, Mapping):
+        return {}
+    out: Dict[str, Tuple[Optional[int], str]] = {}
+    for name, key in (("best_model.pt", "best_step"), ("final_model.pt", "evaluated_step")):
+        step = summary.get(key)
+        if isinstance(step, int) and not isinstance(step, bool):
+            out[name] = (int(step), f"summary.json {key}")
+    return out
+
+
 def average_model_states(states: Sequence[Mapping[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     r"""The uniform average :math:`\frac1n\sum_c\theta_c` of every floating tensor; others from the last state.
 
@@ -149,9 +200,24 @@ def run_checkpoint_average(
     names = [str(name) for name in options.checkpoints]
     check_compatible(states, configs, names)
     averaged = average_model_states(states)
-    steps = {name: _bundle_step(path) for name, path in zip(names, paths)}
+    identical = bitwise_equal_groups(states, names)
+    # A step checkpoint carries its step; best_model.pt and final_model.pt carry none, and summary.json records them.
+    recorded_steps = _summary_steps(run_dir)
+    steps: Dict[str, Optional[int]] = {}
+    step_sources: Dict[str, Optional[str]] = {}
+    for name, path in zip(names, paths):
+        step = _bundle_step(path)
+        source = "bundle step" if step is not None else None
+        if step is None and path.parent == run_dir and path.name == name and name in recorded_steps:
+            step, source = recorded_steps[name]
+        steps[name], step_sources[name] = step, source
     del states
     log(f"[average] {run_dir.name}: uniform average of {', '.join(names)}")
+    for group in identical:
+        what = ("every listed checkpoint holds the same state, so the average is that one iterate"
+                if len(group) == len(names) else "the uniform average weights this one iterate "
+                f"{len(group)} times")
+        log(f"[average] warning: {', '.join(group)} are bitwise equal; {what}")
 
     device = ev.resolve_device(options.device)
     # The model is built from the last listed bundle's config (all configs agree) and loaded with the average.
@@ -163,7 +229,8 @@ def run_checkpoint_average(
     cache_dir = Path(options.cache_dir) if options.cache_dir else None
     report: Dict[str, Any] = {
         "run_dir": str(run_dir), "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "checkpoints": names, "checkpoint_steps": steps, "n_checkpoints": len(names),
+        "checkpoints": names, "checkpoint_steps": steps, "checkpoint_step_sources": step_sources,
+        "n_checkpoints": len(names), "identical_inputs": identical,
         "averaging": ("uniform mean of every floating tensor of the state dict (parameters and floating buffers), "
                       "float64 accumulation; non-floating tensors from the last listed checkpoint"),
         "protocol": {"seq_len": info.seq_len, "eval_stride": info.eval_stride, "batch_size": batch_size,

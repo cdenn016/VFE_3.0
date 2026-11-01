@@ -18,7 +18,7 @@ from torch import nn
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.contracts import host_check, host_read, mark_gathered_frame_pair
+from vfe3.contracts import host_check, host_read, mark_gathered_frame_index, mark_gathered_frame_pair
 from vfe3.runtime import ieee_fp32_matmul
 
 if TYPE_CHECKING:
@@ -508,7 +508,10 @@ def get_transport_registration(name: str) -> TransportRegistration:
 
 
 def get_transport(name: str) -> Callable[..., TransportDict]:
-    """Return the registered transport builder (KeyError-with-available-list if absent)."""
+    """Return the registered transport builder (KeyError-with-available-list if absent).
+
+    Test hook: referenced only by the tests; production reads :func:`get_transport_registration`.
+    """
     return get_transport_registration(name).callable
 
 
@@ -556,7 +559,12 @@ DEFAULT_TRANSPORT_CHART_MAX_NORM: float = VFE3Config.transport_chart_max_norm
 # stored pair keeps the inverse residual <= eps_32 kappa_F(U); CanonicalFrameContext still fails
 # closed far above that. The tolerance (VFE3Config.frame_pair_escalation_tol) is read at call time.
 # The counter is a host int incremented from the already-read decision, so it adds no device work
-# and no synchronization.
+# and no synchronization. The verdict is one per producer call (the maximum over the whole batch), so an
+# escalation triggered by any token moves every position and every sequence of that call to float64
+# frames and float64 consumers: earlier positions then depend on later tokens, and a sequence's outputs on
+# its batch neighbors, at rounding level (prefix logits moved by 9.5e-6 in the audit probe). The toggle
+# trades exact prefix and batch invariance for conditional precision; with it off, or with a float64 model,
+# the frame precision does not depend on the input (audit 2026-10-31, model-assembly-8).
 DEFAULT_FRAME_PAIR_CONDITION_TOL: float = 1e-4
 _FRAME_PAIR_FP64_ESCALATION: bool = False
 _FRAME_PAIR_CONDITION_TOL: float = DEFAULT_FRAME_PAIR_CONDITION_TOL
@@ -641,6 +649,31 @@ def _count_frame_pair_escalation() -> None:
     _FRAME_PAIR_FP64_ESCALATIONS += 1
 
 
+# Precision of the backward of the stored float32 frame inverse (VFE3Config.frame_inverse_adjoint_precision,
+# installed by VFEModel; audit 2026-10-31, transport-geometry-6). The inverse is formed in float64 so that the stored
+# pair is one group element. Under "fp64" its autograd adjoint runs in float64 as well, two float64 batched GEMMs per
+# block in every backward; under "fp32" _Float32InverseAdjoint forms the same adjoint from the stored float32
+# inverse in IEEE fp32. The forward values are the same bits under both.
+FRAME_INVERSE_ADJOINT_PRECISIONS: Tuple[str, ...] = ("fp64", "fp32")
+_FRAME_INVERSE_ADJOINT_PRECISION: str = "fp64"
+
+
+def set_frame_inverse_adjoint_precision(precision: str) -> str:
+    r"""Set the precision of the stored float32 frame inverse's backward; returns the previous value."""
+    if precision not in FRAME_INVERSE_ADJOINT_PRECISIONS:
+        raise ValueError(f"frame inverse adjoint precision must be one of {FRAME_INVERSE_ADJOINT_PRECISIONS}, "
+                         f"got {precision!r}")
+    global _FRAME_INVERSE_ADJOINT_PRECISION
+    previous = _FRAME_INVERSE_ADJOINT_PRECISION
+    _FRAME_INVERSE_ADJOINT_PRECISION = precision
+    return previous
+
+
+def frame_inverse_adjoint_precision() -> str:
+    r"""Return the precision of the stored float32 frame inverse's backward, ``"fp64"`` or ``"fp32"``."""
+    return _FRAME_INVERSE_ADJOINT_PRECISION
+
+
 def _frame_pair_kappa(
     right:  Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (..., d, d) right pair (E, E^-1)
     gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,  # unique -> occurrence rows
@@ -709,7 +742,9 @@ def stable_matrix_exp_pair(
     (``frame_pair_escalation_tol``, typically :math:`10^{-4}`), is returned in float64 for the whole
     call, recomputed from the same ``M`` and inverted from the float64 ``exp(M)`` (audit 2026-09-23
     #12). The verdict rides the inverse's existing host read; ``only_forward`` builds no inverse and
-    is never certified. With the escalation disabled no certificate is formed.
+    is never certified. With the escalation disabled no certificate is formed. Since one block decides
+    the precision of the whole call, the escalation is not prefix- or batch-invariant: a later token can
+    move every earlier position's frame to float64 (audit 2026-10-31, model-assembly-8).
     """
     validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
     # Both chart decisions are reduced on the device and read in ONE host transfer.
@@ -910,11 +945,17 @@ def compute_transport_operators(
 
     Conditioning note (audit 2026-06-09 overnight F26): for the NON-COMPACT groups
     (block_glk; skew_symmetric=False) Omega is not orthogonal and cond(Omega)
-    grows like exp(2 ||phi_matrix||); the only bound is the fail-closed chart radius
-    ``transport_chart_max_norm`` (default 50) on every transport exponential, far above the
-    phi norms at which cond(Omega) reaches ~1e7-1e10; compact so towers give orthogonal Omega
-    (cond = 1). Omega is built at the working dtype here, so for extreme draws prefer a compact
-    group or bound the frames (``phi_mstep_max_matrix_norm``, ``phi_frame_condition_max``).
+    grows like exp(2 ||phi_matrix||); compact so towers give orthogonal Omega (cond = 1). Two
+    optional bounds act on the frame tables after each step: ``phi_frame_condition_max`` bounds
+    cond_2 of every head block by clamping the spread of its traceless symmetric part, and
+    ``phi_mstep_max_matrix_norm`` projects whole rows into an interior radius. The fail-closed chart
+    radius ``transport_chart_max_norm`` (default 50) checks every transport exponential in the forward;
+    it is far above the phi norms at which cond(Omega) reaches ~1e7-1e10, and it is a check, not a
+    bound: with the condition bound alone the skew (rotation) and trace (scale) parts of a row are
+    bounded only by weight decay, and a row above the radius raises and ends the run however well
+    conditioned its frame is (audit 2026-10-31, transport-geometry-7; VFE3Config warns at
+    construction). Omega is built at the working dtype here, so for extreme draws prefer a compact
+    group or bound the frames.
     """
     B, N, _ = phi.shape
     K = group.generator_shape[-1]
@@ -1010,6 +1051,42 @@ def _checked_group_inverse(
         omega, validate=validate, residual_tol=residual_tol)[0]
 
 
+class _Float32InverseAdjoint(torch.autograd.Function):
+    r"""The stored float32 inverse :math:`V = \mathrm{fl}_{32}(U^{-1})` of a float32 :math:`U`, given its float64
+    inverse, with the inverse adjoint formed from :math:`V` in IEEE fp32.
+
+    The forward is ``inverse64.to(float32)``, the bits the default route stores. The backward returns
+    :math:`\bar U = -V^\top \bar V V^\top` in IEEE fp32 with autocast off, the adjoint of
+    :math:`U \mapsto U^{-1}` (Giles 2008, "An extended collection of matrix derivative results for forward and
+    reverse mode algorithmic differentiation", sec. 2.2.3) evaluated at the stored inverse, instead of the
+    float64 autograd adjoint of the float64 inverse rounded once. Entrywise the two differ by at most about
+    :math:`2(d + 1)u\,(|V^\top|\,|\bar V|\,|V^\top|)` (Higham 2002, sec. 3.5, with :math:`u = 2^{-24}`), a
+    rounding-level change of the frame gradients, so the route is opt-in
+    (``VFE3Config.frame_inverse_adjoint_precision='fp32'``; audit 2026-10-31, transport-geometry-6). ``V`` is saved
+    as an output, so a double backward differentiates this backward through the same Function.
+    """
+
+    @staticmethod
+    def forward(ctx, omega: torch.Tensor, inverse64: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        inverse = inverse64.to(omega.dtype)                                 # (..., d, d) V, the stored inverse
+        ctx.save_for_backward(inverse)
+        return inverse
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> Tuple[torch.Tensor, None]:  # type: ignore[override]
+        inverse, = ctx.saved_tensors
+        transposed = inverse.transpose(-2, -1)                              # (..., d, d) V^T
+        with torch.amp.autocast(grad.device.type, enabled=False), ieee_fp32_matmul():
+            return -(transposed @ grad.to(inverse.dtype) @ transposed), None
+
+
+def _float32_inverse_adjoint(omega: torch.Tensor) -> bool:
+    r"""Whether the inverse of ``omega`` takes :class:`_Float32InverseAdjoint`: the ``"fp32"`` adjoint precision,
+    a float32 element and a graph that will differentiate it."""
+    return (_FRAME_INVERSE_ADJOINT_PRECISION == "fp32" and omega.dtype == torch.float32
+            and torch.is_grad_enabled() and omega.requires_grad)
+
+
 def _checked_group_inverse_certified(
     omega:        torch.Tensor,             # (..., d, d) stored full elements or compact blocks
 
@@ -1025,6 +1102,11 @@ def _checked_group_inverse_certified(
     joins the strict route's ONE host read, so certifying costs no extra synchronization. When it
     escalates, the caller discards the cast inverse and rebuilds the pair in float64, so a cast that
     overflowed ``omega.dtype`` is not an error on that call. Without ``kappa`` the verdict is False.
+
+    Under ``frame_inverse_adjoint_precision='fp32'`` (:func:`set_frame_inverse_adjoint_precision`) the strict
+    route builds no float64 graph for the inverse: the float64 inverse is formed under ``no_grad`` and the
+    float32 cast is :class:`_Float32InverseAdjoint`, whose backward reads the stored inverse; the stored values are
+    unchanged.
     """
     if not validate:
         try:
@@ -1033,10 +1115,16 @@ def _checked_group_inverse_certified(
         except RuntimeError as exc:
             raise ValueError("omega group element is singular and cannot be inverted") from exc
         return inverse64.to(omega.dtype), False
+    fp32_adjoint = _float32_inverse_adjoint(omega)
     with torch.amp.autocast(omega.device.type, enabled=False):
-        omega64 = omega.double()
-        inverse64, info = torch.linalg.inv_ex(omega64)
-    inverse = inverse64.to(omega.dtype)
+        if fp32_adjoint:
+            with torch.no_grad():
+                omega64 = omega.double()
+                inverse64, info = torch.linalg.inv_ex(omega64)
+        else:
+            omega64 = omega.double()
+            inverse64, info = torch.linalg.inv_ex(omega64)
+    inverse = _Float32InverseAdjoint.apply(omega, inverse64) if fp32_adjoint else inverse64.to(omega.dtype)
     with torch.no_grad():
         flags = [
             ~torch.isfinite(omega).all(),
@@ -1262,6 +1350,47 @@ class _FixedScheduleExpAdjoint(torch.autograd.Function):
         return matrix_grad, block_grad[..., :n, n:], None
 
 
+def _fixed_schedule_route(
+    blocks:     torch.Tensor,     # (..., d, d) blocks about to be exponentiated
+    norm_bound: float,            # the chart radius bounding every block's ||A||_F (inf: none)
+) -> bool:
+    r"""Whether :func:`_frame_matrix_exp` takes the sync-free fixed schedule: a CUDA float32/float64 call with a
+    finite chart radius. Every other call keeps ``torch.linalg.matrix_exp``."""
+    return (blocks.device.type == "cuda" and math.isfinite(norm_bound)
+            and blocks.dtype in (torch.float32, torch.float64))
+
+
+def _squaring_bound(
+    rows:       torch.Tensor,     # (U, H, d, d) the deduplicated rows about to be exponentiated
+    norm_bound: float,            # the chart radius
+    synced:     bool,             # whether torch.unique has just synchronized this stream
+) -> Optional[float]:
+    r"""A host-side bound :math:`b \ge \max_j \lVert A_j\rVert_F` over the call's blocks, or None for the chart radius.
+
+    The caller passes :math:`\min(r, b)` to :func:`_frame_matrix_exp` as its norm bound. The fixed schedule runs
+    :math:`s_{\max} = \lceil\log_2(\sqrt d\,r/\theta_{18})\rceil` squarings for the chart radius
+    :math:`r`, 7 at :math:`d = 32, r = 50`, although each block needs only
+    :math:`s = \lceil\log_2(\lVert A\rVert_1/\theta_{18})\rceil` and initialization-scale blocks need none (audit
+    2026-10-31, transport-geometry-4). :math:`b` is the observed maximum Frobenius norm widened by
+    :math:`2^{-10} + 2d^2u`, which covers the rounding of its own sum of :math:`d^2` squares (:math:`u` the unit
+    roundoff of the rows), so every computed :math:`\lVert A\rVert_1` and :math:`\lVert A\rVert_\infty`, at most
+    :math:`\sqrt d\,\lVert A\rVert_F`, stays below :math:`\sqrt d\,b`: no block's own count reaches the tightened cap,
+    the per-block counts and scalings are unchanged, the squarings past every count were no-ops of ``torch.where``,
+    and values and gradients are bitwise those of the chart radius. The maximum is read on the host only right after
+    the ``torch.unique`` synchronization of the deduplicated build (``synced``), when the stream is drained and the
+    read waits only for the few kernels queued since; any other call, a CPU call and a nonfinite maximum keep the
+    radius.
+    """
+    if not synced or rows.numel() == 0 or not _fixed_schedule_route(rows, norm_bound):
+        return None
+    with torch.no_grad():
+        observed = float(rows.square().sum(dim=(-2, -1)).amax().sqrt())          # one host read after unique
+    if not math.isfinite(observed):
+        return None
+    d = rows.shape[-1]
+    return observed * (1.0 + 2.0 ** -10 + d * d * torch.finfo(rows.dtype).eps)   # eps = 2u
+
+
 def _frame_matrix_exp(
     blocks:     torch.Tensor,     # (..., d, d) float32/float64, finite or NaN entries
     norm_bound: float,            # bound on every block's ||A||_F (inf: none)
@@ -1284,12 +1413,15 @@ def _frame_matrix_exp(
     there is no synchronization to save and ``torch.linalg.matrix_exp`` is kept (it is 1.2-1.6x faster
     there at d = 10); a group without a radius (skew-symmetric, ``r = inf``) also keeps it.
 
+    ``norm_bound`` may be any bound on every block's Frobenius norm, not only the radius: the deduplicated
+    compact build passes the smaller of the radius and :func:`_squaring_bound`, which leaves every block's own
+    count, and so the values and gradients, bitwise those of the radius and drops only no-op squarings.
+
     References: N. J. Higham, SIAM J. Matrix Anal. Appl. 26(4):1179-1193 (2005); A. H. Al-Mohy and
     N. J. Higham, SIAM J. Matrix Anal. Appl. 30(4):1639-1657 (2009); P. Bader, S. Blanes and F. Casas,
     Mathematics 7(12):1174 (2019); N. J. Higham, Functions of Matrices, SIAM (2008).
     """
-    if (blocks.device.type != "cuda" or not math.isfinite(norm_bound)
-            or blocks.dtype not in (torch.float32, torch.float64)):
+    if not _fixed_schedule_route(blocks, norm_bound):
         return torch.linalg.matrix_exp(blocks)
     return _FixedScheduleMatrixExp.apply(blocks, math.sqrt(blocks.shape[-1]) * norm_bound)
 
@@ -1401,6 +1533,8 @@ def _compact_pair_from_exp(
         # Every occurrence copies a unique row and every unique row occurs, so a frame context built
         # from this exact pair validates its residual on the unique rows.
         mark_gathered_frame_pair(exp_pos, exp_neg, unique_pos, unique_neg)
+        # Which row each occurrence copies, for type-level consumers (relational_type_moments).
+        mark_gathered_frame_index(exp_pos, exp_neg, inverse_index)
     return exp_pos, exp_neg
 
 
@@ -1421,21 +1555,33 @@ def _stable_compact_glk_exp_pair(
 
     Under :func:`frame_pair_fp64_escalation`, float32 storage is certified by
     :func:`_frame_pair_kappa` inside the inverse's single host read (audit 2026-09-23 #12); with the
-    escalation disabled no certificate is formed. A call that fails it returns the whole pair in float64:
+    escalation disabled no certificate is formed. A call that fails it returns the whole pair in float64,
+    every row of every sequence, so the escalation trades prefix and batch invariance for precision
+    (audit 2026-10-31, model-assembly-8):
     ``U = exp(M)`` recomputed in float64 from the same blocks and ``U^-1`` inverted from
     that float64 ``U`` itself, never the float64 inverse of the rounded float32 ``U`` (which is
     no more consistent with a float64 ``U`` than the float32 pair was). ``_right_pair`` certifies
     the composed pair instead, and ``_force_fp64`` goes straight to float64. The exponential is
     :func:`_frame_matrix_exp`.
+
+    The NaN map runs on the deduplicated rows, the only blocks exponentiated, so its values and gradients equal
+    those of the occurrence-level map without its occurrence-sized passes (audit 2026-10-31,
+    transport-geometry-5). The chart check still sees every occurrence before deduplication, as
+    tests/test_frame_reuse_20260906.py pins, so it stays sound even where the ids would not certify equal rows. On
+    the CUDA fixed schedule the deduplicated build reads the rows' largest block norm right after the
+    ``torch.unique`` synchronization and drops the squarings no block needs (:func:`_squaring_bound`;
+    transport-geometry-4).
     """
     validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
-    host_check(*_compact_chart_check(blocks, validity_max_norm))
-    blocks = _finite_or_nan(blocks)
-    # Represented fp32 storage floor; the exponential is evaluated at the storage precision.
-    store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32
+    host_check(*_compact_chart_check(blocks, validity_max_norm))       # every occurrence, before deduplication
     rows, inverse_index, occurrence_shape = _content_rows(blocks, _content_token_ids)
+    rows = _finite_or_nan(rows)
+    # Represented fp32 storage floor; the exponential is evaluated at the storage precision.
+    store_dtype = rows.dtype if rows.dtype in (torch.float32, torch.float64) else torch.float32
+    squaring_bound = _squaring_bound(rows, validity_max_norm, synced=_content_token_ids is not None)
+    exp_norm_bound = validity_max_norm if squaring_bound is None else min(validity_max_norm, squaring_bound)
     with torch.amp.autocast(rows.device.type, enabled=False):
-        exp_pos = _frame_matrix_exp(rows.to(store_dtype).contiguous(), validity_max_norm)
+        exp_pos = _frame_matrix_exp(rows.to(store_dtype).contiguous(), exp_norm_bound)
     return _compact_pair_from_exp(
         exp_pos, rows, validity_max_norm=validity_max_norm, inverse_index=inverse_index,
         occurrence_shape=occurrence_shape, right_pair=_right_pair, force_fp64=_force_fp64)
@@ -1463,12 +1609,16 @@ def _stacked_compact_exp_pairs(
     host_check(*_compact_chart_check(right_blocks, validity_max_norm))
     left_check = _compact_chart_check(left_blocks, validity_max_norm)
     right_rows = _finite_or_nan(right_blocks)
-    left_rows, inverse_index, occurrence_shape = _content_rows(_finite_or_nan(left_blocks), _content_token_ids)
+    # The left factor's NaN map runs on its deduplicated rows (transport-geometry-5).
+    left_rows, inverse_index, occurrence_shape = _content_rows(left_blocks, _content_token_ids)
+    left_rows = _finite_or_nan(left_rows)
     n_right = right_rows.reshape(-1, *right_rows.shape[-3:]).shape[0]
     with torch.amp.autocast(left_rows.device.type, enabled=False):
         stacked = torch.cat((right_rows.reshape(-1, *right_rows.shape[-3:]),
                              left_rows.reshape(-1, *left_rows.shape[-3:]))).to(store[0]).contiguous()
-        exp_both = _frame_matrix_exp(stacked, validity_max_norm)                # (n_right + n_left, H, d, d)
+        squaring_bound = _squaring_bound(stacked, validity_max_norm, synced=_content_token_ids is not None)
+        exp_both = _frame_matrix_exp(                                            # (n_right + n_left, H, d, d)
+            stacked, validity_max_norm if squaring_bound is None else min(validity_max_norm, squaring_bound))
     right_pair = _compact_pair_from_exp(
         exp_both[:n_right].reshape(right_rows.shape), right_rows, validity_max_norm=validity_max_norm,
         inverse_index=None, occurrence_shape=right_rows.shape, right_pair=None, force_fp64=False)
@@ -1528,6 +1678,9 @@ def build_factored_transport(
     local = (None if elementary or not compact_blocks or block_dims is None or len(set(block_dims)) != 1
              else group.certified_block_local_basis())
     head_blocks = None if elementary or local is not None or not compact_blocks else group.head_block_generators()
+    # Shared block_glk (generators I_H (x) E_ab) embeds by broadcasting one row-major block to every head; contracting
+    # its padded (d^2, H, d, d) blocks cost H d^4 multiply-adds per token and factor (audit 2026-10-31, gauge-structure-3).
+    shared = head_blocks is not None and group.shared_elementary_blocks()
     compact = elementary or local is not None or head_blocks is not None
     if gauge_mode == "trivial":
         # Trivial gauge: exp = I. Build the same per-token factors the dense path would (the
@@ -1562,6 +1715,9 @@ def build_factored_transport(
                     group._local_basis_as(torch.float64 if coordinates.dtype == torch.float64 else torch.float32,
                                           coordinates.device),
                     pattern="...hm,mij->...hij")
+            if shared:                                           # the float32 floor of the contraction, then a broadcast
+                floor = coordinates if coordinates.dtype in (torch.float32, torch.float64) else coordinates.float()
+                return floor.reshape(*floor.shape[:-1], 1, d, d).expand(*floor.shape[:-1], H, d, d).contiguous()
             return _embed_algebra_fp32_floor(coordinates, head_blocks, pattern="...a,ahij->...hij")
 
         phi_blocks = _embed(phi)

@@ -76,12 +76,28 @@ def display_text(text: str) -> str:
     return get_display(arabic_reshaper.reshape(text))
 
 
+def mathtext_literal(text: str) -> str:
+    r"""Escape every ``$`` so Matplotlib draws ``text`` literally.
+
+    Matplotlib parses a string with an even number of unescaped dollar signs as mathtext: GPT-2 ids such as
+    13702 ``$$`` raised ``ValueError`` as tick labels, and a joined label of two ``$`` tokens lost its dollar
+    signs (audit 2026-10-31 viz-pipeline-4). Outside math mode Matplotlib draws ``\$`` as ``$``.
+    """
+    return text.replace("$", r"\$")
+
+
 def token_label(
     tid:       int,
     max_chars: int = 12,
     decode:    Optional[Callable[[Sequence[int]], str]] = None,
 ) -> str:
-    """Return a short, printable, display-ready label for token id ``tid``."""
+    """Return a short, printable, display-ready label for token id ``tid``.
+
+    The id string stands in for a fragment that cannot be shown: a decode failure, an invalid or
+    unprintable fragment, or Arabic text without the optional shaping dependencies, for which
+    :func:`display_text` raises (21 GPT-2 ids, audit 2026-10-31 viz-pipeline-4). Dollar signs are
+    escaped (:func:`mathtext_literal`).
+    """
     if decode is None:
         return str(int(tid))
     try:
@@ -94,4 +110,8 @@ def token_label(
     if "�" in logical or not logical.isprintable():
         return str(int(tid))
     shortened = logical if len(logical) <= max_chars else logical[:max_chars - 1] + "…"
-    return display_text(shortened)
+    try:
+        shown = display_text(shortened)
+    except Exception:
+        return str(int(tid))
+    return mathtext_literal(shown)

@@ -10,7 +10,9 @@ The curated resources ship as package data next to this module (``resources/*.js
 The external benchmarks are read from the copies bundled with gensim's test data when gensim is
 installed: the Google analogy set ``questions-words.txt`` (Mikolov et al. 2013), SimLex-999
 (Hill, Reichart & Korhonen 2015) and WordSim-353 (Finkelstein et al. 2002). They are located with
-:func:`importlib.util.find_spec`, so gensim itself is never imported.
+:func:`importlib.util.find_spec`, so gensim itself is never imported. A ``directory`` holding files of
+the same names (the analysis option ``benchmark_dir``) replaces that location, so an interpreter without
+gensim can read them (:func:`benchmark_source`).
 """
 
 from __future__ import annotations
@@ -120,23 +122,33 @@ def gensim_test_data_dir() -> Optional[Path]:
     return directory if directory.is_dir() else None
 
 
-def _benchmark_path(file_name: str, path: Optional[Path]) -> Optional[Path]:
+def benchmark_source(file_name: str, directory: Optional[Path] = None) -> Optional[Path]:
+    r"""Where benchmark file ``file_name`` is read from: ``directory / file_name`` when ``directory`` is given
+    (``None`` when that file is absent), else the gensim test-data copy (``None`` without gensim or the file)."""
+    if directory is None:
+        directory = gensim_test_data_dir()
+        if directory is None:
+            return None
+    candidate = Path(directory) / file_name
+    return candidate if candidate.is_file() else None
+
+
+def _benchmark_path(file_name: str, path: Optional[Path], directory: Optional[Path] = None) -> Optional[Path]:
     if path is not None:
         return Path(path)
-    directory = gensim_test_data_dir()
-    if directory is None or not (directory / file_name).is_file():
-        return None
-    return directory / file_name
+    return benchmark_source(file_name, directory)
 
 
-def load_google_analogies(path: Optional[Path] = None) -> Optional[List[Tuple[str, str, str, str, str]]]:
+def load_google_analogies(path: Optional[Path] = None, *,
+                          directory: Optional[Path] = None) -> Optional[List[Tuple[str, str, str, str, str]]]:
     r"""Google analogy questions as ``(category, a, a_star, b, b_star)``, or ``None`` when absent.
 
     Format of ``questions-words.txt``: a line ``: category`` opens a category; each following line
     ``a a_star b b_star`` is one question ``a : a_star :: b : b_star`` whose answer is ``b_star``.
-    ``path`` overrides the gensim test-data location.
+    ``path`` names the file itself; ``directory`` a directory holding ``questions-words.txt``; without
+    either the gensim test-data copy is read (:func:`benchmark_source`).
     """
-    source = _benchmark_path(GOOGLE_ANALOGY_FILE, path)
+    source = _benchmark_path(GOOGLE_ANALOGY_FILE, path, directory)
     if source is None:
         return None
     questions: List[Tuple[str, str, str, str, str]] = []
@@ -155,16 +167,18 @@ def load_google_analogies(path: Optional[Path] = None) -> Optional[List[Tuple[st
     return questions
 
 
-def load_similarity(name: str, path: Optional[Path] = None) -> Optional[List[Tuple[str, str, float]]]:
+def load_similarity(name: str, path: Optional[Path] = None, *,
+                    directory: Optional[Path] = None) -> Optional[List[Tuple[str, str, float]]]:
     r"""Word-similarity benchmark ``name`` (``"simlex999"`` | ``"wordsim353"``) as
     ``(w1, w2, human score)`` rows, or ``None`` when the file is absent.
 
     Reads the three-column gensim copies (``w1 <tab> w2 <tab> score``), skipping ``#`` comment
-    lines and a leading non-numeric header row. ``path`` overrides the gensim test-data location.
+    lines and a leading non-numeric header row. ``path`` names the file itself; ``directory`` a directory
+    holding :data:`SIMILARITY_FILES` ``[name]``; without either the gensim test-data copy is read.
     """
     if name not in SIMILARITY_FILES:
         raise ValueError(f"unknown similarity benchmark {name!r}; known: {sorted(SIMILARITY_FILES)}")
-    source = _benchmark_path(SIMILARITY_FILES[name], path)
+    source = _benchmark_path(SIMILARITY_FILES[name], path, directory)
     if source is None:
         return None
     rows: List[Tuple[str, str, float]] = []

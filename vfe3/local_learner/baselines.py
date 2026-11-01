@@ -3,6 +3,7 @@ r"""References for the local-learner test: add-k n-gram models and a bootstrap p
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -10,25 +11,56 @@ import torch
 from vfe3.local_learner.core import Params, Tensor, TreeSensor
 
 
-def ngram_nll(train: np.ndarray, streams: np.ndarray, V: int, order: int, k: float) -> tuple[float, int]:
-    r"""Summed add-k NLL (nats) of an order-``order`` model on streams (S, L), scoring positions >= 1 of each
-    stream with context truncated at the stream start (a missing context symbol is replaced by a lower order)."""
-    train = train.astype(np.int64)
+def _ngram_tables(train: np.ndarray, V: int, order: int) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    r"""Per order :math:`o \le` ``order``: the flat counts of every :math:`o`-gram, ``(V**o,)``, indexed by
+    :math:`\sum_j y_j V^{o-1-j}`, and the totals of every context, ``(V**(o-1),)`` (one total for :math:`o = 1`)."""
     tables = {}
     for o in range(1, order + 1):
         idx = np.zeros(len(train) - o + 1, dtype=np.int64)
         for j in range(o):
             idx = idx * V + train[j:len(train) - o + 1 + j]
-        tables[o] = np.bincount(idx, minlength=V ** o).reshape((V,) * o).astype(np.float64)
-    total, count = 0.0, 0
-    for row in streams.astype(np.int64):
-        for t in range(1, len(row)):
-            o = min(order, t + 1)
-            ctx = tuple(row[t - o + 1:t])
-            counts = tables[o][ctx] if o > 1 else tables[1]
-            total -= math.log((counts[row[t]] + k) / (counts.sum() + k * V))
-            count += 1
-    return total, count
+        counts = np.bincount(idx, minlength=V ** o).astype(np.float64)                 # (V**o,)
+        tables[o] = (counts, counts.reshape(-1, V).sum(axis=1))                        # (V**(o-1),) context totals
+    return tables
+
+
+def ngram_nll_grid(train: np.ndarray, streams: np.ndarray, V: int, order: int,
+                   ks: Sequence[float]) -> list[tuple[float, int]]:
+    r"""``[ngram_nll(train, streams, V, order, k) for k in ks]``, building the tables once.
+
+    Each scored position's target count :math:`c` and context total :math:`n` are looked up once; every constant
+    then sums :math:`-\log\frac{c + k}{n + kV}` over the positions in the same order as :func:`ngram_nll`, so the
+    sums equal the per-constant ones bit for bit (counts are integers, so the totals are exact in any order).
+    """
+    train = train.astype(np.int64)
+    rows = streams.astype(np.int64)                                                    # (S, L)
+    S, L = rows.shape
+    tables = _ngram_tables(train, V, order)
+    hits = np.zeros((S, max(L - 1, 0)))                                                # (S, L-1) target counts
+    totals = np.zeros((S, max(L - 1, 0)))                                              # (S, L-1) context totals
+    for t in range(1, L):
+        o = min(order, t + 1)                                       # context truncated at the stream start
+        idx = np.zeros(S, dtype=np.int64)
+        for j in range(o):
+            idx = idx * V + rows[:, t - o + 1 + j]
+        counts, context_totals = tables[o]
+        hits[:, t - 1] = counts[idx]
+        totals[:, t - 1] = context_totals[idx // V]                 # o = 1: idx // V = 0, the unigram total
+    hits, totals = hits.reshape(-1), totals.reshape(-1)             # stream by stream, position by position
+    out = []
+    for k in ks:
+        total = 0.0
+        for p in ((hits + k) / (totals + k * V)).tolist():
+            total -= math.log(p)
+        out.append((total, int(hits.size)))
+    return out
+
+
+def ngram_nll(train: np.ndarray, streams: np.ndarray, V: int, order: int, k: float) -> tuple[float, int]:
+    r"""Summed add-k NLL (nats) of an order-``order`` model on streams (S, L), scoring positions >= 1 of each
+    stream with context truncated at the stream start (a missing context symbol is replaced by a lower order).
+    Several constants on one training set: :func:`ngram_nll_grid`."""
+    return ngram_nll_grid(train, streams, V, order, [k])[0]
 
 
 @torch.no_grad()

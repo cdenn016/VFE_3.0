@@ -17,7 +17,12 @@ failed step) changes no weight, so it neither updates the shadow nor counts towa
 Only parameters with ``requires_grad`` and a floating dtype are averaged. Buffers and frozen parameters are not:
 :meth:`WeightEMA.applied` swaps the shadow into the averaged parameters and leaves every other tensor of the model
 at its raw value, then restores the raw parameters bit for bit from a copy. ``weight_ema_device='cpu'`` keeps the
-shadow (and the raw copy taken during a swap) in host memory.
+shadow (and the raw copy taken during a swap) in host memory. With the parameters on an accelerator, each update then
+moves every averaged parameter to the host, about 1.4 GB at the live K = 192 shape (``phi_embed`` alone 1.2 GB). The
+update copies them into persistent pinned host buffers without blocking, records an event, and runs the lerp in a
+worker thread that waits for the event; the next update, a swap, a state read or a checkpoint record joins it first,
+so every read sees the completed shadow and the values are those of the synchronous update (audit 2026-10-31,
+train-step-5). The pinned buffers hold one host copy of the averaged parameters for the rest of the run.
 
 Checkpoints carry :meth:`WeightEMA.state_dict` under the key ``"weight_ema"``. The retired key ``"ema_state"`` stays
 refused by :func:`vfe3.run_artifacts.load_checkpoint`: its runtime and semantics are gone, so a checkpoint written by
@@ -26,12 +31,13 @@ it cannot be continued exactly, and the new key does not reinterpret it.
 from __future__ import annotations
 
 import math
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional
 
 import torch
 
-WEIGHT_EMA_CHECKPOINT_KEY: str = "weight_ema"
+WEIGHT_EMA_CHECKPOINT_KEY: str = "weight_ema"     # referenced only by the tests; vfe3.run_artifacts spells the key
 WEIGHT_EMA_SCHEMA_VERSION: int = 1
 
 
@@ -70,6 +76,11 @@ class WeightEMA:
         self.updates = 0               # shadow writes, the initialization included
         self.accepted = 0              # accepted updates since the initialization (the interval counter)
         self.initialized_step: Optional[int] = None
+        # Host route of weight_ema_device='cpu' with accelerator parameters (module docstring): the staging buffers,
+        # the worker thread of the update in flight and an error it raised, re-raised by the next join.
+        self._staging: Optional[List[torch.Tensor]] = None
+        self._worker: Optional[threading.Thread] = None
+        self._worker_error: Optional[BaseException] = None
 
     @classmethod
     def from_config(cls, model: torch.nn.Module, cfg: Any) -> Optional["WeightEMA"]:
@@ -89,6 +100,59 @@ class WeightEMA:
     def _storage(self, p: torch.Tensor) -> torch.device:
         return torch.device("cpu") if self.device == "cpu" else p.device
 
+    def _host_staged(self) -> bool:
+        r"""Whether an update takes the host route: a host shadow of parameters that live on an accelerator."""
+        return self.device == "cpu" and any(p.device.type != "cpu" for p in self.params)
+
+    def _join(self) -> None:
+        r"""Wait for the host update in flight, if any, and re-raise an error it hit."""
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.join()
+        error, self._worker_error = self._worker_error, None
+        if error is not None:
+            raise RuntimeError("the weight EMA host update failed") from error
+
+    def _staging_buffers(self) -> List[torch.Tensor]:
+        r"""Persistent host buffers for the parameters, pinned when the parameters live on CUDA."""
+        if self._staging is None:
+            pin = any(p.device.type == "cuda" for p in self.params)
+            try:
+                self._staging = [torch.empty(p.shape, dtype=p.dtype, pin_memory=pin) for p in self.params]
+            except RuntimeError:                            # no pinned memory to spare: pageable, still correct
+                self._staging = [torch.empty(p.shape, dtype=p.dtype) for p in self.params]
+        return self._staging
+
+    def _lerp_on_host(self, weight: float) -> None:
+        r"""Copy the parameters to the staging buffers without blocking and lerp the host shadow in a worker thread.
+
+        The copies are queued on each device's current stream, so the next optimizer step, queued after them, cannot
+        change what they read; the worker waits for an event recorded after the copies, then runs the same
+        ``_foreach_lerp_`` the synchronous update runs, on the same values.
+        """
+        self._join()                                        # the previous update is done with the buffers
+        staging = self._staging_buffers()
+        for buffer, p in zip(staging, self.params):
+            buffer.copy_(p.detach(), non_blocking=True)
+        events = []
+        for device in {p.device for p in self.params if p.device.type == "cuda"}:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            events.append(event)
+        shadow = self.shadow
+
+        def update() -> None:
+            try:
+                for event in events:
+                    event.synchronize()
+                with torch.no_grad():
+                    torch._foreach_lerp_(shadow, staging, weight)
+            except BaseException as exc:                    # noqa: BLE001 - re-raised by the next join
+                self._worker_error = exc
+
+        self._worker = threading.Thread(target=update, name="weight-ema-host-update", daemon=True)
+        self._worker.start()
+
     @torch.no_grad()
     def observe(self, step: int, accepted: bool) -> bool:
         r"""Account for completed step ``step`` (from 1); return whether the shadow was written."""
@@ -102,8 +166,11 @@ class WeightEMA:
         if self.accepted % self.update_interval != 0:
             return False
         weight = 1.0 - self.decay ** self.update_interval
-        sources = [p.detach() if self.device == "same" else p.detach().to("cpu") for p in self.params]
-        torch._foreach_lerp_(self.shadow, sources, weight)
+        if self._host_staged():
+            self._lerp_on_host(weight)
+        else:
+            sources = [p.detach() if self.device == "same" else p.detach().to("cpu") for p in self.params]
+            torch._foreach_lerp_(self.shadow, sources, weight)
         self.updates += 1
         return True
 
@@ -112,6 +179,7 @@ class WeightEMA:
         r"""Swap the shadow into the averaged parameters; restore the raw values bit for bit on exit."""
         if self.shadow is None:
             raise RuntimeError("the weight EMA has not started; there are no EMA weights to apply")
+        self._join()
         with torch.no_grad():
             raw = [p.detach().to(self._storage(p), copy=True) for p in self.params]
             for p, s in zip(self.params, self.shadow):
@@ -126,10 +194,12 @@ class WeightEMA:
 
     def shadow_state(self) -> Dict[str, torch.Tensor]:
         r"""``{parameter name: shadow tensor}`` (the live tensors; empty before the start)."""
+        self._join()
         return {} if self.shadow is None else dict(zip(self.names, self.shadow))
 
     def state_dict(self) -> Dict[str, Any]:
         r"""The checkpoint record (``"weight_ema"``): settings, counters and the shadow (``None`` before the start)."""
+        self._join()
         return {
             "schema_version":   WEIGHT_EMA_SCHEMA_VERSION,
             "decay":            self.decay,
@@ -165,6 +235,7 @@ class WeightEMA:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         r"""Continue from a checkpoint record (validated first); the live settings (decay, start, interval) are kept."""
         self.validate_state(state)
+        self._join()
         shadow = state.get("shadow")
         self.shadow = (None if shadow is None else
                        [s.to(self._storage(p), copy=True) for s, p in zip(shadow, self.params)])
@@ -180,7 +251,8 @@ class WeightEMA:
                 "weight_ema_updates": self.updates, "weight_ema_initialized_step": self.initialized_step}
 
 
-# metrics.csv columns the weight EMA writes (vfe3.train) and :func:`best_ema_validation` reads.
+# metrics.csv columns the weight EMA writes (vfe3.train) and :func:`best_ema_validation` reads; the tuple is
+# referenced only by the tests.
 WEIGHT_EMA_METRIC_COLUMNS = ("val_ema_ce", "val_ema_ppl", "weight_ema_updates")
 
 

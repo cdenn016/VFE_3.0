@@ -140,7 +140,7 @@ def check_irrep_constructible(
     _IRREPS[key][0](N, p)                  # the family's dimension formula refuses an undefined (N, rank)
     if key == "su:pq":
         if tuple(p) not in ((0, 0), (1, 1)) and sum(p) >= 2:
-            _guard_cost(N, sum(p))           # the tensor construction works on N^(p+q) x N^(p+q) matrices
+            _guard_cost(N, p[0], p[1])       # the tensor construction on (C^N)^(x)(p+q), dense or matrix-free
         return
     if key in _WEDGE_FAMILIES:
         return                             # direct construction on the p-vector basis: no tensor power
@@ -167,13 +167,73 @@ def _single_threaded() -> Iterator[None]:
         torch.set_num_threads(threads)
 
 
-def _guard_cost(N: int, p: int) -> None:
-    """The tensor-power construction works on N^p x N^p matrices with p! symmetrizer terms."""
-    if p > 6 or N ** p > 60000:
+# Budget of the estimated peak of one tensor construction (the arrays it allocates), checked before any allocation.
+_TENSOR_POWER_BUDGET_BYTES: int = 2 ** 33            # 8 GiB
+
+# Peak budget under which a construction keeps the dense N^r x N^r Kronecker action. Every label whose dense
+# construction fits it keeps its images, and the so_n / su_n basis fingerprint a checkpoint saves, bit for bit; a
+# larger label applies the action to the invariant basis matrix-free (audit 2026-10-31, gauge-structure-4).
+_DENSE_CONSTRUCTION_BUDGET_BYTES: int = _TENSOR_POWER_BUDGET_BYTES
+
+
+def _tensor_construction_plan(
+    N: int,                                # defining-rep dimension
+    p: int,                                # fundamental rank
+    q: Optional[int] = None,               # antifundamental rank (su(N) (p, q)); None for so(N)
+) -> Tuple[bool, int]:                     # (dense action, estimated peak bytes)
+    r"""Route and estimated peak memory of the tensor construction of :func:`_tensor_power_irrep` (so(N), ``q``
+    None: the symmetric traceless rank-``p`` tensors) or :func:`_su_tensor_irrep` (su(N), the traceless tensors of
+    :math:`\mathrm{Sym}^p\otimes\mathrm{Sym}^q`), from closed-form dimensions only.
+
+    With :math:`n = N^r`, :math:`r = p\,(+q)`, :math:`m` the dimension of the symmetric power basis, :math:`d` the
+    number of basis columns and :math:`e` the bytes of one action entry (8, or 16 for su(N)), the basis construction
+    holds the monomial basis (:math:`8nm`), the trace contraction (:math:`8n^2/N^2`) and the basis itself
+    (:math:`8nd`, plus :math:`16nd` for its complex copy). The dense route adds three :math:`n \times n` arrays of the
+    Kronecker chain (:math:`3en^2`, and :math:`24n^2` for the su(N) slot swap at p = q); the matrix-free route adds
+    three :math:`n \times d` working arrays (:math:`3end`). The images add :math:`n_{gen}` blocks of
+    :math:`d \times d` (twice that for a realified su(N) label). The dense route is taken whenever its peak fits
+    ``_DENSE_CONSTRUCTION_BUDGET_BYTES``, so a label the dense construction could already build within the budget
+    keeps its bytes.
+    """
+    complex_action = q is not None
+    rank = p + (q or 0)
+    n = N ** rank
+    e = 16 if complex_action else 8
+    if complex_action:
+        m = math.comb(N + p - 1, p) * math.comb(N + q - 1, q)
+        d = _su_pq_dim(N, (p, q)) // (1 if p == q else 2)                 # complex columns of the basis Q
+        n_gen = N * N - 1
+        images = n_gen * (2 * d if p != q else d) ** 2 * 8 + n_gen * d * d * 16
+    else:
+        m = math.comb(N + p - 1, p)
+        d = _son_sym_traceless_dim(N, p)
+        n_gen = N * (N - 1) // 2
+        images = n_gen * d * d * 8
+    contraction = 8 * n * (n // (N * N)) if rank >= 2 else 0
+    basis = 8 * n * m + contraction + 8 * n * d + (16 * n * d if complex_action else 0)
+    dense_peak = basis + 3 * e * n * n + (24 * n * n if complex_action and p == q else 0) + images
+    if dense_peak <= _DENSE_CONSTRUCTION_BUDGET_BYTES:
+        return True, dense_peak
+    return False, basis + 3 * e * n * d + images
+
+
+def _guard_cost(N: int, p: int, q: Optional[int] = None) -> None:
+    """Refuse a tensor construction before any allocation: rank <= 6, N^rank <= 60000 and an estimated peak within
+    ``_TENSOR_POWER_BUDGET_BYTES`` (:func:`_tensor_construction_plan`)."""
+    rank = p + (q or 0)
+    if rank > 6 or N ** rank > 60000:
         raise ValueError(
-            f"rank-{p} tensor-power irrep over R^{N} exceeds the supported construction size "
+            f"rank-{rank} tensor-power irrep over R^{N} exceeds the supported construction size "
             f"(rank <= 6 and N^rank <= 60000); SO(3) builds any spin in closed form; higher "
             f"ranks for N != 3 await the Young-tableau buildout."
+        )
+    _, peak = _tensor_construction_plan(N, p, q)
+    if peak > _TENSOR_POWER_BUDGET_BYTES:
+        label = f"su({N}) ({p}, {q})" if q is not None else f"so({N}) rank {p}"
+        raise ValueError(
+            f"the {label} tensor irrep would allocate about {peak / 2 ** 30:.1f} GiB, above the "
+            f"{_TENSOR_POWER_BUDGET_BYTES / 2 ** 30:.0f} GiB construction budget; choose a smaller label "
+            "(SO(3) builds any spin in closed form)"
         )
 
 
@@ -191,6 +251,32 @@ def _leibniz_action(
             M = torch.kron(M, X if slot == k else eye)
         out += M
     return out
+
+
+def _leibniz_apply(
+    X:         torch.Tensor,               # (N, N) algebra element in the defining rep, float64 or complex128
+    Q:         torch.Tensor,               # (N^r, d) columns in (R^N)^(x)r, slot 0 the most significant digit
+    r:         int,                        # tensor rank (>= 1)
+
+    *,
+    conj_from: Optional[int] = None,       # slots k >= conj_from take conj(X) (the antifundamental slots)
+) -> torch.Tensor:                         # (N^r, d) rho_r(X) Q
+    r"""Matrix-free :math:`\rho_r(X)\,Q = \sum_k (I^{(k)}\otimes X\otimes I^{(r-1-k)})\,Q`, slot by slot.
+
+    Each column of ``Q`` is read as an :math:`(N,)^r` tensor in the row-major slot order of :func:`_leibniz_action`
+    and :func:`_mixed_leibniz` (the Kronecker product puts slot 0 first), and :math:`X` (or :math:`\bar X` on the
+    antifundamental slots) contracts its slot :math:`k`: :math:`rN^{r+1}d` multiply-adds and :math:`O(N^r d)` memory
+    instead of the :math:`N^{2r}` dense action. Equal to ``action @ Q`` up to the order of the sums.
+    """
+    N = X.shape[-1]
+    d = Q.shape[-1]
+    tensor = Q.reshape(*([N] * r), d)                                     # (N, ..., N, d)
+    out = torch.zeros_like(tensor)
+    for k in range(r):
+        factor = X.conj() if conj_from is not None and k >= conj_from else X
+        slot = tensor.movedim(k, 0).reshape(N, -1)                        # (N, N^(r-1) d), slot k first
+        out += (factor @ slot).reshape(N, *([N] * (r - 1)), d).movedim(0, k)
+    return out.reshape(N ** r, d)
 
 
 def _contraction(N: int, p: int) -> torch.Tensor:
@@ -277,14 +363,23 @@ def _tensor_power_irrep(
     images are skew to rounding (about 1e-16 at p >= 2), not exactly: Q comes from a pseudo-inverse and
     Gram-Schmidt, and the images are deliberately not antisymmetrized, which would change their bytes and
     refuse saved so_n checkpoints through the fingerprint (audit 2026-10-16, F38).
+
+    A rank whose dense :math:`N^p \times N^p` construction would exceed ``_DENSE_CONSTRUCTION_BUDGET_BYTES``
+    (:func:`_tensor_construction_plan`) applies the action to Q matrix-free (:func:`_leibniz_apply`,
+    :math:`pN^{p+1}d` work and :math:`N^p d` memory per generator); every rank within it keeps the dense product
+    and its bytes. :func:`_guard_cost` refuses, before any allocation, a construction whose estimated peak exceeds
+    ``_TENSOR_POWER_BUDGET_BYTES`` (audit 2026-10-31, gauge-structure-4).
     """
     n_gen, N, _ = G_def.shape
     if p == 0:
         return torch.zeros(n_gen, 1, 1, dtype=torch.float64)  # trivial rep: zero generators
     _guard_cost(N, p)
+    dense, _ = _tensor_construction_plan(N, p)
     with _single_threaded():
         Q = _canonical_invariant_basis(N, p, traceless=traceless)              # (N^p, d)
-        return torch.stack([Q.T @ _leibniz_action(G_def[a], p) @ Q for a in range(n_gen)])
+        if dense:
+            return torch.stack([Q.T @ _leibniz_action(G_def[a], p) @ Q for a in range(n_gen)])
+        return torch.stack([Q.T @ _leibniz_apply(G_def[a], Q, p) for a in range(n_gen)])
 
 
 # Standard rotation generators of R^3 in the (x, y, z) basis, (A_a)_{jk} = -epsilon_{ajk}, so that
@@ -677,17 +772,35 @@ def _su_tensor_irrep(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (
         return _su_tensor_irrep_unthreaded(G_def, p, q)
 
 
+def _slot_swap_apply(Q: torch.Tensor, N: int, p: int) -> torch.Tensor:     # (N^(2p), D) -> (N^(2p), D)
+    r"""Matrix-free :func:`_slot_swap` applied to the columns of ``Q``: the axis permutation exchanging the p
+    fundamental with the p antifundamental slots, exact (no arithmetic)."""
+    D = Q.shape[-1]
+    tensor = Q.reshape(*([N] * (2 * p)), D)
+    order = (*range(p, 2 * p), *range(p), 2 * p)
+    return tensor.permute(order).reshape(N ** (2 * p), D)
+
+
 def _su_tensor_irrep_unthreaded(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (n_gen, d, d) float64
-    """The body of :func:`_su_tensor_irrep`, run under its single-thread guard."""
+    """The body of :func:`_su_tensor_irrep`, run under its single-thread guard. A label whose dense
+    :math:`N^{p+q}` construction would exceed ``_DENSE_CONSTRUCTION_BUDGET_BYTES`` applies the action and the slot
+    swap to Q matrix-free (:func:`_leibniz_apply`, :func:`_slot_swap_apply`); every label within it keeps the dense
+    products and its bytes (audit 2026-10-31, gauge-structure-4)."""
     X = _su_complex_basis(G_def)
     N = X.shape[-1]
+    _guard_cost(N, p, q)
+    dense, _ = _tensor_construction_plan(N, p, q)
     Q = _mixed_trace_basis(N, p, q).to(torch.complex128)
-    rho_c = torch.stack([Q.T @ _mixed_leibniz(X[a], p, q) @ Q for a in range(X.shape[0])])
+    if dense:
+        rho_c = torch.stack([Q.T @ _mixed_leibniz(X[a], p, q) @ Q for a in range(X.shape[0])])
+    else:
+        rho_c = torch.stack([Q.T @ _leibniz_apply(X[a], Q, p + q, conj_from=p) for a in range(X.shape[0])])
     if p != q:
         A, B = rho_c.real, rho_c.imag
         rho = torch.cat([torch.cat([A, -B], dim=-1), torch.cat([B, A], dim=-1)], dim=-2)
     else:
-        Mswap = (Q.T @ _slot_swap(N, p).to(torch.complex128) @ Q).real
+        Mswap = ((Q.T @ _slot_swap(N, p).to(torch.complex128) @ Q).real if dense
+                 else (Q.T @ _slot_swap_apply(Q, N, p)).real)
         if float((Mswap @ Mswap - torch.eye(Mswap.shape[0], dtype=torch.float64)).abs().max()) > 1e-9:
             raise RuntimeError(f"su({N}) irrep ({p}, {p}): the slot swap is not an involution on the irrep")
         eye = torch.eye(Mswap.shape[0], dtype=torch.float64)

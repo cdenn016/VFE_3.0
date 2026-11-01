@@ -1,12 +1,13 @@
 r"""Beta-weighted activation of the routing-cost cap, per layer and head (GL(K)_attention_v2, line 838).
 
 The relational router bounds every cost to :math:`[0, \kappa]` before the softmax,
-:math:`\bar D_{ij} = \min(D_{ij} - m_i, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (non-finite costs are
-also set to :math:`\kappa`) and the clamp reference :math:`m_i` of ``routing_kl_max_reference``: :math:`m_i = 0`
+:math:`\bar D_{ij} = \min(D_{ij} - \rho_i, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (non-finite costs are
+also set to :math:`\kappa`) and the clamp reference :math:`\rho_i` of ``routing_kl_max_reference``: :math:`\rho_i = 0`
 under ``'absolute'``, the row minimum :math:`\min_{j \in \mathcal S_i} D_{ij}` under ``'row_min'``
 (:func:`vfe3.gradients.relational.clamped_routing_cost`), the query-only row constant :math:`c_i` of the cost plus
-the admissible row mean of the key log-volumes under ``'query_shifted'`` (audit 2026-10-20 item 1), and :math:`c_i`
-alone under ``'query_shifted_v1'``; under both the bound is from above only (audit 2026-10-17 item 2). The captured ``score_energy_pre`` is
+the admissible row mean :math:`\bar\ell_i` of the key log-volumes :math:`\ell_j` under ``'query_shifted'`` (audit
+2026-10-20 item 1), and :math:`c_i` alone under ``'query_shifted_v1'``; under both the bound is from above only (audit
+2026-10-17 item 2). The captured ``score_energy_pre`` is
 :math:`\bar D_{ij}` either way, so an entry is *at the cap* when :math:`\bar D_{ij} \ge \kappa`; under
 ``'row_min'`` that is a gap to the row's best source, ``max_cost_uncapped`` is the largest uncapped gap, and
 the reference is recorded in the summary (``kl_max_reference``). The unweighted
@@ -16,11 +17,20 @@ fraction of capped entries says how often the bound is reached; the routing weig
     m_i = \sum_{j \le i,\ \bar D_{ij} \ge \kappa} \beta_{ij},
 
 says how much of the routing the bound touches, and bounds the clamp's effect on the row,
-:math:`\mathrm{TV}(\beta_i, \beta_i^{\text{unclamped}}) \le m_i/(1 - m_i)`; ``capped_beta_mass_max`` is its row
-maximum. Where the capture carries the pre-clamp row extremes ``score_raw_row_min_pre`` and
-``score_raw_row_max_pre`` (the kernel readout, audit 2026-10-17 item 9), ``raw_row_min_mean``, ``raw_row_min_max``
-and ``raw_row_gap_mean`` report the raw row minimum and row range of the cost before the reference and the clamp,
-which separate a row just above the cap from one far above it (NaN without the capture). Two query-row populations are reported, each with its
+:math:`\mathrm{TV}(\beta_i, \beta_i^{\text{unclamped}}) \le m_i`: capping only lowers costs, so every uncapped
+entry loses weight, and the total variation is the weight the capped entries gain, at most their weight :math:`m_i`
+after the clamp (audit 2026-10-31 A301). The bound holds at any temperature and log-prior and is attained as the
+capped entries' unclamped weight goes to zero, so ``capped_beta_mass_max``, its row maximum, bounds the routing change
+of every row directly. Where the capture carries the pre-clamp row extremes ``score_raw_row_min_pre`` and
+``score_raw_row_max_pre`` (the kernel readout, audit 2026-10-17 item 9), ``raw_row_min_mean`` and ``raw_row_min_max``
+report the pre-clamp row minimum on the scale the cap tests, :math:`\min_{j \in \mathcal S_i}(D_{ij} - \rho_i)`, so a
+value just below :math:`\kappa` is a row about to be capped and one far above it a row capped throughout (audit
+2026-10-31 A121). The capture's raw minimum is taken before the reference: under ``'query_shifted'`` it is
+:math:`\min_j(D_{ij} - c_i)`, which still carries :math:`\bar\ell_i` (``score_row_shift_pre`` minus
+``score_query_constant_pre``), subtracted here; under ``'row_min'`` the tested quantity is the gap, whose row minimum is
+zero by construction. ``raw_row_gap_mean`` is the row range (maximum minus minimum), which no reference moves. All
+three are NaN without the capture, and the two minimum columns also when a ``'query_shifted'`` capture carries no row
+shift. Two query-row populations are reported, each with its
 causal sources :math:`j` (finite attention log-prior; every source with :math:`\beta_{ij} > 0` when the
 model has no log-prior). Both keep only rows with at least two causal sources: a single-source row has
 :math:`\beta_{ii} = 1` whatever its cost, so the cap cannot change its routing.
@@ -48,7 +58,7 @@ POPULATIONS: Tuple[str, ...] = ("scored", "computed")
 # Accumulated per (population, layer, head): slot index of each sum.
 _SLOTS: Tuple[str, ...] = (
     "n_rows", "n_entries", "n_capped", "capped_beta_mass", "rows_with_cap", "capped_at_window_start",
-    "n_raw_rows", "raw_row_min_sum", "raw_row_gap_sum")
+    "n_raw_rows", "raw_row_min_sum", "raw_row_gap_sum", "n_raw_min_rows")
 
 
 def causal_support(
@@ -78,6 +88,28 @@ class KLCapObserver:
         self._windows_with_cap: Dict[Tuple[str, int], Set[int]] = {}
         self.n_batches = 0
         self.missing_captures = 0
+
+    def _reference_shift(
+        self,
+        cap:     Mapping[str, Any],                # one layer's capture
+        raw_low: torch.Tensor,                     # (B, H, N) float64 score_raw_row_min_pre
+    ) -> torch.Tensor:                             # (B, H, N) float64: subtract from the raw extremes
+        r"""What separates the capture's raw row minimum from the scale the cap tests (module docstring).
+
+        :math:`\bar\ell_i` = ``score_row_shift_pre - score_query_constant_pre`` under ``'query_shifted'`` (NaN when
+        the capture lacks either), the raw row minimum itself under ``'row_min'``, and zero otherwise (the
+        capture's raw cost is then already the tested one: :math:`D_{ij}` under ``'absolute'``, :math:`D_{ij} - c_i`
+        under ``'query_shifted_v1'``).
+        """
+        if self.kl_max_reference == "row_min":
+            return raw_low
+        if self.kl_max_reference != "query_shifted":
+            return torch.zeros_like(raw_low)
+        shift, constant = cap.get("score_row_shift_pre"), cap.get("score_query_constant_pre")
+        if shift is None or constant is None:
+            return torch.full_like(raw_low, float("nan"))
+        volume = shift.double() - constant.double()                            # (B, H, N) row mean of ell_j
+        return volume.unsqueeze(1) if volume.dim() == 2 else volume
 
     def update(
         self,
@@ -110,15 +142,18 @@ class KLCapObserver:
                 raw_low, raw_high = raw_low.double(), raw_high.double()          # (B, H, N)
                 if raw_low.dim() == 2:
                     raw_low, raw_high = raw_low.unsqueeze(1), raw_high.unsqueeze(1)
+                low = raw_low - self._reference_shift(cap, raw_low)              # (B, H, N) on the capped scale
             else:
-                raw_low = raw_high = torch.full((B, H, N), float("nan"), dtype=torch.float64, device=beta.device)
+                raw_low = raw_high = low = torch.full((B, H, N), float("nan"), dtype=torch.float64,
+                                                      device=beta.device)
             for population, row_mask in (("scored", valid), ("computed", input_valid)):
                 rows = (torch.as_tensor(row_mask, device=beta.device)[:, None, :].expand(B, H, N)
                         & multi_source)                                         # (B, H, N)
                 entries = support & rows[..., None]                                 # (B, H, N, N)
                 capped = entries & at_cap                                           # (B, H, N, N)
                 capped_mass = torch.where(capped, beta, torch.zeros_like(beta)).sum(dim=-1)   # (B, H, N)
-                raw_rows = rows & torch.isfinite(raw_low)                               # (B, H, N)
+                raw_rows = rows & torch.isfinite(raw_low)                               # (B, H, N) row ranges
+                low_rows = rows & torch.isfinite(low)                                   # (B, H, N) capped-scale minima
                 zero = torch.zeros((), dtype=torch.float64, device=beta.device)
                 stacked = torch.stack([
                     rows.sum(dim=(0, 2)).double(),
@@ -128,15 +163,16 @@ class KLCapObserver:
                     capped.any(dim=-1).sum(dim=(0, 2)).double(),
                     capped[..., 0].sum(dim=(0, 2)).double(),
                     raw_rows.sum(dim=(0, 2)).double(),
-                    torch.where(raw_rows, raw_low, zero).sum(dim=(0, 2)),
+                    torch.where(low_rows, low, zero).sum(dim=(0, 2)),
                     torch.where(raw_rows, raw_high - raw_low, zero).sum(dim=(0, 2)),
+                    low_rows.sum(dim=(0, 2)).double(),
                 ], dim=-1).cpu().numpy()                                           # (H, len(_SLOTS))
                 beta_capped = torch.where(capped, beta, torch.full_like(beta, -1.0)).amax(dim=(0, 2, 3))
                 cost_uncapped = torch.where(entries & ~capped, score,
                                             torch.full_like(score, -1.0)).amax(dim=(0, 2, 3))   # (H,)
                 beta_capped, cost_uncapped = beta_capped.cpu().tolist(), cost_uncapped.cpu().tolist()
                 mass_max = torch.where(rows, capped_mass, torch.full_like(capped_mass, -1.0)).amax(dim=(0, 2))
-                raw_max = torch.where(raw_rows, raw_low, torch.full_like(raw_low, -math.inf)).amax(dim=(0, 2))
+                raw_max = torch.where(low_rows, low, torch.full_like(low, -math.inf)).amax(dim=(0, 2))
                 mass_max, raw_max = mass_max.cpu().tolist(), raw_max.cpu().tolist()
                 for head in range(H):
                     key = (population, layer, head)
@@ -174,7 +210,7 @@ class KLCapObserver:
                 "max_cost_uncapped": self._max_cost_uncapped.get(key, float("nan")),
                 "capped_at_window_start": int(s["capped_at_window_start"]),
                 "capped_beta_mass_max": self._max_capped_mass.get(key, float("nan")),
-                "raw_row_min_mean": (s["raw_row_min_sum"] / s["n_raw_rows"] if s["n_raw_rows"]
+                "raw_row_min_mean": (s["raw_row_min_sum"] / s["n_raw_min_rows"] if s["n_raw_min_rows"]
                                      else float("nan")),
                 "raw_row_min_max": self._max_raw_row_min.get(key, float("nan")),
                 "raw_row_gap_mean": (s["raw_row_gap_sum"] / s["n_raw_rows"] if s["n_raw_rows"]
@@ -208,6 +244,8 @@ class KLCapObserver:
         return {
             "kl_max": self.kl_max,
             "kl_max_reference": self.kl_max_reference,
+            "raw_row_min_definition": ("pre-clamp row minimum of the cost the cap tests, D_ij less the reference "
+                                       "rho_i of kl_max_reference (zero under row_min); raw_row_gap is the row range"),
             "populations": {
                 "scored": "scored query rows of the evaluation protocol (each position once) and their causal sources",
                 "computed": "every query row with a real input token in every evaluated window, and its causal sources",

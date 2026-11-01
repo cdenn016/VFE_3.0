@@ -148,10 +148,8 @@ def test_existing_unavailable_probes_are_refreshed_without_changing_valid_record
         record = json.loads((tmp_path / f"{name}.json").read_text())
         assert record["available"] is True
         assert record["report_replay"]["split"] == "test"
-        if name == "estep_character":                 # single readout: record kept, no figure
-            assert not (tmp_path / f"{name}.png").exists()
-        else:
-            assert (tmp_path / f"{name}.png").stat().st_size > 0
+        # Records only: the figure worker renders them afterwards (audit 2026-10-31 viz-pipeline-11).
+        assert not (tmp_path / f"{name}.png").exists()
     # A subsequent call has no work; even the placeholder phi record is preserved.
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     report._prepare_missing_saved_probes(

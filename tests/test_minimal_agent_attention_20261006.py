@@ -264,7 +264,10 @@ def test_single_head_matches_explicit_gaussian_conditioning(K: int, d: int) -> N
         _close(post.Lambda_bar[i], sum(w_ref[i, j] * W_inv[j] for j in range(N)), 1e-10)
         _close(post.R[i], sum(w_ref[i, j] * torch.outer(r[j], r[j]) for j in range(N)) - torch.outer(u, u), 1e-10)
     noisy = projected_noisy_query_cost(a[None, :, None], A[None, :, None], b[None, :, None], B[None, :, None])[0, 0]
-    _close(post.cost, noisy + 0.5 * torch.logdet(A).unsqueeze(-1), 1e-10)
+    # On the prior's support; a masked pair is not factored and its cost reads 0 (audit 2026-10-31 A090, A192).
+    masked = ~torch.isfinite(lp[0])
+    _close(post.cost[~masked], (noisy + 0.5 * torch.logdet(A).unsqueeze(-1))[~masked], 1e-10)
+    assert torch.equal(post.cost[masked], torch.zeros(int(masked.sum()), dtype=F64))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -592,7 +595,8 @@ def test_finite_difference_gradients(inference: str, family: str) -> None:
 
 @pytest.mark.parametrize("inference", ["exact"])
 def test_tile_boundaries_give_identical_values_and_gradients(inference: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""One pair per tile (checkpointed, online log-sum-exp over source tiles) against the single default tile."""
+    r"""One pair per tile (each through the pinned recompute, online log-sum-exp over source tiles) against the single
+    default tile."""
     ops = _ops(inference, seed=95)
     data = _inputs(N=4, seed=96)
 
@@ -607,8 +611,8 @@ def test_tile_boundaries_give_identical_values_and_gradients(inference: str, mon
 
     default = run()
     calls: List[int] = []
-    real = ma.checkpoint
-    monkeypatch.setattr(ma, "checkpoint", lambda *a, **k: calls.append(1) or real(*a, **k))
+    real = ma._IEEEFP32TileRecompute.apply
+    monkeypatch.setattr(ma._IEEEFP32TileRecompute, "apply", lambda *a: calls.append(1) or real(*a))
     monkeypatch.setattr(ma, "PAIR_TILE_BYTES", 1)
     tiny = run()
     assert len(calls) == 2 * 10              # two heads, N(N+1)/2 = 10 causal one-pair tiles each (6 masked: skipped)
@@ -958,8 +962,8 @@ def test_optimizer_grouping_resources_and_run_record() -> None:
     assert record["score_covariance_contract"].endswith("_plus_channel_noise")
     mean_field = _relational_artifact_fields(tiny_config(**_AGENT, minimal_agent_inference="mean_field"))
     assert mean_field["relational_operators"]["routing_state"] == "pre_update"      # labels at the input moments
-    assert mean_field["relational_operators"]["factorization_fallback"] == (
-        "fp32_failure_or_certificate_layer_fp64_recompute_kl_certificate_fp64_refactor")
+    assert mean_field["relational_operators"]["factorization_fallback"] == (   # no KL refactor (audit 2026-10-31 A078)
+        "fp32_failure_or_certificate_layer_fp64_recompute")
     kernel = _relational_artifact_fields(tiny_config())["relational_operators"]
     assert "predictive_readout" not in kernel
     assert kernel["factorization_fallback"] == "failed_entries_source_root_shifted_cholesky_qr3_fp32_then_qr_fp64"

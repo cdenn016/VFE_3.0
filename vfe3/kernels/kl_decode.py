@@ -23,9 +23,12 @@ recomputes the scores tile by tile and writes
 into one (S, Vc) buffer that feeds the two cuBLAS backward GEMMs (dlhs = G rhs, drhs = G^T lhs) and the column
 reduction db = sum_i G, and accumulates :math:`\partial/\partial c_i = -\sum_v G_{iv}` and
 :math:`\partial/\partial\tau = \tau^{-2}\sum_{iv} w_{iv}\,\mathrm{kl}_{iv}` per row. The backward GEMMs run under the
-caller's fp32 matmul policy and db is a float32 reduction, as in the torch route's autograd backward. When the torch
-route would keep its chunk workspace for backward (``decode_ce_checkpoint`` accounting), A is kept per chunk and G
-goes to a separate buffer; when it would checkpoint, A is recomputed by the same GEMM in backward and G overwrites it.
+caller's fp32 matmul policy, as in the torch route's autograd backward, or at IEEE fp32 with ``ieee_backward``
+(``decode_backward_ieee_fp32``; audit 2026-10-31 numerics-1); db is a float32 reduction. When the torch route would
+keep its chunk workspace for backward (``decode_ce_checkpoint`` accounting), A is kept per chunk and G overwrites the
+kept chunk once the kernel has read it (audit 2026-10-31 triton-kernels-3; a retained graph differentiated again
+recomputes A, since a Triton write does not bump the version counter); when it would checkpoint, A is recomputed by
+the same GEMM in backward and G overwrites it.
 
 The logits are the torch route's bitwise (same operations in the same order, fp32 division by IEEE ``div_rn``; the
 compiled division flushes denormal results to zero; pinned by the CUDA test). The torch route is unchanged and
@@ -42,11 +45,12 @@ remains the reference; the differences are rounding-level and none changes the f
 The kernels use no atomics, so results are bitwise reproducible run to run for a fixed GPU, shape and dtype.
 ``triton`` is imported only when this route launches.
 """
+from contextlib import nullcontext
 from typing import Any, List, Optional, Tuple
 
 import torch
-from torch.autograd.function import once_differentiable
 
+from vfe3.kernels._autograd import strict_once_differentiable
 from vfe3.runtime import ieee_fp32_matmul
 
 _KERNELS: Any = None
@@ -82,9 +86,10 @@ def _cross_term(lhs: torch.Tensor, rhs_c: torch.Tensor) -> torch.Tensor:
 class KLDecodeCE(torch.autograd.Function):
     r"""Per-row KL-decode cross-entropy over packed rows; see the module docstring.
 
-    The backward is ``once_differentiable``: G is a Triton write autograd does not track (it can even overwrite
-    a recomputed cross term in place), so a ``create_graph=True`` gradient would carry a truncated graph and a
-    wrong second derivative. A double backward raises instead (audit 2026-10-16, F49).
+    The backward is once differentiable: G is a Triton write autograd does not track (it overwrites the cross term
+    in place), so a ``create_graph=True`` gradient would carry a truncated graph and a wrong second derivative. A
+    double backward raises instead (audit 2026-10-16, F49), also toward a leaf upstream of lhs or rhs under a
+    constant cotangent (``strict_once_differentiable``; audit 2026-10-31 triton-kernels-2).
     """
 
     @staticmethod
@@ -99,6 +104,7 @@ class KLDecodeCE(torch.autograd.Function):
         targets: torch.Tensor,           # (S,) int64 target ids in [0, V)
         chunk:   int,                    # vocabulary chunk width
         keep:    bool,                   # keep A per chunk for backward (else recompute)
+        ieee_backward: bool,             # run the two backward GEMMs at IEEE fp32 (decode_backward_ieee_fp32)
     ) -> torch.Tensor:                   # (S,) CE rows
         tk = _kernels()
         S, V = lhs.shape[0], rhs.shape[0]
@@ -127,10 +133,12 @@ class KLDecodeCE(torch.autograd.Function):
         # the leading difference for the logits that carry the mass).
         ctx.save_for_backward(lhs, per_pos, rhs, bias, u_arg, tau, targets, m, log_l, *kept)
         ctx.has_u, ctx.precise, ctx.chunk, ctx.keep = has_u, precise, chunk, keep
+        ctx.ieee_backward = ieee_backward
+        ctx.kept_overwritten = False                                       # set once G has replaced the kept A
         return (m - t) + log_l
 
     @staticmethod
-    @once_differentiable
+    @strict_once_differentiable
     def backward(ctx: Any, grad_rows: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
         lhs, per_pos, rhs, bias, u_arg, tau, targets, m, log_l, *kept = ctx.saved_tensors
@@ -139,8 +147,8 @@ class KLDecodeCE(torch.autograd.Function):
         dtype, device = lhs.dtype, lhs.device
         want_lhs, want_pp, want_rhs, want_bias, want_tau = need[0], need[1], need[2], need[3], need[5]
         g_lhs = torch.zeros_like(lhs) if want_lhs else None                  # (S, 2K)
-        # d_rhs is a GEMM under the caller's fp32 matmul policy, as the torch route's autograd backward runs it;
-        # d_bias is a float32 column reduction, as the torch route's sum over the "+ bias" broadcast is. Folded into
+        # d_rhs is a GEMM under the caller's fp32 matmul policy (IEEE fp32 with ieee_backward), as the torch route's
+        # autograd backward runs it; d_bias is a float32 column reduction, as the torch route's sum over the "+ bias" broadcast is. Folded into
         # the GEMM as the ones column of [lhs, 1], it rounded G to TF32 under 'high' on CUDA (audit 2026-10-16, F115).
         g_rhs = torch.empty(V, lhs.shape[1], dtype=dtype, device=device) if want_rhs else None   # (V, 2K)
         g_bias = torch.empty(V, dtype=dtype, device=device) if want_bias else None               # (V,)
@@ -148,8 +156,11 @@ class KLDecodeCE(torch.autograd.Function):
         d_tau = torch.zeros(S if want_tau else 1, dtype=dtype, device=device)   # (S,) sum_v w kl
         grad_rows = grad_rows.contiguous()
         cfg = tk.launch_config()["bwd"]
-        scratch = (torch.empty(S * min(ctx.chunk, V), dtype=dtype, device=device)
-                   if ctx.keep and S > 0 else None)                          # G when A is kept
+        # A kept chunk is dead once its backward kernel has read it, so G overwrites it; a second backward of a
+        # retained graph then finds G there, and recomputes A instead. The flag is set before the first write, so a
+        # backward that stops partway (an exception) also leaves the next one recomputing.
+        use_kept = ctx.keep and not ctx.kept_overwritten
+        ctx.kept_overwritten = ctx.kept_overwritten or (ctx.keep and S > 0)
         with torch.autocast(device_type=device.type, enabled=False):
             for index, v0 in enumerate(range(0, V, ctx.chunk)):
                 v1 = min(v0 + ctx.chunk, V)
@@ -160,24 +171,21 @@ class KLDecodeCE(torch.autograd.Function):
                     if want_bias:
                         g_bias[v0:v1].zero_()
                     continue
-                if ctx.keep:
-                    A = kept[index]
-                    G = scratch[:S * (v1 - v0)].view(S, v1 - v0)
-                else:
-                    A = _cross_term(lhs, rhs_c)                              # recompute; G overwrites it
-                    G = A
+                A = kept[index] if use_kept else _cross_term(lhs, rhs_c)    # (S, Vc); G overwrites it
+                G = A
                 _launch(tk.kl_ce_bwd_kernel, S, cfg, A, G, bias[v0:v1], per_pos, u_arg[v0:v1], targets, tau,
                         m, log_l, grad_rows, d_pp, d_tau, S, v1 - v0, v0,
                         HAS_U=ctx.has_u, PRECISE_DIV=ctx.precise, ACCURATE_EXP=not tk.INTERPRETED,
                         NEED_TAU=want_tau)
-                if want_lhs:
-                    g_lhs.addmm_(G, rhs_c)                                   # (S, 2K) += G rhs_c
-                if want_rhs:
-                    torch.mm(G.t(), lhs, out=g_rhs[v0:v1])                   # (Vc, 2K) = G^T lhs
+                with (ieee_fp32_matmul() if ctx.ieee_backward else nullcontext()):
+                    if want_lhs:
+                        g_lhs.addmm_(G, rhs_c)                               # (S, 2K) += G rhs_c
+                    if want_rhs:
+                        torch.mm(G.t(), lhs, out=g_rhs[v0:v1])               # (Vc, 2K) = G^T lhs
                 if want_bias:
                     torch.sum(G, dim=0, out=g_bias[v0:v1])                   # (Vc,) = sum_i G_iv
         g_tau = (d_tau.sum() / (tau * tau)).reshape(tau.shape) if want_tau else None
-        return (g_lhs, d_pp if want_pp else None, g_rhs, g_bias, None, g_tau, None, None, None)
+        return (g_lhs, d_pp if want_pp else None, g_rhs, g_bias, None, g_tau, None, None, None, None)
 
 
 def kl_decode_ce_rows(
@@ -191,6 +199,7 @@ def kl_decode_ce_rows(
     *,
     chunk:   int,                        # vocabulary chunk width
     keep:    bool,                       # keep the (S, Vc) cross terms for backward instead of recomputing
+    ieee_backward: bool = False,         # decode_backward_ieee_fp32: the backward GEMMs at IEEE fp32
 ) -> torch.Tensor:                       # (S,) CE rows
     r"""Validate the packed operands and run the fused forward/backward (see the module docstring).
 
@@ -217,4 +226,4 @@ def kl_decode_ce_rows(
     return KLDecodeCE.apply(
         lhs.contiguous(), per_pos.contiguous(), rhs.contiguous(), bias.contiguous(),
         u.contiguous() if u is not None else None, tau_eff.reshape(1).contiguous(),
-        targets.to(torch.int64).contiguous(), int(chunk), bool(keep))
+        targets.to(torch.int64).contiguous(), int(chunk), bool(keep), bool(ieee_backward))

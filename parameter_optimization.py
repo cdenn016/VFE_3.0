@@ -13,7 +13,14 @@ Optimization cells retain metrics and reports but do not write model weights or 
 n_trials is the total number of candidate configurations, including the untouched baseline.
 If enabled parameters require a different regime, a second search_baseline anchor is included
 with only those prerequisites changed. Bounds are continuous and may use linear or logarithmic
-sampling; values defines an explicit discrete domain.
+sampling; values defines an explicit discrete domain. A sampled candidate is labeled by its Sobol
+draw index, so its label and cell do not move when an anchor is added or a draw is rejected.
+
+ablation.py's module route switches (principled_exact_route, fully_gauge_covariant) are pinned for the
+whole search to SEARCH_CONFIG's own values (False unless named there), and the manifest, the
+fingerprints and the inert gate are built from the cell configuration ablation executes, so the record
+is the trained configuration (audit 2026-10-31, A001). A multi-seed confirmation runs in its own sweep
+directory and reuses the cells a single-seed screen already trained (A371).
 """
 
 import copy
@@ -312,7 +319,12 @@ SEARCH_CONFIG: Dict[str, Any] = {
     # One seed screens candidates. Use [6, 23, 64] for a joint multi-seed confirmation run.
     "seeds":      [6],
     "resume":     True,
+    "retry_failed": False,              # False | True: under resume, retrain candidates whose earlier attempt failed
     "output_dir": "vfe3_parameter_optimization_results",
+
+    # ablation.py's route switches for this search; ablation.py's own click-to-run values are not read.
+    "principled_exact_route": False,    # False | True
+    "fully_gauge_covariant":  False,    # False | True
 
     "parameters": {
         
@@ -526,18 +538,45 @@ def _resolved_model_config(model_config: Mapping[str, Any]) -> Dict[str, Any]:
     return asdict(cfg)
 
 
+_ROUTE_SWITCHES = ("principled_exact_route", "fully_gauge_covariant")
+
+
+def _search_route_switches(search_config: Mapping[str, Any]) -> Dict[str, bool]:
+    """Return the ablation route switches a search runs under: SEARCH_CONFIG's own values, False when absent."""
+    switches: Dict[str, bool] = {}
+    for name in _ROUTE_SWITCHES:
+        value = search_config.get(name, False)
+        if type(value) is not bool:
+            raise ValueError(f"SEARCH_CONFIG[{name!r}] must be a bool")
+        switches[name] = value
+    return switches
+
+
 @contextmanager
 def _ablation_baseline_scope(
     model_config: Mapping[str, Any],
+
+    *,
+    route_switches: Optional[Mapping[str, bool]] = None,
 ) -> Iterator[None]:
-    """Temporarily make the local model config, as declared, the ablation runner's baseline."""
+    r"""Temporarily make the local model config, as declared, the ablation runner's baseline.
+
+    ablation.py's module switches ``principled_exact_route`` and ``fully_gauge_covariant`` rewrite that
+    baseline in ``ablation._resolved_sweep_baseline`` before every arm, so they are pinned for the scope to the
+    search's own ``route_switches`` (both False when None) and restored on exit; ablation.py's click-to-run
+    values never select the route a search trains (audit 2026-10-31, A001).
+    """
     declared = _declared_model_config(model_config)
-    original = ablation.BASELINE_CONFIG
+    switches = {name: False for name in _ROUTE_SWITCHES}
+    switches.update(route_switches or {})
+    saved = (ablation.BASELINE_CONFIG, ablation.principled_exact_route, ablation.fully_gauge_covariant)
     ablation.BASELINE_CONFIG = declared
+    ablation.principled_exact_route = bool(switches["principled_exact_route"])
+    ablation.fully_gauge_covariant = bool(switches["fully_gauge_covariant"])
     try:
         yield
     finally:
-        ablation.BASELINE_CONFIG = original
+        ablation.BASELINE_CONFIG, ablation.principled_exact_route, ablation.fully_gauge_covariant = saved
 
 
 def _is_finite_number(value: object) -> bool:
@@ -677,21 +716,32 @@ def _parameter_from_unit(unit: float, spec: Mapping[str, Any]) -> Any:
     return low + unit * (high - low)
 
 
+def _candidate_cfg_dict(
+    overrides: Mapping[str, Any],
+    model_config: Mapping[str, Any],
+
+    *,
+    seed:           int,
+    max_steps:      Optional[int],
+    route_switches: Optional[Mapping[str, bool]] = None,
+) -> Dict[str, Any]:
+    """Return the exact VFE3Config kwargs ablation builds the candidate's cell from (``ablation._cell_cfg_dict``)."""
+    with _ablation_baseline_scope(model_config, route_switches=route_switches):
+        return ablation._cell_cfg_dict(dict(overrides), seed=seed, max_steps=max_steps)
+
+
 def _candidate_config(
     overrides: Mapping[str, Any],
     model_config: Mapping[str, Any],
 
     *,
-    seed:      int,
-    max_steps: Optional[int],
+    seed:           int,
+    max_steps:      Optional[int],
+    route_switches: Optional[Mapping[str, bool]] = None,
 ) -> Dict[str, Any]:
-    """Return a validated full VFE3Config mapping for one candidate."""
-    candidate = _declared_model_config(model_config)
-    candidate.update(overrides)
-    candidate["checkpoint_interval"] = 0
-    candidate["seed"] = seed
-    if max_steps is not None:
-        candidate["max_steps"] = max_steps
+    """Return the validated full VFE3Config mapping of the cell ablation trains for one candidate."""
+    candidate = _candidate_cfg_dict(overrides, model_config, seed=seed, max_steps=max_steps,
+                                    route_switches=route_switches)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         resolved = VFE3Config(**candidate)
@@ -703,8 +753,9 @@ def _candidate_fingerprint(
     model_config: Mapping[str, Any],
 
     *,
-    seed:      int,
-    max_steps: Optional[int],
+    seed:           int,
+    max_steps:      Optional[int],
+    route_switches: Optional[Mapping[str, bool]] = None,
 ) -> str:
     """Return the semantic full-config identity used to remove duplicate candidates."""
     return ablation.semantic_config_fingerprint(
@@ -713,6 +764,7 @@ def _candidate_fingerprint(
             model_config,
             seed=seed,
             max_steps=max_steps,
+            route_switches=route_switches,
         )
     )
 
@@ -721,14 +773,20 @@ def _refuse_inert_parameters(
     enabled_specs:        Sequence[tuple[str, Mapping[str, Any]]],
     model_config:         Mapping[str, Any],
     changed_requirements: Mapping[str, Any],
+
+    *,
+    seed:           int                          = 0,
+    max_steps:      Optional[int]                = None,
+    route_switches: Optional[Mapping[str, bool]] = None,
 ) -> None:
     """Refuse enabled parameters that ``inactive_fields`` reports unread on the search baseline.
 
-    Runs before ``optimization_manifest.json`` is written, so an inert entry fails at once instead
-    of after the manifest (audit 2026-10-07 F41).
+    The baseline is the cell ablation executes for the search-baseline requirements under the search's route
+    switches (audit 2026-10-31, A001). Runs before ``optimization_manifest.json`` is written, so an inert entry
+    fails at once instead of after the manifest (audit 2026-10-07 F41).
     """
-    resolved = dict(model_config)
-    resolved.update(changed_requirements)
+    resolved = _candidate_cfg_dict(changed_requirements, model_config, seed=seed, max_steps=max_steps,
+                                   route_switches=route_switches)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         inactive = VFE3Config(**resolved).inactive_fields()
@@ -747,7 +805,7 @@ def generate_candidates(
     local_model_config = _declared_model_config(
         config if model_config is None else model_config
     )
-    resolved_model_config = _resolved_model_config(local_model_config)
+    route_switches = _search_route_switches(search_config)
     parameters = search_config.get("parameters")
     _validate_parameter_catalog(parameters)
     enabled_specs = _enabled_parameter_specs(parameters)
@@ -763,12 +821,16 @@ def generate_candidates(
         raise ValueError("SEARCH_CONFIG['max_steps'] must be None or an exact positive integer")
 
     requirements = _fixed_requirements(enabled_specs)
+    # Requirements are compared with, and the inert gate reads, the baseline cell ablation executes.
+    resolved_model_config = _candidate_config({}, local_model_config, seed=seeds[0], max_steps=max_steps,
+                                              route_switches=route_switches)
     changed_requirements = {
         field: value
         for field, value in requirements.items()
         if resolved_model_config.get(field) != value
     }
-    _refuse_inert_parameters(enabled_specs, local_model_config, changed_requirements)
+    _refuse_inert_parameters(enabled_specs, local_model_config, changed_requirements,
+                             seed=seeds[0], max_steps=max_steps, route_switches=route_switches)
     anchors: List[Dict[str, Any]] = [{"label": "baseline", "overrides": {}}]
     if changed_requirements:
         anchors.append({
@@ -789,6 +851,7 @@ def generate_candidates(
             local_model_config,
             seed=seeds[0],
             max_steps=max_steps,
+            route_switches=route_switches,
         )
         if fingerprint not in seen:
             seen.add(fingerprint)
@@ -814,6 +877,7 @@ def generate_candidates(
                 local_model_config,
                 seed=seeds[0],
                 max_steps=max_steps,
+                route_switches=route_switches,
             )
         except (NotImplementedError, TypeError, ValueError) as exc:
             message = str(exc)
@@ -823,7 +887,10 @@ def generate_candidates(
             continue
         seen.add(fingerprint)
         candidates.append({
-            "label": f"joint_{len(candidates):04d}",
+            # The 1-based Sobol draw index, not the position in the design: adding or removing the
+            # search_baseline anchor, or rejecting a draw, leaves every other label, and the cell resume
+            # finds under it, in place (audit 2026-10-31, A371).
+            "label": f"joint_{draws:04d}",
             "overrides": overrides,
         })
 
@@ -837,6 +904,19 @@ def generate_candidates(
             + (f"; rejected: {invalid_summary}" if invalid_summary else "")
         )
     return candidates
+
+
+def _joint_sweep_name(seeds: Sequence[int]) -> str:
+    r"""The ablation sweep, and output subdirectory, of a search: one for single-seed screens, one for multi-seed runs.
+
+    A multi-seed sweep names its cells ``label__s{seed}``, a single-seed sweep ``label``, and ablation's sweep view
+    (``ablation._collect_sweep_results``) groups the cells of one directory by base label and admits a candidate
+    only with exactly one cell per seed. A confirmation run in the screen's directory would therefore find two
+    cells for the screened seed and admit no candidate, and it retrained that seed. In its own directory it
+    completes, and ablation's cohort reuse, which matches cells of other sweeps by their full contract, serves
+    each screened cell instead of training it again (audit 2026-10-31, A371).
+    """
+    return _JOINT_SWEEP_NAME if len(seeds) == 1 else f"{_JOINT_SWEEP_NAME}_multiseed"
 
 
 def _joint_sweep(
@@ -1661,8 +1741,13 @@ def _manifest(
     candidates:    Sequence[Mapping[str, Any]],
     seeds:         Sequence[int],
 ) -> Dict[str, Any]:
-    """Return the immutable candidate-generation record for this invocation."""
-    effective_model_config = _resolved_model_config(model_config)
+    """Return the immutable candidate-generation record for this invocation.
+
+    Schema 4 (audit 2026-10-31, A001): ``model_config`` is the baseline cell ablation executes (the local config
+    under the search's ``route_switches``, as ``ablation._cell_cfg_dict`` builds it), not the local declaration,
+    and ``joint_sweep`` names the ablation sweep directory of the cells.
+    """
+    route_switches = _search_route_switches(search_config)
     enabled = [
         name
         for name, spec in search_config["parameters"].items()
@@ -1673,9 +1758,10 @@ def _manifest(
         model_config,
         seed=seeds[0],
         max_steps=search_config.get("max_steps"),
+        route_switches=route_switches,
     )
     return {
-        "schema_version":       3,
+        "schema_version":       4,
         "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
         "method":               "scrambled_sobol_joint",
         "n_trials":             len(candidates),
@@ -1683,10 +1769,10 @@ def _manifest(
         "training_seeds":       list(seeds),
         "enabled_parameters":   enabled,
         "parameter_order":      list(search_config["parameters"]),
+        "route_switches":       route_switches,
+        "joint_sweep":          _joint_sweep_name(seeds),
         "baseline_fingerprint": ablation.semantic_config_fingerprint(baseline),
-        "model_config":         ablation._jsonable(
-            effective_model_config
-        ),
+        "model_config":         ablation._jsonable(baseline),
         "search_config":        ablation._jsonable(
             copy.deepcopy(dict(search_config))
         ),
@@ -1713,6 +1799,10 @@ def main() -> int:
     max_tokens = SEARCH_CONFIG.get("max_tokens")
     if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
         raise ValueError("SEARCH_CONFIG['max_tokens'] must be None or an exact positive integer")
+    retry_failed = SEARCH_CONFIG.get("retry_failed", False)
+    if type(retry_failed) is not bool:
+        raise ValueError("SEARCH_CONFIG['retry_failed'] must be a bool")
+    route_switches = _search_route_switches(SEARCH_CONFIG)
 
     seeds = _validated_seeds(SEARCH_CONFIG.get("seeds"))
     candidates = generate_candidates(SEARCH_CONFIG, model_config)
@@ -1737,50 +1827,56 @@ def main() -> int:
         )
     )
 
-    if _JOINT_SWEEP_NAME in ablation.SWEEPS:
+    sweep_name = _joint_sweep_name(seeds)
+    if sweep_name in ablation.SWEEPS:
         raise ValueError(
-            f"temporary sweep name {_JOINT_SWEEP_NAME!r} already exists in ablation.SWEEPS"
+            f"temporary sweep name {sweep_name!r} already exists in ablation.SWEEPS"
         )
     sweep = _joint_sweep(candidates, seeds)
-    ablation.SWEEPS[_JOINT_SWEEP_NAME] = sweep
+    ablation.SWEEPS[sweep_name] = sweep
     collected: List[Dict[str, Any]] = []
     try:
-        with _ablation_baseline_scope(model_config):
-            ablation.validate_sweeps([_JOINT_SWEEP_NAME])
+        with _ablation_baseline_scope(model_config, route_switches=route_switches):
+            ablation.validate_sweeps([sweep_name])
             results = ablation.run_sweep(
-                _JOINT_SWEEP_NAME,
+                sweep_name,
                 output_dir,
                 dataset=dataset,
                 device=device,
                 seed=seeds[0],
                 resume=SEARCH_CONFIG["resume"],
+                retry_failed=retry_failed,
                 save_model_artifacts=_SAVE_MODEL_ARTIFACTS,
                 max_tokens=max_tokens,
                 max_steps=SEARCH_CONFIG.get("max_steps"),
                 collected_out=collected,
             )
     finally:
-        if ablation.SWEEPS.get(_JOINT_SWEEP_NAME) is sweep:
-            del ablation.SWEEPS[_JOINT_SWEEP_NAME]
+        if ablation.SWEEPS.get(sweep_name) is sweep:
+            del ablation.SWEEPS[sweep_name]
 
     # run_sweep returns [] for an incomplete sweep; rank its collected cohort instead, so one
     # failed cell leaves the completed candidates ranked and marks the rest incomplete.
     rows = _leaderboard_rows(candidates, results or collected, len(seeds))
     _write_leaderboard(output_dir / "leaderboard.csv", rows)
     expected_results = len(candidates) * len(seeds)
-    complete = len(results) == expected_results
+    # The sweep view also holds earlier invocations' cells whose labels are no candidate of this design (a
+    # smaller n_trials, another sobol_seed); only this design's candidates count (audit 2026-10-31, A371).
+    admitted = [result for result in results if _result_base_label(result, candidates) is not None]
+    complete = len(admitted) == expected_results
     figure_status, figures, tables, figure_error = _try_write_sweep_figures(
         output_dir,
         [row for row in rows if row["status"] == "complete"],
         candidates,
         SEARCH_CONFIG,
-        _resolved_model_config(model_config),
+        _candidate_config({}, model_config, seed=seeds[0], max_steps=SEARCH_CONFIG.get("max_steps"),
+                          route_switches=route_switches),
     )
     ablation._write_json_atomic(output_dir / "optimization_status.json", {
         "schema_version":   4,
         "status":           "complete" if complete else "incomplete",
         "expected_results": expected_results,
-        "admitted_results": len(results),
+        "admitted_results": len(admitted),
         "figure_status":    figure_status,
         "figures":          figures,
         "tables":           tables,
@@ -1792,7 +1888,7 @@ def main() -> int:
     if not complete:
         logger.error(
             "optimization incomplete: admitted %d of %d requested seed-cells",
-            len(results),
+            len(admitted),
             expected_results,
         )
         return 1

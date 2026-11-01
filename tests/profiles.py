@@ -58,6 +58,8 @@ _CONFIG_VALUES: dict[str, Any] = {
     'decode_chunk_size': 8192,
     'decode_ce_checkpoint': 'auto',
     'decode_ce_triton': False,
+    'decode_bank_triton': False,
+    'decode_backward_ieee_fp32': False,
     'decode_logits_amp': False,
     'decode_second_order': False,
     'decode_ranking_fp64_escalation': True,
@@ -81,12 +83,14 @@ _CONFIG_VALUES: dict[str, Any] = {
     'attention_mode': 'projected_gradient',
     'attention_residual': False,
     'content_link_chart': 'affine',
+    'content_link_exp_precision': 'fp64',
     'content_link_edges': 'off',
     'content_link_edge_rank': 4,
     'content_link_latent': False,
     'content_link_latent_steps': 1,
     'content_link_latent_sigma': 0.1,
     'content_link_latent_damping': 1.0,
+    'content_link_latent_guard': False,
     'content_link_loop_weight': 0.0,
     'content_link_loop_window': 1,
     'relational_receiver_noise': 1.0,
@@ -149,6 +153,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'per_type_hidden_bias': False,
     'm_per_type_hidden_bias_lr': None,
     'layernorm_affine': True,
+    'layernorm_fused': False,
     'block_norm_covariance': 'passthrough',
     'block_norm_trace_cap': True,
     'block_norm_cap_moment_fallback': False,
@@ -176,18 +181,28 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_phi_group_differential_mode': 'series',
     'm_phi_fisher_rotation_weight': 2.0,
     'm_phi_fisher_completion': 'rotation',
+    'adam_beta1': 0.9,
+    'adam_beta2': 0.999,
+    'adam_eps': 1e-08,
     'weight_decay': 0.05,
+    'block_mlp_bias_weight_decay': None,
+    'relational_content_weight_decay': 0.0,
     'sigma_weight_decay': None,
     'mu_weight_decay': None,
     'decode_mu_weight_decay': None,
     'phi_weight_decay': 0.065,
     'relational_score_weight_decay': 0.0,
     'eps': 1e-06,
+    'sigma_log_floor_mode': 'absorbing',
     'kl_max': 100.0,
     'routing_kl_max_reference': 'absolute',
     'pair_kl_gemm_tol': None,
+    'pair_kl_gemm_shift': 'first_key',
     'relational_tile_mib': 32,
+    'routing_causal_tiles': False,
     'relational_diag_moments_kernel': 'torch',
+    'relational_type_moments': False,
+    'relational_shared_canonical_mean': False,
     'sigma_max': 100.0,
     'e_mu_q_trust': 2,
     'e_sigma_q_trust': 5.0,
@@ -199,6 +214,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'decode_av_precision': 'fp64',
     'transport_chart_max_norm': 20.0,
     'frame_pair_escalation_tol': None,
+    'frame_inverse_adjoint_precision': 'fp64',
     'phi_mstep_max_matrix_norm': None,
     'phi_frame_condition_max': None,
     'phi_type_dropout': 0.0,
@@ -248,13 +264,15 @@ def tiny_config(**overrides: Any) -> VFE3Config:
 # taken from it, so the route switches (readout, MLP mode, family, decode, routing, prior, rope, norms, residual,
 # alpha form, ...) follow the launcher; _LIVE_TINY then shrinks the shape and run fields to a CPU unit test. A field
 # the launcher omits runs at its VFE3Config default, which _LIVE_OMITTED pins here as a test-owned value wherever
-# the legacy baseline differs (test_live_route_profile checks every omitted field against its default). The legacy
-# baseline above (projected_gradient, Euler, state-dependent alpha) stays the default profile; this one is opt-in.
+# the legacy baseline differs (test_live_route_profile checks every omitted field against the value the launcher run
+# resolves). The legacy baseline above (projected_gradient, Euler, state-dependent alpha) stays the default profile;
+# this one is opt-in.
 _LIVE_OMITTED: dict[str, Any] = {
     'decode_av_precision': 'fp32',
     'decode_ranking_fp64_escalation': False,
     'skip_belief_sigma_update': False,
     'transport_chart_max_norm': 50.0,
+    'min_lr_frac': 0.0,                       # the launcher run's cosine decays to zero (audit 2026-10-31 config-launcher-10)
 }
 
 _LIVE_TINY: dict[str, Any] = {
@@ -468,8 +486,10 @@ _PRIOR_BANK_BASELINE: dict[str, Any] = {
     'decode_mode': 'diagonal_chunked',
     'decode_chunk_size': 8192,
     'decode_av_precision': None,
+    'decode_backward_ieee_fp32': False,
     'decode_ce_checkpoint': 'auto',
     'decode_ce_triton': False,
+    'decode_bank_triton': False,
     'decode_ranking_fp64_escalation': False,
     'unigram_kappa': 1.0,
     'decode_unigram_prior': False,

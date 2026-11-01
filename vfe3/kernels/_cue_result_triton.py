@@ -24,18 +24,25 @@ exclusive prefix and suffix of :math:`p_lV_lV_l^\top` inside the element's own t
 by one coordinate). The full Gram would carry the self term :math:`p_kV_kV_k^\top`, whose rounding erased any off-axis
 remainder below :math:`\epsilon p_ka_k^2` (audit 2026-10-28 F01); the result noise is added last (audit 2026-10-25
 F02). Every kernel that reads the partials uses the same BK, so a coordinate tile is the same set of coordinates in all
-of them.
+of them. At rank two or more the contraction with :math:`U_k` can still cancel (its rounding error is of order
+:math:`\epsilon\lvert U_k\rvert^2\operatorname{tr}G^{(-k)}`), so elements below :math:`2^{12}` times that bound are
+recomputed directly as :math:`\sum_{l\ne k}p_l(U_k\cdot V_l)^2` in float64 (``_off_axis``; audit 2026-10-31 A085).
+The weights kernel writes :math:`\ell_{ia}` without the constant :math:`-\tfrac K2\log 2\pi`, which cancels in the
+normalized weights; torch adds it to the log evidence in the route's dtype (A089).
 
 Kernels (one owner per output element, no atomics):
   ``cr_fwd_weights_kernel``   program = (row, BA components); k loop; writes the unnormalized log weights, the t planes
-                              and the per-tile Gram partial planes.
+                              and the per-tile Gram partial planes (``cr_fwd_weights_scan_kernel``: the same planes,
+                              with the exclusive tile sums formed by two scans; opt-in, A200).
   ``cr_fwd_moments_kernel``   program = (row, BK coordinates); loop over component tiles with a weighted Chan merge;
                               writes the result mean and variances.
   ``cr_bwd_pairs_kernel``     program = (row, BA components); k loop over the planes the weights kernel rewrote;
-                              accumulates wbar = dL/dw, tbar and Gbar and writes their planes.
+                              accumulates wbar = dL/dw, tbar and Gbar, writes their planes and packs the clamp
+                              indicator into int32 bits.
   ``cr_bwd_rows_kernel``      program = (row, BK coordinates); loop over component tiles; writes dL/dxi and dL/dc.
   ``cr_bwd_cols_kernel``      program = (BA components, BK coordinates, row split); loop over the split's rows;
                               writes one partial of dL/dnu, dL/dlambda, dL/domega, dL/dq, dL/dU and dL/dV.
+The rows and column kernels read the pairs kernel's indicator bits, so every backward kernel uses one indicator.
 """
 from typing import Dict
 
@@ -135,18 +142,59 @@ def _shifts(C, LAM, V, row, offs_a, ma, offs_k, k0, K, BK: tl.constexpr, RANK: t
 
 
 @triton.jit
-def _off_axis(U, V, GP, RM, NKT, j, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi,
-              BA: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr):
+def _off_axis_direct(C, LAM, U, V, row, offs_a, ma, offs_k, idx, m2, K, RANK: tl.constexpr):
+    r"""sum_{l != k} p_l (U_k . V_l)^2 for the (BA, BK) tile in float64: a sum of nonnegative terms whose dot products
+    are formed in float64 from the stored values, so it keeps its relative accuracy where the Gram contraction of
+    :func:`_off_axis` cancels. O(K RANK) per element, with p_l formed as in :func:`_elem`; it runs only for a tile with
+    a flagged element (audit 2026-10-31 A085)."""
+    acc = tl.zeros_like(m2.to(tl.float64))                                      # (BA, BK)
+    arow = offs_a.to(tl.int64) * K                                              # (BA,) row a of the (M, K) tables
+    for l in range(0, K):
+        c_l = tl.load(C + row * K + l)
+        lam_l = tl.load(LAM + arow + l, mask=ma, other=1.0)                     # (BA,)
+        p_l = (lam_l * (1.0 / (c_l + lam_l)) * c_l).to(tl.float64)              # gain c at coordinate l
+        dot = tl.zeros_like(acc)                                                # (BA, BK) U_k . V_l
+        for r in tl.static_range(RANK):
+            u_r = tl.load(U + idx * RANK + r, mask=m2, other=0.0).to(tl.float64)
+            v_r = tl.load(V + (arow + l) * RANK + r, mask=ma, other=0.0).to(tl.float64)
+            dot += u_r * v_r[:, None]
+        acc += tl.where(offs_k[None, :] != l, p_l[:, None] * (dot * dot), 0.0)
+    return acc
+
+
+@triton.jit
+def _off_axis(C, LAM, U, V, GP, RM, NKT, j, row, M, K, offs_a, ma, offs_k, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi,
+              m_hi, BA: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr):
     r"""U_k^T G^(-k) U_k = sum_{l != k} p_l (U_k . V_l)^2 for the tile, unclamped; G^(-k) is symmetric, so each pair
-    r <= s is formed once and the off-diagonal ones count twice."""
+    r <= s is formed once and the off-diagonal ones count twice.
+
+    The rounding error of the contraction is of order eps |U_k|^2 tr G^(-k); at rank two or more a factor row with
+    entries of both signs cancels inside it however small the couplings U_k . V_l are, so the elements whose computed
+    sum lies below 2^12 eps |U_k|^2 tr G^(-k) are recomputed by :func:`_off_axis_direct` (audit 2026-10-31 A085, the
+    threshold of the torch route's ``_rescue_off_axis``). A tile with no flagged element keeps the contraction."""
     off = tl.zeros_like(p_lo)
+    uu = tl.zeros_like(p_lo)                                                    # |U_k|^2
+    trg = tl.zeros_like(p_lo)                                                   # tr G^(-k)
     for r in tl.static_range(RANK):
         u_r = tl.load(U + idx * RANK + r, mask=m2, other=0.0)
+        uu += u_r * u_r
         for s in tl.static_range(r, RANK):
             u_s = tl.load(U + idx * RANK + s, mask=m2, other=0.0)
             w = 1.0 if s == r else 2.0
-            off += (w * u_r * u_s) * _gram_loo(GP, RM, NKT, j, row, M, offs_a, ma, V, r, s, p_lo, idx_lo, m_lo, p_hi,
-                                               idx_hi, m_hi, BA, RANK, RP)
+            g_rs = _gram_loo(GP, RM, NKT, j, row, M, offs_a, ma, V, r, s, p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi, BA,
+                             RANK, RP)
+            off += (w * u_r * u_s) * g_rs
+            if s == r:
+                trg += g_rs
+    if RANK > 1:
+        if off.dtype == tl.float64:
+            tol = 2.0 ** -40                                                    # 2^12 eps, float64
+        else:
+            tol = 2.0 ** -11                                                    # 2^12 eps, float32
+        flag = tl.abs(off) < tol * uu * trg
+        if tl.sum(tl.sum(flag.to(tl.int32), 1), 0) > 0:
+            direct = _off_axis_direct(C, LAM, U, V, row, offs_a, ma, offs_k, idx, m2, K, RANK)
+            off = tl.where(flag, direct.to(off.dtype), off)
     return off
 
 
@@ -201,14 +249,21 @@ def _store_planes(P, RM, row, M, offs_a, ma, vals, offs_p, valid_p):
 
 
 @triton.jit
-def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE, HALF_K_LOG2PI,
-                          BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
-                          ACC: tl.constexpr, WRITE_LOGW: tl.constexpr, NKTP: tl.constexpr):
-    r"""Unnormalized log weights (only with ``WRITE_LOGW``; the backward's rerun needs just the planes), the t
-    planes, and for each coordinate tile j the exclusive tile sum O^(j) = sum_{j' != j} G^(j') of the Gram partials,
-    accumulated in registers in ascending j' from zero with a zero added at j' = j, the order in which the consumers
-    used to sum the stored partials, so the values are the same (docs/perf-investigation_2026-10-28.md, rank 7).
-    ``NKTP`` is NKT padded to a power of two."""
+def _weights_planes(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE,
+                    BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
+                    ACC: tl.constexpr, WRITE_LOGW: tl.constexpr, NKTP: tl.constexpr, SCAN: tl.constexpr):
+    r"""Body of the two weights kernels: the unnormalized log weights without the constant -K/2 log 2 pi (only with
+    ``WRITE_LOGW``; the backward's rerun needs just the planes), the t planes, and for each coordinate tile j the
+    exclusive tile sum O^(j) = sum_{j' != j} G^(j') of the Gram partials. ``NKTP`` is NKT padded to a power of two.
+
+    ``SCAN`` False accumulates O in registers in ascending j' from zero with a zero added at j' = j, the order in which
+    the consumers used to sum the stored partials, so the values are the same (docs/perf-investigation_2026-10-28.md,
+    rank 7); that is BA NKTP RP^2 select-adds per coordinate tile, O(NKT^2) per program. ``SCAN`` True stores each
+    tile's partial G^(j) in its own planes and then forms O^(j), one (r, s) plane at a time, as an exclusive prefix
+    plus an exclusive suffix of the partials (two scans along the tile axis, no subtraction): O(NKT) per program, and
+    only (BA, NKTP) tiles live after the k loop instead of the (BA, NKTP, RP^2) tile through it. It sums in a different
+    order, so it is opt-in (audit 2026-10-31 A200). The constant of the log density is added in torch in the route's
+    dtype (a Python float argument would reach a compiled launch as fp32; A089)."""
     row = tl.program_id(0).to(tl.int64)
     offs_a = tl.program_id(1) * BA + tl.arange(0, BA)
     ma = offs_a < M
@@ -229,16 +284,54 @@ def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_ST
             s_acc += tl.sum(tl.where(m2, delta * delta * inv + _log(W, ACC), 0.0), 1)
         dt_, dG = _pair_sums(V, idx, m2, g, p, offs_r, offs_rr, BA, RANK, RP)
         t += dt_
-        O += tl.where((offs_j != k0 // BK)[None, :, None], dG[:, None, :], 0.0)  # tile j' = k0 / BK into every O^(j)
+        if SCAN:                                                                # G^(j) into tile j's planes
+            pptr = GP + (offs_rr[None, :] * NKT + k0 // BK).to(tl.int64) * RM + row * M + offs_a[:, None]
+            tl.store(pptr, dG, mask=ma[:, None] & valid_rr[None, :])
+        else:                                                                   # tile j' = k0 / BK into every O^(j)
+            O += tl.where((offs_j != k0 // BK)[None, :, None], dG[:, None, :], 0.0)
     if WRITE_LOGW:
         lp = tl.load(LP + row * LP_STRIDE + offs_a, mask=ma, other=0.0)
-        logw = lp - 0.5 * s_acc - HALF_K_LOG2PI
+        logw = lp - 0.5 * s_acc
         tl.store(LOGW + row * M + offs_a, tl.where(ma, logw, float("-inf")), mask=ma)
     _store_planes(T, RM, row, M, offs_a, ma, t, offs_r, offs_r < RANK)
-    # O^(j) for plane (r, s) at index (r RP + s) NKT + j
-    optr = (GP + (offs_rr[None, None, :] * NKT + offs_j[None, :, None]).to(tl.int64) * RM + row * M
-            + offs_a[:, None, None])
-    tl.store(optr, O, mask=ma[:, None, None] & (offs_j < NKT)[None, :, None] & valid_rr[None, None, :])
+    if SCAN:
+        # One (r, s) plane at a time, so only (BA, NKTP) tiles are live: slot j of lo holds G^(j - 1) (zero at j = 0)
+        # and slot j of hi G^(j + 1) (zero past the last tile), whose scans are the exclusive prefix and suffix.
+        tl.debug_barrier()                                                      # every partial is stored
+        pmask = ma[:, None] & (offs_j < NKT)[None, :]
+        for rs in tl.static_range(RP * RP):
+            if (rs // RP < RANK) and (rs % RP < RANK):
+                pptr = GP + (rs * NKT + offs_j[None, :]).to(tl.int64) * RM + row * M + offs_a[:, None]  # (BA, NKTP)
+                lo = tl.load(pptr - RM, mask=pmask & (offs_j >= 1)[None, :], other=0.0)
+                hi = tl.load(pptr + RM, mask=pmask & (offs_j + 1 < NKT)[None, :], other=0.0)
+                Ors = tl.cumsum(lo, axis=1) + tl.cumsum(hi, axis=1, reverse=True)   # sum_{j' < j} + sum_{j' > j}
+                tl.debug_barrier()                                              # the plane's partials are read
+                tl.store(pptr, Ors, mask=pmask)
+    else:
+        # O^(j) for plane (r, s) at index (r RP + s) NKT + j
+        optr = (GP + (offs_rr[None, None, :] * NKT + offs_j[None, :, None]).to(tl.int64) * RM + row * M
+                + offs_a[:, None, None])
+        tl.store(optr, O, mask=ma[:, None, None] & (offs_j < NKT)[None, :, None] & valid_rr[None, None, :])
+
+
+@triton.jit
+def cr_fwd_weights_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE,
+                          BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
+                          ACC: tl.constexpr, WRITE_LOGW: tl.constexpr, NKTP: tl.constexpr):
+    r"""Log weights, t planes and exclusive Gram tile sums accumulated in registers (:func:`_weights_planes`,
+    ``SCAN`` False; the default)."""
+    _weights_planes(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE, BA, BK, RANK, RP, ACC, WRITE_LOGW,
+                    NKTP, False)
+
+
+@triton.jit
+def cr_fwd_weights_scan_kernel(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE,
+                               BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
+                               ACC: tl.constexpr, WRITE_LOGW: tl.constexpr, NKTP: tl.constexpr):
+    r"""The same planes with the exclusive Gram tile sums formed by two scans over the stored partials
+    (:func:`_weights_planes`, ``SCAN`` True; ``launch_config()["fwd_weights"]["scan_tile_sums"]``)."""
+    _weights_planes(X, C, NU, LAM, V, LP, LOGW, T, GP, R, M, K, NKT, LP_STRIDE, BA, BK, RANK, RP, ACC, WRITE_LOGW,
+                    NKTP, True)
 
 
 @triton.jit
@@ -263,8 +356,8 @@ def cr_fwd_moments_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, T, GP, MEAN, VAR
         m2, idx, c, lam, W, inv, delta, gain, g, p = _elem(X, C, NU, LAM, row, offs_a, offs_k, ma, mk, K)
         t = _load_planes(T, RM, row, M, offs_a, ma, offs_r, valid_r)
         p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi = _shifts(C, LAM, V, row, offs_a, ma, offs_k, k0, K, BK, RANK)
-        off = _off_axis(U, V, GP, RM, NKT, j, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi,
-                        BA, RANK, RP)
+        off = _off_axis(C, LAM, U, V, GP, RM, NKT, j, row, M, K, offs_a, ma, offs_k, idx, m2, p_lo, idx_lo, m_lo, p_hi,
+                        idx_hi, m_hi, BA, RANK, RP)
         mY, vY, uv, ind = _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK)
         w = tl.where(ma, _exp(tl.load(LOGWN + row * M + offs_a, mask=ma, other=float("-inf")), ACC), 0.0)
         bw = tl.sum(w, 0)
@@ -289,7 +382,8 @@ def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G
                         ACC: tl.constexpr):
     r"""wbar_ia = sum_k gm m^Y + gv (v^Y + (m^Y - mean)^2); tbar_r = sum_k mbar U_r; Gbar_rs = sum_k vbar U_r U_s.
     The t and Gram planes are those the weights kernel rewrote for these rows. The indicator ind = [off >= 0] of each
-    coordinate tile is packed into one int32 per (tile, row, component), bit k - k0, for the rows kernel (rank 2)."""
+    coordinate tile is packed into one int32 per (tile, row, component), bit k - k0, for the rows kernel (rank 2) and
+    the column kernel (audit 2026-10-31 A087), so all three use one indicator; BK is at most 32 (``_tile_k``)."""
     row = tl.program_id(0).to(tl.int64)
     offs_a = tl.program_id(1) * BA + tl.arange(0, BA)
     ma = offs_a < M
@@ -309,8 +403,8 @@ def cr_bwd_pairs_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, G
         mk = offs_k < K
         m2, idx, c, lam, W, inv, delta, gain, g, p = _elem(X, C, NU, LAM, row, offs_a, offs_k, ma, mk, K)
         p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi = _shifts(C, LAM, V, row, offs_a, ma, offs_k, k0, K, BK, RANK)
-        off = _off_axis(U, V, GP, RM, NKT, k0 // BK, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi,
-                        m_hi, BA, RANK, RP)
+        off = _off_axis(C, LAM, U, V, GP, RM, NKT, k0 // BK, row, M, K, offs_a, ma, offs_k, idx, m2, p_lo, idx_lo,
+                        m_lo, p_hi, idx_hi, m_hi, BA, RANK, RP)
         mY, vY, uv, ind = _result_moments(U, V, t, off, offs_r, idx, m2, OMEGA, Q, g, p, RANK)
         lane = tl.arange(0, BK)
         bits = tl.sum(tl.where(ind > 0.5, 1, 0).to(tl.int32) << lane[None, :], axis=1)   # (BA,) distinct bits
@@ -402,11 +496,14 @@ def cr_bwd_rows_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP
 
 
 @triton.jit
-def cr_bwd_cols_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP, TBAR, GBAR, LBAR,
+def cr_bwd_cols_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP, TBAR, GBAR, LBAR, IND,
                        DNU, DLAM, DOMEGA, DQ, DU, DV, R, M, K, NKT, ROWS_PER_SPLIT,
                        BA: tl.constexpr, BK: tl.constexpr, RANK: tl.constexpr, RP: tl.constexpr,
                        ACC: tl.constexpr):
-    r"""One row split's partial parameter gradients; DNU ... DV are (splits, M, K[, RANK]) buffers."""
+    r"""One row split's partial parameter gradients; DNU ... DV are (splits, M, K[, RANK]) buffers. The indicator is
+    the pairs kernel's packed bits, the one Gbar and the rows kernel carry: recomputed here, under this kernel's own
+    scan layout, it could round to the other side of zero and pair one subgradient with another's Gbar (audit
+    2026-10-31 A087)."""
     offs_a = tl.program_id(0) * BA + tl.arange(0, BA)
     j = tl.program_id(1)
     k0 = j * BK
@@ -437,11 +534,10 @@ def cr_bwd_cols_kernel(X, C, NU, LAM, OMEGA, Q, U, V, LOGWN, MEAN, GM, GV, T, GP
         gv = tl.load(GV + row * K + offs_k, mask=mk, other=0.0)
         t = _load_planes(T, RM, row, M, offs_a, ma, offs_r, valid_r)
         p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi = _shifts(C, LAM, V, row, offs_a, ma, offs_k, k0, K, BK, RANK)
-        off = _off_axis(U, V, GP, RM, NKT, j, row, M, offs_a, ma, idx, m2, p_lo, idx_lo, m_lo, p_hi, idx_hi, m_hi,
-                        BA, RANK, RP)
         tbar = _load_planes(TBAR, RM, row, M, offs_a, ma, offs_r, valid_r)
         Gbar = _load_planes(GBAR, RM, row, M, offs_a, ma, offs_rr, valid_rr)
-        ind = tl.where(off >= 0.0, 1.0, 0.0)                                    # torch.clamp_min passes x >= 0
+        bits = tl.load(IND + j * RM + row * M + offs_a, mask=ma, other=0)                  # (BA,) int32, pairs kernel
+        ind = ((bits[:, None] >> tl.arange(0, BK)[None, :]) & 1).to(dt)
         mbar, vbar, dbar, lambar, cbar, uv = _chain(U, V, t, ind, tbar, Gbar, offs_r, offs_rr, row, M, offs_a,
                                                     ma, idx, m2, OMEGA, Q, LOGWN, LBAR, mean, gm, gv, c, lam,
                                                     inv, delta, gain, g, p, RANK, RP, ACC)
@@ -485,11 +581,14 @@ def launch_config() -> Dict[str, Dict[str, int]]:
     r"""Tile and launch parameters per kernel (shared by the launcher and the sm_120 compile test).
 
     Not tuned on the GPU yet. Every kernel uses the same BK: the Gram partials are stored per coordinate tile of that
-    width. (BA, BK) = (32, 32) at four warps compiles without spills on sm_120 for the weights kernel. The kernels that
-    assemble the leave-one-out Gram (audit 2026-10-28 F01) hold its in-tile scans as extra (BA, BK) tiles and spilled at
-    BA = 32 (up to 220 bytes at rank 2), so they take BA = 16, and the column backward, with its six parameter
-    accumulators, BA = 8; the compile test records the counts.
+    width, and the packed indicator bits hold one tile in an int32, so BK is at most 32 (``cue_result._tile_k``). (BA,
+    BK) = (32, 32) at four warps compiles without spills on sm_120 for the weights kernel. The kernels that assemble
+    the leave-one-out Gram (audit 2026-10-28 F01) hold its in-tile scans as extra (BA, BK) tiles and spilled at BA = 32
+    (up to 220 bytes at rank 2), so they take BA = 16, and the column backward, with its six parameter accumulators,
+    BA = 8; the compile test records the counts. ``scan_tile_sums`` selects ``cr_fwd_weights_scan_kernel``, whose
+    exclusive Gram tile sums cost O(NKT) instead of O(NKT^2) per program but sum in another order (off by default;
+    audit 2026-10-31 A200; its gain at large K is not measured on the GPU).
     """
     tile = dict(BA=32, BK=32, num_warps=4, num_stages=2)
-    return {"fwd_weights": dict(tile), "fwd_moments": dict(tile, BA=16), "bwd_pairs": dict(tile, BA=16),
-            "bwd_rows": dict(tile, BA=16), "bwd_cols": dict(tile, BA=8)}
+    return {"fwd_weights": dict(tile, scan_tile_sums=False), "fwd_moments": dict(tile, BA=16),
+            "bwd_pairs": dict(tile, BA=16), "bwd_rows": dict(tile, BA=16), "bwd_cols": dict(tile, BA=8)}

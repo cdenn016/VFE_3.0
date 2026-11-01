@@ -1,4 +1,5 @@
 import os
+import random
 import sys
 from collections.abc import Mapping, MutableMapping
 from contextlib import AbstractContextManager, contextmanager
@@ -46,6 +47,7 @@ _validate_cuda_preimport(_REQUESTED_DEVICE_NAME, os.environ, sys.modules)
 if _requests_cuda(_REQUESTED_DEVICE_NAME):
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+import numpy as np
 import pytest
 import torch
 
@@ -226,13 +228,18 @@ def restore_projected_scorer_policy() -> Iterator[None]:
 _FP32_PRECISION_BACKENDS = ("cuda.matmul", "cudnn")
 
 
-@pytest.fixture(autouse=True)
-def restore_model_process_globals() -> Iterator[None]:
-    r"""Restore the process-global state ``VFEModel.__init__`` installs after each test (audit 2026-10-20 item 24).
+@contextmanager
+def model_process_globals_restored() -> Iterator[None]:
+    r"""Restore on exit the process-global state that model construction, ``train()`` and ``seed_everything`` set.
 
-    The fp32 matmul precision (the legacy getter and the per-backend ``fp32_precision`` the CUDA lane pins to IEEE
-    above), the scorer and routed-spread tile budgets, the diagonal-moments kernel and the frame-pair float64
-    escalation settings, so a model built in one test cannot change what a later test reads.
+    ``VFEModel.__init__`` (audit 2026-10-20 item 24): the fp32 matmul precision (the legacy getter and the per-backend
+    ``fp32_precision`` the CUDA lane pins to IEEE above), the scorer and routed-spread tile budgets, the
+    diagonal-moments kernel and the frame-pair float64 escalation settings. ``train()`` and ``seed_everything``
+    (audit 2026-10-31 test-infrastructure-3): ``torch.utils.deterministic.fill_uninitialized_memory``, which every
+    ``train()`` turns off and which, under the CUDA lane's deterministic algorithms, fills uninitialized allocations
+    with NaN; the deterministic-algorithms mode with its ``warn_only`` flag; the cuDNN ``deterministic`` and
+    ``benchmark`` flags; ``CUBLAS_WORKSPACE_CONFIG``; and the intra-op thread count, which several tests set. A thread
+    count set when a test module is imported, at collection, precedes every test and is not undone here.
     """
     import vfe3.geometry.transport as transport
     import vfe3.model.relational_operators as relational_operators
@@ -251,6 +258,13 @@ def restore_model_process_globals() -> Iterator[None]:
     kernel = scoring.diagonal_moments_kernel()
     escalation = transport.frame_pair_fp64_escalation()
     condition_tol = transport._FRAME_PAIR_CONDITION_TOL
+    fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+    deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    cudnn_deterministic = torch.backends.cudnn.deterministic
+    cudnn_benchmark = torch.backends.cudnn.benchmark
+    cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    num_threads = torch.get_num_threads()
     try:
         yield
     finally:
@@ -263,3 +277,35 @@ def restore_model_process_globals() -> Iterator[None]:
         scoring.set_diagonal_moments_kernel(kernel)
         transport.set_frame_pair_fp64_escalation(escalation)
         transport.set_frame_pair_condition_tol(condition_tol)
+        torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized
+        torch.use_deterministic_algorithms(deterministic_algorithms, warn_only=deterministic_warn_only)
+        torch.backends.cudnn.deterministic = cudnn_deterministic
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+        if cublas_workspace is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = cublas_workspace
+        if torch.get_num_threads() != num_threads:
+            torch.set_num_threads(num_threads)
+
+
+@pytest.fixture(autouse=True)
+def restore_model_process_globals() -> Iterator[None]:
+    r"""Restore the process-global state a test installs (:func:`model_process_globals_restored`) after each test."""
+    with model_process_globals_restored():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def seed_global_rngs() -> None:
+    r"""Seed the global torch, NumPy (legacy) and Python generators to 0 before every test (audit 2026-10-31
+    test-infrastructure-5).
+
+    Model initialization and many test inputs draw from the global generators. Without a per-test seed their values
+    depended on which tests ran earlier in the same worker, which ``--dist loadscope`` assigns dynamically, so a
+    failure seen in a full run could not be reproduced by running the test alone. A test that seeds a generator itself
+    is unaffected.
+    """
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)

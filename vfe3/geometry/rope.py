@@ -30,50 +30,17 @@ orthogonal (the GL(K)-congruence divergence invariance and the block-diagonal ex
 unaffected). Parameter-free; default-off (config ``rope_mode="none"``).
 """
 
-from typing import Callable, Dict, List, Optional
+import math
+from typing import List, Optional
 
 import torch
 
-_POS_ROTATIONS: Dict[str, Callable[..., Optional[torch.Tensor]]] = {}
+# The pos_rotation builder registry was retired on 2026-10-31 (audit 2026-10-31, dead-code-4): it was keyed by the
+# pos_rotation field that _migrate_rope_mode folded into rope_mode on 2026-10-12, its one production lookup used the
+# literal key "rope", and the comparison RoPE and the baseline already called build_rope_rotation directly, so a
+# registered builder could never be selected by a configuration. Every caller now calls build_rope_rotation.
 
 
-def register_pos_rotation(name: str, *, override: bool = False) -> Callable:
-    """Decorator registering a positional-rotation builder -> (N, K, K) rotation or None.
-
-    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
-    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
-    """
-    def _wrap(fn: Callable[..., Optional[torch.Tensor]]) -> Callable[..., Optional[torch.Tensor]]:
-        if name in _POS_ROTATIONS and not override:
-            raise KeyError(f"positional rotation {name!r} already registered; pass override=True to replace")
-        _POS_ROTATIONS[name] = fn
-        return fn
-    return _wrap
-
-
-def get_pos_rotation(name: str) -> Callable[..., Optional[torch.Tensor]]:
-    """Return the registered positional-rotation builder (KeyError if absent)."""
-    if name not in _POS_ROTATIONS:
-        raise KeyError(f"no pos_rotation {name!r}; available: {sorted(_POS_ROTATIONS)}")
-    return _POS_ROTATIONS[name]
-
-
-@register_pos_rotation("none")
-def _pos_rotation_none(
-    positions:  torch.Tensor,
-    irrep_dims: List[int],
-
-    *,
-    base:     float = 100.0,
-    fraction: float = 1.0,
-    device:   Optional[torch.device] = None,
-    dtype:    torch.dtype  = torch.float32,
-) -> Optional[torch.Tensor]:
-    r"""No rotation: returns None (the transport is left un-rotated)."""
-    return None
-
-
-@register_pos_rotation("rope")
 def build_rope_rotation(
     positions:  torch.Tensor,             # (N,) integer token positions
     irrep_dims: List[int],                # block sizes; sum == K
@@ -127,9 +94,14 @@ def rope_rotated_pairs(d: int, fraction: float) -> int:
     r"""Number of rotated coordinate pairs of a block of size ``d`` under p-RoPE fraction p: floor(p d / 2).
 
     Pairs (2k, 2k+1) with k below this count rotate; the remaining coordinates (the slower pairs and an odd
-    block's last coordinate) are position-free.
+    block's last coordinate) are position-free. The floor is that of the configured decimal p: the binary product
+    can round below an integer it equals in decimal (0.58 x 100 = 57.99999999999999), which left 5 of the 255,000
+    (width, thousandth) pairs at widths 2 to 256 one pair short, so the floor takes an absolute tolerance of 1e-9.
+    It exceeds the binary rounding of p d / 2 at any practical width and is smaller than the distance to the next
+    integer of p d / 2 for any fraction given to eight decimal places (audit 2026-10-31, type-contracts-2). Every
+    caller (the rotation builder, the commutant projection and the configuration checks) reads the count here.
     """
-    return int(fraction * d // 2)
+    return int(math.floor(float(fraction) * d / 2.0 + 1e-9))
 
 
 def rope_commutant_projection(

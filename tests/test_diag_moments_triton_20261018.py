@@ -232,6 +232,10 @@ cases = [
     case(2, 9, 2, 1, 16, 4, 2),                      # a single dense K x K frame block
     case(1, 6, 2, 4, 4, 8, 1),                       # M != H: four frame blocks under two heads
     case(2, 5, 4, 2, 8, 8, 2, inverse_batch=1),      # a frame batch broadcast over the belief batch
+    # Block widths the kernels pad (audit 2026-10-31 relational-operators-9): d = 12 is not a power of two
+    # (BD = 16), and d = 40 lies above 32 (BD = 64: one token per row tile and narrower row tiles).
+    case(1, 9, 2, 2, 12, 5, 2),
+    case(1, 3, 2, 1, 40, 8, 2),
 ]
 
 # A zero variance takes the zero root with zero gradient; a negative one reaches g as NaN on both routes.

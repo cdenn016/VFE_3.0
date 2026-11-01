@@ -70,15 +70,21 @@ class _GeneratorTensor:
             raise AttributeError("generators is a required constructor argument")
         source = instance._generator_source
         if isinstance(source, _ElementaryBlockBasis):
+            gram_certified = instance._gram_certificate_key == instance._generator_cache_key()
             source = generate_glk_multihead(
                 source.K, source.n_heads, dtype=source.dtype, device=source.device)
             instance._generator_source = source
             instance._elementary_certificate = instance._generator_cache_key()
+            if gram_certified:                         # the dense tensor IS the declared basis
+                instance._gram_certificate_key = instance._elementary_certificate
         elif isinstance(source, _BlockLocalBasis):
+            gram_certified = instance._gram_certificate_key == instance._generator_cache_key()
             source = generate_block_local(source.K, source.n_heads, source.local,
                                           dtype=source.dtype, device=source.device)
             instance._generator_source = source
             instance._block_local_certificate = instance._generator_cache_key()
+            if gram_certified:
+                instance._gram_certificate_key = instance._block_local_certificate
         elif instance._elementary_layout is not None and instance.elementary_block_shape is None:
             instance.phi_coordinate_layout = None
             instance.frobenius_gram_diagonal = False
@@ -93,6 +99,13 @@ class _GeneratorTensor:
             instance.frobenius_gram_diagonal = False
             instance.frobenius_gram_uniform = None
             instance.phi_coordinate_layout = None
+        elif previous is not None:
+            # The builder certified the Gram of the basis it built, not of a replacement: every replaced source
+            # withdraws the diagonal-Gram certificate and its declared weight (audit 2026-10-31,
+            # gauge-structure-2). Construction assigns the first source with no previous one.
+            instance.frobenius_gram_diagonal = False
+            instance.frobenius_gram_uniform = None
+        instance._gram_certificate_key = None           # re-recorded by __post_init__ at construction
         instance._generator_source = value
         instance.float64_generators = None              # a replaced basis has no float64 master
         instance._elementary_certificate = None
@@ -141,7 +154,12 @@ class GaugeGroup:
     _gram_uniform_ready:  bool                   = field(default=False, init=False, repr=False, compare=False)
     _head_block_cache:    Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
     _head_block_key:      Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
+    _shared_blocks_cache: bool                   = field(default=False, init=False, repr=False, compare=False)
+    _shared_blocks_key:   Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
     _local_cast_cache:    Optional[Dict[tuple, torch.Tensor]] = field(default=None, init=False, repr=False, compare=False)
+    # Generator cache key of the basis the builder declared ``frobenius_gram_uniform`` for: recorded at construction,
+    # carried through lazy materialization and ``apply_generators`` moves, None after a replacement.
+    _gram_certificate_key: Optional[tuple]       = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def generator_shape(self) -> Tuple[int, int, int]:
@@ -209,6 +227,8 @@ class GaugeGroup:
     def apply_generators(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
         """Move basis metadata with the model, materializing only an already-dense source."""
         source = self._generator_source
+        # A device or dtype move of the declared basis keeps its declared Frobenius weight.
+        gram_certified = self._gram_certificate_key == self._generator_cache_key()
         if isinstance(source, _ElementaryBlockBasis):
             moved = fn(torch.empty(0, device=source.device, dtype=source.dtype))
             self._generator_source = _ElementaryBlockBasis(
@@ -228,6 +248,8 @@ class GaugeGroup:
                 self._elementary_certificate = self._generator_cache_key()
             if block_local:
                 self._block_local_certificate = self._generator_cache_key()
+        if gram_certified:
+            self._gram_certificate_key = self._generator_cache_key()
 
     def embed_algebra(
         self,
@@ -303,6 +325,31 @@ class GaugeGroup:
             self._head_block_key = key
         return self._head_block_cache
 
+    def shared_elementary_blocks(self) -> bool:
+        r"""Whether every generator acts identically on every head as the row-major elementary basis.
+
+        That is the basis :math:`I_H\otimes E_{ab}` of shared ``block_glk``: its head blocks are
+        :math:`G_{(a,b)}^{(h)} = E_{ab}` for every head :math:`h`, so the embedding of :math:`\phi` is one row-major
+        :math:`d\times d` block broadcast to every head, and a consumer can reshape instead of contracting the
+        :math:`(d^2, H, d, d)` blocks of :meth:`head_block_generators`, which costs :math:`H d^4` per row (audit
+        2026-10-31, gauge-structure-3). Checked exactly against those blocks once per basis (one host read) and cached
+        on the generator key, so a mutated or replaced basis is checked again.
+        """
+        dims = self.irrep_dims
+        if (len(dims) < 2 or len(set(dims)) != 1 or self.elementary_block_shape is not None
+                or self.certified_block_local_basis() is not None):       # per-head or block-local: never shared
+            return False
+        key = ("shared_elementary",) + self._generator_cache_key()
+        if self._shared_blocks_key != key:
+            blocks = self.head_block_generators()                                         # (n_gen, H, d, d) or None
+            H, d = len(dims), dims[0]
+            shared = blocks is not None and tuple(blocks.shape) == (d * d, H, d, d)
+            if shared:
+                elementary = torch.eye(d * d, dtype=blocks.dtype, device=blocks.device).reshape(d * d, 1, d, d)
+                shared = bool(torch.equal(blocks, elementary.expand(d * d, H, d, d)))
+            self._shared_blocks_cache, self._shared_blocks_key = shared, key
+        return self._shared_blocks_cache
+
     def generator_traces(self) -> torch.Tensor:
         r"""Return $\operatorname{tr}(G_a)$ in coordinate order without a dense basis."""
         layout = self.elementary_block_shape
@@ -349,8 +396,13 @@ class GaugeGroup:
             return None
         key = self._generator_cache_key()
         if self._gram_diagonal_cache is None or self._gram_diagonal_key != key:
-            first_read = self._gram_diagonal_key is None
-            if self.elementary_block_shape is not None or (first_read and self.frobenius_gram_uniform is not None):
+            # The declared weight describes the basis its builder built, so it is read only while the generator
+            # key is that basis' certificate key (construction, lazy materialization, moves). A basis changed in
+            # place before the first read used to take it too (audit 2026-10-31, gauge-structure-2); its weights
+            # are now measured, as they already were after a first read.
+            declared = (self.elementary_block_shape is not None
+                        or (self.frobenius_gram_uniform is not None and self._gram_certificate_key == key))
+            if declared:
                 self._gram_diagonal_cache = torch.full(
                     (self.generator_shape[0],),
                     self.frobenius_gram_uniform,
@@ -362,7 +414,7 @@ class GaugeGroup:
                     "aij,aij->a", self.generators, self.generators
                 ).detach()
             self._gram_diagonal_key = key
-            if self.elementary_block_shape is not None or (first_read and self.frobenius_gram_uniform is not None):
+            if declared:
                 self._gram_uniform_cache = self.frobenius_gram_uniform
                 self._gram_uniform_key = key
                 self._gram_uniform_ready = True
@@ -408,6 +460,7 @@ class GaugeGroup:
                 f"irrep_labels has {len(self.irrep_labels)} entries but there are "
                 f"{len(self.irrep_dims)} irrep blocks"
             )
+        self._gram_certificate_key = self._generator_cache_key()     # the basis the declared Gram describes
 
     def invariant_for(self, family: str) -> bool:
         """Whether the divergence of ``family`` is invariant under this group.
@@ -633,7 +686,7 @@ def check_admissible(
     the per-build random-sample congruence draws would tax every model build for a contract that
     holds for all shipped (group, family) pairs. Run it in tests/CI when adding a group or declaring
     a new ``invariant_families`` entry; ``invariant_for`` is the cheap string-membership check used at
-    runtime.
+    runtime. Test oracle: referenced only by the tests.
     """
     from vfe3.families.base import get_family, get_functional     # local import: avoid an import cycle
 
@@ -823,7 +876,8 @@ def _build_su_n(
     irreps whose inner Dynkin labels vanish, so for example :math:`\Lambda^2\mathbb{C}^4` of SU(4) is not among
     them. The trivial 'pq0_0' (no generators) and the adjoint 'pq1_1' (real dimension N^2 - 1,
     :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` for :math:`X_a = i\lambda_a`) are built in closed form, and every other
-    (p, q) with p + q <= 6 and N^(p+q) <= 60000 by the tensor construction
+    (p, q) with p + q <= 6, N^(p+q) <= 60000 and an estimated construction peak within the 8 GiB budget of
+    :func:`vfe3.geometry.irreps._guard_cost` by the tensor construction
     (:func:`vfe3.geometry.irreps._su_tensor_irrep`), realified to real dimension 2D when p != q. The generators
     are real and exactly skew (skew_symmetric=True, det = 1), n_gen = N^2 - 1 per tied tower; the first N(N-1)/2
     phi coordinates are the so(N) subalgebra. An adjoint-only tower is a representation of PSU(N) = SU(N)/Z_N,

@@ -102,7 +102,8 @@ def test_resumed_run_flags_the_same_spikes_and_divergence_columns(
     got_spikes = _spikes(tmp_path / "resumed")
     assert [r["step"] for r in got_spikes] == [r["step"] for r in expected_spikes]
     assert [r["spike"] for r in got_spikes] == [r["spike"] for r in expected_spikes]
-    assert [r["causes"] for r in got_spikes] == [r["causes"] for r in expected_spikes]
+    # An unreported event below the burst's peak carries no attribution (audit 2026-10-31 train-loop-lifecycle-5).
+    assert [r.get("causes") for r in got_spikes] == [r.get("causes") for r in expected_spikes]
     expected_rows = [row for row in _rows(tmp_path / "straight" / "metrics.csv") if int(row["step"]) > 6]
     got_rows = _rows(tmp_path / "resumed" / "metrics.csv")
     assert [row["step"] for row in got_rows] == [row["step"] for row in expected_rows]

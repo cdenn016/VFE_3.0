@@ -1,8 +1,8 @@
 r"""Click-to-run hyperparameter ablation/sweep runner for the VFE_3.0 transformer.
 
-Sweeps one (or several) ``VFE3Config`` field(s) around the operating point defined in
-``train_vfe3.py``. There is no CLI arg parsing (project policy): edit the ``CONFIG`` dict
-at the bottom, pick a sweep, then run ``python ablation.py``.
+Sweeps one (or several) ``VFE3Config`` field(s) around the operating point ``BASELINE_CONFIG``
+below. There is no CLI arg parsing (project policy): edit the ``CONFIG`` dict near the top of
+this file, pick a sweep, then run ``python ablation.py``.
 
 Three sweep shapes are supported, all declared in the ``SWEEPS`` registry:
 
@@ -15,12 +15,13 @@ Three sweep shapes are supported, all declared in the ``SWEEPS`` registry:
     exactly and reduced to one closest configuration per embedding width under the click-run
     target and relative-tolerance settings.
 
-The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
-set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
-operating point. It tracks train_vfe3.py's K=20 / block_glk point; keep the two in sync by hand
-when the training operating point moves. ``kl_max=None`` resolves to ``8 * embed_dim`` in every cell
-exactly as in train_vfe3.py, and ``DATA_SEED mirrors ``train_vfe3.DATA_SEED``, so an identical config
-trains on the identical batch order and reproduces train_vfe3.py run-for-run. Each run gets a self-contained
+The baseline is the self-contained ``BASELINE_CONFIG`` dict below, kept deliberately separate from
+``train_vfe3.py`` so an ablation can pin its own (fast) operating point; it is not kept in sync with
+the launcher. A field it omits runs its ``VFE3Config`` default, and ``main`` prints the omitted fields
+that ``train_vfe3.config`` sets differently, and the explicit baseline settings no active path reads.
+``kl_max=None`` resolves to ``8 * embed_dim`` in every cell exactly as in train_vfe3.py. ``DATA_SEED``
+has the semantics of ``train_vfe3.DATA_SEED`` but its own value: a cell reproduces a train_vfe3.py
+run only when its resolved config and the data seed both match. Each run gets a self-contained
 ``RunArtifacts`` directory (``config.json``, ``metrics.csv``, ``best_model.pt``, figures)
 nested under its sweep, plus an ``ablation_result.json`` headline used for resume and the
 sweep-level leaderboard.
@@ -46,7 +47,8 @@ Three guards make this safe for VFE_3.0's strict config surface:
   3. a config-construction failure (a cross-field violation caught by
      ``VFE3Config.__post_init__``) is tagged ``error_kind = "config"`` and kept DISTINCT
      from a training crash (``"train"``), so a mis-specified cell is not silently bucketed
-     as ``ppl = inf``.
+     as ``ppl = inf``; an environment failure inside a cell (a missing cache, a full disk,
+     CUDA out of memory) is ``"environment"``, which a resumed run retries.
 """
 
 import os
@@ -79,7 +81,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import MISSING, asdict, fields as dataclass_fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -227,7 +229,7 @@ def _git_code_identity() -> Dict[str, object]:
     }
 
 
-# DATA_SEED (EXP-1 variance floor), mirroring train_vfe3.DATA_SEED: when set to an int, the TRAIN
+# DATA_SEED (EXP-1 variance floor), with the semantics of train_vfe3.DATA_SEED: when set to an int, the TRAIN
 # loader's shuffle order is fixed to this seed via an explicit generator, INDEPENDENT of the
 # per-cell model seed. None gives each cell its own order: the train generator is re-pinned to the
 # cell's cfg.seed in run_single, as train_vfe3 does. The frame-capacity comparison uses None to pair
@@ -286,6 +288,10 @@ CONFIG: Dict[str, Any] = {
     # so results are not conditioned on eventual success; True retrains it (every attempt is archived).
     "retry_failed": False,   # False | True
 
+    # Every cell writes best_model.pt and a resumable terminal checkpoint (True), or neither (False: lightweight
+    # cells, validation metrics only). Bound into the cell contract, so a change re-runs the cells.
+    "save_model_artifacts": True,   # True | False
+
     "output_dir":  "vfe3_ablation_results",   # "vfe3_ablation_results_attention_20260913"
 }
 
@@ -295,8 +301,9 @@ CONFIG: Dict[str, Any] = {
 # rate moved per cell, everything else at the baseline), then fits, per rate, log(best lr) against log(K) and writes
 # lr_width_transfer_fit.json beside the sweep CSV. The best multiplier of a width is the one with the lowest final
 # validation PPL; a best multiplier at either end of the grid is flagged, since the optimum may lie outside it.
-# Instability shows within a few hundred steps here, so a short max_steps screens well. The defaults keep the head
-# block d = K / n_heads = 10 of the K=20 operating point fixed.
+# Instability shows within a few hundred steps here, so a short max_steps screens well. The default widths share one
+# head width d = K / n_heads (d = 32 for the pairs below). At multiplier 1 every rate sits at its baseline value, so
+# each width trains one shared x1 cell (label "K=<K>,H=<H>,baseline"), the x1 point of every rate's grid.
 LR_WIDTH_TRANSFER: Dict[str, Any] = {
     "enabled":     False,                                   # True | False
     "widths":      [(128, 4), (96, 3), (64, 2)],             # (embed_dim, n_heads) pairs; n_heads must divide embed_dim
@@ -310,7 +317,9 @@ LR_WIDTH_TRANSFER: Dict[str, Any] = {
 
 
 # =============================================================================
-# BASELINE CONFIG  -- self-contained operating point: EVERY VFE3Config toggle.
+# BASELINE CONFIG  -- self-contained operating point: the VFE3Config toggles set explicitly here.
+# A field omitted below runs its VFE3Config default (main() prints the omitted fields train_vfe3.config sets
+# otherwise, and the settings below that no active path reads).
 # =============================================================================
 
 # True: every cell runs the fully gauge-covariant model. BASELINE_CONFIG is left as written; the keys that break
@@ -810,8 +819,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
    
    "m_pos_phi_lr": {
-        "description": "M-step LR for the learned POSITIONAL frame table (the 0.0015 arm is the "
-                       "inherited m_phi_lr baseline)",
+        "description": "M-step LR for the learned POSITIONAL frame table (None inherits m_phi_lr)",
         "param": "m_pos_phi_lr",
         "values": [0.001, 0.0025, 0.0035, 0.005],
         "scale": "linear",
@@ -819,8 +827,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
    "m_layernorm_lr": {
-        "description": "M-step LR for the LayerNorm affine gamma/beta (the 0.009 arm is the "
-                       "inherited m_p_mu_lr baseline)",
+        "description": "M-step LR for the LayerNorm affine gamma/beta (None inherits m_p_mu_lr)",
         "param": "m_layernorm_lr",
         "values": [0.001, 0.003],
         "scale": "linear",
@@ -974,7 +981,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 #################################
 
      "mstep_self_coupling_weight": {
-         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
+         "description": "M-step self-coupling term alpha_hat * mean_i c0 log(1 + KL(q_i*||p_i)/b0), gradient alpha_i* dKL",
          "param": "mstep_self_coupling_weight", 
          "log_range": [0.0001, 2, 20],
          "scale": "log",
@@ -984,8 +991,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
      "lambda_beta": {
          "description": "belief-coupling block weight (1.0 = pure F)",
          "param": "lambda_beta", "range": [0.0, 5, 0.05],
-         # projected_predictive weights no coupling block in training; projected_gradient (kernel readout) does
+         # projected_predictive weights no coupling block in training; projected_gradient (kernel readout) does.
+         # projected_gradient admits only relational_routing='gaussian_kl' (every projected_gradient sweep pins it).
          "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel",
+                      "relational_routing": "gaussian_kl",
                       "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
      },
 
@@ -1041,6 +1050,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "range": [0.8, 1.1, 0.1],
        "scale": "linear",
        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                   "relational_routing": "gaussian_kl",
                    "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},   
     },
   
@@ -1048,6 +1058,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "description": "E-step retraction step size for sigma_q",
        "param": "e_q_sigma_lr", "range": [0.0000, 0.1, 0.005],
        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                    "relational_routing": "gaussian_kl",
                     "skip_belief_sigma_update": False, "lambda_alpha_mode": "state_dependent",
                     "rope_mode": "frame"},
     },
@@ -1105,6 +1116,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # The ceiling binds only in a sigma E-step: projected_gradient's euler receiver (the closed-form
         # receiver on gaussian_full has none), which takes the scalar alpha and frame-space RoPE.
         "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                     "relational_routing": "gaussian_kl",
                      "skip_belief_sigma_update": False, "lambda_alpha_mode": "state_dependent",
                      "rope_mode": "frame"},
     },
@@ -1284,6 +1296,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # gaussian_full refuses the per-coordinate alpha on the receiver (the scalar form is the frame-invariant one),
         # and projected_gradient takes only frame-space RoPE.
         "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "lambda_alpha_mode": "state_dependent",
+                     "relational_routing": "gaussian_kl",
                      "rope_mode": "frame"},
     },
     
@@ -1293,6 +1306,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "values": [0.001, 0.1, 0.25, 0.5, 0.75, 1],
         "scale": "linear",
         "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "closed_form",
+                     "relational_routing": "gaussian_kl",
                      "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
     },
     
@@ -1381,7 +1395,24 @@ SWEEPS["frame_capacity"] = {
 # the route's requirements; exact_route_components alone declares "leaves_exact_route", since each of its arms
 # replaces one component of the route by the setting it was derived from (the reference arm is the route itself).
 # Cheap-to-expensive: the components screen first, then the memory's own tunables, then attention's.
-_EXACT_ROUTE_REQUIRES: Dict[str, Any] = principled_exact_route_overrides(BASELINE_CONFIG)
+_EXACT_ROUTE_MIN_LAYERS = 2
+
+
+def _exact_route_requires(baseline: Mapping[str, Any]) -> Dict[str, Any]:
+    r"""The ``requires`` of every ``exact_route_*`` sweep: the route's overrides resolved from ``baseline``, at a depth
+    of at least :data:`_EXACT_ROUTE_MIN_LAYERS` layers.
+
+    The route carries its regime belief through depth and shares one tied bank across layers; at one layer no layer
+    receives the carried belief or shares the bank, so the regime knobs and the tying contrast would be inert. A
+    deeper baseline keeps its own depth."""
+    from vfe3.gauge_covariant import _launcher_lookup
+
+    requires = principled_exact_route_overrides(baseline)
+    requires["n_layers"] = max(_EXACT_ROUTE_MIN_LAYERS, int(_launcher_lookup(baseline)("n_layers")))
+    return requires
+
+
+_EXACT_ROUTE_REQUIRES: Dict[str, Any] = _exact_route_requires(BASELINE_CONFIG)
 SWEEPS.update({
     "exact_route_components": {
         "description": "exact route with one component replaced (reference arm: the route itself)",
@@ -1405,7 +1436,9 @@ SWEEPS.update({
     "exact_route_regression_rank": {
         "description": "exact route: rank r of the memory's regression F_a = I + U_a V_a^T",
         "param": "block_memory_regression_rank", "values": [1, 2, 4, 8], "scale": "log",
-        "requires": _EXACT_ROUTE_REQUIRES, "exact_route": True,
+        # Rank 8 lies outside the fused Triton kernels' rank 1..4, so every arm runs the torch memory path: one kernel
+        # path for all ranks, whatever block_memory_triton the baseline sets.
+        "requires": {**_EXACT_ROUTE_REQUIRES, "block_memory_triton": False}, "exact_route": True,
     },
     "exact_route_regime_beta": {
         "description": "exact route: trust beta in the carried regime belief (0 = the shared prior at every layer)",
@@ -1466,10 +1499,16 @@ _VFE3_FIELDS = {f.name for f in dataclass_fields(VFE3Config)}
 
 
 _LR_WIDTH_TRANSFER_SWEEP = "lr_width_transfer"
+_LR_WIDTH_TRANSFER_BASE = "baseline"                 # label tail of a width's shared multiplier-one cell
 
 
 def _lr_width_transfer_label(embed_dim: int, n_heads: int, field: str, multiplier: float) -> str:
     return f"K={embed_dim},H={n_heads},{field}=x{multiplier:g}"
+
+
+def _lr_width_transfer_base_label(embed_dim: int, n_heads: int) -> str:
+    r"""The label of a width's shared multiplier-one cell, the x1 point of every rate's grid at that width."""
+    return f"K={embed_dim},H={n_heads},{_LR_WIDTH_TRANSFER_BASE}"
 
 
 def _lr_width_transfer_arms(
@@ -1479,19 +1518,23 @@ def _lr_width_transfer_arms(
     *,
     strict:   bool = True,                # False: skip a rate without a positive baseline value instead of raising
 ) -> List[Dict[str, Any]]:
-    r"""One arm per (width, rate, multiplier): ``embed_dim``, ``n_heads`` and that rate times the multiplier.
+    r"""One arm per (width, rate, multiplier other than 1): ``embed_dim``, ``n_heads`` and that rate times the
+    multiplier; and, when the multipliers include 1, one shared arm per width.
 
     The sweep is registered at import with ``strict`` set to ``LR_WIDTH_TRANSFER["enabled"]``, so a listed rate the
     baseline leaves unset refuses the transfer run but does not break importing the module for other sweeps.
 
-    At multiplier 1 every rate's arm is the same configuration, the width's baseline, so a width with :math:`R`
-    rates carries :math:`R` copies of its x1 cell (:math:`R - 1` extra runs per width): identical runs under
-    ``deterministic=True``, otherwise independent replicates of the baseline cell, and each rate's best multiplier
-    is chosen against its own replicate."""
+    At multiplier 1 every rate sits at its baseline value, so all x1 arms of a width are one configuration, the
+    width's baseline. It is trained once, as :func:`_lr_width_transfer_base_label` (overrides ``embed_dim`` and
+    ``n_heads`` only), and :func:`fit_lr_width_transfer` reads it as the x1 point of every rate's grid. Copies of it
+    would share the seed, the data order and the initialization and differ only by kernel nondeterminism, so they
+    are not replicates; replication needs a seeded sweep."""
     arms: List[Dict[str, Any]] = []
     for embed_dim, n_heads in settings["widths"]:
         if embed_dim % n_heads:
             raise ValueError(f"LR_WIDTH_TRANSFER width ({embed_dim}, {n_heads}): n_heads must divide embed_dim")
+        rate_arms: List[Dict[str, Any]] = []
+        unit_multiplier = False
         for field in settings["lr_fields"]:
             base = baseline.get(field)
             if not isinstance(base, (int, float)) or isinstance(base, bool) or base <= 0:
@@ -1500,9 +1543,16 @@ def _lr_width_transfer_arms(
                 raise ValueError(f"LR_WIDTH_TRANSFER rate {field!r} needs a positive BASELINE_CONFIG value, "
                                  f"got {base!r}")
             for multiplier in settings["multipliers"]:
-                arms.append({"label": _lr_width_transfer_label(embed_dim, n_heads, field, multiplier),
-                             "embed_dim": int(embed_dim), "n_heads": int(n_heads),
-                             field: float(base) * float(multiplier)})
+                if float(multiplier) == 1.0:             # the width's baseline: the one shared x1 arm below
+                    unit_multiplier = True
+                    continue
+                rate_arms.append({"label": _lr_width_transfer_label(embed_dim, n_heads, field, multiplier),
+                                  "embed_dim": int(embed_dim), "n_heads": int(n_heads),
+                                  field: float(base) * float(multiplier)})
+        if unit_multiplier:
+            arms.append({"label": _lr_width_transfer_base_label(embed_dim, n_heads),
+                         "embed_dim": int(embed_dim), "n_heads": int(n_heads)})
+        arms.extend(rate_arms)
     return arms
 
 
@@ -1795,8 +1845,39 @@ def _parameter_records_by_label(value: object) -> Optional[Dict[str, Mapping[str
     return records
 
 
-def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True) -> None:
-    r"""Abort unless every named arm references real fields and constructs against the baseline.
+def _coinciding_arms(
+    fingerprints: List[Tuple[str, Dict[str, Any]]],   # (label, VFE3Config.route_fingerprint()) per constructed arm
+) -> List[List[str]]:                                # the labels of each group of two or more equal fingerprints
+    r"""Group the arms of a sweep whose route fingerprints are equal, in arm order."""
+    groups: List[Tuple[Dict[str, Any], List[str]]] = []
+    for label, fingerprint in fingerprints:
+        for representative, labels in groups:
+            if representative == fingerprint:
+                labels.append(label)
+                break
+        else:
+            groups.append((fingerprint, [label]))
+    return [labels for _fingerprint, labels in groups if len(labels) > 1]
+
+
+def validate_sweeps(
+    sweep_names:          List[str],
+
+    *,
+    require_construction: bool                                             = True,
+    max_steps:            Union[None, int, Mapping[str, Optional[int]]]    = None,
+) -> None:
+    r"""Abort unless every named arm references real fields and its ``VFE3Config`` validates against the baseline.
+
+    Only the configuration is built: a refusal that model construction alone raises (a frozen positional factor that
+    leaves the condition bound no budget, ``phi_frame_condition_max``) still arrives when the cell is launched. A
+    contrast is refused when it is inert on every arm, or when every arm resolves to one effective configuration
+    (:meth:`VFE3Config.route_fingerprint`: the same settings once coerced, inert and coinciding values are resolved).
+
+    Each arm is built as :func:`run_single` builds its cell, through :func:`_cell_cfg_dict`, so the run knobs it
+    applies (``checkpoint_interval=0``, the stride rule and the cosine horizon) are part of the check. ``max_steps``
+    is the horizon the cells run at: one value for every sweep, a mapping from sweep name to its value (as
+    :func:`main` passes it, :func:`_session_max_steps`), or None for the baseline's own ``max_steps``.
 
     VFE3Config(**cfg) would silently ignore an unknown kwarg only if it were dropped first;
     here a bad name would instead raise a TypeError mid-run (or, worse under a dict-merge
@@ -1861,11 +1942,12 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
         )
     construction_errors: List[Tuple[str, str, str]] = []
     for name in sweep_names:
+        steps = max_steps.get(name) if isinstance(max_steps, Mapping) else max_steps
         if "parameter_grid" in SWEEPS[name]:
             valid_candidates = 0
             for index, overrides in enumerate(_parameter_grid_overrides(SWEEPS[name])):
                 try:
-                    VFE3Config(**{**_resolved_sweep_baseline(), **overrides})
+                    VFE3Config(**_cell_cfg_dict(overrides, seed=0, max_steps=steps))
                     valid_candidates += 1
                 except (TypeError, ValueError):
                     pass
@@ -1883,6 +1965,15 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
         duplicate_labels = sorted({label for label in labels if labels.count(label) > 1})
         if duplicate_labels:
             raise ValueError(f"sweep {name!r} has duplicate expanded label(s): {duplicate_labels}")
+        forest_baseline = SWEEPS[name].get("forest_baseline_label")
+        if forest_baseline and (forest_baseline not in labels or len(labels) < 2):
+            # A forest draws each component arm's paired band against its baseline arm; one arm compares nothing.
+            construction_errors.append((
+                name, "all arms",
+                f"a paired-token forest needs its baseline arm {forest_baseline!r} and at least one component "
+                f"arm beside it, but declares {labels}; add the component arms to its 'configs'",
+            ))
+            continue
         # Keys whose value actually DIFFERS across this sweep's arms -- the sweep's contrast. For a
         # 'param' sweep that is the swept parameter; for a 'configs' sweep it is whatever the arm
         # dicts disagree on. Everything else in an arm dict is a constant REGIME setting shared by
@@ -1893,17 +1984,32 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             if len({repr(ov.get(key)) for _label, ov in runs}) > 1
         }
         inert_per_arm: List[set] = []
+        fingerprints: List[Tuple[str, Dict[str, Any]]] = []
         for label, overrides in runs:
-            cfg = _resolved_sweep_baseline()
-            cfg.update(overrides)
             try:
+                # The executed cell configuration: run_single's constructor at the run's cosine horizon.
+                cfg = _cell_cfg_dict(overrides, seed=0, max_steps=steps)
                 # Activity is structural, including default-valued fields; warnings are display only.
                 resolved = VFE3Config(**cfg)
                 _require_gauge_covariant(resolved)
                 _require_exact_route(resolved, name)
                 inert_per_arm.append(set(resolved.inactive_fields()) & varying_keys)
+                fingerprints.append((label, resolved.route_fingerprint()))
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
+        # Arms that all resolve to one effective configuration (a value __post_init__ coerces, an inert field, or a
+        # value-level coincidence such as decode_covariance 'belief' and 'encoded' where no seam writes the covariance)
+        # train the same function, so the sweep's contrast is a null effect by construction (audit 2026-10-31,
+        # gap-route-admissibility-fuzz-5 and -8). Only the whole sweep is refused: some arms may share a point by
+        # design (the x1 centre of each rate scan of lr_width_transfer).
+        groups = _coinciding_arms(fingerprints)
+        if len(fingerprints) == len(runs) >= 2 and len(groups) == 1 and len(groups[0]) == len(runs):
+            construction_errors.append((
+                name, "all arms",
+                f"every arm resolves to one effective configuration (VFE3Config.route_fingerprint: the same settings "
+                "once coerced, inert and coinciding values are resolved), so each arm trains the same function and "
+                "the contrast is a null effect. Add the enabling setting(s) to the sweep's 'requires'.",
+            ))
         if inert_per_arm and len(inert_per_arm) == len(runs):
             # A contrast may be live in only one arm. Reject it only when every arm is inactive.
             always_dead = sorted(set.intersection(*inert_per_arm))
@@ -2154,6 +2260,28 @@ def _print_baseline_default_divergence() -> None:
             print(f"    {name}: default {default!r} (ablation) vs {value!r} (train_vfe3)")
 
 
+def _print_inactive_baseline_settings() -> None:
+    r"""Print the explicit ``BASELINE_CONFIG`` settings that no active path reads under the resolved baseline.
+
+    The resolved baseline is the one every cell starts from: the route or gauge switch applied, built through
+    :func:`_cell_cfg_dict` with the run knobs a cell gets (``checkpoint_interval=0`` decides whether
+    ``checkpoint_keep_last`` is read; the horizon decides nothing here, so the baseline's own is kept).
+    ``train_vfe3.py`` prints the same report for its own dictionary. A sweep's ``requires`` or arm can make a field
+    live again, so this is a note, never a refusal; the per-sweep inert-contrast guard is :func:`validate_sweeps`."""
+    try:
+        cfg = VFE3Config(**_cell_cfg_dict({}, seed=CONFIG["seed"]))
+    except Exception as exc:                     # a baseline only the sweeps' requirements complete: say so, go on
+        print(f"  note: the resolved baseline does not construct on its own ({type(exc).__name__}: {exc}); "
+              "no inactive-settings report")
+        return
+    inert = {name: reason for name, reason in cfg.inactive_fields().items() if name in BASELINE_CONFIG}
+    if inert:
+        print("  note: BASELINE_CONFIG settings read by no active path under the resolved baseline (a sweep's "
+              "'requires' or arm can make one live again):")
+        for name, reason in inert.items():
+            print(f"    {name}={getattr(cfg, name)!r}: {reason}")
+
+
 def _resolved_sweep_baseline() -> Dict[str, Any]:
     r"""Return the one broadly compatible baseline used before applying every sweep arm.
 
@@ -2166,6 +2294,12 @@ def _resolved_sweep_baseline() -> Dict[str, Any]:
     elif fully_gauge_covariant:
         resolved.update(fully_gauge_covariant_overrides(resolved))
     return resolved
+
+
+def _session_max_steps(sweep_name: str) -> Optional[int]:
+    r"""The cosine horizon :func:`main` gives ``sweep_name``'s cells: ``LR_WIDTH_TRANSFER['max_steps']`` for the
+    width-transfer sweep, else ``CONFIG['max_steps']`` (None keeps the baseline's own ``max_steps``)."""
+    return LR_WIDTH_TRANSFER["max_steps"] if sweep_name == _LR_WIDTH_TRANSFER_SWEEP else CONFIG["max_steps"]
 
 
 # =============================================================================
@@ -2244,7 +2378,7 @@ def _cell_cfg_dict(
     d = _resolved_sweep_baseline()
     d.update(overrides)
     # eval_stride is bounded by max_seq_len -- config.__post_init__ rejects a stride above it -- and
-    # the baseline ships 32. Any arm that shrinks max_seq_len below that (a context-length sweep, or
+    # the baseline sets its own stride. Any arm that shrinks max_seq_len below that (a context-length sweep, or
     # a test shrinking the model to a toy) would otherwise be an INVALID cell and be silently
     # bucketed as error_kind='config'. An arm whose context is shorter than the stride has no
     # meaningful sliding window at all, so it drops to the disjoint (None) default rather than being
@@ -2347,7 +2481,8 @@ def _cell_diagnostics(
 
     Each probe is isolated: a failure (e.g. OOM on the O(N^2 K^2) Omega at large K) is logged and
     drops that scalar, never crashing the cell. The dominant cost is the diagnostic forward inside
-    ``readout_state``; the experiment sweeps run at the baseline K=20, where it is cheap.
+    ``readout_state``, and the dense Omega probe grows as O(N^2 K^2), so at a large baseline K it may be
+    the probe that fails and is dropped.
     """
     out: Dict[str, Any] = {}
     try:
@@ -2385,7 +2520,9 @@ def _cell_diagnostics(
 
     def _gauge_resid() -> float:
         res = projected_gauge_equivariance(model, token_ids)["residuals"]
-        return max(max(per_layer) for per_layer in res.values())
+        # NaN-propagating: Python's max keeps a NaN or drops it by position (audit 2026-10-31 viz-pipeline-3).
+        values = [float(value) for per_layer in res.values() for value in per_layer]
+        return math.nan if any(math.isnan(value) for value in values) else max(values)
     _probe("gauge_resid_in", _gauge_resid)
 
     # Dong rank-one residual r(X) of the converged per-token mean cloud (F2/EXP-7). The final-layer
@@ -2724,6 +2861,8 @@ _CSV_COLUMNS = [
     "paired_token_bootstrap", "val_token_nats_path", "val_token_nats_sha256",
     "val_token_nats_size_bytes", "val_token_nats_numel", "val_token_nats_dtype",
     "wall_time_s", "seed", "error",
+    # the cell's stored overrides as sorted JSON, so the regime each row trained under is visible in the view
+    "overrides",
 ]
 
 _DIAGNOSTIC_RESULT_KEYS = {
@@ -3820,8 +3959,69 @@ def _write_sweep_csv(sweep_dir: Path, results: List[Dict[str, Any]]) -> None:
             for result in results:
                 row = {key: result.get(key, "") for key in _CSV_COLUMNS}
                 row["skipped_updates_flag"] = _skipped_updates(result) > 0
+                overrides = result.get("overrides")
+                row["overrides"] = (json.dumps(overrides, sort_keys=True, default=str)
+                                    if isinstance(overrides, Mapping) else "")
                 writer.writerow(row)
         _atomic_replace(final_path, temporary_path)
+
+
+# Terminal publication of a sweep's view waits out a destination lock this long before it raises.
+_TERMINAL_PUBLICATION_TIMEOUT_SECONDS = 600.0
+_TERMINAL_PUBLICATION_RETRY_SECONDS   = 5.0
+
+
+def _refresh_best_effort(what: str, write: Callable[[], object]) -> bool:
+    r"""Run one mid-sweep refresh of a sweep view (``sweep_results.csv``, ``cell_attempts.json``), surviving OSError.
+
+    The views are rebuilt from the cell markers and the in-memory ledger at the end of the sweep, so a refresh that
+    fails (on Windows any reader holding the file open makes the atomic replace fail) is logged and the sweep goes
+    on to its next cell. Returns whether the refresh was written."""
+    try:
+        write()
+    except OSError as exc:
+        logger.warning("  [%s not refreshed (%s: %s); the sweep continues and publishes it at the end]",
+                       what, type(exc).__name__, exc)
+        return False
+    return True
+
+
+def _publish_with_backoff(what: str, write: Callable[[], object]) -> None:
+    r"""Run one terminal publication of a sweep view, waiting out a lock on its destination, else raise.
+
+    A ``PermissionError`` (the Windows open-handle lock) is retried every :data:`_TERMINAL_PUBLICATION_RETRY_SECONDS`
+    for up to :data:`_TERMINAL_PUBLICATION_TIMEOUT_SECONDS`, with one notice to close the file; after that, and on
+    any other error, the error propagates, so a sweep never reports complete over a view it could not publish."""
+    deadline = time.monotonic() + _TERMINAL_PUBLICATION_TIMEOUT_SECONDS
+    notified = False
+    while True:
+        try:
+            write()
+            return
+        except PermissionError as exc:
+            if time.monotonic() >= deadline:
+                raise
+            if not notified:
+                logger.warning("  [%s is locked (%s); close the program holding it open. Retrying for up to %.0f s]",
+                               what, exc, _TERMINAL_PUBLICATION_TIMEOUT_SECONDS)
+                notified = True
+            time.sleep(_TERMINAL_PUBLICATION_RETRY_SECONDS)
+
+
+def _is_environment_failure(exc: BaseException) -> bool:
+    r"""Whether a cell's exception came from its environment rather than from training.
+
+    An ``OSError`` (a missing or unreadable tokenized cache, a full disk, a locked file) or a CUDA out-of-memory error
+    says nothing about the cell's configuration or its optimization, so :func:`run_sweep` records it as
+    ``error_kind = "environment"``, a ``"contract"`` failure that a resumed run retries; a training crash stays a
+    terminal ``"run"`` failure."""
+    if isinstance(exc, OSError):
+        return True
+    cuda_oom = getattr(torch.cuda, "OutOfMemoryError", None)
+    if cuda_oom is not None and isinstance(exc, cuda_oom):
+        return True
+    message = str(exc).lower()
+    return isinstance(exc, RuntimeError) and "out of memory" in message and "cuda" in message
 
 
 def _skipped_updates(row: Mapping[str, Any]) -> int:
@@ -3833,11 +4033,62 @@ def _skipped_updates(row: Mapping[str, Any]) -> int:
     return int(value) if math.isfinite(value) and value > 0 else 0
 
 
+def _sweep_definition_check(
+    sweep_name:        str,
+    parameter_records: Optional[Mapping[str, Mapping[str, object]]],
+) -> Optional[Callable[[str, Mapping[str, Any]], bool]]:
+    r"""A predicate ``(cell label, stored overrides) -> bool``: whether a row is a cell of the sweep's CURRENT
+    registry definition, or None when there is no definition to check against.
+
+    The contract check proves that a row trained on the current baseline plus its own stored overrides; this
+    predicate also requires those overrides to be the ones the current ``SWEEPS`` entry gives the row, compared
+    as effective settings over the VFE3Config defaults and the resolved baseline (:func:`_same_setting`). A label of
+    the current expansion must carry that label's current overrides; a value the registry no longer lists (the
+    tack-on design) must carry ``requires`` plus its own value; an arm the registry no longer lists must meet every
+    current ``requires`` item. A parameter-grid row is checked against its persisted selection record. None for an
+    unregistered sweep, a grid sweep without a persisted selection, or an entry that no longer expands.
+    """
+    sweep = SWEEPS.get(sweep_name)
+    if not isinstance(sweep, Mapping):
+        return None
+    try:
+        if parameter_records is not None:
+            expected = {label: dict(record.get("overrides") or {}) for label, record in parameter_records.items()}
+        elif "parameter_grid" in sweep:
+            return None
+        else:
+            expected = {label: dict(overrides) for label, overrides in make_run_overrides(sweep_name)}
+        requires = _jsonable(dict(sweep.get("requires", {}) or {}))
+        base = _sweep_base_settings({})
+    except Exception as exc:                                  # an entry that no longer expands: nothing to check
+        logger.debug("  [%s] sweep definition unavailable for the row check: %s", sweep_name, exc)
+        return None
+    param = sweep.get("param") if not ({"configs", "parameter_grid"} & set(sweep)) else None
+    seeded_labels = "seeds" in sweep or "schedule_seed" in sweep or parameter_records is not None
+
+    def _same_settings(stored: Mapping[str, Any], wanted: Mapping[str, Any]) -> bool:
+        row, want = {**base, **stored}, {**base, **_jsonable(dict(wanted))}
+        return all(_same_setting(row.get(key, _NO_SETTING), want.get(key, _NO_SETTING))
+                   for key in set(stored) | set(wanted))
+
+    def admits(label: str, stored: Mapping[str, Any]) -> bool:
+        key = _base_label(label) if seeded_labels else label
+        if key in expected:
+            return _same_settings(stored, expected[key])
+        if param is not None and param in stored:
+            return _same_settings(stored, {**requires, param: stored[param]})
+        effective = {**base, **stored}
+        return all(_same_setting(effective.get(name, _NO_SETTING), value) for name, value in requires.items())
+
+    return admits
+
+
 def _collect_sweep_results(
     sweep_dir: Path,
 
     *,
     aggregation_contract: Optional[Mapping[str, object]] = None,
+    excluded_out:         Optional[List[str]]               = None,
 ) -> List[Dict[str, Any]]:
     r"""Collect only successful cells whose full contracts belong to one invocation cohort.
 
@@ -3845,7 +4096,10 @@ def _collect_sweep_results(
     common code, corpus, tokenizer, token budget, diagnostic requests, and baseline plus that row's
     own overrides and seed. A base label is retained only with exactly one admitted row for every
     seed in the cohort's declared panel. Missing, malformed, fingerprint-mismatched, adjacent, or
-    seed-incomplete contracts are excluded before CSV publication, plotting, or winner selection.
+    seed-incomplete contracts are excluded before CSV publication, plotting, or winner selection,
+    and so is a row of a registered sweep that the current definition no longer produces
+    (:func:`_sweep_definition_check`: an earlier ``requires`` regime); ``excluded_out`` receives the
+    labels of those rows.
     """
     try:
         meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
@@ -3866,6 +4120,11 @@ def _collect_sweep_results(
         )
     except (TypeError, ValueError):
         return []
+    recorded_name = meta.get("sweep_name") if isinstance(meta, Mapping) else None
+    admits_row = _sweep_definition_check(
+        recorded_name if isinstance(recorded_name, str) and recorded_name else sweep_dir.name,
+        parameter_records,
+    )
 
     results: List[Dict[str, Any]] = []
     for marker in sorted(sweep_dir.glob("*/ablation_result.json")):
@@ -3922,6 +4181,11 @@ def _collect_sweep_results(
                 for key, value in gauge_fields.items()
             )
         ):
+            continue
+        overrides = result.get("overrides")
+        if admits_row is not None and not (isinstance(overrides, Mapping) and admits_row(label, overrides)):
+            if excluded_out is not None:
+                excluded_out.append(label)
             continue
         results.append(dict(result))
 
@@ -4183,8 +4447,9 @@ def _cell_failure_class(marker: Mapping[str, object]) -> Optional[str]:
 
     A run failure is a training crash (``error_kind = "train"``), a non-finite terminal validation PPL or
     incomplete requested outputs; setup, configuration, parameter-count, corpus, code or contract failures
-    are ``"contract"``. Markers written before the field existed are classified from ``error_kind`` and
-    ``final_val_ppl``.
+    are ``"contract"``, and so is an environment failure inside the cell (``error_kind = "environment"``: an
+    ``OSError`` such as a missing tokenized cache, or a CUDA out-of-memory error; :func:`_is_environment_failure`).
+    Markers written before the field existed are classified from ``error_kind`` and ``final_val_ppl``.
     """
     if marker.get("status") != "failed":
         return None
@@ -4328,17 +4593,20 @@ def _cohort_duplicate_cell(
     *,
     save_model_artifacts:   bool,
     paired_token_bootstrap: bool,
+    run_dir:                Optional[Path] = None,
 ) -> Optional[Tuple[Path, Dict[str, Any]]]:
-    r"""A successful cell of another sweep under ``output_dir`` with this cell's exact contract, or None.
+    r"""A successful cell under ``output_dir`` with this cell's exact contract, or None.
 
     Cells pair by ``cell_contract_fingerprint`` (:func:`vfe3.run_artifacts.semantic_config_fingerprint` of the
     cell contract: semantic config, seed, data, code and requested outputs; neither the sweep nor the label
     enters it), and the candidate must still pass :func:`_cell_is_current`, the model-artifact check and the
-    paired-token check (audit 2026-10-17 item 59).
+    paired-token check (audit 2026-10-17 item 59). With ``run_dir`` the sweep's own cells other than ``run_dir``
+    are candidates too, so a cell whose label changed, such as a joint-search candidate relabeled by its Sobol
+    draw index, is served from its earlier label instead of being retrained (audit 2026-10-31, A371).
     """
     fingerprint = semantic_config_fingerprint(dict(expected_contract))
     for other in sorted(output_dir.iterdir()):
-        if (other == sweep_dir or not other.is_dir() or other.name.startswith(".")
+        if ((other == sweep_dir and run_dir is None) or not other.is_dir() or other.name.startswith(".")
                 or other.is_symlink() or _path_is_junction(other)):
             continue
         for marker_path in sorted(other.glob("*/ablation_result.json")):
@@ -4347,6 +4615,8 @@ def _cohort_duplicate_cell(
             except (OSError, ValueError):
                 continue
             source = marker_path.parent
+            if other == sweep_dir and run_dir is not None and source.name == run_dir.name:
+                continue                                          # the cell itself is never its own source
             if (isinstance(marker, Mapping) and marker.get("status") == "success"
                     and marker.get("error_kind") is None
                     and marker.get("cell_contract_fingerprint") == fingerprint
@@ -4484,9 +4754,14 @@ def run_sweep(
     receives the collected cohort in either case, for callers that rank partial results.
 
     Under ``resume`` a cell whose marker records a run failure (:func:`_cell_failure_class`) is terminal
-    and is reported rather than retrained, unless ``retry_failed`` is True. Every generation of a cell is
+    and is reported rather than retrained, unless ``retry_failed`` is True; an environment failure
+    (:func:`_is_environment_failure`) is a contract failure and is retried. Every generation of a cell is
     archived before it is cleared and recorded in ``cell_attempts.json``; ``sweep_meta.json`` carries the
     per-cell attempts and failures under ``cell_attempts`` and they are printed (audit 2026-10-17 item 28).
+
+    The views refreshed after each cell (``sweep_results.csv``, ``cell_attempts.json``) are best effort
+    (:func:`_refresh_best_effort`): a locked view never ends the sweep. The terminal publication rebuilds
+    them from the markers and waits out a lock (:func:`_publish_with_backoff`) before it raises.
     """
     stop_after_steps = _validated_stop_after_steps(stop_after_steps)
     sweep_name = _validated_sweep_name(sweep_name)
@@ -4620,9 +4895,11 @@ def run_sweep(
     }
     # Invalidate any prior complete view before even the invocation identity probes run. Cell
     # artifacts remain available for exact-contract resume, but a crash cannot leave the old
-    # metadata/CSV pair externally visible as the outcome of this new invocation.
+    # metadata/CSV pair externally visible as the outcome of this new invocation. The "running"
+    # metadata is what invalidates; emptying the CSV view is best effort (a held-open CSV stays
+    # beside status="running" until the terminal publication).
     _write_json_atomic(sweep_dir / "sweep_meta.json", running_meta)
-    _write_sweep_csv(sweep_dir, [])
+    _refresh_best_effort("sweep_results.csv", lambda: _write_sweep_csv(sweep_dir, []))
 
     try:
         invocation_code_identity = _validated_ablation_code_identity(code_identity_snapshot())
@@ -4730,7 +5007,8 @@ def run_sweep(
                       f"{n_tried} attempt(s); set retry_failed=True to retrain] ---")
                 if not attempt_ledger.get(label):
                     attempt_ledger[label] = [_attempt_record(cached_result, 1)]
-                    _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger)
+                    _refresh_best_effort(_CELL_ATTEMPTS_FILENAME, lambda: _write_json_atomic(
+                        sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger))
                 results.append(dict(cached_result))
                 continue
             parameter_record = parameter_record_by_label.get(label)
@@ -4769,7 +5047,11 @@ def run_sweep(
                 _write_json_atomic(marker, cached_result)
                 results.append(cached_result)
                 continue
-            print(f"\n--- {i + 1}/{len(cells)}: {label}  [contract changed -> re-running] ---")
+            if isinstance(cached_result, Mapping) and _cell_failure_class(cached_result) == "contract":
+                print(f"\n--- {i + 1}/{len(cells)}: {label}  [earlier attempt failed "
+                      f"({cached_result.get('error_kind')}) -> retrying] ---")
+            else:
+                print(f"\n--- {i + 1}/{len(cells)}: {label}  [contract changed -> re-running] ---")
         else:
             print(f"\n--- {i + 1}/{len(cells)}: {label} ---")
         t0 = time.perf_counter()
@@ -4782,11 +5064,13 @@ def run_sweep(
             else:
                 if archived_attempt is not None:
                     print(f"  [ARCHIVED] earlier attempt of {label} -> {archived_attempt}")
-        # A cell another sweep of the cohort already trained under the identical contract is reused rather
-        # than retrained (audit 2026-10-17 item 59): the shared baseline appears in most sweeps.
+        # A cell another sweep of the cohort, or another cell of this sweep, already trained under the identical
+        # contract is reused rather than retrained (audit 2026-10-17 item 59; 2026-10-31 A371): the shared
+        # baseline appears in most sweeps, and a relabeled cell keeps its earlier generation under the old label.
         duplicate = (_cohort_duplicate_cell(output_dir, sweep_dir, expected_contract,
                                             save_model_artifacts=save_model_artifacts,
-                                            paired_token_bootstrap=paired_token_bootstrap)
+                                            paired_token_bootstrap=paired_token_bootstrap,
+                                            run_dir=run_dir)
                      if resume and expected_contract is not None and label not in parameter_record_by_label
                      else None)
         if duplicate is not None:
@@ -4805,10 +5089,11 @@ def run_sweep(
                 cell_attempts = attempt_ledger.setdefault(label, [])
                 cell_attempts.append({**_attempt_record(reused, len(cell_attempts) + 1),
                                       "reused_from": reused["reused_from"]})
-                _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger)
+                _refresh_best_effort(_CELL_ATTEMPTS_FILENAME, lambda: _write_json_atomic(
+                    sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger))
                 results.append(reused)
-                _write_sweep_csv(sweep_dir, _collect_sweep_results(
-                    sweep_dir, aggregation_contract=(aggregation_contract or {})))
+                _refresh_best_effort("sweep_results.csv", lambda: _write_sweep_csv(sweep_dir, _collect_sweep_results(
+                    sweep_dir, aggregation_contract=(aggregation_contract or {}))))
                 continue
         try:
             _start_owned_cell_generation(
@@ -4835,9 +5120,12 @@ def run_sweep(
                                     max_tokens=max_tokens, max_steps=max_steps,
                                     stop_after_steps=stop_after_steps)
             except Exception as exc:                         # one training crash must not kill the sweep
-                logger.exception("sweep %s / %s training crashed", sweep_name, label)
-                result = {"label": label, "error_kind": "train", "error": str(exc),
-                          "primary_val_ppl": float("inf"), "seed": int(cell_seed),
+                environment = _is_environment_failure(exc)   # a contract failure: a resumed run retries it
+                logger.exception("sweep %s / %s %s", sweep_name, label,
+                                 "failed in its environment (retried on resume)" if environment
+                                 else "training crashed")
+                result = {"label": label, "error_kind": ("environment" if environment else "train"),
+                          "error": str(exc), "primary_val_ppl": float("inf"), "seed": int(cell_seed),
                           "overrides": _jsonable(overrides)}
         finally:
             _cleanup()
@@ -4980,7 +5268,8 @@ def run_sweep(
             _write_json_atomic(marker, result)
         cell_attempts = attempt_ledger.setdefault(label, [])
         cell_attempts.append(_attempt_record(result, len(cell_attempts) + 1))
-        _write_json_atomic(sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger)
+        _refresh_best_effort(_CELL_ATTEMPTS_FILENAME, lambda: _write_json_atomic(
+            sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger))
         results.append(result)
 
         ppl = result["primary_val_ppl"]
@@ -4992,11 +5281,11 @@ def run_sweep(
 
         # Keep the CSV whole AND accumulated after each cell: write the union of every persisted
         # marker (this cell, the rest of this run, and any prior run's cells) so the tacked-on
-        # frame is live even mid-sweep.
-        _write_sweep_csv(sweep_dir, _collect_sweep_results(
+        # frame is live even mid-sweep. Best effort: the terminal publication rebuilds it.
+        _refresh_best_effort("sweep_results.csv", lambda: _write_sweep_csv(sweep_dir, _collect_sweep_results(
             sweep_dir,
             aggregation_contract=(aggregation_contract or {}),
-        ))
+        )))
 
     try:
         terminal_code_identity = _validated_ablation_code_identity(code_identity_snapshot())
@@ -5017,10 +5306,18 @@ def run_sweep(
     # The final frame is the one compatible cohort only. A requested label counts as successful
     # exactly when its current marker, contract, optional paired artifact, and gauge disclosure all
     # passed that collector; historical survivors cannot make an incomplete invocation complete.
+    excluded_stale: List[str] = []
     union = _collect_sweep_results(
         sweep_dir,
         aggregation_contract=(aggregation_contract or {}),
+        excluded_out=excluded_stale,
     )
+    if excluded_stale:
+        logger.warning(
+            "  [%s] %d earlier row(s) left out of the sweep view: trained under a definition the current "
+            "SWEEPS entry no longer gives them (an earlier 'requires' regime): %s",
+            sweep_name, len(excluded_stale), ", ".join(excluded_stale),
+        )
     collected_labels = {str(result["label"]) for result in union}
     failed_requested_labels = [
         label for label, _overrides, _cell_seed in cells
@@ -5042,9 +5339,14 @@ def run_sweep(
     cell_attempts_summary = _cell_attempt_summary(attempt_ledger, [label for label, _o, _s in cells])
 
     # Publish the complete accumulated frame before the terminal metadata. A reader that observes
-    # status="complete" therefore cannot see a truncated or previous-generation CSV.
-    _write_sweep_csv(sweep_dir, union)
-    _write_json_atomic(sweep_dir / "sweep_meta.json", {
+    # status="complete" therefore cannot see a truncated or previous-generation CSV. Each publication
+    # waits out a lock on its file and then raises; the attempt ledger is republished first because
+    # its per-cell refreshes were best effort.
+    if attempt_ledger:
+        _publish_with_backoff(_CELL_ATTEMPTS_FILENAME, lambda: _write_json_atomic(
+            sweep_dir / _CELL_ATTEMPTS_FILENAME, attempt_ledger))
+    _publish_with_backoff("sweep_results.csv", lambda: _write_sweep_csv(sweep_dir, union))
+    _publish_with_backoff("sweep_meta.json", lambda: _write_json_atomic(sweep_dir / "sweep_meta.json", {
         "sweep_name":  sweep_name,
         "description": sweep["description"],
         "n_runs":      len(cells),
@@ -5063,7 +5365,7 @@ def run_sweep(
         # PB-07 report metadata (null for ordinary sweeps): lets the ablation-forest / joint-LR-grid
         # adapters operate after a process restart, when only the persisted sweep view survives.
         **report_metadata,
-    })
+    }))
 
     if collected_out is not None:
         collected_out[:] = union
@@ -5075,7 +5377,8 @@ def run_sweep(
     best_mean = _best_by_seed_mean(finished)
     if best_mean is not None:
         print(f"\nSWEEP COMPLETE: {sweep_name}  ->  best {best_mean['label']} "
-              f"(mean val PPL {best_mean['mean']:.3f} over {best_mean['n']} seed(s))")
+              f"(mean val CE {best_mean['mean_ce']:.4f} nats, geometric-mean PPL {best_mean['geomean_ppl']:.3f}, "
+              f"over {best_mean['n']} seed(s))")
     else:
         print(f"\nSWEEP COMPLETE: {sweep_name}  ->  no successful run")
     return union
@@ -5110,9 +5413,10 @@ def _base_label(label: str) -> str:
 
 def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     r"""Group finished cells by base label into across-seed statistics: n, and the mean / SD / CV of the
-    primary val PPL. A single-seed base reports n=1 with SD = CV = NaN: its seed variance is unknown,
-    not zero. Sorted by mean PPL; bases with no finite PPL are dropped. The honest endpoint for
-    reading a sub-3-percent ablation effect against seed noise."""
+    primary val PPL, with ``mean_ce`` the mean validation CE :math:`\overline{\log \mathrm{PPL}}` in nats. A
+    single-seed base reports n=1 with SD = CV = NaN: its seed variance is unknown, not zero. Sorted by mean
+    PPL; bases with no finite PPL are dropped. The honest endpoint for reading a sub-3-percent ablation
+    effect against seed noise."""
     groups: Dict[str, List[float]] = {}
     for r in rows:
         ppl = _as_float(r.get("primary_val_ppl"))
@@ -5123,7 +5427,8 @@ def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(vals)
         mean = sum(vals) / n
         sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else float("nan")
-        agg.append({"label": base, "n": n, "mean": mean, "sd": sd,
+        mean_ce = (sum(math.log(v) for v in vals) / n) if all(v > 0.0 for v in vals) else float("inf")
+        agg.append({"label": base, "n": n, "mean": mean, "sd": sd, "mean_ce": mean_ce,
                     "cv": (sd / mean) if mean > 0 else float("nan")})
     return sorted(agg, key=lambda d: d["mean"])
 
@@ -5186,18 +5491,15 @@ def _is_shared_baseline_overrides(overrides: object) -> bool:
 def _baseline_noise_floor(sweep_dirs: Sequence[Path]) -> Optional[Dict[str, Any]]:
     r"""The shared-baseline seed noise floor across ``sweep_dirs`` (None with fewer than two seeds).
 
-    Every successful cell whose overrides leave the shared baseline unchanged is one baseline replicate;
-    duplicates of one seed (the same cell in several sweeps) count once. Returns the seeds, the mean and SD
-    (ddof = 1) of the validation CE :math:`\log \mathrm{PPL}` in nats, and the SD of the PPL (audit
-    2026-10-17 item 59).
+    Every row :func:`_collect_sweep_results` admits whose overrides leave the shared baseline unchanged is one
+    baseline replicate; duplicates of one seed (the same cell in several sweeps) count once. A raw marker the
+    collector refuses (another cohort, a stale contract) is not a replicate. Returns the seeds, the mean and SD
+    (ddof = 1) of the validation CE :math:`\log \mathrm{PPL}` in nats, and the SD of the PPL (audit 2026-10-17
+    item 59). A comparison cohort fixes one seed design, so a single-seed cohort has no floor.
     """
     by_seed: Dict[int, float] = {}
     for sweep_dir in sweep_dirs:
-        for marker in sorted(Path(sweep_dir).glob("*/ablation_result.json")):
-            try:
-                result = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
+        for result in _collect_sweep_results(Path(sweep_dir)):
             if (not isinstance(result, Mapping) or result.get("status") != "success"
                     or type(result.get("seed")) is not int
                     or not _is_shared_baseline_overrides(result.get("overrides"))):
@@ -5217,17 +5519,33 @@ def _baseline_noise_floor(sweep_dirs: Sequence[Path]) -> Optional[Dict[str, Any]
 
 
 def _print_noise_floor(floor: Optional[Mapping[str, Any]]) -> None:
+    r"""Print the shared-baseline floor with the 95% half-width of a difference of two single-seed runs.
+
+    The half-width is :math:`t_{n-1,\,0.975}\sqrt{2}\,s` (``multiseed_analysis.single_seed_noise_floor``), with
+    :math:`s` the CE SD from :math:`n` seeds; a fixed two-SD rule exceeds its null rate at small :math:`n`."""
     if floor is None:
         return
+    from multiseed_analysis import single_seed_noise_floor
+
+    half_width = single_seed_noise_floor(float(floor["sd_ce"]), int(floor["n"]))
     print(f"\nbaseline noise floor: {floor['n']} seeds {floor['seeds']} of the shared baseline, SD of val CE "
-          f"{floor['sd_ce']:.4f} nats (SD of PPL {floor['sd_ppl']:.3f}); a single-seed difference smaller than "
-          "about twice this is within seed noise")
+          f"{floor['sd_ce']:.4f} nats (SD of PPL {floor['sd_ppl']:.3f}); a single-seed CE difference within "
+          f"+/-{half_width:.4f} nats (t_{{{int(floor['n']) - 1},0.975}} sqrt(2) SD, the 95% band of the difference "
+          "of two single-seed runs) is within seed noise")
 
 
 def _best_by_seed_mean(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    r"""The base label with the lowest across-seed mean PPL (seeds aggregated before the pick; audit item 58)."""
+    r"""The base label with the lowest across-seed mean validation CE (seeds aggregated before the pick; audit item 58).
+
+    CE :math:`= \log \mathrm{PPL}` is the decision scale of the paired tables; one blown-up seed dominates an
+    arithmetic PPL mean. The entry carries ``mean_ce`` and :math:`\exp(\overline{\mathrm{CE}})`, the geometric-mean PPL,
+    beside the arithmetic ``mean``."""
     aggregated = _seed_aggregate(list(rows))
-    return aggregated[0] if aggregated else None
+    if not aggregated:
+        return None
+    best = dict(min(aggregated, key=lambda d: (d["mean_ce"], d["mean"])))
+    best["geomean_ppl"] = math.exp(best["mean_ce"]) if math.isfinite(best["mean_ce"]) else float("inf")
+    return best
 
 
 _NO_SETTING = object()                    # a field neither the baseline nor VFE3Config sets
@@ -5381,6 +5699,40 @@ def _print_ablation_rows(rows: List[Dict[str, Any]], *, parameter_matched: bool)
 
 
 _LR_WIDTH_TRANSFER_LABEL = re.compile(r"^K=(\d+),H=(\d+),([A-Za-z0-9_]+)=x([0-9.eE+-]+)$")
+_LR_WIDTH_TRANSFER_BASE_LABEL = re.compile(rf"^K=(\d+),H=(\d+),{_LR_WIDTH_TRANSFER_BASE}$")
+
+
+def _parabolic_log_optimum(
+    grid: Sequence[Tuple[float, float]],     # (multiplier, mean PPL) of one rate and width, sorted by multiplier
+    best: float,                             # the grid multiplier with the lowest finite PPL
+) -> Optional[float]:
+    r"""The multiplier at the vertex of the parabola through the CE at ``best`` and its two grid neighbors.
+
+    With :math:`x = \log m` and :math:`y = \log \mathrm{PPL}` (validation CE) at the neighbors :math:`x_0 < x_1 < x_2`,
+    :math:`a = x_1 - x_0`, :math:`b = x_2 - x_1`, :math:`p = y_0 - y_1 \ge 0` and :math:`q = y_2 - y_1 \ge 0`, the
+    vertex is
+
+    .. math::
+        x_v = x_1 + \tfrac12 \frac{b^2 p - a^2 q}{a q + b p} \in [x_1 - a/2,\, x_1 + b/2],
+
+    so the refined optimum stays within half a grid step of the grid best. None when ``best`` is a grid edge or a
+    neighbor diverged; ``best`` itself when the three CEs are equal (no curvature).
+    """
+    multipliers = [m for m, _ppl in grid]
+    if best not in multipliers:
+        return None
+    i = multipliers.index(best)
+    if i == 0 or i == len(grid) - 1:
+        return None
+    (m0, ppl0), (m1, ppl1), (m2, ppl2) = grid[i - 1], grid[i], grid[i + 1]
+    if not all(math.isfinite(v) and v > 0.0 for v in (ppl0, ppl1, ppl2)) or min(m0, m1, m2) <= 0.0:
+        return None
+    a, b = math.log(m1) - math.log(m0), math.log(m2) - math.log(m1)
+    p, q = math.log(ppl0) - math.log(ppl1), math.log(ppl2) - math.log(ppl1)
+    curvature = a * q + b * p
+    if not curvature > 0.0:                             # three equal CEs, or best not the minimum of the three
+        return float(m1) if p == 0.0 and q == 0.0 else None
+    return math.exp(math.log(m1) + 0.5 * (b * b * p - a * a * q) / curvature)
 
 
 def fit_lr_width_transfer(
@@ -5393,27 +5745,52 @@ def fit_lr_width_transfer(
 
     A cell with an error or a non-finite PPL counts as diverged, and so does a ``requested`` cell with no row (a cell
     whose run failed before it wrote one, which leaves the sweep incomplete); a finite cell whose run rejected
-    optimizer updates is listed under ``skipped_update_multipliers``. Seeds of one cell are averaged. ``b`` is the width
-    exponent (``eta* ~ K^b``) and ``eta_at`` extrapolates it; a rate with fewer than two interior widths gets no fit.
+    optimizer updates is listed under ``skipped_update_multipliers``. Seeds of one cell are averaged. A width's shared
+    multiplier-one cell (:func:`_lr_width_transfer_base_label`) is the x1 point of every rate at that width.
+
+    An interior best is refined by :func:`_parabolic_log_optimum` (``refined_multiplier``, ``refined_lr``): on a
+    coarse grid the grid best takes few values, so a fit on it is quantized to a few exponents. ``b`` is fit on the
+    refined optima (the grid best where a neighbor diverged); it is the width exponent (``eta* ~ K^b``) and ``eta_at``
+    extrapolates it; a rate with fewer than two interior widths gets no fit.
     """
     cells: Dict[Tuple[str, int, int, float], List[float]] = {}
     skipped_cells: set = set()
+    shared: Dict[Tuple[int, int], List[float]] = {}          # (K, H) -> PPLs of the width's shared x1 cell
+    shared_skipped: set = set()
     for row in rows:
         # _base_label strips the __s<seed> suffix of a seeded sweep, so the seeds of a cell meet in one key.
-        match = _LR_WIDTH_TRANSFER_LABEL.match(_base_label(str(row.get("label", "")).split("|")[0].strip()))
-        if match is None:
-            continue
-        embed_dim, n_heads, field, multiplier = int(match[1]), int(match[2]), match[3], float(match[4])
+        label = _base_label(str(row.get("label", "")).split("|")[0].strip())
         # The final PPL, not primary_val_ppl: that keeps the best periodic evaluation of a cell that blew up later.
         ppl = _as_float(row.get("final_val_ppl"))
         failed = bool(str(row.get("error", "") or "").strip()) or not math.isfinite(ppl)
+        base_match = _LR_WIDTH_TRANSFER_BASE_LABEL.match(label)
+        if base_match is not None:
+            width = (int(base_match[1]), int(base_match[2]))
+            shared.setdefault(width, []).append(float("inf") if failed else ppl)
+            if _skipped_updates(row):
+                shared_skipped.add(width)
+            continue
+        match = _LR_WIDTH_TRANSFER_LABEL.match(label)
+        if match is None:
+            continue
+        embed_dim, n_heads, field, multiplier = int(match[1]), int(match[2]), match[3], float(match[4])
         cells.setdefault((field, embed_dim, n_heads, multiplier), []).append(float("inf") if failed else ppl)
         if _skipped_updates(row):
             skipped_cells.add((field, embed_dim, n_heads, multiplier))
     for label in requested:
+        base_match = _LR_WIDTH_TRANSFER_BASE_LABEL.match(str(label))
+        if base_match is not None:
+            shared.setdefault((int(base_match[1]), int(base_match[2])), [float("inf")])
+            continue
         match = _LR_WIDTH_TRANSFER_LABEL.match(str(label))
         if match is not None:
             cells.setdefault((match[3], int(match[1]), int(match[2]), float(match[4])), [float("inf")])
+    rate_fields = {key[0] for key in cells}
+    for (embed_dim, n_heads), values in shared.items():
+        for field in rate_fields:
+            cells.setdefault((field, embed_dim, n_heads, 1.0), []).extend(values)
+            if (embed_dim, n_heads) in shared_skipped:
+                skipped_cells.add((field, embed_dim, n_heads, 1.0))
     fields: Dict[str, Any] = {}
     for field in sorted({key[0] for key in cells}):
         widths = sorted({(key[1], key[2]) for key in cells if key[0] == field})
@@ -5435,13 +5812,16 @@ def fit_lr_width_transfer(
                 entry.update(best_multiplier=best_multiplier, best_ppl=best_ppl,
                              best_lr=float(baseline[field]) * best_multiplier,
                              at_grid_edge=best_multiplier in (grid[0][0], grid[-1][0]))
+                refined = _parabolic_log_optimum(grid, best_multiplier)
+                if refined is not None:
+                    entry.update(refined_multiplier=refined, refined_lr=float(baseline[field]) * refined)
             per_width.append(entry)
         interior = [e for e in per_width if "best_lr" in e and not e["at_grid_edge"]]
         fit: Dict[str, Any] = {"field": field, "base_lr": float(baseline[field]), "widths": per_width,
                                "interior_widths": len(interior)}
         if len({e["embed_dim"] for e in interior}) >= 2:
             x = [math.log(e["embed_dim"]) for e in interior]
-            y = [math.log(e["best_lr"]) for e in interior]
+            y = [math.log(e.get("refined_lr", e["best_lr"])) for e in interior]
             mx, my = sum(x) / len(x), sum(y) / len(y)
             b = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / sum((xi - mx) ** 2 for xi in x)
             a = my - b * mx
@@ -5466,14 +5846,16 @@ def analyze_lr_width_transfer(sweep_dir: Path) -> Dict[str, Any]:
     horizon = f"a {horizon_steps}-step horizon" if horizon_steps is not None else "the baseline horizon"
     for field, fit in report["fields"].items():
         best = ", ".join(f"K={e['embed_dim']}: x{e['best_multiplier']:g}{' (edge)' if e['at_grid_edge'] else ''}"
+                         + (f" -> x{e['refined_multiplier']:.3g}" if "refined_multiplier" in e else "")
                          for e in fit["widths"] if "best_multiplier" in e)
         # Only the exponent is published, with its horizon: absolute rates chosen on a short horizon are
         # biased toward larger values (audit 2026-10-17 item 60); eta_at stays in the JSON.
         exponent = (f"exponent {fit['exponent']:+.2f} at {horizon}" if "exponent" in fit
                     else f"no fit ({fit['interior_widths']} interior widths)")
         print(f"  {field:<28}{exponent}  [{best}]")
-    print(f"  (exponents fit on {horizon}; short-horizon optima favor larger rates, so the absolute rates in "
-          "lr_width_transfer_fit.json are not adopted as long-run rates)")
+    print(f"  (exponents fit on {horizon} to each width's optimum refined by a parabola in log rate through the best "
+          "grid point and its neighbors (-> x...); short-horizon optima favor larger rates, so the absolute rates "
+          "in lr_width_transfer_fit.json are not adopted as long-run rates)")
     return report
 
 
@@ -5503,7 +5885,11 @@ def analyze_sweep(sweep_dir: Path) -> None:
             print(f"  {r['label']:<34}{(r['_ppl'] - best) / best * 100:+.1f}%")
     print(_data_order_status_line(sweep_dir))
     if not any(a["n"] > 1 for a in _seed_aggregate(rows)):
-        _print_noise_floor(_baseline_noise_floor(_cohort_sweep_dirs(sweep_dir)))
+        floor = _baseline_noise_floor(_cohort_sweep_dirs(sweep_dir))
+        if floor is None:
+            print("no seed noise floor: this comparison cohort holds fewer than two seeds of the shared baseline, "
+                  "so the single-seed differences above are not calibrated against seed noise")
+        _print_noise_floor(floor)
 
     # Across-seed aggregation (only when a base label carries multiple seeds): n / mean / SD / CV of the
     # val PPL per config, so a sub-3-percent effect is read against the seed noise rather than as a
@@ -5633,7 +6019,8 @@ def summarize_sweeps(
         groups.setdefault(_requires_text(requires).strip(), []).append((d, requires))
     for base_text in sorted(groups, key=lambda text: (text != "", text)):
         print("\nshared baseline" if not base_text else f"\nanother base: {base_text.strip('[]')}")
-        print(f"{'sweep':<24}{'best config (seed mean)':<34}{'n':>3}{'val PPL':>10}  gauge classification")
+        # Ranked and shown on the seed-mean CE: the PPL column is exp(mean CE), the geometric-mean PPL.
+        print(f"{'sweep':<24}{'best config (seed-mean CE)':<34}{'n':>3}{'geo PPL':>10}  gauge classification")
         print("-" * 108)
         for d, _requires in groups[base_text]:
             rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
@@ -5642,7 +6029,7 @@ def summarize_sweeps(
                 continue
             member = next(r for r in rows if _base_label(str(r.get("label", ""))) == best["label"])
             gauge = _sensitivity_gauge_label(member)
-            print(f"{d.name:<24}{best['label']:<34}{best['n']:>3}{best['mean']:>10.3f}  {gauge}")
+            print(f"{d.name:<24}{best['label']:<34}{best['n']:>3}{best['geomean_ppl']:>10.3f}  {gauge}")
     print(_data_order_status_line(sweep_dirs[0]))
     _print_noise_floor(_baseline_noise_floor(sweep_dirs))
 
@@ -6050,6 +6437,23 @@ def sensitivity_rows(sweep_dirs: Sequence[Path]) -> List[Dict[str, Any]]:
     return out
 
 
+def _sensitivity_bars(
+    sensitivity: Sequence[Mapping[str, Any]],     # sensitivity_rows(...)
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    r"""Split :func:`sensitivity_rows` into the sweeps drawn as bars and the two kinds left out of the figure.
+
+    A bar needs a reference arm and a paired SE, so at least two shared seeds. A single-seed bar would be the most
+    negative of :math:`k` single-seed differences: under no effect its expectation is negative and grows in magnitude
+    with :math:`k` (the selection effect that rules out a worst-minus-best range), and nothing measures its spread.
+    Returns (bars, sweeps without a reference arm, single-seed sweeps)."""
+    bars = [dict(row) for row in sensitivity
+            if row["difference"] is not None and row["n"] >= 2 and row["se"] is not None]
+    no_reference = [str(row["sweep"]) for row in sensitivity if row["difference"] is None]
+    single_seed = [str(row["sweep"]) for row in sensitivity
+                   if row["difference"] is not None and (row["n"] < 2 or row["se"] is None)]
+    return bars, no_reference, single_seed
+
+
 def _plot_sensitivity(
     output_dir: Path,
     fig_dir:    Path,
@@ -6061,10 +6465,12 @@ def _plot_sensitivity(
 
     For each sweep with a reference arm (:func:`_paired_reference_label`), the arm with the most negative
     seed-paired mean CE difference (:math:`\log\mathrm{PPL}`, nats) against the reference is the sweep's best,
-    and its difference (with the paired SE when two or more seeds pair) is the bar. A worst-minus-best range
-    grows with the number of cells under pure noise, so it is not used (audit 2026-10-17 item 58). A sweep
-    on another base carries its ``requires`` in the label; one without a reference arm is listed in the
-    title as not comparable. Scans EVERY persisted sweep under ``output_dir`` in the cohort.
+    and its difference, with its paired SE as the error bar, is the bar. Only a sweep with two or more shared
+    seeds is drawn (:func:`_sensitivity_bars`); the bar is still the best of :math:`k` arms, so it leans negative
+    under no effect. A worst-minus-best range grows with the number of cells under pure noise, so it is not used
+    (audit 2026-10-17 item 58). A sweep on another base carries its ``requires`` in the label; one without a
+    reference arm, or with a single seed, is listed in the title. Scans EVERY persisted sweep under ``output_dir``
+    in the cohort.
     """
     sweep_dirs = [
         directory
@@ -6082,7 +6488,7 @@ def _plot_sensitivity(
         gauge_summary = _sweep_gauge_purity(d)
         if isinstance(gauge_summary, Mapping):
             gauge_summaries.append(gauge_summary)
-    comparable = [row for row in sensitivity if row["difference"] is not None]
+    comparable, missing, single_seed = _sensitivity_bars(sensitivity)
     if not comparable:
         return
     plt = _plt_or_none()
@@ -6091,16 +6497,17 @@ def _plot_sensitivity(
     comparable.sort(key=lambda row: row["difference"])
     fig, ax = plt.subplots(figsize=(9, max(3, 0.5 * len(comparable))))
     ax.barh(range(len(comparable)), [row["difference"] for row in comparable],
-            xerr=[row["se"] if row["se"] is not None else 0.0 for row in comparable],
+            xerr=[row["se"] for row in comparable],
             color="#d62728", alpha=0.8)
     ax.axvline(0.0, color="black", lw=0.8)
     ax.set_yticks(range(len(comparable)))
     ax.set_yticklabels([f"{row['sweep']}{row['requires_text']}\n(best: {row['best']} vs {row['reference']}, "
                         f"n={row['n']}; gauge: {row['gauge']})" for row in comparable])
     ax.invert_yaxis()
-    ax.set_xlabel("paired best - baseline validation CE (nats; bar = paired SE)")
-    missing = [row["sweep"] for row in sensitivity if row["difference"] is None]
-    ax.set_title("hyperparameter sensitivity" + (f"\n(no reference arm: {', '.join(missing)})" if missing else ""))
+    ax.set_xlabel("paired best arm - reference validation CE (nats; error bar = paired SE, n >= 2 seeds)")
+    notes = ([f"no reference arm: {', '.join(missing)}"] if missing else []) + (
+        [f"single seed, no paired SE: {', '.join(single_seed)}"] if single_seed else [])
+    ax.set_title("hyperparameter sensitivity" + "".join(f"\n({note})" for note in notes))
     fig.tight_layout()
     _annotate_gauge_disclosure(fig, {
         "contains_coordinate_mean_only_nonintertwiner": any(
@@ -6194,6 +6601,40 @@ def _render_sweep_figures(sweep_dir: Path, fig_dir: Path) -> None:
     _plot_pos_extrapolation(sweep_dir, fig_dir)
 
 
+def _canonical_definition(value: object) -> object:
+    r"""A JSON form of a declarative value whose serialization does not depend on the process.
+
+    Mappings get string keys (``repr`` of a non-string key) and are serialized with sorted keys, sets are sorted by
+    their serialized members, and any object that is not plain data is reduced to its type name, so no hash order or
+    object address enters a fingerprint."""
+    if isinstance(value, Mapping):
+        return {key if isinstance(key, str) else repr(key): _canonical_definition(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_definition(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonical_definition(item) for item in value),
+                      key=lambda item: json.dumps(item, sort_keys=True))
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+
+
+def _figure_definition_fingerprints() -> Dict[str, str]:
+    r"""SHA-256 fingerprints of the definitions an ablation figure scope reads from this module.
+
+    ``baseline`` covers :func:`_resolved_sweep_baseline` (``BASELINE_CONFIG`` with the route switches), from which the
+    collector rebuilds each cell's contract; ``sweeps`` covers ``SWEEPS``, from which the sensitivity plot resolves
+    reference arms. The figure worker imports this file anew from disk, so the parent sends its own fingerprints in the
+    request and the worker refuses a scope whose definitions no longer match (audit 2026-10-31 ablation-harness-13).
+    """
+    def digest(value: object) -> str:
+        payload = json.dumps(_canonical_definition(value), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    return {"baseline": digest(_resolved_sweep_baseline()), "sweeps": digest(SWEEPS)}
+
+
 def _run_ablation_figures_isolated(
     output_dir: Path,
 
@@ -6213,6 +6654,7 @@ def _run_ablation_figures_isolated(
             "cohort_identity": (
                 dict(cohort_identity) if cohort_identity is not None else None
             ),
+            "definition_fingerprints": _figure_definition_fingerprints(),
         }), encoding="utf-8")
         environment = os.environ.copy()
         environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -6316,16 +6758,20 @@ def main() -> int:
     for name in sweep_names:
         if name not in SWEEPS:
             raise ValueError(f"unknown sweep {name!r}; choose from {sorted(SWEEPS)}")
-    validate_sweeps(sweep_names)                             # scheduled arms MUST construct upfront
-    validate_sweeps(list(SWEEPS), require_construction=False)  # rest of registry: names/fields only
+    # Scheduled arms MUST construct upfront, built as run_single builds them, at each sweep's own horizon.
+    validate_sweeps(sweep_names, max_steps={name: _session_max_steps(name) for name in sweep_names})
+    validate_sweeps(list(SWEEPS), require_construction=False,      # rest of registry: names/fields only
+                    max_steps={name: _session_max_steps(name) for name in SWEEPS})
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nVFE_3.0 ablation suite\n  device:  {device}\n  dataset: {CONFIG['dataset']}"
           f"\n  output:  {output_dir}\n  seed:    {CONFIG['seed']}"
           f"\n  sweeps:  {', '.join(sweep_names)}")
     _print_baseline_default_divergence()
+    _print_inactive_baseline_settings()
 
     current_cohort: Optional[Dict[str, object]] = None
+    cohort_anchor: Optional[str] = None                      # the first complete sweep, which fixes current_cohort
     incomplete_sweeps: List[str] = []
     failed_figure_scopes: List[str] = []
     _write_ablation_run_status(
@@ -6364,9 +6810,9 @@ def main() -> int:
         run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
                   seed=CONFIG["seed"], resume=CONFIG["resume"],
                   retry_failed=bool(CONFIG.get("retry_failed", False)),
+                  save_model_artifacts=CONFIG.get("save_model_artifacts", True),
                   max_tokens=CONFIG["max_tokens"],
-                  max_steps=(LR_WIDTH_TRANSFER["max_steps"] if name == _LR_WIDTH_TRANSFER_SWEEP
-                             else CONFIG["max_steps"]),
+                  max_steps=_session_max_steps(name),
                   stop_after_steps=CONFIG.get("stop_after_steps"))
         sweep_dir = output_dir / sweep_scope
 
@@ -6391,11 +6837,15 @@ def main() -> int:
             incomplete_sweeps.append(name)
             continue
         if current_cohort is None:
-            current_cohort = sweep_cohort
+            current_cohort, cohort_anchor = sweep_cohort, name
         elif sweep_cohort != current_cohort:
-            logger.error("sweep %s belongs to a different comparison cohort", name)
-            incomplete_sweeps.append(name)
-            continue
+            # A complete sweep is analyzed and rendered on its own either way; only the outputs that compare
+            # sweeps with one another (the cross-sweep summary and sensitivity figure) need one cohort.
+            logger.warning(
+                "sweep %s belongs to a different comparison cohort than %s (seed design, horizon, data or code): "
+                "it is analyzed and rendered on its own and left out of the cross-sweep summary",
+                name, cohort_anchor,
+            )
         analyze_sweep(sweep_dir)                            # this sweep's numeric table (accumulated)
         if name == _LR_WIDTH_TRANSFER_SWEEP:
             analyze_lr_width_transfer(sweep_dir)

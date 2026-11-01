@@ -64,7 +64,9 @@ class EdgeContext(NamedTuple):
     :math:`\Phi_{ij} = \Phi_j` on routed pairs and 0 elsewhere, so ``Phi[..., j]`` holds :math:`\Phi_j` once per
     sender, ``(..., N, r, r)``, and every consumer contracts it with the routed weights without a per-edge broadcast
     (audit 2026-10-20 item 51; :func:`_sender_terms`). A per-edge ``(..., N, N, r, r)`` tensor is still
-    accepted in either mode and read edge by edge.
+    accepted in either mode and read edge by edge. ``causal`` records that the routing is strictly causal, so the
+    lowrank :math:`\Phi_{ij}` is evaluated on the pairs :math:`j \le i` only, here and in
+    :func:`with_receiver_factors` (:func:`edge_coefficients`).
     """
 
     mode:    str
@@ -79,6 +81,7 @@ class EdgeContext(NamedTuple):
     Phi:     torch.Tensor              # (..., N, N, r, r) Phi_ij, or (..., N, r, r) Phi_j per sender (pure_gauge)
     g_phi:   Optional[torch.Tensor]    # (..., N, r, r) phi_1(B_i^T A) of g_i (pure_gauge), else None
     mask:    torch.Tensor              # (..., N, N) bool, routed in some head
+    causal:  bool = False              # beta_ij = 0 exactly for j > i (the routing prior is strictly causal)
 
 
 def cast_context(ctx: EdgeContext, dtype: torch.dtype) -> EdgeContext:
@@ -130,12 +133,17 @@ def edge_coefficients(
     B:    torch.Tensor,                # (..., N, K, r)
     beta: torch.Tensor,                # (..., H, N, N) routing weights
     mode: str,
+    causal: bool = False,              # beta_ij = 0 exactly for j > i (a strictly causal routing prior)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     r"""The coefficients :math:`\Phi`, the outer :math:`\varphi_1(B_i^\top A)` (pure gauge) and the routed mask.
 
     ``"lowrank"``: per-edge :math:`\Phi_{ij} = \varphi_1(B_j^\top A_i)`, ``(..., N, N, r, r)``, the argument zeroed
     on pairs whose routing weight vanishes in every head (the future under a causal prior) BEFORE
-    :math:`\varphi_1`, so a large unused argument cannot overflow into :math:`\infty\cdot 0`. ``"pure_gauge"``:
+    :math:`\varphi_1`, so a large unused argument cannot overflow into :math:`\infty\cdot 0`. Under ``causal`` the
+    :math:`N(N+1)/2` pairs :math:`j \le i` (``torch.tril_indices``) go through :math:`\varphi_1` and the others take
+    :math:`\varphi_1(0) = I`, the value the full evaluation returns there exactly, so the masked half costs no matrix
+    function (audit 2026-10-31 A187); with a routing that is not causal the flag gives a wrong result, so it defaults
+    to False. ``"pure_gauge"``:
     :math:`\Phi_j = -\varphi_1(-B_j^\top A)` depends on the sender only (N matrix functions, no per-edge one) and is
     returned per sender, ``(..., N, r, r)``; the edge coefficient is :math:`\Phi_j` on routed pairs and 0 elsewhere,
     which the consumers apply through the mask (audit 2026-10-20 item 51). :math:`g_i` uses
@@ -145,7 +153,13 @@ def edge_coefficients(
     if mode == "lowrank":
         arg = torch.einsum("...jka,...ikb->...ijab", B, A)                              # (..., N, N, r, r) B_j^T A_i
         arg = torch.where(mask[..., None, None], arg, torch.zeros_like(arg))
-        return phi1(arg), None, mask
+        if not causal:
+            return phi1(arg), None, mask
+        N, r = arg.shape[-3], arg.shape[-1]
+        rows, cols = torch.tril_indices(N, N, device=arg.device)                        # (P,) pairs j <= i
+        Phi = torch.eye(r, dtype=arg.dtype, device=arg.device).expand(arg.shape).clone()   # phi_1(0) = I
+        Phi[..., rows, cols, :, :] = phi1(arg[..., rows, cols, :, :])                   # (..., P, r, r)
+        return Phi, None, mask
     BA = torch.einsum("...jka,kb->...jab", B, A)                                         # (..., N, r, r) B_j^T A
     sender = -phi1(-BA)                                                                  # (..., N, r, r) Phi_j
     return sender, phi1(BA), mask
@@ -198,6 +212,8 @@ def build_edge_context(
     mode:           str,
     sender_map:     torch.Tensor,      # (K r, K) W_B
     receiver_param: torch.Tensor,      # (K r, K) W_A or (K, r) A
+    *,
+    causal:         bool = False,      # beta_ij = 0 exactly for j > i (edge_coefficients)
 ) -> EdgeContext:
     r"""Factors, :math:`\tilde B_j = T^{-\top}B_j`, :math:`p_j^h = (\tilde B_j)_h^\top T_h\xi_j` and :math:`\Phi_{ij}`.
 
@@ -209,8 +225,8 @@ def build_edge_context(
     B_ref = R.transpose(-1, -2) @ B                                                      # (..., N, K, r)
     values = torch.einsum("hsk,...nk->...nhs", T.reshape(H, K // H, K), xi)              # (..., N, H, d) v_j^h
     p = torch.einsum("...nhsa,...nhs->...nha", _head_rows(B_ref, H), values)             # (..., N, H, r)
-    Phi, g_phi, mask = edge_coefficients(A, B, beta, mode)
-    return EdgeContext(mode, T, R, receive, F, A, B, B_ref, p, Phi, g_phi, mask)
+    Phi, g_phi, mask = edge_coefficients(A, B, beta, mode, causal)
+    return EdgeContext(mode, T, R, receive, F, A, B, B_ref, p, Phi, g_phi, mask, causal)
 
 
 def outer_gauge_vector(ctx: EdgeContext, x: torch.Tensor) -> torch.Tensor:   # (..., N, K) -> (..., N, K)
@@ -490,7 +506,10 @@ def edge_inner_rows(
 
 
 def edge_link_matrices(ctx: EdgeContext) -> torch.Tensor:             # (..., N, N, K, K)
-    r"""Every reference link :math:`G_{ij} = g_iFE_{ij}` explicitly (all pairs, unmasked; small N only)."""
+    r"""Every reference link :math:`G_{ij} = g_iFE_{ij}` explicitly (all pairs, unmasked; small N only).
+
+    Test oracle: referenced only by the tests.
+    """
     K = ctx.F.shape[-1]
     eye = torch.eye(K, dtype=ctx.F.dtype, device=ctx.F.device)
     if ctx.mode == "lowrank":
@@ -618,8 +637,9 @@ def with_receiver_factors(
     A:    torch.Tensor,                # (..., N, K, r) receiver factors
     beta: torch.Tensor,                # (..., H, N, N)
 ) -> EdgeContext:
-    r"""The context with receiver factors ``A`` and :math:`\Phi_{ij} = \varphi_1(B_j^\top A_i)` recomputed (masked)."""
-    Phi, _, _ = edge_coefficients(A, ctx.B, beta, "lowrank")
+    r"""The context with receiver factors ``A`` and :math:`\Phi_{ij} = \varphi_1(B_j^\top A_i)` recomputed (masked;
+    on the pairs :math:`j \le i` only under ``ctx.causal``)."""
+    Phi, _, _ = edge_coefficients(A, ctx.B, beta, "lowrank", ctx.causal)
     return ctx._replace(A=A, Phi=Phi)
 
 
@@ -829,7 +849,7 @@ def latent_receiver_energy(
         \mathcal F_i(A_i) = E_i(A_i) + \frac{1}{2\sigma_L^2}\|A_i - A_i^0\|_F^2 + \lambda_W\mathrm{Loop}_i(A_i),
 
     with :math:`E_i` of :func:`latent_transport_energy` and :math:`\mathrm{Loop}_i` of :func:`loop_energy`
-    (absent when ``loop`` is None or :math:`\lambda_W = 0`).
+    (absent when ``loop`` is None or :math:`\lambda_W = 0`). Test oracle: referenced only by the tests.
     """
     energy = (latent_transport_energy(A, ctx, beta, sources)
               + (A - A0).square().sum(dim=(-2, -1)) / (2.0 * sigma ** 2))
@@ -849,6 +869,7 @@ def infer_latent_receivers(
     loop_weight: float = 0.0,           # lambda_W
     loop:        Optional[LoopInputs] = None,
     stats:       Optional[Dict[str, torch.Tensor]] = None,   # out-param: LATENT_DIAGNOSTIC_KEYS
+    guard:       bool = False,          # keep A_i^(t-1) where the step raises F_i or makes it non-finite
 ) -> torch.Tensor:                      # (..., N, K, r) A^{(T)}
     r"""Damped fixed-point MAP inference of the latent receiver factors.
 
@@ -864,6 +885,18 @@ def infer_latent_receivers(
     receives the means over receivers of :math:`\mathcal F_i(A^{(0)})`, :math:`\mathcal F_i(A^{(T)})`,
     :math:`\mathrm{Loop}_i(A^{(T)})` (0 without a previous layer, NaN with the loop prior off) and
     :math:`\|A_i^{(T)} - A_i^0\|_F/\|A_i^0\|_F`.
+
+    The step is a gradient step of size :math:`\rho\sigma_L^2` on :math:`\mathcal F_i`, which descends only while
+    :math:`\sigma_L^2` times the curvature of :math:`E_i` stays small, and that curvature grows with
+    :math:`\varphi_1(B_j^\top A_i)`, which no fixed :math:`\sigma_L` bounds: once the sender map has grown, a step can
+    raise :math:`\mathcal F_i` or make :math:`A_i` non-finite (``edge_latent_links.tex``, Proposition
+    ``prop:fixed_point`` and Section ``sec:scope``; audit 2026-10-31 A025). ``guard`` (``content_link_latent_guard``)
+    keeps :math:`A_i^{(t-1)}` for every receiver whose candidate :math:`\mathcal F_i(A_i^{(t)})` is non-finite or
+    above :math:`\mathcal F_i(A_i^{(t-1)})`, decided on a detached energy evaluation (one more per step) and applied
+    through ``torch.where`` on the per-receiver mask. The receivers decouple, so a receiver that descends takes the
+    specified step, value and unrolled graph, bit for bit, and a kept receiver carries its previous iterate and its
+    graph; :math:`\mathcal F_i` never increases. A kept receiver is not retried with a shorter step. Without
+    ``guard`` the specified iteration runs unguarded.
     """
     if torch.is_inference_mode_enabled():
         raise RuntimeError("content_link_latent differentiates the link energy and cannot run under "
@@ -873,6 +906,9 @@ def infer_latent_receivers(
     def link_energy(A: torch.Tensor) -> torch.Tensor:              # (..., N) E_i + lambda_W Loop_i
         energy = latent_transport_energy(A, ctx, beta, sources)
         return energy + loop_weight * loop_energy(A, ctx.B, *loop) if use_loop else energy
+
+    def map_energy(A: torch.Tensor, link: torch.Tensor) -> torch.Tensor:   # (..., N) F_i, link = E_i + lambda Loop_i
+        return link + (A - A0).square().sum(dim=(-2, -1)) / (2.0 * sigma ** 2)
 
     create_graph = torch.is_grad_enabled()
     A0 = ctx.A if create_graph else ctx.A.detach()
@@ -885,7 +921,15 @@ def infer_latent_receivers(
         if initial is None:
             initial = energy.detach()                                  # F_i(A^0): the prior vanishes there
         target = A0 - sigma ** 2 * grad
-        A = target if damping == 1.0 else (1.0 - damping) * A + damping * target
+        candidate = target if damping == 1.0 else (1.0 - damping) * A + damping * target
+        if guard:
+            with torch.no_grad():
+                trial = candidate.detach()
+                before = map_energy(A.detach(), energy.detach())                       # (..., N) F_i(A^(t-1))
+                after = map_energy(trial, link_energy(trial))                          # (..., N) F_i(candidate)
+                accept = torch.isfinite(after) & (after <= before)                     # (..., N) per receiver
+            candidate = torch.where(accept[..., None, None], candidate, A)
+        A = candidate
     if stats is not None:
         with torch.no_grad():
             final_A, anchor = A.detach(), A0.detach()

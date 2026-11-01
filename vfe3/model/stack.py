@@ -6,8 +6,8 @@ embedding by default; phi flows through the belief, not the prior. Uncaptured
 all-predictive stacks omit this arithmetic when no prior consumer is enabled.
 
 Placement note (audit 2026-06-09 overnight F23): the opt-in cg_coupling runs
-inside each block after its E-step and before its norm; the opt-in block MLP runs after
-that norm. Both transforms precede handoff, so the belief
+inside each block after its E-step and before its norm; the block MLP (on by default,
+use_block_mlp=True) runs after that norm. Both transforms precede handoff, so the belief
 handed off above is the POST-transform belief — at n_layers > 1 the transforms recurse
 into every subsequent block's prior. The manuscript places head mixing in the single
 W_O-readout slot (Manuscripts-Theory/GL(K)_attention.tex); the head mixer was removed
@@ -59,10 +59,27 @@ def _can_omit_prior_handoff(
         for operator in layers)
 
 
+def _handoff_blend(
+    prior:  torch.Tensor,                 # (..., N, K) prior mean, or the prior covariance in either layout
+    belief: torch.Tensor,                 # the block output's moment, same layout
+    weight: float,                        # prior_handoff_rho or prior_handoff_sigma, in [0, 1]
+) -> torch.Tensor:                        # (1 - w) prior + w belief
+    r"""One handoff blend :math:`(1 - w) p + w q`, returning ``prior`` itself at :math:`w = 0`.
+
+    At :math:`w = 0` the blend is the identity on a finite belief, bit for bit up to the sign of a zero entry of the
+    prior, so skipping it changes no value and no gradient; it also keeps a non-finite belief moment out of the next
+    prior (:math:`0\cdot\infty` is NaN) and avoids three temporaries of the covariance layout per layer (audit
+    2026-10-31 A183).
+    """
+    if weight == 0.0:
+        return prior
+    return (1.0 - weight) * prior + weight * belief
+
+
 def vfe_stack(
     belief:     BeliefState,
-    mu_p:       torch.Tensor,             # (N, K) initial prior means
-    sigma_p:    torch.Tensor,             # (N, K) initial prior variances
+    mu_p:       torch.Tensor,             # (..., N, K) initial prior means
+    sigma_p:    torch.Tensor,             # (..., N, K) diagonal or (..., N, K, K) full initial prior covariance
     group:      GaugeGroup,
     cfg:        VFE3Config,
 
@@ -171,6 +188,6 @@ def vfe_stack(
             diagnostic_capture["layer_block_mlp_inputs"].append(capture["block_mlp_input"])
             diagnostic_capture["layer_block_mlp_outputs"].append(capture["block_mlp_output"])
         if need_prior_handoff and layer_index < cfg.n_layers - 1:
-            mu_p = (1.0 - rho) * mu_p + rho * belief.mu
-            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
+            mu_p = _handoff_blend(mu_p, belief.mu, rho)
+            sigma_p = _handoff_blend(sigma_p, belief.sigma, rho_s)
     return belief

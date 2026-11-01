@@ -1,9 +1,9 @@
-r"""A single VFE block for VFE_3.0: E-step belief inference + optional norm.
+r"""A single VFE block for VFE_3.0: E-step belief inference, then the block norm and the block MLP.
 
-Parameter-free (the block owns no nn.Parameters): on the pure default path the learnable capacity
-is the PriorBank's prior tables, but the block also receives the opt-in learned exceptions
-(CG coupling) as arguments and applies them; the block
-runs the attention step and the configured block norm (the default ``layernorm`` is not
+Parameter-free (the block owns no nn.Parameters): the learned modules it applies are passed in as arguments, namely
+the block norm (the default affine ``layernorm``, whose gamma/beta are one shared module), the block MLP (on by
+default, ``use_block_mlp=True``) and the opt-in CG coupling, next to the PriorBank's prior tables and the relational
+operators. The block runs the attention step and the configured block norm (the default ``layernorm`` is not
 gauge-equivariant; ``none`` and ``mahalanobis`` are) on the mean, and under ``block_norm_covariance='pushforward'``
 its pushforward on the covariance (first order plus the radial second-order term), or under ``'pushforward_moment'``
 the same at the effective scale of the input's expected LayerNorm variance. The belief handoff across blocks
@@ -55,8 +55,8 @@ def e_step_shared_kwargs(
 
 def vfe_block(
     belief:     BeliefState,
-    mu_p:       torch.Tensor,             # (N, K) prior means
-    sigma_p:    torch.Tensor,             # (N, K) prior variances
+    mu_p:       torch.Tensor,             # (..., N, K) prior means
+    sigma_p:    torch.Tensor,             # (..., N, K) diagonal or (..., N, K, K) full prior covariance
     group:      GaugeGroup,
     cfg:        VFE3Config,
 
@@ -245,7 +245,7 @@ def _local_coordinate_block(
         out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
-    if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
+    if block_mlp is not None:                # residual moment transform (use_block_mlp), after norm before handoff
         context, mu_in = _block_mlp_precision(out.mu)
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
@@ -410,10 +410,12 @@ def _reference_coordinate_block(
     ``block_mlp_input``/``block_mlp_output`` stay in local coordinates (:math:`U_iv_i`, :math:`U_i\xi_i^+`).
 
     Frame-diagonal family (``frame_diagonal``, ``gaussian_frame_diagonal``): ``out.sigma`` is already
-    :math:`c_i = \operatorname{diag}C_i`, so every covariance action runs through the identity frame
-    (:func:`vfe3.model.frame_actions.identity_frame`): the pushforwards read :math:`C_i = \operatorname{diag}(c_i)` and
-    a pushed :math:`C_i'` returns as its diagonal, the family's M-projection in reference coordinates, which the
-    passive action leaves fixed. The mean still moves through :math:`U_i`.
+    :math:`c_i = \operatorname{diag}C_i`. The norm pushforward and the ``delta_full`` composite read :math:`c_i` in
+    the diagonal layout, whose results are the diagonals of their dense pushforwards of
+    :math:`C_i = \operatorname{diag}(c_i)`, the family's M-projection in reference coordinates, which the passive
+    action leaves fixed; no :math:`K\times K` covariance is formed (audit 2026-10-31 A145). The other covariance
+    actions run through the identity frame (:func:`vfe3.model.frame_actions.identity_frame`). The mean still moves
+    through :math:`U_i`.
     """
     from vfe3.model.block_mlp import (CueResultMemoryBlockMLP, GaussianTemplateBlockMLP, PrototypeAgentBlockMLP,
                                       block_norm_covariance_pushforward, block_norm_linearization,
@@ -441,7 +443,11 @@ def _reference_coordinate_block(
     sigma = out.sigma
     linearization = radial = cap = C = None
     if push or delta_full:
-        C = reference_covariance(out.mu, out.sigma, cov_frame)               # (B, N, K, K) invariant C
+        # gaussian_frame_diagonal: C_i = diag(c_i) exactly, so the pushforwards read the stored c_i in the diagonal
+        # layout and return the diagonal of their dense result, the family's M-projection, with no (B, N, K, K)
+        # tensor (audit 2026-10-31 A145).
+        C = (out.sigma if frame_diagonal                                     # (B, N, K) c_i
+             else reference_covariance(out.mu, out.sigma, cov_frame))        # (B, N, K, K) invariant C
         if delta_full and block_norm is not None:
             linearization = block_norm_linearization(block_norm, xi)         # at the pre-norm xi
             radial = block_norm_radial_term(block_norm, xi, C)
@@ -450,8 +456,8 @@ def _reference_coordinate_block(
         if push:                                                             # Sigma' = U C' U^T, C' at the pre-norm xi
             pushed = block_norm_covariance_pushforward(block_norm, xi, C, covariance_floor, mode=norm_covariance,
                                                        trace_cap=trace_cap, cap_moment_fallback=cap_moment_fallback)
-            sigma = readout(local_covariance(out.mu, pushed, cov_frame,
-                                             diagonal=frame_diagonal).to(out.sigma.dtype))
+            sigma = (pushed.to(out.sigma.dtype) if frame_diagonal            # c_i' = diag C_i', (B, N, K)
+                     else readout(local_covariance(out.mu, pushed, cov_frame, diagonal=False).to(out.sigma.dtype)))
     c = (C if delta_full                                                     # the composite reads the pre-norm C
          else sigma if diagonal_memory                                       # c_i (of the pushed belief), (B, N, K)
          else reference_variances(out.mu, sigma, cov_frame) if template      # diag C (of the pushed belief)
@@ -476,8 +482,9 @@ def _reference_coordinate_block(
                 result = block_mlp.forward_moments(xi, c, **extra)
             xi = result.mu                                                   # passthrough: covariance kept
             if delta_full:
-                sigma = readout(local_covariance(out.mu, result.sigma, cov_frame,  # Sigma' = U C' U^T
-                                                 diagonal=frame_diagonal).to(out.sigma.dtype))
+                sigma = (result.sigma.to(out.sigma.dtype) if frame_diagonal  # c_i^+ = diag C_i^+, (B, N, K)
+                         else readout(local_covariance(out.mu, result.sigma, cov_frame,  # Sigma' = U C' U^T
+                                                       diagonal=False).to(out.sigma.dtype)))
             elif diagonal_memory:
                 sigma = result.sigma.to(out.sigma.dtype)                     # c_i^+, reference variances
             elif prototype and block_mlp.covariance_contract == "posterior":

@@ -1,13 +1,17 @@
 r"""Click-to-run: load a finalized run's best model and generate text.
 
-Points at a run directory written by ``train_vfe3.py`` (``config.json`` + ``best_model.pt``),
-rebuilds the selected model through the same validated load boundary the figure pipeline uses
+Points at a run directory written by ``train_vfe3.py`` or ``train_baseline.py`` (``config.json`` +
+``best_model.pt``), rebuilds the selected model of the run's family (``model_family``: the VFE model or the
+conventional baseline) through the same validated load boundary the figure pipeline uses
 (:mod:`vfe3.viz.run_loading`), and autoregressively extends prompts with
-:meth:`vfe3.model.model.VFEModel.generate`.
+:meth:`vfe3.model.model.VFEModel.generate` or :meth:`vfe3.baseline.BaselineTransformer.generate`, which share
+one sampler.
 
 The prompt is tokenized with the tokenizer the run's corpus cache was built with -- GPT-2 BPE for
 ``wikitext-103``, cl100k for the ``wiki-*`` corpora, the word vocabulary for the ``-word`` corpora --
-so generated ids map back to text consistently.
+so generated ids map back to text consistently. A prompt token that never occurs in the training stream
+(read from the run's unigram table) is reported: its input row was never trained. WikiText lines begin with
+a space, so ``"The"`` and ``" The"`` are different GPT-2 tokens, and only the second occurs in the corpus.
 
 Two properties of the sampler are worth knowing before reading the output. First, there is no
 incremental belief/KV cache: every generated token re-runs the full forward (encode -> E-step ->
@@ -36,13 +40,15 @@ sampled) is walking a flat, uninformative distribution. Note that the held-out r
 model's own, not a ceiling: this script scores one model against itself, and says nothing about how
 its held-out CE compares to another model's. The ``BASELINE`` control decodes its continuation with
 the same sampler settings and per-prompt seed, so its row differs from the run's by model, not by
-sampler.
+sampler. GPT-2 reads the run's token ids directly, so the control is refused unless the run's corpus
+was tokenized with GPT-2 BPE.
 
 Usage
 -----
 Click-to-run: edit the settings below and run ``python generate_text.py``. ``RUN_DIR = None`` picks
-the most recently finalized run under ``RUN_ROOT`` (the launcher's ``vfe3_runs/<ppl>_<label>/``
-folders, or a ``<timestamp>_<label>/`` folder not yet renamed). For example, ``GREEDY = True`` for
+the most recently finalized run of either family under ``RUN_ROOT`` (the launcher's
+``vfe3_runs/<ppl>_<label>/`` folders, a ``<timestamp>_<label>/`` folder not yet renamed, or a baseline
+run under ``vfe3_runs/baselines/``). For example, ``GREEDY = True`` for
 argmax decoding, ``TEMPERATURE = 0.8; TOP_K = 40; TOP_P = 0.95; SEED = 1`` for sampling, and
 ``SELF_CE = True; REFERENCE_DRAWS = 8; SPLIT = "test"`` for the self-CE diagnostic.
 """
@@ -50,8 +56,9 @@ argmax decoding, ``TEMPERATURE = 0.8; TOP_K = 40; TOP_P = 0.95; SEED = 1`` for s
 import json
 import math
 import sys
+import warnings
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -89,6 +96,8 @@ class LoadedRun(NamedTuple):
     run_dir: Path
     best_step:    Optional[int]
     best_val_ppl: Optional[float]
+    model_family: str = "vfe"                          # the config's model_family: "vfe" | "conventional_transformer"
+    unseen_ids:   Optional[FrozenSet[int]] = None      # ids with zero training count; None when not recorded
 
 
 class Generation(NamedTuple):
@@ -136,7 +145,8 @@ def newest_run_dir(root: 'str | Path') -> Path:
     so every directory below ``root`` holding ``config.json``, ``best_model.pt`` and ``summary.json``
     is a candidate, ranked by the newest modification time of those three files (ties by path).
     ``summary.json`` is written only by finalization, so a run still training, or one that crashed
-    after its first validation best, is never selected.
+    after its first validation best, is never selected. Runs of either model family are candidates
+    (``train_baseline.py`` writes under ``vfe3_runs/baselines/``); :func:`load_run` builds either.
     """
     names = ("config.json", "best_model.pt", "summary.json")
     candidates = [path.parent for path in Path(root).rglob("best_model.pt")
@@ -177,26 +187,97 @@ def _run_summary(run_dir: Path) -> "tuple[Optional[int], Optional[float]]":
             float(ppl) if isinstance(ppl, (int, float)) and not isinstance(ppl, bool) else None)
 
 
+def _load_run_config(run_dir: Path) -> "tuple[object, str]":
+    r"""``(cfg, dataset)`` of ``run_dir``'s ``config.json``, for either model family.
+
+    A VFE config goes through :func:`vfe3.viz.run_loading.load_run_config` (the strict
+    :func:`vfe3.config.config_from_serialized`, which migrates the frozen field set it was written with); a config
+    tagged ``model_family='conventional_transformer'`` builds :class:`vfe3.baseline.BaselineConfig` under the same
+    strict rule, as :func:`vfe3.posthoc.evaluate.load_model` dispatches.
+    """
+    from vfe3.contracts import is_vfe_config
+    from vfe3.viz.run_loading import load_run_config
+
+    path = run_dir / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    raw = data.get("config") if isinstance(data, dict) else None
+    if not isinstance(raw, dict) or is_vfe_config(raw):
+        return load_run_config(run_dir)
+    from vfe3.baseline import baseline_config_from_serialized
+
+    cfg, _ = baseline_config_from_serialized(raw, source=str(path))
+    dataset = data.get("dataset", "")
+    if not isinstance(dataset, str):
+        raise ValueError(f"run metadata {path} has a non-string dataset")
+    return cfg, dataset
+
+
+def _unigram_log_prior(model: "torch.nn.Module") -> Optional[torch.Tensor]:
+    r"""The model's ``(V,)`` unigram decode table :math:`\log\pi_v`, or None (VFE prior bank or baseline decoder)."""
+    for owner in (getattr(model, "prior_bank", None), getattr(model, "decoder", None)):
+        table = getattr(owner, "unigram_log_prior", None)
+        if isinstance(table, torch.Tensor):
+            return table
+    return None
+
+
+def zero_count_ids(
+    model:          "torch.nn.Module",
+    n_train_tokens: Optional[int],      # provenance.json train_data_n_tokens: the stream the counts were taken on
+) -> Optional[FrozenSet[int]]:
+    r"""Token ids that never occur in the run's training stream, read from its unigram table; None when unknown.
+
+    Training fills :math:`\log\pi_v = \log\frac{c_v + 1}{T + V}` from the counts :math:`c_v` of the :math:`T`
+    training tokens (:meth:`vfe3.model.prior_bank.PriorBank.set_unigram_log_prior`), so
+    :math:`c_v + 1 = (T + V)\,\pi_v` and a zero count is :math:`(T + V)\,\pi_v = 1`, against at least 2 for a seen
+    token; the test :math:`(T + V)\,\pi_v < 3/2` is far from the float32 rounding of the table. A model without the
+    table (``decode_unigram_prior=False``) or a run without a recorded token count gives None.
+    """
+    table = _unigram_log_prior(model)
+    if table is None or n_train_tokens is None or not bool(table.ne(0).any()):
+        return None
+    scale = float(int(n_train_tokens) + table.numel())                      # T + V
+    implied = torch.exp(table.detach().double().cpu()) * scale             # (V,) c_v + 1
+    return frozenset(int(i) for i in torch.nonzero(implied < 1.5).flatten().tolist())
+
+
+def _recorded_train_tokens(run_dir: Path) -> Optional[int]:
+    r"""``train_data_n_tokens`` of ``provenance.json``, the stream the unigram counts were taken on, or None."""
+    try:
+        provenance = json.loads((run_dir / "provenance.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = provenance.get("train_data_n_tokens") if isinstance(provenance, dict) else None
+    return value if type(value) is int and value > 0 else None
+
+
 def load_run(run_dir: Path, device: str) -> LoadedRun:
     r"""Rebuild the selected best model for ``run_dir`` through the validated load boundary.
 
-    The config is deserialized with :func:`vfe3.config.config_from_serialized`, which migrates the
-    frozen field set it was written with, and the weights pass the same
-    executable-code/validation-data identity contract the offline figure pipeline enforces.
+    The config is deserialized by :func:`_load_run_config`, which dispatches on ``model_family``, the model of
+    that family is built (:class:`vfe3.model.model.VFEModel` or :class:`vfe3.baseline.BaselineTransformer`), and
+    the weights pass the same executable-code/validation-data identity contract the offline figure pipeline
+    enforces. The ids with zero training count are read from the restored unigram table (:func:`zero_count_ids`).
     """
-    from vfe3.model.model import VFEModel
+    from vfe3.contracts import is_vfe_config, model_family_of
     from vfe3.viz.run_loading import (
         load_best_model_state,
-        load_run_config,
         load_run_selection_contract,
     )
 
-    cfg, dataset = load_run_config(run_dir)
+    cfg, dataset = _load_run_config(run_dir)
     code_identity, selection_identity = load_run_selection_contract(run_dir)
     # Construction only draws RNG for parameter init, every one of which the checkpoint overwrites;
     # fork_rng keeps that draw from perturbing the caller's global stream (mirrors make_figures.py).
     with torch.random.fork_rng(devices=[]):
-        model = VFEModel(cfg)
+        if is_vfe_config(cfg):
+            from vfe3.model.model import VFEModel
+
+            model = VFEModel(cfg)
+        else:
+            from vfe3.baseline import BaselineTransformer
+
+            model = BaselineTransformer(cfg)
     state = load_best_model_state(
         run_dir / "best_model.pt",
         cfg,
@@ -209,11 +290,23 @@ def load_run(run_dir: Path, device: str) -> LoadedRun:
     model = model.to(device=device)
     model.eval()
     best_step, best_val_ppl = _run_summary(run_dir)
-    return LoadedRun(model, cfg, dataset, run_dir, best_step, best_val_ppl)
+    return LoadedRun(model, cfg, dataset, run_dir, best_step, best_val_ppl, model_family_of(cfg),
+                     zero_count_ids(model, _recorded_train_tokens(run_dir)))
 
 
-def prompt_token_ids(text: str, dataset: str) -> List[int]:
-    r"""Encode ``text`` with the tokenizer that built ``dataset``'s cache."""
+def prompt_token_ids(
+    text:    str,
+    dataset: str,
+
+    *,
+    unseen_ids: Optional[FrozenSet[int]] = None,   # ids with zero training count (LoadedRun.unseen_ids)
+) -> List[int]:
+    r"""Encode ``text`` with the tokenizer that built ``dataset``'s cache.
+
+    With ``unseen_ids``, a prompt id that never occurs in the training stream raises a ``UserWarning``: the model
+    reads an input row that training never updated, so the continuation starts from an untrained context. The
+    prompt text itself is left as given.
+    """
     from vfe3.data.datasets import tiktoken_encoding_name
 
     name = tiktoken_encoding_name(dataset)
@@ -224,7 +317,20 @@ def prompt_token_ids(text: str, dataset: str) -> List[int]:
 
     # encode_ordinary, not encode: the default disallowed_special="all" raises on a literal
     # "<|endoftext|>" in user text, and training never prepends or reserves special tokens anyway.
-    return tiktoken.get_encoding(name).encode_ordinary(text)
+    encoding = tiktoken.get_encoding(name)
+    ids = encoding.encode_ordinary(text)
+    unseen = [(position, token) for position, token in enumerate(ids) if unseen_ids and token in unseen_ids]
+    if unseen:
+        pieces = ", ".join(f"position {position}: id {token} {encoding.decode([token])!r}"
+                           for position, token in unseen)
+        # The GPT-2 corpus is WikiText-103, whose lines begin with a space.
+        hint = (" WikiText lines begin with a space, so a prompt without its leading space starts from a token the "
+                "corpus does not contain (' The' and 'The' are different GPT-2 tokens)." if name == "gpt2" else "")
+        warnings.warn(
+            f"prompt {text!r} holds token(s) that never occur in the training stream ({pieces}); the model reads "
+            f"untrained input rows there.{hint}",
+            UserWarning, stacklevel=2)
+    return ids
 
 
 def decode_ids(token_ids: Sequence[int], dataset: str) -> str:
@@ -254,7 +360,7 @@ def generate_for_prompts(
     device = next(loaded.model.parameters()).device
     generations: List[Generation] = []
     for prompt in prompts:
-        ids = prompt_token_ids(prompt, loaded.dataset)
+        ids = prompt_token_ids(prompt, loaded.dataset, unseen_ids=loaded.unseen_ids)
         if not ids:
             raise ValueError("prompt encodes to zero tokens; supply non-empty text")
         context = torch.tensor([ids], dtype=torch.long, device=device)
@@ -544,6 +650,14 @@ def main() -> None:
     prompts = list(PROMPTS)
     if not prompts:
         raise SystemExit("PROMPTS must hold at least one prompt")
+    if BASELINE == "gpt2":
+        from vfe3.data.datasets import tiktoken_encoding_name
+
+        # GPT-2 reads the run's token ids as its own: they must be GPT-2 BPE ids.
+        encoding = tiktoken_encoding_name(loaded.dataset)
+        if encoding != "gpt2":
+            raise SystemExit(f"BASELINE='gpt2' scores the run's token ids with GPT-2, but {loaded.dataset!r} was "
+                             f"tokenized with {encoding!r}; use BASELINE='none' for this run")
 
     sampler = "greedy" if GREEDY else (
         f"temperature={TEMPERATURE}, top_k={TOP_K}, top_p={TOP_P}, seed={SEED}")
@@ -614,6 +728,7 @@ def main() -> None:
     if JSON_OUTPUT:
         payload = {
             "run_dir":        str(run_dir),
+            "model_family":   loaded.model_family,
             "dataset":        loaded.dataset,
             "best_step":      loaded.best_step,
             "best_val_ppl":   loaded.best_val_ppl,
@@ -666,7 +781,7 @@ def main() -> None:
         return
 
     ppl = "n/a" if loaded.best_val_ppl is None else f"{loaded.best_val_ppl:.3f}"
-    print(f"\nrun:     {run_dir}")
+    print(f"\nrun:     {run_dir}   model: {loaded.model_family}")
     print(f"dataset: {loaded.dataset}   best_step: {loaded.best_step}   best_val_ppl: {ppl}")
     print(f"device:  {DEVICE}   sampler: {sampler}"
           f"   max_new_tokens: {MAX_NEW_TOKENS}\n")

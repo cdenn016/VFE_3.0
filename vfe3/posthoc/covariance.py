@@ -51,6 +51,16 @@ the ratio of the mean stored variance at initialization to the final one ("sharp
 the inverse-variance mean :math:`\sigma^2_{\mathrm{init}}\,\overline{1/\sigma^2}` and the
 occurrence-weighted mean over the split stream are reported beside it, with the variance summary
 quoted in v2:872 (mean, standard deviation, fraction within 10% of unit variance).
+
+The :math:`1/c` scaling needs a cost whose key covariance scales with :math:`\Sigma`. Under
+``relational_routing='noisy_key'`` the router adds the learned key noise :math:`n_hI` to every projected key
+covariance, so along a key-covariance eigendirection of eigenvalue :math:`\lambda` the Mahalanobis term scales by
+:math:`(\lambda + n_h)/(c\lambda + n_h)`, between 1 and :math:`1/c`; the factor is then ``not_applicable``, as for the
+minimal agent's channel noise and the covariance-blind ``mean_distance`` cost (audit 2026-10-31
+posthoc-measurement-1). Where it applies, :func:`covariance_analysis` records whether the stack keeps the covariance
+fixed (``covariance_fixed_through_stack``) and the ``scope`` this implies: with covariance passthrough every layer
+routes on the stored covariances, otherwise (``predictive_covariance='moment_matched'`` adds the routed mean spread,
+which does not scale with :math:`c`) :math:`\kappa` describes the layer-0 routing covariance only.
 """
 
 from __future__ import annotations
@@ -122,15 +132,22 @@ def routing_frame_and_covariance(
     ``_canonical_frame_context(transport, fold_rope=True, compact=True)``
     (``VFEModel._relational_frames``). A dense
     frame is split into its head blocks, as ``relational_score`` does (which rejects a frame with
-    off-block entries). Float32 frames outside autocast, as the model computes them.
+    off-block entries). Float32 frames outside autocast, as the model computes them, on the replay ladder of
+    the evaluation forwards (:func:`vfe3.posthoc.evaluate.ladder_call`).
     """
+    from vfe3.posthoc.evaluate import ladder_call
+
     device = token_ids.device
-    with torch.autocast(device_type=device.type, enabled=False):
-        beliefs = model.prior_bank.encode(token_ids)
-        beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi),
-                                   right_phi=model._pos_phi_right(beliefs.phi))
-        rope = model._rope_rotation(int(token_ids.shape[1]), device)
-        _, frame, _ = model._relational_frames(beliefs, rope)
+
+    def frames() -> Tuple[Any, Any]:
+        with torch.autocast(device_type=device.type, enabled=False):
+            beliefs = model.prior_bank.encode(token_ids)
+            beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi),
+                                       right_phi=model._pos_phi_right(beliefs.phi))
+            rope = model._rope_rotation(int(token_ids.shape[1]), device)
+            return beliefs, model._relational_frames(beliefs, rope)[1]
+
+    (beliefs, frame), _ = ladder_call(model, frames, "post-hoc covariance frame")
     inverse = frame.inverse
     block_diagonal = bool(frame.block_diagonal)
     if not block_diagonal:                                                    # (B, N, K, K) dense layout
@@ -314,8 +331,14 @@ def summarize_sample(stats: Mapping[str, np.ndarray], c: float, *, block_diagona
 @torch.no_grad()
 def _stack_covariance_change(model: torch.nn.Module, inputs: torch.Tensor) -> Optional[float]:
     r"""Max relative change of the belief covariance through the stack on ``inputs`` (None if uncaptured)."""
-    capture: Dict[str, Any] = {"diagnostic": {}}
-    model.forward_beliefs(inputs, capture=capture)
+    from vfe3.posthoc.evaluate import ladder_call
+
+    def forward() -> Dict[str, Any]:
+        capture: Dict[str, Any] = {"diagnostic": {}}                          # afresh for a replayed attempt
+        model.forward_beliefs(inputs, capture=capture)
+        return capture
+
+    capture, _ = ladder_call(model, forward, "post-hoc covariance forward")
     diagnostic = capture["diagnostic"]
     initial = diagnostic.get("initial_belief")
     outputs = diagnostic.get("layer_outputs") or []
@@ -397,7 +420,11 @@ def hidden_temperature(
     *,
     type_counts: Optional[np.ndarray] = None,     # (V,) occurrences of each type in a stream
 ) -> Dict[str, Any]:
-    r"""The v2:872 factor :math:`\kappa = \sigma^2_{\rm init}/\overline{\sigma^2}` and its distribution."""
+    r"""The v2:872 factor :math:`\kappa = \sigma^2_{\rm init}/\overline{\sigma^2}` and its distribution.
+
+    ``not_applicable`` wherever :math:`\Sigma \to c\Sigma` does not rescale the routing cost's Mahalanobis term by
+    :math:`1/c`: the minimal agent's and the ``noisy_key`` router's learned noise (module docstring), and the
+    covariance-blind ``mean_distance`` cost."""
     from vfe3.numerics import bounded_variance_from_log
 
     if getattr(model.cfg, "predictive_readout", "kernel") == "minimal_agent":
@@ -409,6 +436,13 @@ def hidden_temperature(
     if getattr(model.cfg, "relational_routing", "gaussian_kl") == "mean_distance":
         return {"status": "not_applicable",
                 "reason": _MEAN_DISTANCE_REASON + "; it has no Mahalanobis term for Sigma -> c Sigma to rescale"}
+    if getattr(model.cfg, "relational_routing", "gaussian_kl") == "noisy_key":
+        # The learned key noise n_h I does not scale with Sigma (audit 2026-10-31 posthoc-measurement-1).
+        return {"status": "not_applicable",
+                "reason": "relational_routing='noisy_key': the router adds the learned key noise n_h I to every "
+                          "projected key covariance and n_h does not scale with Sigma, so Sigma -> c Sigma rescales "
+                          "the Mahalanobis term along a key-covariance eigendirection of eigenvalue lambda by "
+                          "(lambda + n_h) / (c lambda + n_h), not by the 1/c that defines the hidden temperature"}
     pb = model.prior_bank
     if getattr(pb, "sigma_log_embed", None) is None:                         # None under block_cholesky
         return {"status": "not_applicable", "reason": "the prior bank has no stored log-variance table"}
@@ -444,6 +478,40 @@ def hidden_temperature(
     return out
 
 
+def _hidden_temperature_scope(
+    model:   torch.nn.Module,
+    dataset: Optional[Any],
+    gap:     Mapping[str, Any],                   # the routing_covariance_gap result (its probe, when it ran)
+    device:  torch.device,
+) -> Dict[str, Any]:
+    r"""Whether the stack keeps the covariance fixed, and over which layers :math:`\kappa` describes the routing.
+
+    The stack change is the routing-covariance gap's probe (:func:`_stack_covariance_change` on one evaluation window)
+    when that analysis ran, else the same probe on window 0 of ``dataset``; without a dataset it is not recorded.
+    With the covariance fixed every layer routes on the stored covariances, which :math:`\Sigma \to c\Sigma` rescales;
+    otherwise later layers route on covariances that include the routed mean spread
+    (:math:`\sum_j\beta_{ij}(\mu_j - m_i)(\mu_j - m_i)^\top` under ``predictive_covariance='moment_matched'``), which
+    does not scale with :math:`c`, so :math:`\kappa` describes the layer-0 routing covariance only.
+    """
+    if gap.get("status") == "ok":
+        change = gap.get("stack_covariance_max_rel_change")
+    elif dataset is not None and len(dataset) > 0:
+        probe = next(_window_batches(dataset, np.arange(1, dtype=np.int64), 1))[0].to(device)
+        change = _stack_covariance_change(model, probe)
+    else:
+        return {"covariance_fixed_through_stack": None, "stack_covariance_max_rel_change": None,
+                "scope": "not recorded: no evaluation window to probe the stack"}
+    if change is None:
+        return {"covariance_fixed_through_stack": None, "stack_covariance_max_rel_change": None,
+                "scope": "not recorded: the forward captured no per-layer covariance"}
+    fixed = bool(change <= PASSTHROUGH_TOL)
+    scope = ("the stack keeps the covariance fixed, so every layer routes on the stored covariances and kappa "
+             "describes every layer's Mahalanobis term" if fixed else
+             "the stack changes the covariance (later layers route on covariances that include the routed mean "
+             "spread, which does not scale with c), so kappa describes the layer-0 routing covariance only")
+    return {"covariance_fixed_through_stack": fixed, "stack_covariance_max_rel_change": float(change), "scope": scope}
+
+
 # ----------------------------------------------------------------------------------------------
 # Driver and outputs
 # ----------------------------------------------------------------------------------------------
@@ -458,7 +526,10 @@ def covariance_analysis(
     n_windows:         int = OCCURRENCE_WINDOWS,
     n_uniform_windows: int = UNIFORM_WINDOWS,
 ) -> Dict[str, Any]:
-    r"""Both v2:872 analyses; each part is isolated (a failure is recorded, the other still runs)."""
+    r"""Both v2:872 analyses; each part is isolated (a failure is recorded, the other still runs).
+
+    An applicable hidden temperature also records whether the stack keeps the covariance fixed
+    (:func:`_hidden_temperature_scope`)."""
     result: Dict[str, Any] = {}
     counts = None
     if stream_tokens is not None:
@@ -477,6 +548,13 @@ def covariance_analysis(
                 n_uniform_windows=n_uniform_windows)
         except Exception as exc:
             result["routing_covariance"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+    if result["hidden_temperature"].get("status") == "ok":
+        try:
+            result["hidden_temperature"].update(
+                _hidden_temperature_scope(model, dataset, result["routing_covariance"], device))
+        except Exception as exc:
+            result["hidden_temperature"].update(covariance_fixed_through_stack=None,
+                                                scope=f"not recorded ({type(exc).__name__}: {exc})")
     statuses = {part.get("status") for part in result.values()}
     result["status"] = "ok" if "ok" in statuses else sorted(statuses)[0]
     return result
@@ -531,6 +609,8 @@ def covariance_table(result: Mapping[str, Any]) -> str:
                   f"| stored variance mean +- sd | {num(ht['variance_mean'])} +- {num(ht['variance_sd'])} |",
                   f"| entries within 10% of unit variance | {100 * ht['fraction_within_10pct_of_unit']:.1f}% |",
                   "", f"Definition: {ht['definition']}."]
+        if ht.get("scope"):
+            lines.append(f"Scope: {ht['scope']}.")
     else:
         lines.append(f"Hidden temperature {ht.get('status')}: {ht.get('reason') or ht.get('error')}.")
     lines.append(f"\nWeights: {result.get('checkpoint')}.")

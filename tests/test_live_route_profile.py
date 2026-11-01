@@ -2,11 +2,12 @@
 
 The default test profile is the legacy projected_gradient route; these checks run the route
 ``train_vfe3.py`` trains. The profile takes every key of the launcher's ``config`` dictionary, shrinks the
-shape and run fields to a CPU unit test, and pins the fields the launcher omits at test-owned values (their frozen
-introduction values, ``vfe3.config_history``), so a route switch in the launcher reaches these checks without an
-edit here. Every check here must hold for any valid launcher setting: where a check needs a toggle the launcher may
-hold otherwise (the frame transport of the frame-exponential check), it sets it.
+shape and run fields to a CPU unit test, and pins the fields the launcher omits at test-owned values, each equal to
+the value the launcher run resolves for it (audit 2026-10-31 config-launcher-10), so a route switch in the launcher
+reaches these checks without an edit here. Every check here must hold for any valid launcher setting: where a check
+needs a toggle the launcher may hold otherwise (the frame transport of the frame-exponential check), it sets it.
 """
+import warnings
 import math
 from dataclasses import asdict, fields
 from typing import Any, Callable, Dict, Tuple
@@ -16,7 +17,6 @@ import torch
 
 from tests.profiles import _LIVE_TINY, config_values, launcher_values, live_config, live_kl_max, live_values
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
-from vfe3.config_history import FIELD_INTRODUCTION_VALUES
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
 
@@ -43,11 +43,16 @@ def test_live_profile_is_the_launcher_route() -> None:
                        "log_interval", "eval_interval", "checkpoint_interval", "generate_embedding_figures"}
     followed = {name: (values[name], launcher[name]) for name in launcher if name not in resized}
     assert {name: pair for name, pair in followed.items() if pair[0] != pair[1]} == {}
-    # A field the launcher omits holds a test-owned value: its frozen introduction value (which a changed default
-    # leaves alone); a field newer than that table holds the baseline value of tests.profiles.
-    omitted = {name for name in values if name not in launcher and name not in resized}
-    assert {name: (values[name], FIELD_INTRODUCTION_VALUES[name]) for name in omitted
-            if name in FIELD_INTRODUCTION_VALUES and values[name] != FIELD_INTRODUCTION_VALUES[name]} == {}
+    # A field the launcher omits holds a test-owned value (tests.profiles._LIVE_OMITTED or the baseline), and that
+    # value is the one the launcher run resolves, the dataclass default after validation (audit 2026-10-31
+    # config-launcher-10: the profile trained with min_lr_frac 0.01, its introduction value, while the run decays to
+    # 0). A changed default fails here until the profile pins the new value. The seed is excluded: the launcher sets
+    # it per run from its SEEDS list.
+    omitted = {name for name in values if name not in launcher and name not in resized and name != "seed"}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        resolved = asdict(VFE3Config(**launcher))
+    assert {name: (values[name], resolved[name]) for name in omitted if values[name] != resolved[name]} == {}
     # kl_max keeps the launcher's nats per comparison coordinate: it scales by the head width d = K / H, d_tiny /
     # d_launcher, and a launcher None (8 K) is resolved at the launcher's K first (audit 2026-10-20 item 5).
     cfg = live_config()

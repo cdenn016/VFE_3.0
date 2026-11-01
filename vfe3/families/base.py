@@ -41,18 +41,30 @@ def ratio_minus_one_minus_log(num: torch.Tensor, den: torch.Tensor) -> torch.Ten
     r"""Cancellation-free :math:`r - 1 - \log r` for :math:`r = \text{num}/\text{den} > 0`.
 
     Near equality (:math:`|x| < 1/2`, :math:`x = (\text{num} - \text{den})/\text{den}`) it is
-    :func:`x_minus_log1p`; farther out the value is at least about 0.1 and the two-log form
-    :math:`r - 1 + \log\text{den} - \log\text{num}` has no cancellation, and it stays finite when :math:`x` rounds
-    to :math:`-1` (a ratio below float32 resolution). Each branch sees placeholder inputs off its own region, so
-    neither the value nor the gradient carries a non-finite term from the unselected branch.
+    :func:`x_minus_log1p`. Farther out the value is at least about 0.1, and where the rounded ratio :math:`r` is a
+    normal positive float the one-log form :math:`r - 1 - \log r` is used: its absolute error is a few units of
+    roundoff times :math:`r + 1 + |\log r|`, so its relative error stays at a few units of roundoff whatever the
+    size of the operands. The two-log form :math:`r - 1 + \log\text{den} - \log\text{num}` carries an absolute error
+    of about :math:`u(|\log\text{num}| + |\log\text{den}|)` instead, which at variances near :math:`10^6` cost it a
+    hundred units of roundoff in float32 (audit 2026-10-31, tables-families-3); it is kept only where :math:`r`
+    underflows to a subnormal or zero, or overflows, and there it stays finite as long as the operands are. Each
+    branch sees placeholder inputs off its own region, so neither the value nor the gradient carries a non-finite
+    term from an unselected branch.
     """
     x = (num - den) / den
     near = x.abs() < 0.5
     ones = torch.ones_like(x)
     small = x_minus_log1p(torch.where(near, x, torch.zeros_like(x)))
     far_num, far_den = torch.where(near, ones, num), torch.where(near, ones, den)
-    far = far_num / far_den - 1.0 + torch.log(far_den) - torch.log(far_num)
-    return torch.where(near, small, far)
+    with torch.no_grad():
+        ratio = far_num / far_den
+        finfo = torch.finfo(ratio.dtype)
+        normal = (ratio >= finfo.tiny) & (ratio <= finfo.max)            # r is a normal positive float
+    one_ratio = torch.where(normal, far_num, ones) / torch.where(normal, far_den, ones)
+    one_log = one_ratio - 1.0 - torch.log(one_ratio)
+    two_num, two_den = torch.where(normal, ones, far_num), torch.where(normal, ones, far_den)
+    two_log = two_num / two_den - 1.0 + torch.log(two_den) - torch.log(two_num)
+    return torch.where(near, small, torch.where(normal, one_log, two_log))
 
 
 def safe_kl_clamp(
@@ -61,9 +73,60 @@ def safe_kl_clamp(
     *,
     kl_max: float = 100.0,
 ) -> torch.Tensor:
-    r"""Clamp to [0, kl_max]; positive infinity disables the finite upper ceiling."""
-    kl = kl.clamp(min=0.0, max=kl_max)
-    return kl.nan_to_num(nan=kl_max, posinf=kl_max, neginf=0.0)
+    r"""Clamp to [0, kl_max]; positive infinity disables the finite upper ceiling. NaN and :math:`+\infty` map to
+    ``kl_max`` and :math:`-\infty` to 0, through :func:`clamp_nonfinite`, which holds one boolean mask for backward."""
+    return clamp_nonfinite(kl, lower=0.0, upper=kl_max, neginf=0.0)
+
+
+class _ClampNonfinite(torch.autograd.Function):
+    r"""``x.clamp(lower, upper).nan_to_num(nan=upper, posinf=upper, neginf=neginf)`` saving one boolean mask.
+
+    The composite holds both of its float inputs for backward (``clamp`` its input, ``nan_to_num`` the clamped
+    value), and its backward evaluates the four-kernel ``isfinite`` of the latter. The gradient it passes is the
+    incoming one exactly on
+
+    .. math::
+        M = [x \le u] \wedge [x \ge l] \wedge [\lvert x\rvert < \infty]
+
+    (no lower test when ``lower`` is None) and zero elsewhere, so the forward here saves :math:`M` alone and the
+    backward is ``where(M, grad, 0)``: the composite's values and gradients, up to the sign of a zero gradient
+    (audit 2026-10-31 A138). The backward is built from differentiable operations, so a double backward sees the
+    composite's second derivative (zero in ``x``, :math:`M` in the incoming gradient).
+    """
+
+    @staticmethod
+    def forward(ctx: "torch.autograd.function.FunctionCtx", x: torch.Tensor, lower: Optional[float], upper: float,
+                neginf: Optional[float]) -> torch.Tensor:
+        # x <= u excludes NaN and +inf for a finite u, x >= l excludes NaN and -inf.
+        mask = x <= upper if upper < float("inf") else x < float("inf")             # (...) bool
+        mask &= x > float("-inf") if lower is None else x >= lower
+        ctx.save_for_backward(mask)
+        return x.clamp(min=lower, max=upper).nan_to_num(nan=upper, posinf=upper, neginf=neginf)
+
+    @staticmethod
+    def backward(ctx: "torch.autograd.function.FunctionCtx",
+                 grad: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, None, None]:
+        (mask,) = ctx.saved_tensors
+        return torch.where(mask, grad, 0.0), None, None, None
+
+
+def clamp_nonfinite(
+    x:      torch.Tensor,
+
+    *,
+    upper:  float,
+    lower:  Optional[float] = None,
+    neginf: Optional[float] = None,
+) -> torch.Tensor:
+    r"""``x.clamp(lower, upper).nan_to_num(nan=upper, posinf=upper, neginf=neginf)``: NaN and :math:`+\infty` map to
+    ``upper``, :math:`-\infty` to ``neginf`` (the most negative finite value when None).
+
+    Under autograd it runs through :class:`_ClampNonfinite`, which holds one boolean mask for backward instead of two
+    float tensors of the input's shape, with the composite's values and gradients (audit 2026-10-31 A138).
+    """
+    if torch.is_grad_enabled() and x.requires_grad:
+        return _ClampNonfinite.apply(x, lower, upper, neginf)
+    return x.clamp(min=lower, max=upper).nan_to_num(nan=upper, posinf=upper, neginf=neginf)
 
 
 def _logdet_chol(L: torch.Tensor) -> torch.Tensor:
@@ -390,7 +453,8 @@ def divergence_functionals() -> Tuple[str, ...]:
     r"""Registered functional names, the divergences reachable from tests and post-hoc analysis.
 
     ``divergence_family`` (and the Renyi order) is pinned by ``VFE3Config`` validation, so training
-    runs use only the pinned functional; the other members are not configuration values.
+    runs use only the pinned functional; the other members are not configuration values. Test hook:
+    referenced only by the tests; production reads the registry through :func:`get_functional`.
     """
     return tuple(sorted(_FUNCTIONALS))
 
@@ -426,13 +490,11 @@ def get_functional_per_coord(name: str) -> Callable[..., torch.Tensor]:
     return _FUNCTIONALS_PER_COORD[name]
 
 
-def has_per_coord_functional(name: str) -> bool:
-    r"""Whether divergence ``name`` has a registered per-coordinate (coordinate-decomposing) form."""
-    return name in _FUNCTIONALS_PER_COORD
-
-
 def divergence_functionals_per_coord() -> Tuple[str, ...]:
-    r"""Registered per-coordinate functional names (the divergences that decompose coordinate-wise)."""
+    r"""Registered per-coordinate functional names (the divergences that decompose coordinate-wise).
+
+    Test hook: referenced only by the tests; production reads the registry through :func:`get_functional_per_coord`.
+    """
     return tuple(sorted(_FUNCTIONALS_PER_COORD))
 
 

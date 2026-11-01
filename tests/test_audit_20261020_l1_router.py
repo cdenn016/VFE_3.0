@@ -294,7 +294,8 @@ def test_query_constant_capture_is_the_dropped_constant() -> None:
     model = _model("query_shifted", "comparison_invariant", 1e6)
     snapshot = model.build_diagnostic_snapshot(TOKENS)
     cap = model._layer_capture(snapshot, 0)
-    G_q = cap["projected_covariance_pre"].diagonal(dim1=-2, dim2=-1).double()     # (B, N, H, r)
+    assert cap["projected_covariance_diagonal_pre"] is True                       # the diagonal route's capture
+    G_q = cap["projected_covariance_pre"].double()                                # (B, N, H, r) diag P(G)
     expected = (-.5 * (R + G_q.log().sum(-1))).movedim(-1, -2)                    # (B, H, N)
     torch.testing.assert_close(cap["score_query_constant_pre"], expected, rtol=0, atol=1e-12)
     assert cap["score_row_shift_pre"].shape == expected.shape

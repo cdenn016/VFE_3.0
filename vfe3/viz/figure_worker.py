@@ -150,9 +150,10 @@ def _load_worker_config(run_dir: Path) -> 'VFE3Config | SimpleNamespace':
     """Load one run's serialized config for history-only figure reconstruction.
 
     No forward is replayed, so a run that saved a value this build refuses is read from its raw saved
-    values, as the manuscript assemblers read it (:func:`vfe3.paper.runs.load_config`).
+    values, as the manuscript assemblers read it (:func:`vfe3.paper.runs.load_config`), with the fields the
+    record predates filled with the values it ran (:func:`vfe3.paper.runs.raw_config_namespace`).
     """
-    from vfe3.paper.runs import load_config
+    from vfe3.paper.runs import load_config, raw_config_namespace
 
     metadata_path = run_dir / "config.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -162,7 +163,7 @@ def _load_worker_config(run_dir: Path) -> 'VFE3Config | SimpleNamespace':
     if cfg is None:
         logging.getLogger(__name__).warning(
             "%s: config could not be built (%s); raw saved values used", metadata_path, load_mode)
-        return SimpleNamespace(**metadata["config"])
+        return raw_config_namespace(metadata["config"])
     return cfg
 
 
@@ -368,6 +369,21 @@ def _render_ablation_request(request: Mapping[str, object], output_dir: Path) ->
 
     import ablation
 
+    if not invalidate:
+        # This process imports ablation.py as it is on disk now: its collector rebuilds cell contracts from that
+        # file's baseline and the sensitivity plot resolves reference arms from its SWEEPS. A definition edited after
+        # the parent imported the file would change those figures while the parent's tables keep the session's
+        # definitions, so the scope is refused instead (audit 2026-10-31 ablation-harness-13).
+        expected = request.get("definition_fingerprints")
+        if not isinstance(expected, Mapping):
+            raise ValueError("ablation figure request carries no definition fingerprints")
+        current = ablation._figure_definition_fingerprints()
+        changed = sorted(name for name in set(expected) | set(current) if expected.get(name) != current.get(name))
+        if changed:
+            raise ValueError(
+                f"ablation.py on disk no longer matches the definitions of the run that requested scope {scope!r} "
+                f"({', '.join(changed)} changed since it was imported); the scope is not rendered")
+
     figure_dir = ablation._prepare_owned_output_child(
         output_dir,
         "figures",
@@ -516,8 +532,12 @@ def main() -> int:
 
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         logger = logging.getLogger(__name__)
-        from vfe3.viz.report import generate_figures
+        from vfe3.viz.report import generate_figures, generate_history_figures
 
+        if n_e_steps is not None:
+            logger.info("n_e_steps=%d is ignored: no retained figure reads the E-step count (the E-step trace "
+                        "figures were removed, audit 2026-10-17 item 71)", n_e_steps)
+        replayed = False
         try:
             paths = generate_figures(
                 run_dir,
@@ -529,13 +549,23 @@ def main() -> int:
                 n_e_steps=n_e_steps,
                 logger=logger,
             )
+            replayed = True
         finally:
             # The history dashboards and saved probes need only metrics.csv and the lenient config, so they are
             # rebuilt even when the strict model replay above refuses this run's saved config; after a
             # successful replay they also render the probes it persisted (audit 2026-10-16 F84).
+            persisted_cfg = _load_worker_config(run_dir)
+            if not replayed:
+                # generate_figures draws the eval-cadence history figures last, so a replay it refused (saved
+                # config, checkpoint, corpus cache) or that failed left them unwritten; they read only the CSV
+                # tables (audit 2026-10-31 viz-figures-9).
+                try:
+                    generate_history_figures(run_dir, cfg=persisted_cfg, logger=logger)
+                except Exception as exc:
+                    logger.warning("history figures failed (%s); continuing", exc)
             _render_persisted_run_figures(
                 run_dir,
-                _load_worker_config(run_dir),
+                persisted_cfg,
                 None,
                 logger,
             )

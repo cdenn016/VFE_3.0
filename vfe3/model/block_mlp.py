@@ -556,7 +556,7 @@ def block_norm_jacobian(
 
     Only the LayerNorm seams have this closed form here; the Mahalanobis norm reads the covariance and is
     refused, so ``block_mlp_covariance='delta_full'`` never pushes a covariance through a norm whose
-    Jacobian it omits.
+    Jacobian it omits. Test oracle: referenced only by the tests.
     """
     eps, weight = _layernorm_arguments(norm)
     return layernorm_jacobian(mu, eps=eps, weight=weight)
@@ -795,9 +795,18 @@ def block_norm_trace_cap(
     r"""The sphere-bound scale :math:`\lambda` of a block LayerNorm seam (:func:`layernorm_trace_cap`) for the
     ``delta_full`` composite: its pushforward is linear in the norm-stage covariance
     :math:`J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D + \rho gg^\top`, so capping that stage by :math:`\lambda`
-    scales the whole composite by :math:`\lambda` (``input_cap`` of ``forward_moments``)."""
-    pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor)
-    return layernorm_trace_cap(pushed, _layernorm_arguments(norm)[1], _is_diagonal_layout(mu, sigma))
+    scales the whole composite by :math:`\lambda` (``input_cap`` of ``forward_moments``).
+
+    The scale reads only the trace, so a full layout forms the diagonal of the pushforward in closed form
+    (:func:`layernorm_full_pushforward_diagonal`), with no :math:`K\times K` result and no Cholesky certificate (audit
+    2026-10-31 A175); the diagonal layout reads :func:`layernorm_diagonal_pushforward` as before."""
+    eps, weight = _layernorm_arguments(norm)
+    if _is_diagonal_layout(mu, sigma):
+        entries = layernorm_diagonal_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)
+    else:
+        entries = layernorm_full_pushforward_diagonal(mu, sigma, eps=eps, covariance_floor=covariance_floor,
+                                                      weight=weight)
+    return layernorm_trace_cap(entries, weight, True)
 
 
 def layernorm_trace_cap_elements() -> int:
@@ -852,11 +861,11 @@ def layernorm_full_pushforward(
 
     a rank-two correction of :math:`\Sigma` instead of the dense Jacobian, its Cholesky factor, :math:`JL` and their
     Gram (about :math:`2.3K^3` per token). Below float64 the result is checked by a Cholesky factorization, of
-    each head block when ``head_dims`` is given (only those blocks are kept), and tokens that fail are recomputed in
-    float64 and cast back, as in :func:`_delta_covariance`; the cast is not re-checked, so a float64 result whose
-    condition number approaches :math:`1/u_{32}` can still fail to factor at the working dtype (the capped delta
-    method at :math:`\Sigma \gg s^2`, audit 2026-10-16 F2). Autocast off and IEEE fp32 GEMMs at
-    ``promote_types(dtype, float32)``.
+    each head block when ``head_dims`` is given (only those blocks are kept), and the tokens that fail, only those
+    (audit 2026-10-31 A176), are recomputed in float64 and cast back, as in :func:`_delta_covariance`; the cast is not
+    re-checked, so a float64 result whose condition number approaches :math:`1/u_{32}` can still fail to factor at
+    the working dtype (the capped delta method at :math:`\Sigma \gg s^2`, audit 2026-10-16 F2). Autocast off and IEEE
+    fp32 GEMMs at ``promote_types(dtype, float32)``.
 
     The delta method approximates the LayerNorm output's moments only while :math:`\Sigma` is small against
     :math:`s^2`; beyond, its radial term dominates and the capped result is near rank one (condition number about
@@ -875,11 +884,62 @@ def layernorm_full_pushforward(
             return pushed
         failed = _cholesky_failures(pushed, head_dims)                              # (...,)
         if bool(failed.any()):
-            high = _layernorm_full_pushforward_at(
-                mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double(),
-                head_dims, effective_scale)
-            pushed = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(dtype), pushed)
+            lead = pushed.shape[:-2]
+            high = _layernorm_full_pushforward_at(                                  # (n_failed, K, K)
+                _failed_rows(mu, lead, failed, 1).double(), _failed_rows(sigma, lead, failed, 2).double(), eps,
+                covariance_floor, None if weight is None else weight.double(), head_dims, effective_scale)
+            pushed = pushed.clone()
+            pushed[failed] = high.to(dtype)
     return pushed
+
+
+def layernorm_full_pushforward_diagonal(
+    mu:               torch.Tensor,                   # (..., K) pre-norm means
+    sigma:            torch.Tensor,                   # (..., K, K) covariance at mu
+    *,
+    eps:              float,
+    covariance_floor: float,
+    weight:           Optional[torch.Tensor] = None,  # (K,) affine gamma, or None for the plain norm
+) -> torch.Tensor:                                    # (..., K)
+    r"""The diagonal of the full-layout LayerNorm pushforward (:func:`layernorm_full_pushforward`), O(K^2) per token.
+
+    With :math:`W = [\mathbf 1, z]/\sqrt K`, :math:`A = W^\top\Sigma W`, :math:`d = \gamma/s` and the radial term
+    :math:`\rho gg^\top` (:func:`layernorm_radial_term`),
+
+    .. math::
+        \bigl[D(P\Sigma P + f\Sigma)D + \rho gg^\top\bigr]_{kk} = d_k^2\bigl[(P\Sigma P)_{kk} + f\Sigma_{kk}\bigr]
+            + \rho g_k^2,\qquad (P\Sigma P)_{kk} = \Sigma_{kk} - 2\sum_aW_{ka}(\Sigma W)_{ka} + (WAW^\top)_{kk},
+
+    which is all the sphere-bound cap reads (:func:`block_norm_trace_cap`), so no :math:`K\times K` result, Cholesky
+    certificate or float64 recompute is formed (audit 2026-10-31 A175). Equal to the diagonal of the dense evaluation
+    to rounding. Autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``.
+    """
+    dtype = _pushforward_dtype(mu, sigma)
+    with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
+        work, cov = mu.to(dtype), sigma.to(dtype)
+        K = work.shape[-1]
+        centered = work - work.mean(dim=-1, keepdim=True)                           # (..., K)
+        s2 = centered.square().mean(dim=-1, keepdim=True) + eps                     # (..., 1) s^2
+        z = centered / s2.sqrt()                                                    # (..., K)
+        W = torch.stack([torch.ones_like(z), z], dim=-1) / math.sqrt(K)             # (..., K, 2)
+        SW = cov @ W                                                                # (..., K, 2) Sigma W
+        A = W.transpose(-1, -2) @ SW                                                # (..., 2, 2) W^T Sigma W
+        variances = torch.diagonal(cov, dim1=-2, dim2=-1)                          # (..., K) Sigma_kk
+        projected = variances - 2.0 * (W * SW).sum(dim=-1) + ((W @ A) * W).sum(dim=-1)   # (..., K) (P Sigma P)_kk
+        d2 = 1.0 / s2 if weight is None else weight.to(dtype).square() / s2         # (..., 1) or (..., K): D^2
+        g2 = z.square() if weight is None else (weight.to(dtype) * z).square()      # (..., K) (gamma o z)^2
+        rho = _layernorm_radial_coefficient(centered, s2, cov, eps)                 # (..., 1)
+        return d2 * (projected + covariance_floor * variances) + rho * g2
+
+
+def _failed_rows(
+    tensor:   torch.Tensor,                           # broadcastable to (*lead, *trailing)
+    lead:     torch.Size,                             # the leading (token) shape of the certified result
+    failed:   torch.Tensor,                           # (*lead,) bool
+    trailing: int,                                    # trailing (per-token) dimensions of tensor
+) -> torch.Tensor:                                    # (n_failed, *trailing)
+    r"""The tokens of ``tensor`` whose certificate failed, for a float64 recompute of those rows only."""
+    return tensor.expand(*lead, *tensor.shape[tensor.dim() - trailing:])[failed]
 
 
 def _layernorm_full_pushforward_at(
@@ -997,18 +1057,20 @@ def _push_radial(
 def _covariance_cholesky(sigma: torch.Tensor) -> torch.Tensor:   # (..., K, K) SPD -> lower factor L
     r"""Lower Cholesky factor :math:`L` of the SPD belief covariance, :math:`\Sigma = LL^\top`.
 
-    No jitter. Matrices whose factor fails at the working precision are refactored in float64; a float64 failure
-    raises, because :math:`\Sigma` is then not numerically SPD and the pushforward has no Gram factor.
+    No jitter. Matrices whose factor fails at the working precision are refactored in float64, those only (audit
+    2026-10-31 A176); a float64 failure raises, because :math:`\Sigma` is then not numerically SPD and the pushforward
+    has no Gram factor.
     """
     factor, info = torch.linalg.cholesky_ex(sigma)
     failed = info != 0
     if bool(failed.any()):
         if sigma.dtype == torch.float64:
             raise FloatingPointError("delta_full: the belief covariance is not numerically SPD (float64 Cholesky failed)")
-        high, high_info = torch.linalg.cholesky_ex(sigma.double())
-        if bool((high_info[failed] != 0).any()):
+        high, high_info = torch.linalg.cholesky_ex(sigma[failed].double())          # (n_failed, K, K)
+        if bool((high_info != 0).any()):
             raise FloatingPointError("delta_full: the belief covariance is not numerically SPD after float64 escalation")
-        factor = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(sigma.dtype), factor)
+        factor = factor.clone()
+        factor[failed] = high.to(sigma.dtype)
     return factor
 
 
@@ -1054,15 +1116,21 @@ def _delta_covariance(
             return _apply_trace_cap(pushed, cap, False)
         # The GEMM rounding of the Gram is bounded by about K u ||J L||^2, which exceeds the floor's smallest
         # eigenvalue f lambda_min(D Sigma D) once cond(Sigma) passes about f / (K u) (u the working roundoff). The
-        # result is therefore certified by a Cholesky factorization at the working precision, and matrices that
-        # fail it are recomputed in float64 and rounded back (still indefinite only if the float64 result itself
-        # cannot be represented as SPD at the working precision).
+        # result is therefore certified by a Cholesky factorization at the working precision, and the matrices that
+        # fail it, only those (audit 2026-10-31 A176), are recomputed in float64 and rounded back (still indefinite
+        # only if the float64 result itself cannot be represented as SPD at the working precision).
         _, info = torch.linalg.cholesky_ex(pushed)
         failed = info != 0
         if bool(failed.any()):
-            high = _gram_pushforward(jacobian.double(), sigma.double(), covariance_floor,
-                                     None if floor_scale is None else floor_scale.double(), radial)
-            pushed = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(dtype), pushed)
+            lead = pushed.shape[:-2]
+            rows_radial = None if radial is None else LayerNormRadialTerm(
+                _failed_rows(radial.rho, lead, failed, 1), _failed_rows(radial.direction, lead, failed, 1))
+            high = _gram_pushforward(                                               # (n_failed, K, K)
+                _failed_rows(jacobian, lead, failed, 2).double(), _failed_rows(sigma, lead, failed, 2).double(),
+                covariance_floor, None if floor_scale is None else _failed_rows(floor_scale, lead, failed, 1).double(),
+                rows_radial)
+            pushed = pushed.clone()
+            pushed[failed] = high.to(dtype)
         return _apply_trace_cap(pushed, cap, False)
 
 
@@ -1258,7 +1326,6 @@ class GaugeGateBlockMLP(nn.Module):
         mu: torch.Tensor,
         sigma: torch.Tensor,
     ) -> 'tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]':
-        mu_blocks = []
         expected_dim = sum(self.irrep_dims)
         if mu.shape[-1] != expected_dim:
             raise ValueError(
@@ -1272,36 +1339,62 @@ class GaugeGateBlockMLP(nn.Module):
                 "gauge gate covariance axes must match sum(irrep_dims), got "
                 f"{tuple(sigma.shape[-2:])} and expected {(expected_dim, expected_dim)}"
             )
-        sigma_solutions = []
-        invariants = []
-        start = 0
+        return self._full_invariants(mu, sigma)
+
+    def _full_invariants(
+        self,
+        mu:    torch.Tensor,                          # (..., K)
+        sigma: torch.Tensor,                          # (..., K, K), the head blocks Sigma_hh read
+    ) -> 'tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]':
+        r"""Block invariants of a full covariance layout by certified Cholesky solves.
+
+        .. math::
+            s_h = \mu_h^\top\Sigma_{hh}^{-1}\mu_h,
+
+        evaluated at ``promote_types(mu, sigma, float32)``. The heads of one width are stacked into a single
+        :func:`vfe3.numerics.validated_cholesky_solve` call, ``(..., n, d, d)``, and one host read covers the
+        certificates of every head. Rows (token and head) whose working-precision certificate fails, a spectral
+        condition above :math:`1/(64d\epsilon)`, are solved again in float64, those rows only, and the float64
+        solution is cast back to the working dtype, so the invariants, the gates and the returned mean keep it (audit
+        2026-10-31 A019, A186: the whole batch was recomputed in float64 per head, one host read per head, and the
+        float64 solution promoted the gated mean, which the next float32 consumer refused).
+        """
+        dtype = torch.promote_types(torch.promote_types(mu.dtype, sigma.dtype), torch.float32)
+        starts = [0]
         for dim in self.irrep_dims:
-            stop = start + dim
-            mu_h = mu[..., start:stop]
-            sigma_hh = sigma[..., start:stop, start:stop]
-            rhs = mu_h.unsqueeze(-1)
-            checked = validated_cholesky_solve(sigma_hh, rhs)
-            if bool(checked.certified.all()):
-                assert checked.solution is not None
-                solved = checked.solution.squeeze(-1)
-            elif sigma_hh.dtype is torch.float64:
-                raise FloatingPointError(
-                    "GaugeGate Mahalanobis system could not be certified in float64")
-            else:
-                high = validated_cholesky_solve(sigma_hh.double(), rhs.double())
+            starts.append(starts[-1] + dim)
+        widths: Dict[int, list] = {}
+        for head, dim in enumerate(self.irrep_dims):
+            widths.setdefault(dim, []).append(head)
+        stacks = []
+        for dim, heads in widths.items():
+            S = torch.stack([sigma[..., starts[h]:starts[h] + dim, starts[h]:starts[h] + dim] for h in heads],
+                            dim=-3).to(dtype)                                       # (..., n, d, d)
+            rhs = torch.stack([mu[..., starts[h]:starts[h] + dim] for h in heads],
+                              dim=-2).to(dtype).unsqueeze(-1)                       # (..., n, d, 1)
+            stacks.append((heads, S, rhs, validated_cholesky_solve(S, rhs)))
+        certified = torch.cat([checked.certified.reshape(-1) for (_, _, _, checked) in stacks]).all()
+        all_certified = bool(certified)                                             # the one host read
+        if not all_certified and dtype is torch.float64:
+            raise FloatingPointError("GaugeGate Mahalanobis system could not be certified in float64")
+        sigma_solutions: list = [None] * len(self.irrep_dims)
+        for heads, S, rhs, checked in stacks:
+            assert checked.solution is not None
+            solved = checked.solution                                               # (..., n, d, 1)
+            failed = ~checked.certified                                             # (..., n)
+            if not all_certified and bool(failed.any()):
+                high = validated_cholesky_solve(S[failed].double(), rhs[failed].double())   # (n_failed, d, d)
                 if not bool(high.certified.all()):
                     raise FloatingPointError(
-                        "GaugeGate Mahalanobis system could not be certified after float64 "
-                        "escalation")
-                assert checked.solution is not None and high.solution is not None
-                solved = torch.where(
-                    checked.certified.unsqueeze(-1).unsqueeze(-1),
-                    checked.solution.double(), high.solution,
-                ).squeeze(-1)
-            mu_blocks.append(mu_h)
-            sigma_solutions.append(solved)
-            invariants.append((mu_h.to(solved.dtype) * solved).sum(dim=-1))
-            start = stop
+                        "GaugeGate Mahalanobis system could not be certified after float64 escalation")
+                assert high.solution is not None
+                solved = solved.clone()
+                solved[failed] = high.solution.to(dtype)
+            solved = solved.squeeze(-1)                                             # (..., n, d)
+            for index, head in enumerate(heads):
+                sigma_solutions[head] = solved[..., index, :]
+        mu_blocks = [mu[..., starts[h]:starts[h + 1]] for h in range(len(self.irrep_dims))]
+        invariants = [(mu_h.to(dtype) * solved).sum(dim=-1) for mu_h, solved in zip(mu_blocks, sigma_solutions)]
         return torch.stack(invariants, dim=-1), mu_blocks, sigma_solutions
 
     def _diagonal_invariants(
@@ -1605,6 +1698,38 @@ class GaussianTemplateBlockMLP(nn.Module):
         return BlockMLPMomentResult(self.mean_update(mu, sigma), sigma, None)
 
 
+@torch.no_grad()
+def _calibration_template_means(
+    rows:      torch.Tensor,                          # (n, K) block-input means
+    M:         int,                                   # number of templates
+    c_bar:     float,                                 # mean diagonal working variance of the inputs
+    generator: torch.Generator,                       # CPU generator for the draw
+) -> Tuple[torch.Tensor, int]:                        # (M, K) template means, number of distinct input rows
+    r"""Calibrated template means: block inputs drawn without replacement, no two templates equal.
+
+    With at least :math:`M` rows, none repeated, the draw is :math:`M` of them without replacement. With repeated
+    rows (two windows that give the same block input) the draw is over the distinct rows; with fewer than :math:`M`
+    distinct rows each is used once and the remaining templates are drawn rows plus an isotropic jitter
+    :math:`\mathcal N(0, \bar cI)` at the measured working variance. Two equal templates (with equal variances and
+    weights, as the calibration sets them) enter the template posterior symmetrically and receive equal gradients and
+    optimizer updates, so a tie set at calibration lasted for the whole run (audit 2026-10-31 A086).
+    """
+    n, K = rows.shape
+    distinct = torch.unique(rows, dim=0)                                           # (n_distinct, K), sorted
+    n_distinct = int(distinct.shape[0])
+    if n_distinct == n and n >= M:
+        index = torch.randperm(n, generator=generator)[:M]
+        return rows[index.to(rows.device)], n_distinct
+    if n_distinct >= M:
+        index = torch.randperm(n_distinct, generator=generator)[:M]
+        return distinct[index.to(distinct.device)], n_distinct
+    order = torch.randperm(n_distinct, generator=generator)
+    extra = torch.randint(0, n_distinct, (M - n_distinct,), generator=generator)
+    jitter = math.sqrt(c_bar) * torch.randn(M - n_distinct, K, generator=generator, dtype=torch.float64)
+    jittered = distinct[extra.to(distinct.device)] + jitter.to(device=distinct.device, dtype=distinct.dtype)
+    return torch.cat([distinct[order.to(distinct.device)], jittered]), n_distinct      # (M, K)
+
+
 class PrototypeAgentBlockMLP(nn.Module):
     r"""Residual block as the minimal agent model with :math:`M = eK` static prototype agents (``prototype_agents``).
 
@@ -1730,13 +1855,15 @@ class PrototypeAgentBlockMLP(nn.Module):
 
         With :math:`\bar c` the mean diagonal working variance of the inputs, every template variance is set to
         :math:`\lambda_0 = \bar c(1 - p)/p`, so that at uniform routing the gain :math:`\bar c/(\bar c + \lambda_0)`
-        is the target pull :math:`p`, and the template means are :math:`M` input means drawn without replacement
-        (with replacement when there are fewer than :math:`M`), so they sit at the scale of the block input. The
-        absolute default placed :math:`\nu` at scale :math:`K^{-1/2}` and used a fixed :math:`\lambda_0`, which gave
-        a 12 to 44 percent initial pull and near-uniform routing at ``sigma_init=15`` (audit 2026-10-07, F77/F78).
-        :math:`\lambda` sets both the pull and the routing temperature, so a small pull still implies soft initial
-        routing unless the spread of the inputs exceeds :math:`\lambda_0`. Returns the measured
-        :math:`\bar c` and the chosen :math:`\lambda_0`.
+        is the target pull :math:`p`, and the template means are :math:`M` distinct input means drawn without
+        replacement (:func:`_calibration_template_means`; with fewer than :math:`M` distinct inputs the remaining
+        templates are drawn inputs plus a jitter of variance :math:`\bar c`, so no two templates start equal), so they
+        sit at the scale of the block input. The absolute default placed :math:`\nu` at scale :math:`K^{-1/2}` and
+        used a fixed :math:`\lambda_0`, which gave a 12 to 44 percent initial pull and near-uniform routing at
+        ``sigma_init=15`` (audit 2026-10-07, F77/F78). :math:`\lambda` sets both the pull and the routing temperature,
+        so a small pull still implies soft initial routing unless the spread of the inputs exceeds :math:`\lambda_0`.
+        Returns the measured :math:`\bar c`, the chosen :math:`\lambda_0`, the number of distinct input rows and the
+        number of jittered templates.
         """
         K = self.nu.shape[-1]
         if sigma.dim() == mu.dim():
@@ -1747,13 +1874,11 @@ class PrototypeAgentBlockMLP(nn.Module):
             diag = sigma.diagonal(dim1=-2, dim2=-1).reshape(*sigma.shape[:-3], K)
         c_bar = float(diag.double().mean())
         lam0 = c_bar * (1.0 - pull) / pull
-        rows = mu.reshape(-1, K)
-        M, n = self.nu.shape[0], rows.shape[0]
-        index = (torch.randperm(n, generator=generator)[:M] if n >= M
-                 else torch.randint(0, n, (M,), generator=generator))
-        self.nu.copy_(rows[index.to(rows.device)].to(self.nu.dtype))
+        nu, distinct = _calibration_template_means(mu.reshape(-1, K), self.nu.shape[0], c_bar, generator)
+        self.nu.copy_(nu.to(self.nu.dtype))
         self.log_lambda.fill_(math.log(lam0))
-        return {"working_variance": c_bar, "lambda0": lam0}
+        return {"working_variance": c_bar, "lambda0": lam0, "distinct_inputs": distinct,
+                "jittered_templates": max(0, self.nu.shape[0] - distinct)}
 
     def forward_moments(
         self,
@@ -1972,7 +2097,9 @@ class CueResultMemoryBlockMLP(nn.Module):
     ``regression_right`` (M, K, r). Initialization: ``nu``, ``log_lambda`` and ``log_pi`` as in
     :class:`PrototypeAgentBlockMLP`, ``omega = nu``, :math:`Q_a = \rho L_a` with :math:`\rho` = ``result_noise_ratio``,
     ``regression_offset = 0`` or ``regression_left = 0`` and ``regression_right`` normal with standard deviation
-    :math:`0.01/\sqrt K`, so :math:`F_a = I` with nonzero initial gradients for both factors. ``log_lambda``, ``log_pi``
+    :math:`0.01/\sqrt K`, so :math:`F_a = I`; ``regression_left`` (:math:`U_a`) receives a gradient at the first step,
+    and ``regression_right`` (:math:`V_a`) once :math:`U_a` is nonzero, since every output depends on :math:`V_a` only
+    through :math:`U_aV_a^\top`. ``log_lambda``, ``log_pi``
     and ``log_result_noise`` train without weight decay (:func:`vfe3.train.build_optimizer`); decay on the regression
     parameters pulls :math:`F_a` toward the identity.
 
@@ -2119,15 +2246,13 @@ class CueResultMemoryBlockMLP(nn.Module):
         diag = sigma if sigma.dim() == mu.dim() else sigma.diagonal(dim1=-2, dim2=-1)
         c_bar = float(diag.double().mean())
         lam0 = c_bar * (1.0 - pull) / pull
-        rows = mu.reshape(-1, K)
-        M, n = self.nu.shape[0], rows.shape[0]
-        index = (torch.randperm(n, generator=generator)[:M] if n >= M
-                 else torch.randint(0, n, (M,), generator=generator))
-        self.nu.copy_(rows[index.to(rows.device)].to(self.nu.dtype))
+        nu, distinct = _calibration_template_means(mu.reshape(-1, K), self.nu.shape[0], c_bar, generator)
+        self.nu.copy_(nu.to(self.nu.dtype))
         self.log_lambda.fill_(math.log(lam0))
         self.omega.copy_(self.nu)
         self.log_result_noise.copy_(self.log_lambda + math.log(self.result_noise_ratio))
-        return {"working_variance": c_bar, "lambda0": lam0}
+        return {"working_variance": c_bar, "lambda0": lam0, "distinct_inputs": distinct,
+                "jittered_templates": max(0, self.nu.shape[0] - distinct)}
 
     def forward_moments(
         self,
@@ -2193,6 +2318,10 @@ class BlockMLPRegistration:
     # (width, expansion, regression_rank) -> per-layer count, for modes whose count depends on the regression rank
     # (cue_result_memory); takes precedence over parameter_count_per_layer.
     rank_parameter_count_per_layer: Optional[Callable[[int, int, Optional[int], str], int]] = None
+    # (width, expansion, regression_rank) -> per-layer FLOPs replacing matmul_flops_per_layer on the diagonal
+    # covariance layout, for modes whose diagonal route is elementwise rather than dense (cue_result_memory on
+    # gaussian_frame_diagonal; audit 2026-10-31 A088); None means the layout does not change that cost.
+    diagonal_flops_per_layer: Optional[Callable[[int, int, Optional[int]], float]] = None
 
     def parameter_count(
         self,
@@ -2222,14 +2351,16 @@ class BlockMLPRegistration:
         covariance_contract: str,
         n_layers: int,
         covariance_layout: str = "full",
+        regression_rank: Optional[int] = None,            # read by diagonal_flops_per_layer only
     ) -> float:
         width = self.width(embed_dim, irrep_dims)
-        per_layer = (
-            self.matmul_flops_per_layer(width, expansion)
-            if self.matmul_flops_per_layer is not None
-            else 4.0 * expansion * width * width
-        )
         layout = _validate_covariance_layout(covariance_layout)
+        if layout == "diagonal" and self.diagonal_flops_per_layer is not None:
+            per_layer = self.diagonal_flops_per_layer(width, expansion, regression_rank)
+        elif self.matmul_flops_per_layer is not None:
+            per_layer = self.matmul_flops_per_layer(width, expansion)
+        else:
+            per_layer = 4.0 * expansion * width * width
         extra_flops = self.extra_flops_per_layer
         if layout == "diagonal" and self.diagonal_extra_flops_per_layer is not None:
             extra_flops = self.diagonal_extra_flops_per_layer
@@ -2291,6 +2422,26 @@ def _cue_result_parameter_count(width: int, expansion: int, regression_rank: Opt
     return 4 * M * width + M + regression + regime  # nu, log_lambda, omega, log_result_noise; log_pi; F_a; T
 
 
+def _cue_result_diagonal_flops(width: int, expansion: int, regression_rank: Optional[int]) -> float:
+    r"""Per-token FLOPs of one cue/result memory layer on the diagonal layout (``gaussian_frame_diagonal``).
+
+    :func:`vfe3.model.cue_result_memory.cue_result_diagonal_posterior` is elementwise in each (token, component) pair:
+    about :math:`17K` operations for the record evidence, the gain, the cue moments and the mixture merge, then the
+    result moments, :math:`K(7 + 4r + 6r^2)` for :math:`F_a = I + U_aV_a^\top` of rank :math:`r` (the products
+    :math:`V^\top g` and :math:`Ut`, and the leave-one-out Gram :math:`U_k^\top G^{(-k)}U_k` with its scans) or
+    :math:`4K^2 + 2K` for a dense :math:`F_a`; :math:`M = eK` components. An operation count, not a timing (audit
+    2026-10-31 A088: the dense-record bound :math:`\tfrac{25}{3}eK^4` overstated it by about four orders of magnitude
+    at K = 192).
+    """
+    M, K = expansion * width, width
+    if regression_rank is None:
+        per_pair = 4.0 * K * K + 19.0 * K
+    else:
+        r = int(regression_rank)
+        per_pair = K * (24.0 + 4.0 * r + 6.0 * r * r)
+    return float(M) * per_pair
+
+
 def _coordinate_report_label(covariance: str) -> str:
     return (
         "coordinate_mean_only_nonintertwiner"
@@ -2325,8 +2476,11 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         gauge_class="invariant_scalar_intertwiner",
         intertwiner_compatible=True,
         width=lambda _embed_dim, irrep_dims: len(irrep_dims),
+        # Full layout, per block: the Cholesky solve (2 d^3 + 2 d^2) and the certificate of
+        # validated_cholesky_solve: eigvalsh (about 4/3 d^3), the reconstruction L L^T (2 d^3), and the
+        # residual product and elementwise passes (about 12 d^2) (audit 2026-10-31 A186).
         extra_flops_per_layer=lambda _embed_dim, irrep_dims: float(sum(
-            2.0 * dim ** 3 + 2.0 * dim ** 2 for dim in irrep_dims
+            2.0 * dim ** 3 + 2.0 * dim ** 2 + (10.0 / 3.0) * dim ** 3 + 12.0 * dim ** 2 for dim in irrep_dims
         )),
         report_label=lambda _covariance: "invariant_scalar_gate",
         # Diagonal layout: s_b = sum_k mu_k * (mu_k / sigma_k), a divide, a multiply and an add per
@@ -2379,10 +2533,11 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         factory_options=frozenset({"inference", "template_init_variance", "cavi_steps"}),
     ),
     # nu, log_lambda, omega, log_result_noise: (M, K) each; log_pi: (M,); regression_offset (M, K, K) or
-    # regression_left/right (M, K, r); M = expansion * K. Exact inference in reference coordinates on a dense C only.
-    # The FLOP metadata is the dense-regression exact path per token: per component a K x K Cholesky (K^3/3), the
-    # solve W^-1 L (2 K^3), C W^-1 L (2 K^3) and F P F^T (4 K^3), about 25/3 K^3; the low-rank form is cheaper and
-    # is booked at the same bound.
+    # regression_left/right (M, K, r); M = expansion * K. Exact inference in reference coordinates, on a dense C
+    # (gaussian_full) or on the reference variances c (gaussian_frame_diagonal). The full-layout FLOP metadata is the
+    # dense-regression exact path per token: per component a K x K Cholesky (K^3/3), the solve W^-1 L (2 K^3),
+    # C W^-1 L (2 K^3) and F P F^T (4 K^3), about 25/3 K^3; the low-rank form is cheaper and is booked at the same
+    # bound. The diagonal layout books its elementwise route with its rank dependence (_cue_result_diagonal_flops).
     "cue_result_memory": BlockMLPRegistration(
         factory=_cue_result_memory_factory,
         requires_frame_context=False,
@@ -2396,6 +2551,7 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         factory_options=frozenset({"inference", "template_init_variance", "regression_rank", "result_noise_ratio",
                                    "regime_transition", "regime_beta", "regime_stay"}),
         rank_parameter_count_per_layer=_cue_result_parameter_count,
+        diagonal_flops_per_layer=_cue_result_diagonal_flops,
     ),
 })
 
@@ -2427,8 +2583,8 @@ def block_mlp_build_metadata(
     regime_transition: str = "off",
 ) -> BlockMLPBuildMetadata:
     r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs,
-    ``regression_rank`` the cue_result_memory parameter count (other modes ignore it), and ``tied_layers`` (one
-    module shared by every layer) counts the parameters once while the FLOPs stay per layer."""
+    ``regression_rank`` the cue_result_memory parameter count and diagonal-layout FLOPs (other modes ignore it), and
+    ``tied_layers`` (one module shared by every layer) counts the parameters once while the FLOPs stay per layer."""
     registration = get_block_mlp_registration(mode)
     if covariance not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance!r}")
@@ -2448,6 +2604,7 @@ def block_mlp_build_metadata(
         covariance_contract=covariance,
         n_layers=n_layers,
         covariance_layout=covariance_layout,
+        regression_rank=regression_rank,
     )
     covariance_report = (
         "not_applicable" if not enabled else

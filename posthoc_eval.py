@@ -11,7 +11,9 @@ the checkpoint config) on the run's identity-checked token streams:
 
 * validation, test and a fixed training-split sample at the final and best-validation weights, each
   cross-checked against ``vfe3.train.evaluate`` and, on a full split, against ``summary.json``
-  (``tab:relational_run``);
+  (``tab:relational_run``); with ``ema_weights`` also at the weight-EMA shadow of the latest
+  ``checkpoints/step_*.pt``, checked against ``val_ema_ce`` and ``test_ema_ce`` when it is the shadow the
+  run evaluated;
 * the M5 frozen interventions, rows 1-12 (rows 9-12 remove the frames one role at a time), on the
   validation split with paired article-bootstrap intervals (4096-token blocks when the stream has no
   article headings);
@@ -53,7 +55,7 @@ CONFIG = {
     "checkpoints":                ("final_model.pt", "best_model.pt"),
     "splits":                     ("validation", "test", "train_sample"),
     "batch_size":                 None,          # None -> the run's cfg.batch_size
-    "max_windows":                None,          # None -> full splits; an int -> evenly spaced subset
+    "max_windows":                None,          # None -> full splits; an int -> evenly spaced subset (no window 0)
     "window_indices":             None,          # explicit validation/test windows (overrides max_windows)
     "cross_check":                True,          # also run vfe3.train.evaluate on the same windows
     "interventions":              None,          # None -> M5 rows 1-12; () -> skip; or a tuple of keys
@@ -77,6 +79,7 @@ CONFIG = {
     "word_stream_path":           None,          # None -> pinned Salesforce/wikitext parquet in the HF cache
     "routing":                    True,          # M4 via vfe3.posthoc.routing (skipped with a reason if absent)
     "routing_split":              "validation",  # at the final weights
+    "ema_weights":                False,         # False | True: also the weight-EMA shadow of checkpoints/step_*.pt
 }
 
 _THREADS = int(CONFIG["threads"] or max(1, (os.cpu_count() or 2) - 2))

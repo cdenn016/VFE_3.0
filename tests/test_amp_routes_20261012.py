@@ -15,8 +15,10 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from tests.profiles import config_values
+from tests.profiles import config_values, live_values, reference_values
 from vfe3.config import VFE3Config
+from vfe3.exact_route import principled_exact_route_overrides
+from vfe3.gauge_covariant import fully_gauge_covariant_overrides
 from vfe3.model.model import VFEModel
 
 V, K, H, N, B = 11, 4, 2, 6, 2
@@ -24,7 +26,8 @@ _REDUCED = (torch.bfloat16, torch.float16)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-# The user's live route at tiny size: full family, full_chunked decode, kernel readout, noisy-key routing,
+# The October 12 live route at tiny size (the current launcher route is read by the current-route test below):
+# full family, full_chunked decode, kernel readout, noisy-key routing,
 # moment-matched covariance, comparison-invariant RoPE, block_glk frames, coordinate block MLP with layernorm.
 _KERNEL: Dict[str, Any] = dict(
     vocab_size=V, embed_dim=K, n_heads=H, max_seq_len=N, batch_size=B, eval_stride=None, attention_window=N,
@@ -141,6 +144,59 @@ def test_cg_coupling_is_a_bf16_consumer_and_stays_live(device: torch.device) -> 
 def test_fp16_and_none_are_never_marked(values: Dict[str, Any]) -> None:
     for amp_dtype in (None, "fp16"):
         assert "amp_dtype" not in _config(values, amp_dtype).inactive_fields()
+
+
+_SWEEP_TINY: Dict[str, Any] = dict(
+    vocab_size=V, embed_dim=K, n_heads=H, max_seq_len=N, batch_size=B, n_layers=2, block_mlp_expansion=2,
+    kl_max=None, eval_stride=None, attention_window=N, deterministic=False, fp32_matmul_precision="highest",
+    decode_chunk_size=8192, log_interval=0, eval_interval=0, checkpoint_interval=0, generate_embedding_figures=False)
+
+
+def _current_route(route: str) -> Dict[str, Any]:
+    r"""The launcher route, its principled exact and fully covariant switches, the frozen reference route, and the
+    scaling.py and parameter_optimization.py baselines, at the shape above (audit 2026-10-31
+    gap-mixed-precision-routes-10). Read when the test runs, so they follow the launchers."""
+    if route in ("scaling_baseline", "parameter_optimization_baseline"):
+        import importlib
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            launcher = importlib.import_module(route.rsplit("_", 1)[0])
+        return {**launcher.config, **_SWEEP_TINY}
+    if route == "reference":
+        return reference_values(vocab_size=V, max_seq_len=N, batch_size=B)
+    live = live_values(vocab_size=V, max_seq_len=N, batch_size=B, fp32_matmul_precision="highest", amp_dtype=None)
+    if route == "principled_exact":
+        return {**live, **principled_exact_route_overrides(live)}
+    if route == "fully_gauge_covariant":
+        return {**live, **fully_gauge_covariant_overrides(live)}
+    assert route == "live", route
+    return live
+
+
+@pytest.mark.usefixtures("restore_model_process_globals")
+@pytest.mark.parametrize("route", ["live", "principled_exact", "fully_gauge_covariant", "reference",
+                                   "scaling_baseline", "parameter_optimization_baseline"])
+def test_bf16_marking_agrees_with_the_probe_on_the_current_routes(route: str, device: torch.device) -> None:
+    r"""On any route, ``inactive_fields()`` marks ``amp_dtype`` exactly when bf16 changes nothing: a marked route runs
+    no reduced-precision operation and is bitwise the ``amp_dtype=None`` run, and an unmarked one has a bf16 consumer.
+    The assertion holds whatever the launchers hold, so no launcher value is pinned here; a sweep baseline the
+    tiny shape cannot admit is skipped with the validation message."""
+    values = _current_route(route)
+    try:
+        bf16 = _config(values, "bf16")
+    except ValueError as exc:
+        if route.endswith("_baseline"):
+            pytest.skip(f"the launcher's {route} does not admit the tiny shape: {exc}")
+        raise
+    assert "amp_dtype" not in _config(values, "fp16").inactive_fields()
+    reference = _run(values, None, device)
+    amp = _run(values, "bf16", device)
+    assert reference[3] == set()
+    if "amp_dtype" in bf16.inactive_fields():
+        assert amp[3] == set(), amp[3]
+        _assert_bitwise_equal(reference, amp)
+    else:
+        assert amp[3] != set()
 
 
 @requires_cuda

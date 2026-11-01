@@ -174,15 +174,18 @@ repair, and a failed factorization is never repaired: it raises ``ValueError`` o
 reported to the caller.
 """
 
+import functools
 import math
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.autograd.function import once_differentiable
+from torch.utils.weak import WeakTensorKeyDictionary
 
+from vfe3.contracts import host_read
 from vfe3.relational_scoring import (
-    _compute_dtype, _GramPrecision, _projected_kl_gemm, projected_condition_recovery, projected_gaussian_kl,
-    projected_gram_condition_tol,
+    _compute_dtype, _GramPrecision, _ieee_fp32_autograd, _projected_kl_gemm, projected_condition_recovery,
+    projected_gaussian_kl, projected_gram_condition_tol,
 )
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -213,7 +216,8 @@ MINIMAL_AGENT_ELBO_KEYS: Tuple[str, ...] = (
 MINIMAL_AGENT_IS_SAMPLES: int = 64
 MINIMAL_AGENT_IS_SEED: int = 0
 MINIMAL_AGENT_IS_TILE_BYTES: int = 32 * 1024 ** 2
-# Per-layer, per-head diagnostics written to the relational capture (means over receivers).
+# Per-layer, per-head diagnostics written to the relational capture (means over receivers). This list and the next
+# document the keys; they are referenced only by the tests, which check the capture against them.
 MINIMAL_AGENT_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
     "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
@@ -232,7 +236,7 @@ class RecordPosterior(NamedTuple):
     r"""Exact one-head source posterior and its gain statistics (:func:`exact_record_posterior`)."""
 
     weights:    torch.Tensor   # (..., I, J) w_ij, rows sum to one, exactly 0 on masked pairs
-    cost:       torch.Tensor   # (..., I, J) -log N(b_j; a_i, W_ij) - (r/2) log 2 pi; 0 in a skipped masked tile
+    cost:       torch.Tensor   # (..., I, J) -log N(b_j; a_i, W_ij) - (r/2) log 2 pi; 0 on every masked pair
     u:          torch.Tensor   # (..., I, r) u_i = sum_j w_ij W_ij^{-1}(b_j - a_i)
     Lambda_bar: torch.Tensor   # (..., I, r, r) sum_j w_ij W_ij^{-1}
     R:          torch.Tensor   # (..., I, r, r) between-source spread of r_ij
@@ -296,19 +300,20 @@ class MinimalAgentResult(NamedTuple):
     of the removed probed variance that the between-source spread gives back, the part the mean field drops) only
     with ``diagnostics=True``.
     ``failed`` reports a failed
-    zero-jitter factorization or a non-finite cost anywhere in the call; ``ill_conditioned`` reports a float32 ADF
-    query covariance that failed the certificate (only under a certified ``projected_factorization``, else False).
-    ``flagged_receivers`` localizes both: a receiver whose own query, record, label cost or information step is
-    flagged, or one whose admissible sources include a flagged utterance covariance :math:`B_j`. Under a causal
-    prior it depends only on the tokens up to the receiver, so a caller that escalates only these receivers keeps
-    the others' outputs independent of later tokens (audit 2026-10-25 F20).
+    zero-jitter factorization or a non-finite cost that reaches some receiver; ``ill_conditioned`` reports a float32
+    ADF query covariance that failed the certificate (only under a certified ``projected_factorization``, else False).
+    ``flagged_receivers`` localizes both: a receiver whose own query, admitted records, label cost or information
+    step is flagged, or one whose admissible sources include a flagged utterance covariance :math:`B_j`. A masked pair
+    is never factored and a source that no receiver admits raises no flag, so either flag implies a flagged receiver,
+    and under a causal prior the set depends only on the tokens up to the receiver: a caller that escalates only these
+    receivers keeps the others' outputs independent of later tokens (audit 2026-10-25 F20; 2026-10-31 A090).
     """
 
     xi:               torch.Tensor             # (..., N, K) xi_i^+
     gains:            torch.Tensor             # (..., N, H, K, d) Kmat_i^h = C_i^{(h-1)} S_h^T
     M:                torch.Tensor             # (..., N, H, d, d) M_i^h
     weights:          torch.Tensor             # (..., H, N, N) labels actually used (w^h, or beta^h of the last sweep)
-    cost:             torch.Tensor             # (..., H, N, N) the per-pair costs those labels read (exact: 0 in a skipped masked tile)
+    cost:             torch.Tensor             # (..., H, N, N) the per-pair costs those labels read (exact: 0 on masked pairs)
     gain_fraction:    Optional[torch.Tensor]   # (..., N, H) in [0, 1): exact at the ADF moments, mean field at the input
     query_covariance: torch.Tensor             # (..., N, H, d, d) S_h C_i S_h^T at the input moments
     key_covariance:   torch.Tensor             # (..., N, H, d, d) T_h C_j T_h^T (noise-free key law)
@@ -357,12 +362,146 @@ def readout_failure_message(dtype: torch.dtype) -> str:
 # One head: exact source posterior (Proposition ma:prop:minimal (a))
 # ----------------------------------------------------------------------------------------------
 
+class _IEEEFP32TileRecompute(torch.autograd.Function):
+    r"""A tuple-valued tile ``body(*inputs)`` with the GEMMs of its forward AND its backward at IEEE fp32 (audit
+    2026-10-31 A015): the tuple form of :class:`vfe3.relational_scoring._IEEEFP32Recompute`.
+
+    :func:`vfe3.runtime.ieee_fp32_matmul` pins only the GEMMs it encloses, so the autograd backward of a pinned tile,
+    and a ``torch.utils.checkpoint`` recompute in backward, ran at the caller's policy: under
+    ``fp32_matmul_precision="high"`` they rounded the tile's GEMM operands to TF32. In :func:`_exact_tile` the
+    gradient of the weighted mean :math:`\bar r_i` and of the centered spread is formed from operands of the size of
+    a common offset of the :math:`r_{ij}`, so its relative error grew with that offset (0.26 at 30 source spreads in a
+    TF32 emulation, against 5e-6 pinned): the cancellation the two-pass centering removes from the forward. Here the
+    forward evaluates ``body`` without autograd and saves only its tensor inputs, as a non-reentrant checkpoint does;
+    the backward evaluates ``body`` again from them with autograd and differentiates it, both inside
+    :func:`ieee_fp32_matmul`. Values and gradients are those of plain autograd through ``body`` at IEEE fp32 (bit for
+    bit on the CPU, where the policy has no effect). The outputs at the positions in ``detached`` and every integer or
+    boolean output carry no gradient. Double backward is not supported.
+    """
+
+    @staticmethod
+    def forward(ctx, body: Callable[..., Tuple[torch.Tensor, ...]], detached: Tuple[int, ...],
+                *inputs: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        ctx.body = body
+        ctx.save_for_backward(*inputs)
+        with ieee_fp32_matmul():
+            outputs = body(*inputs)
+        ctx.mark_non_differentiable(*(out for k, out in enumerate(outputs)
+                                      if k in detached or not out.is_floating_point()))
+        ctx.set_materialize_grads(False)
+        return outputs
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, *grads: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], ...]:
+        needs = ctx.needs_input_grad[2:]
+        leaves = [x.detach().requires_grad_(need) for x, need in zip(ctx.saved_tensors, needs)]
+        wanted = [x for x in leaves if x.requires_grad]
+        with torch.enable_grad(), ieee_fp32_matmul():
+            outputs = ctx.body(*leaves)
+            used = [(out, grad) for out, grad in zip(outputs, grads) if grad is not None and out.requires_grad]
+            found = (torch.autograd.grad([out for out, _ in used], wanted, [grad for _, grad in used],
+                                         allow_unused=True) if used and wanted else (None,) * len(wanted))
+        found = iter(found)
+        return (None, None, *(next(found) if need else None for need in needs))
+
+
+class _TilePlan(NamedTuple):
+    r"""Which pair tiles of :func:`exact_record_posterior` the prior admits (:func:`_tile_support_plan`)."""
+
+    live:  List[List[bool]]                         # (n_q, n_k): some batch element admits a pair of the tile
+    pairs: Dict[Tuple[int, int], torch.Tensor]      # tiles masked in part: (P,) long, i * Jk + j of the admitted pairs
+
+
+# Tile plans of exact_record_posterior, keyed weakly by the root tensor of the log-prior view the tiles read and
+# checked against its version counter and the view's geometry: the plan reads only the prior's support, so a prior the
+# model caches per sequence length is read to the host once per head view, and a checkpoint recompute reads it never
+# (audit 2026-10-25 optimization row "Cache the causal tile-support plan"; 2026-10-31 A194).
+_TILE_PLAN_CACHE: "WeakTensorKeyDictionary" = WeakTensorKeyDictionary()
+
+
+def _build_tile_plan(
+    lp:     torch.Tensor,     # (..., I, J) the log-prior the tiles read (-inf masks a pair)
+    q_step: int,
+    k_step: int,
+) -> _TilePlan:
+    r"""The tile plan of ``lp`` from one host read of its support: the pairs admitted at some index of its leading
+    axes."""
+    I, J = lp.shape[-2], lp.shape[-1]
+    n_q, n_k = -(-I // q_step), -(-J // k_step)
+    with torch.no_grad():
+        support = torch.isfinite(lp).reshape(-1, I, J).any(dim=0)               # (I, J)
+        host = torch.tensor(host_read(support.flatten()), dtype=torch.bool).view(I, J)   # the one host read
+    any_live = torch.zeros(n_q * q_step, n_k * k_step, dtype=torch.bool)
+    all_live = torch.ones(n_q * q_step, n_k * k_step, dtype=torch.bool)
+    any_live[:I, :J] = host
+    all_live[:I, :J] = host
+    live = any_live.view(n_q, q_step, n_k, k_step).any(dim=3).any(dim=1)       # (n_q, n_k)
+    full = all_live.view(n_q, q_step, n_k, k_step).all(dim=3).all(dim=1)       # (n_q, n_k)
+    partial = [tuple(tile) for tile in (live & ~full).nonzero().tolist()]
+    pieces = [host[i * q_step:(i + 1) * q_step, j * k_step:(j + 1) * k_step].flatten().nonzero().flatten()
+              for i, j in partial]                                              # local i * Jk + j, row major
+    pairs: Dict[Tuple[int, int], torch.Tensor] = {}
+    if pieces:
+        flat = torch.cat(pieces).to(lp.device)                                  # one host-to-device copy
+        pairs = dict(zip(partial, flat.split([piece.numel() for piece in pieces])))
+    return _TilePlan(live.tolist(), pairs)
+
+
+def _tile_support_plan(
+    lp:     torch.Tensor,     # (..., I, J) the log-prior the tiles read, a view of the caller's prior
+    q_step: int,
+    k_step: int,
+) -> _TilePlan:
+    r""":func:`_build_tile_plan`, cached per root tensor of the ``lp`` view, its version and the view's geometry.
+
+    The readout slices the caller's prior per head and broadcasts it, so the view is new on every call, but its root
+    (``_base``) is the prior the model caches; a write to the prior bumps the version and rebuilds the plan. An
+    inference tensor carries no version counter and is planned on every call, as is a prior the readout had to cast.
+    """
+    if lp.device.type == "meta":
+        n_q, n_k = -(-lp.shape[-2] // q_step), -(-lp.shape[-1] // k_step)
+        return _TilePlan([[True] * n_k for _ in range(n_q)], {})
+    root = lp if lp._base is None else lp._base
+    try:
+        version: Optional[int] = root._version
+    except RuntimeError:                                  # inference tensors carry no version counter
+        version = None
+    key = (tuple(lp.shape), tuple(lp.stride()), lp.storage_offset(), q_step, k_step)
+    entries = _TILE_PLAN_CACHE.get(root) if version is not None else None
+    if entries is not None and key in entries and entries[key][0] == version:
+        return entries[key][1]
+    plan = _build_tile_plan(lp, q_step, k_step)
+    if version is not None:
+        if entries is None:
+            entries = {}
+            _TILE_PLAN_CACHE[root] = entries
+        entries[key] = (version, plan)
+    return plan
+
+
+def _scatter_pairs(
+    values: torch.Tensor,     # P entries along ``dim``
+    pairs:  torch.Tensor,     # (P,) long, distinct
+    n:      int,              # the full length along ``dim``
+    dim:    int,
+) -> torch.Tensor:
+    r"""``values`` written at ``pairs`` into zeros of length ``n`` along ``dim`` (distinct indices, so its backward is
+    a gather)."""
+    dim = dim % values.dim()
+    shape = list(values.shape)
+    shape[dim] = n
+    return values.new_zeros(shape).index_copy(dim, pairs, values)
+
+
+@ieee_fp32_matmul()
 def _exact_tile(
     a:         torch.Tensor,   # (..., Iq, r) receiver query means
     A:         torch.Tensor,   # (..., Iq, r, r) receiver query covariances
     b:         torch.Tensor,   # (..., Jk, r) source utterance means
     B:         torch.Tensor,   # (..., Jk, r, r) noisy utterance covariances
     log_prior: torch.Tensor,   # (..., Iq, Jk) log pi_ij (-inf masks a pair)
+    pairs:     Optional[torch.Tensor] = None,   # (P,) i * Jk + j of the pairs some batch element admits; None: all
 ) -> Tuple[torch.Tensor, ...]:
     r"""One pair tile of :func:`exact_record_posterior`: costs and the tile's statistics at its own row maximum.
 
@@ -377,18 +516,41 @@ def _exact_tile(
     sum :math:`\sum_je_{ij}W_{ij}^{-1}` and centered spread
     :math:`M_{2,i} = \sum_je_{ij}(r_{ij} - \bar r_i)(r_{ij} - \bar r_i)^\top` (two-pass, so a common offset of the
     :math:`r_{ij}` does not cancel in finite precision). The caller combines tiles by an online log-sum-exp with Chan's
-    pairwise update outside any checkpoint, so a checkpointed tile saves only its input slices. A masked pair
-    (:math:`\log\pi_{ij} = -\infty`) contributes exactly 0; its :math:`W_{ij}` is still positive definite. A row with no
-    live pair has :math:`s_i = 0` and mean 0. Returns ``(cost, t, s, mean, Lam, M2, failed)``, ``failed`` per
-    receiver row ``(..., Iq)``: a failed factorization of some :math:`W_{ij}` or a non-finite :math:`c_{ij}` of the row.
+    pairwise update outside the tile, so the recompute of :class:`_IEEEFP32TileRecompute` saves only the input
+    slices; the tile is pinned to IEEE fp32 itself, so that recompute factors under the forward's policy.
+
+    A masked pair (:math:`\log\pi_{ij} = -\infty`) contributes exactly 0: its record covariance is replaced by the
+    identity and its difference by 0 before the factorization, so it cannot fail, its cost reads 0 and it never raises
+    its row's flag (audit 2026-10-31 A090). ``pairs`` (a tile the prior masks in part) factors only the pairs some
+    batch element admits and writes 0 at the others; the batched factorizations act matrix by matrix and the row sums
+    keep their layout, so values and gradients are those of the full tile bit for bit (A192). A failed factorization
+    of an admitted pair reads the identity factor before the solves and the inverse, so an exactly singular float32
+    :math:`W_{ij}` (a zero pivot, on which ``cholesky_inverse`` raises) is a flag, not a ``LinAlgError`` (A026); the
+    caller recomputes or refuses the call and never differentiates the placeholder. A row with no live pair has
+    :math:`s_i = 0` and mean 0. Returns ``(cost, t, s, mean, Lam, M2, failed)``, ``failed`` per receiver row
+    ``(..., Iq)``: a failed factorization of an admitted :math:`W_{ij}` or a non-finite :math:`c_{ij}` of the row.
     """
-    delta = b.unsqueeze(-3) - a.unsqueeze(-2)                                   # (..., Iq, Jk, r) b_j - a_i
-    W = A.unsqueeze(-3) + B.unsqueeze(-4)                                       # (..., Iq, Jk, r, r), exactly symmetric
+    eye = torch.eye(a.shape[-1], dtype=A.dtype, device=A.device)
+    live = torch.isfinite(log_prior)                                            # (..., Iq, Jk) admitted pairs
+    delta = torch.where(live.unsqueeze(-1), b.unsqueeze(-3) - a.unsqueeze(-2),
+                        torch.zeros((), dtype=a.dtype, device=a.device))         # (..., Iq, Jk, r) b_j - a_i
+    W = torch.where(live[..., None, None], A.unsqueeze(-3) + B.unsqueeze(-4), eye)   # (..., Iq, Jk, r, r), symmetric
+    grid = W.shape[-4:-2]                                                       # (Iq, Jk)
+    if pairs is not None:                                                       # the admitted pairs only: (..., P)
+        W, delta = W.flatten(-4, -3).index_select(-3, pairs), delta.flatten(-3, -2).index_select(-2, pairs)
     L, info = torch.linalg.cholesky_ex(W)
+    bad = info != 0                                                             # (..., Iq, Jk) or (..., P)
+    L = torch.where(bad[..., None, None], eye, L)                               # a failed factor reads the identity
     z = torch.linalg.solve_triangular(L, delta.unsqueeze(-1), upper=False)       # (..., Iq, Jk, r, 1)
     r_ij = torch.linalg.solve_triangular(L.transpose(-1, -2), z, upper=True).squeeze(-1)   # W_ij^{-1}(b_j - a_i)
     W_inv = torch.cholesky_inverse(L)                                           # (..., Iq, Jk, r, r)
     cost = 0.5 * z.squeeze(-1).square().sum(dim=-1) + L.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)
+    if pairs is not None:                                                       # back to (..., Iq, Jk), 0 elsewhere
+        n = grid[0] * grid[1]
+        r_ij = _scatter_pairs(r_ij, pairs, n, -2).unflatten(-2, grid)
+        W_inv = _scatter_pairs(W_inv, pairs, n, -3).unflatten(-3, grid)
+        cost = _scatter_pairs(cost, pairs, n, -1).unflatten(-1, grid)
+        bad = _scatter_pairs(bad, pairs, n, -1).unflatten(-1, grid)
     logits = log_prior - cost                                                   # (..., Iq, Jk)
     t = logits.amax(dim=-1).detach()                                            # (..., Iq) tile row maximum
     shift = torch.where(torch.isfinite(t), t, torch.zeros_like(t))              # a fully masked tile row: 0
@@ -399,8 +561,21 @@ def _exact_tile(
     Lam = torch.einsum("...ij,...ijrs->...irs", e, W_inv)
     centered = r_ij - mean.unsqueeze(-2)                                        # (..., Iq, Jk, r)
     M2 = torch.einsum("...ij,...ijr,...ijs->...irs", e, centered, centered)
-    failed = (info != 0).any(dim=-1) | ~torch.isfinite(cost).all(dim=-1)        # (..., Iq) per receiver row
+    failed = bad.any(dim=-1) | ~torch.isfinite(cost).all(dim=-1)                # (..., Iq) per receiver row
     return cost, t, s, mean, Lam, M2, failed
+
+
+def _exact_tile_call(
+    pairs: Optional[torch.Tensor],     # (P,) the admitted pairs of a tile the prior masks in part, or None
+    grad:  bool,                       # autograd records the call
+    *args: torch.Tensor,               # the (a, A, b, B, log_prior) slices of the tile
+) -> Tuple[torch.Tensor, ...]:
+    r""":func:`_exact_tile` on one tile, through :class:`_IEEEFP32TileRecompute` under autograd (``t``, output 1, is
+    detached), directly otherwise."""
+    body = _exact_tile if pairs is None else functools.partial(_exact_tile, pairs=pairs)
+    if grad:
+        return _IEEEFP32TileRecompute.apply(body, (1,), *args)
+    return body(*args)
 
 
 def exact_record_posterior(
@@ -428,14 +603,19 @@ def exact_record_posterior(
 
     Every pair needs its own :math:`r\times r` Cholesky factor of :math:`W_{ij}`. One pass over bounded pair tiles
     (:data:`PAIR_TILE_BYTES` of :math:`W_{ij}`, its factor and :math:`W_{ij}^{-1}`), with an online log-sum-exp over the
-    source tiles (:func:`_exact_tile`), factors each pair once. A tile whose every pair the prior masks in every
-    batch element (above the causal diagonal) contributes exactly 0 to every sum, so it is skipped: it is not
-    factored and its entries of ``cost`` read 0 (their weights are exactly 0 either way). Each tile is a
-    non-reentrant checkpoint when gradients are on and the grid has more than one tile, and a grid of more than
-    one tile makes one host read of the tile mask. Autocast is disabled, the compute dtype is
-    ``_compute_dtype`` of the inputs, factorizations use zero jitter and no repair. ``check`` makes the one host
-    check for factorization failure and raises ``ValueError``; ``check=False`` returns the flag in ``failed`` for the
-    caller to fold into its own single check. Every row needs at least one finite prior entry.
+    source tiles (:func:`_exact_tile`), factors each admitted pair once. A pair the prior masks contributes exactly 0
+    to every sum and its entry of ``cost`` reads 0 (its weight is exactly 0 either way): a tile whose every pair the
+    prior masks in every batch element (above the causal diagonal) is skipped, a tile it masks in part factors only
+    the pairs some batch element admits (bitwise the full tile), and a masked pair of a factored tile enters as the
+    identity. The tile plan of a grid of more than one tile reads only the prior's support: one host read per prior
+    tensor, version and view (:func:`_tile_support_plan`), so a cached prior is read once and a checkpoint recompute
+    of the call reads nothing. Under autograd every tile, a lone tile included, runs through
+    :class:`_IEEEFP32TileRecompute`: its forward and backward GEMMs are IEEE fp32 whatever ``fp32_matmul_precision`` is,
+    and it saves only its input slices, as a non-reentrant checkpoint would (audit 2026-10-31 A014, A015). Autocast
+    is disabled, the compute dtype is ``_compute_dtype`` of the inputs, factorizations use zero jitter and no repair.
+    ``check`` makes the one host check for factorization failure and raises ``ValueError``; ``check=False`` returns
+    the flag in ``failed`` for the caller to fold into its own single check. Every row needs at least one finite
+    prior entry.
     """
     if a.dim() < 2 or b.dim() < 2 or a.shape[-1] != b.shape[-1]:
         raise ValueError("exact_record_posterior needs means (..., I, r) and (..., J, r) of one comparison rank")
@@ -453,17 +633,12 @@ def exact_record_posterior(
         budget = max(1, PAIR_TILE_BYTES // (element * max(1, math.prod(batch)) * 3 * r * r))
         q_step = max(1, min(I, 32, budget))
         k_step = max(1, min(J, budget // q_step))
-        tiled = (I > q_step or J > k_step) and torch.is_grad_enabled() and any(
-            x.requires_grad for x in (a, A, b, B, lp))
+        grad = torch.is_grad_enabled() and any(x.requires_grad for x in (a, A, b, B, lp))
         n_q, n_k = -(-I // q_step), -(-J // k_step)
-        if n_q * n_k > 1:
-            # A tile the prior masks in every batch element (the causal upper triangle) adds exactly 0 to every sum
-            # and is not factored; its costs read 0. One host read of the tile mask.
-            grid = torch.zeros(n_q * q_step, n_k * k_step, dtype=torch.bool, device=a.device)
-            grid[:I, :J] = torch.isfinite(lp).reshape(-1, I, J).any(dim=0)
-            live = grid.view(n_q, q_step, n_k, k_step).any(dim=3).any(dim=1).tolist()   # (n_q, n_k) bool
-        else:
-            live = [[True]]
+        # A tile the prior masks in every batch element (the causal upper triangle) adds exactly 0 to every sum and is
+        # not factored; a tile it masks in part factors only its admitted pairs. A lone tile, or a uniform prior, needs
+        # no plan (its masked pairs enter as the identity).
+        plan = _tile_support_plan(lp, q_step, k_step) if n_q * n_k > 1 and log_prior is not None else None
         rows, U_rows, Lam_rows, Q_rows, s_rows, flags = [], [], [], [], [], []
         for i in range(0, I, q_step):
             n_i = min(q_step, I - i)
@@ -480,16 +655,14 @@ def exact_record_posterior(
             Q = torch.zeros((*batch, n_i, r, r), dtype=dtype, device=a.device)
             columns = []
             for j in range(0, J, k_step):
-                if not live[i // q_step][j // k_step]:
+                tile = (i // q_step, j // k_step)
+                if plan is not None and not plan.live[tile[0]][tile[1]]:
                     columns.append(torch.zeros((*batch, n_i, min(k_step, J - j)), dtype=dtype, device=a.device))
                     continue
                 args = (a[..., i:i + q_step, :], A[..., i:i + q_step, :, :], b[..., j:j + k_step, :],
                         B[..., j:j + k_step, :, :], lp[..., i:i + q_step, j:j + k_step])
-                if tiled:
-                    out = checkpoint(_exact_tile, *args, use_reentrant=False, preserve_rng_state=False)
-                else:
-                    out = _exact_tile(*args)
-                cost, t, s_t, U_t, Lam_t, Q_t, failed = out                   # U_t tile mean, Q_t centered spread
+                cost, t, s_t, U_t, Lam_t, Q_t, failed = _exact_tile_call(
+                    None if plan is None else plan.pairs.get(tile), grad, *args)   # U_t tile mean, Q_t centered spread
                 m_new = torch.maximum(m, t)
                 shift = torch.where(torch.isfinite(m_new), m_new, torch.zeros_like(m_new))
                 old, new = torch.exp(m - shift), torch.exp(t - shift)          # (..., n_i), 0 where -inf
@@ -585,8 +758,10 @@ def mean_field_record_posterior(
     covariance once per layer: the KL is then the healthy centered
     GEMM of :func:`vfe3.relational_scoring.projected_gaussian_kl` on those factors, the label statistics read the
     same precision, and a non-finite cost is a failure flag. Values equal the unshared call to rounding (audit
-    2026-10-12 round 2, item 15). Under :func:`vfe3.relational_scoring.projected_condition_recovery`, which may
-    rebuild ill-conditioned factors in float64, the KL keeps its own factorization.
+    2026-10-12 round 2, item 15). The shared factors serve every ``projected_factorization``: without source tuples
+    the KL's own certificate can rebuild nothing (a flagged float32 entry keeps its factor), so refactoring under a
+    certified value bought two factorizations and a host read per label step and changed no value; the certificate
+    that acts is the readout's screen of its query covariances (audit 2026-10-31 A078).
     """
     if A.shape != (*a.shape, a.shape[-1]) or B.shape != (*b.shape, b.shape[-1]):
         raise ValueError("mean_field_record_posterior needs covariances (..., I, r, r) and (..., J, r, r)")
@@ -594,8 +769,7 @@ def mean_field_record_posterior(
     I, J = a.shape[-2], b.shape[-2]
     with torch.autocast(device_type=a.device.type, enabled=False):
         a, A, b, B = a.to(dtype), A.to(dtype), b.to(dtype), B.to(dtype)
-        shared = (factors is not None and query_logdet is not None and labels_only_cost
-                  and not projected_condition_recovery())
+        shared = factors is not None and query_logdet is not None and labels_only_cost
         if shared:
             cost = _projected_kl_gemm(a, b, A, factors.P, query_logdet.to(dtype), factors.logdet)   # (..., I, J)
         else:
@@ -629,12 +803,17 @@ def information_step(
     current Gaussian by :math:`\exp(-\tfrac12x^\top S^\top\Lambda Sx + x^\top S^\top\eta)`: the precision gains exactly
     :math:`S^\top\Lambda S` and the information vector :math:`S^\top\eta`. :math:`E` has eigenvalues at least 1, so no
     inverse of :math:`\Lambda` is formed. ``failed`` flags, per receiver, a failed factorization of
-    :math:`\Lambda` or :math:`E`.
+    :math:`\Lambda` or :math:`E`; a failed factor reads the identity before the solves and the inverse, so an exactly
+    singular float32 matrix (a zero pivot, on which ``cholesky_inverse`` raises) is a flag, not a ``LinAlgError``, and
+    the outputs stay finite placeholders (audit 2026-10-31 A026).
     """
     r = a.shape[-1]
+    eye = torch.eye(r, dtype=A.dtype, device=A.device)
     L, info_L = torch.linalg.cholesky_ex(Lambda)                                # (..., I, r, r)
-    E = _symmetrize(torch.eye(r, dtype=A.dtype, device=A.device) + L.transpose(-1, -2) @ A @ L)
+    L = torch.where((info_L != 0)[..., None, None], eye, L)
+    E = _symmetrize(eye + L.transpose(-1, -2) @ A @ L)
     L_E, info_E = torch.linalg.cholesky_ex(E)
+    L_E = torch.where((info_E != 0)[..., None, None], eye, L_E)
     v = (torch.linalg.solve_triangular(L, eta.unsqueeze(-1), upper=False)
          - L.transpose(-1, -2) @ a.unsqueeze(-1))                               # (..., I, r, 1)
     u = (L @ torch.cholesky_solve(v, L_E)).squeeze(-1)                          # (..., I, r)
@@ -929,13 +1108,15 @@ def _label_staleness(
     return tv.movedim(-1, -2).masked_fill(bad, math.nan)                        # (..., N, H)
 
 
+@ieee_fp32_matmul()
 def _label_spread_tile(
     weights: torch.Tensor,                      # (..., I, J) labels of the tile's receivers
     a:       torch.Tensor,                      # (..., I, r) posterior query means of the tile's receivers
     B_inv:   torch.Tensor,                      # (..., J, r, r) B_j^{-1}
     v:       torch.Tensor,                      # (..., J, r) B_j^{-1} b_j
 ) -> torch.Tensor:                              # (..., I, r, r)
-    r"""One receiver-row tile of :func:`label_spread`."""
+    r"""One receiver-row tile of :func:`label_spread`, pinned to IEEE fp32 itself, so its recompute in backward
+    reproduces the forward (audit 2026-10-31 A014)."""
     e = v.unsqueeze(-3) - torch.einsum("...jst,...it->...ijs", B_inv, a)       # (..., I, J, r) B_j^{-1}(b_j - a_i)
     mean = torch.einsum("...ij,...ijs->...is", weights, e)                      # (..., I, r) eta_i - Lambda_i a_i
     diff = e - mean.unsqueeze(-2)                                               # (..., I, J, r) d_ij
@@ -961,10 +1142,13 @@ def label_spread(
     accumulated about each row's own mean (the two-pass form of ``_centered_spread``, so the label average is not
     cancelled against a second moment) and positive semidefinite up to the rounding of that mean. One Cholesky factor
     per source; receiver rows are tiled so that one tile holds at most :data:`SPREAD_TILE_BYTES` of the
-    :math:`(I, J, r)` deviations, and each tile is a non-reentrant checkpoint under autograd when there is more than
-    one. No :math:`(I, J, r, r)` tensor is formed: the spread is a batched product over :math:`j`. Cost
-    :math:`O(IJr^2)` per batch element. ``factors`` is the label step's factorization of ``B`` (:func:`key_factors`),
-    so the readout factors it once (audit 2026-10-12 round 2, item 15).
+    :math:`(I, J, r)` deviations. Under autograd every tile, a lone tile included, runs through
+    :class:`vfe3.relational_scoring._IEEEFP32Recompute`: it saves only its inputs, as a non-reentrant checkpoint would,
+    and its forward and backward GEMMs are IEEE fp32 whatever ``fp32_matmul_precision`` is (under TF32 the gradient was
+    off by 38 percent when receivers and sources shared a common component of 300 spreads, in an emulation; audit
+    2026-10-31 A015). No :math:`(I, J, r, r)` tensor is formed: the spread is a batched product over
+    :math:`j`. Cost :math:`O(IJr^2)` per batch element. ``factors`` is the label step's factorization of ``B``
+    (:func:`key_factors`), so the readout factors it once (audit 2026-10-12 round 2, item 15).
     """
     if factors is None:
         factors = key_factors(b, B)
@@ -974,13 +1158,8 @@ def label_spread(
     batch = math.prod(torch.broadcast_shapes(weights.shape[:-2], a.shape[:-2], b.shape[:-2]))
     per_row = max(1, batch * J * r * a.element_size())
     step = max(1, min(I, SPREAD_TILE_BYTES // per_row))
-    tiles = []
-    for i in range(0, I, step):
-        args = (weights[..., i:i + step, :], a[..., i:i + step, :], B_inv, v)
-        if torch.is_grad_enabled() and step < I and any(x.requires_grad for x in args):
-            tiles.append(checkpoint(_label_spread_tile, *args, use_reentrant=False, preserve_rng_state=False))
-        else:
-            tiles.append(_label_spread_tile(*args))
+    tiles = [_ieee_fp32_autograd(_label_spread_tile, weights[..., i:i + step, :], a[..., i:i + step, :], B_inv, v)
+             for i in range(0, I, step)]                                        # (..., step, r, r) each
     spread = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-3)
     return _symmetrize(spread), factors.failed.any()
 
@@ -1133,7 +1312,7 @@ def minimal_agent_log_evidence(
     log probability of the record :math:`o_h = 0` given the records of heads :math:`1..h-1` under the collapsed
     Gaussian. For one head this is the exact :math:`\log p(o)`; for several it is exact when
     :math:`S_hC_iS_g^\top = 0` for :math:`h\ne g` (module docstring, Exactness). A head without a record contributes 0.
-    Detached, float64, no autograd; costs of a skipped masked tile (0) meet :math:`\log\hat\pi = -\infty` and add nothing.
+    Detached, float64, no autograd; the costs of masked pairs (0) meet :math:`\log\hat\pi = -\infty` and add nothing.
     """
     with torch.no_grad():
         cost, lp = cost.detach().to(torch.float64), lp.detach().to(torch.float64)
@@ -1292,10 +1471,11 @@ def minimal_agent_readout(
     folded into ``failed``. Under a certified ``projected_factorization`` a float32 call also screens every :math:`A^h`
     with the certificate into ``ill_conditioned``. ``check=True`` makes one host check and raises ``ValueError`` on
     a failure (a certificate alone does not raise); ``check=False`` returns both flags for the caller's single
-    check. The mean field's input covariances are factored here first, so ``projected_gaussian_kl`` (which keeps its
-    own host transfer) never receives a failed one. Requires :math:`n_h > 0`, every :math:`S_h` of full row rank and
-    :math:`C_i\succ 0`. ``rope`` applies the comparison-space rotation of the module docstring (labels depend on
-    position only through :math:`j - i`; ``query_covariance`` and ``key_covariance`` stay unrotated).
+    check. The mean field's input covariances are factored here first and its label KL reads those factors, so it
+    never receives a failed one and makes no host transfer of its own. Requires :math:`n_h > 0`, every :math:`S_h`
+    of full row rank and :math:`C_i\succ 0`. ``rope`` applies the comparison-space rotation of the module docstring
+    (labels depend on position only through :math:`j - i`; ``query_covariance`` and ``key_covariance`` stay
+    unrotated).
 
     ``spread_corrected`` (mean field only) also returns ``spread_gains`` :math:`P_iS_h^\top` (:func:`_spread_gains`) and
     ``label_spread`` :math:`R'^h_i` (:func:`label_spread`, in the record frame, 0 for a head without a record), from
@@ -1423,7 +1603,10 @@ def minimal_agent_readout(
             logdet_Q, bad_Q = _query_logdet(V_Q)                                # (..., N, H) each
             factors = key_factors(b, B)                                         # B_j: (..., H, N, d, d)
             bad_B = factors.failed                                              # (..., H, N)
-            flags += [bad_Q.any(), bad_B.any()]
+            # A flagged B_j reaches only the receivers that admit source j: a source no receiver admits (the last
+            # token of a self-masking prior) changes no output and raises no flag (audit 2026-10-31 A090). The source
+            # flags of the label statistics and the label spread are this one factorization's.
+            flags += [bad_Q.any(), (bad_B.unsqueeze(-2) & admissible).any()]
             receivers.append(bad_Q.any(dim=-1))                                 # (..., N)
             sources.append(bad_B)                                               # (..., H, N)
             V_Q_kl = torch.where(bad_Q[..., None, None], eye, V_Q)
@@ -1455,9 +1638,11 @@ def minimal_agent_readout(
                         eta=torch.einsum("nts,...hnt->...hns", Rot, step.eta))
                 weights.append(step.weights)
                 costs.append(step.cost)
-                flags.append(step.failed)
-                # step.failed is the flagged B_j (bad_B, in sources) or a non-finite label cost of a receiver row.
-                receivers.append((~torch.isfinite(step.cost)).any(dim=-1).any(dim=-2))   # (..., N)
+                # step.failed is the flagged B_j (folded above through admissibility) or a non-finite label cost of a
+                # receiver row; only the cost is new here.
+                nonfinite = (~torch.isfinite(step.cost)).any(dim=-1).any(dim=-2)    # (..., N)
+                flags.append(nonfinite.any())
+                receivers.append(nonfinite)
                 return step
 
             labels = label_step(a0_r, V_Q_r, logdet_r)                          # sweep 1: the input moments
@@ -1492,10 +1677,16 @@ def minimal_agent_readout(
             xi_plus, gains, M, _ = sequential_head_assembly(xi, X0, S, head_update)
         if diagnostics and inference == "mean_field":
             with torch.no_grad():                                               # gain fraction at the input moments
-                L_lab = torch.linalg.cholesky_ex(labels.Lambda)[0]               # (..., H, N, d, d) Lambda = L L^T
+                # A failed factor reads the identity before the inverse (a zero pivot raised there; audit 2026-10-31
+                # A026) and its receiver and head read NaN.
+                L_lab, info_lab = torch.linalg.cholesky_ex(labels.Lambda)        # (..., H, N, d, d) Lambda = L L^T
+                L_lab = torch.where((info_lab != 0)[..., None, None], eye, L_lab)
                 E0 = _symmetrize(eye + L_lab.transpose(-1, -2) @ V_Q.movedim(-3, -4) @ L_lab)
-                E0_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(E0)[0])
-                fractions.append(1.0 - torch.diagonal(E0_inv, dim1=-2, dim2=-1).sum(-1).movedim(-2, -1) / d)
+                L_E0, info_E0 = torch.linalg.cholesky_ex(E0)
+                bad_E0 = (info_lab != 0) | (info_E0 != 0)                        # (..., H, N)
+                E0_inv = torch.cholesky_inverse(torch.where(bad_E0[..., None, None], eye, L_E0))
+                fraction = 1.0 - torch.diagonal(E0_inv, dim1=-2, dim2=-1).sum(-1).movedim(-2, -1) / d
+                fractions.append(fraction.masked_fill(bad_E0.movedim(-2, -1), math.nan))   # (..., N, H)
         weights_out = torch.stack(weights, dim=-3) if inference == "exact" else weights[-1]   # (..., H, N, N)
         cost_out = torch.stack(costs, dim=-3) if inference == "exact" else costs[-1]
         gain_fraction = coupling = contraction = staleness = spread = mstep = mstep_boundary = None
@@ -1531,8 +1722,7 @@ def minimal_agent_readout(
             a_post = torch.einsum("hsk,...nk->...hns", S, xi_plus)              # (..., H, N, d) a^+
             if Rot is not None:
                 a_post = torch.einsum("nst,...hnt->...hns", Rot, a_post)
-            R_prime, bad_spread = label_spread(weights_out, a_post, b, B_kl, factors)   # (..., H, N, d, d)
-            flags.append(bad_spread)
+            R_prime, _ = label_spread(weights_out, a_post, b, B_kl, factors)   # (..., H, N, d, d); its flag is bad_B
             if Rot is not None:
                 R_prime = _symmetrize(torch.einsum("nts,...hntu,nuv->...hnsv", Rot, R_prime, Rot))
             R_prime = torch.where(no_record[..., None, None], torch.zeros((), dtype=dtype, device=xi.device), R_prime)
@@ -1591,7 +1781,7 @@ def minimal_agent_readout(
 
 def local_covariance(
     C:              torch.Tensor,               # (..., N, G, g, g) blocks (diagonal on block frames) or (..., N, K, K)
-    forward:        torch.Tensor,               # (..., N, G, g, g) compact or (..., N, K, K) dense U_i
+    forward:        Optional[torch.Tensor],     # (..., N, G, g, g) compact or (..., N, K, K) dense U_i; None: identity
     block_diagonal: bool,
     diagonal:       bool,                       # return diag(U_i C_i U_i^T) (..., N, K)
 ) -> torch.Tensor:                              # (..., N, K) or (..., N, K, K)
@@ -1600,7 +1790,13 @@ def local_covariance(
     ``C`` is laid out as ``RelationalOperators._reference_covariance`` returns it: the :math:`G` diagonal blocks
     :math:`C_{i,m}` for diagonal beliefs on block frames (then
     :math:`[U_iC_iU_i^\top]_{kk} = \sum_{ab}U_{i,m,ka}C_{i,m,ab}U_{i,m,kb}` per block, :math:`O(NKg)`), else dense.
+    ``forward=None`` is the identity frame: the diagonal of ``C`` (blockwise), or ``C``, bitwise the identity products.
     """
+    if forward is None:
+        if diagonal:
+            values = torch.diagonal(C, dim1=-2, dim2=-1)                        # (..., N, G, g) or (..., N, K)
+            return values.flatten(-2) if block_diagonal else values
+        return _symmetrize(C)
     if block_diagonal and diagonal:
         return torch.einsum("...nmab,...nmbc,...nmac->...nma", forward, C, forward).flatten(-2)   # (..., N, K)
     U = forward
@@ -1615,7 +1811,7 @@ def local_covariance(
 
 def local_posterior_covariance(
     sigma:          torch.Tensor,               # (..., N, K) diagonal or (..., N, K, K) full input Sigma_i
-    forward:        torch.Tensor,               # (..., N, G, g, g) compact or (..., N, K, K) dense U_i
+    forward:        Optional[torch.Tensor],     # (..., N, G, g, g) compact or (..., N, K, K) dense U_i; None: identity
     block_diagonal: bool,
     gains:          torch.Tensor,               # (..., N, H, K, d) Kmat_i^h
     M:              torch.Tensor,               # (..., N, H, d, d) M_i^h
@@ -1654,6 +1850,10 @@ def local_posterior_covariance(
     the term :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`, is added (its row quadratic forms on
     the diagonal family), which is :math:`U_i(\sum_hP_iS_h^\top R'^h_iS_hP_i)U_i^\top`. Without them the arithmetic is
     the moment-matched one, operation for operation.
+
+    ``forward=None`` is the identity frame (the reference coordinates of ``gaussian_frame_diagonal``): :math:`Z_i^h`
+    is :math:`\mathsf K_i^h` itself, bitwise the identity product, with no :math:`(\ldots, N, H, K, d)` copy formed
+    (audit 2026-10-25 optimization row 2; 2026-10-31 A194), and ``reference`` reads the diagonal of :math:`C_i`.
     """
     if floor.shape != sigma.shape:
         raise ValueError(f"the floor must have the covariance's shape {tuple(sigma.shape)}, got {tuple(floor.shape)}")
@@ -1664,6 +1864,8 @@ def local_posterior_covariance(
         sigma = local_covariance(reference, forward, block_diagonal, diagonal=sigma.dim() == gains.dim() - 2)
 
     def local(X: torch.Tensor) -> torch.Tensor:                                 # (..., N, H, K, d) -> U_i X
+        if forward is None:                                                     # the identity frame: U_i X = X
+            return X
         if block_diagonal:
             G, g = forward.shape[-3], forward.shape[-1]
             return torch.einsum("...nmab,...nhmbs->...nhmas", forward,

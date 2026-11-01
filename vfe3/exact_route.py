@@ -5,7 +5,8 @@ leaving every other key as given:
 
 * attention is exact Bayesian conditioning, the minimal agent's exact source posterior with its posterior covariance
   (``projected_predictive``, ``predictive_readout='minimal_agent'``, ``minimal_agent_inference='exact'``,
-  ``predictive_covariance='moment_matched'``);
+  ``predictive_covariance='moment_matched'``), with no Loewner ceiling clamping it
+  (``predictive_covariance_ceiling=None``);
 * the block MLP slot is the exact cue/result memory, one switching linear-Gaussian step with Bayesian regime
   selection, in reference coordinates, with no block norm between attention and the memory (``cue_result_memory``,
   ``block_mlp_inference='exact'``, ``block_mlp_covariance='posterior'``, no dropout, no EM term,
@@ -15,24 +16,31 @@ leaving every other key as given:
 * the belief family is the covariant diagonal one, ``gaussian_frame_diagonal``, which stores the reference variances
   :math:`c_i = \operatorname{diag}(U_i^{-1}\Sigma_iU_i^{-\top})` (so every consumer, the minimal agent, the memory and the
   decoder, reads the reference moments and the diagonal truncation commutes with frame changes), with the Gaussian-KL
-  ``diagonal_chunked`` decoder at unit temperature and an untied decode bank (``decode_tau=1``);
+  ``diagonal_chunked`` decoder at unit temperature on the belief's own covariance and an untied decode bank
+  (``decode_tau=1``, ``decode_covariance='belief'``, so the logit is the exact :math:`-\mathrm{KL}(q^*\|p_v)`);
 * everything :func:`vfe3.gauge_covariant.fully_gauge_covariant_overrides` requires on top of that (frame transport on,
-  reference decoding, no fixed-coordinate caps or trust regions, the total-KL self term), except the frame condition
-  bound ``phi_frame_condition_max``, which is kept as configured.
+  reference decoding, no fixed-coordinate caps or trust regions, no type-level frame dropout, the total-KL self term),
+  except the frame condition bound ``phi_frame_condition_max``, which is kept as configured. The frame dropout is not
+  kept like the bound: it acts in every training forward, which it makes frame dependent (audit 2026-10-31,
+  gauge-covariance-e2e-2).
 
 The frame condition bound is an M-step constraint on the frame table, not part of inference: after an optimizer step
 it projects each frame back to :math:`\operatorname{cond}_2(U_i) \le \kappa_{\max}`. Every forward pass is still exact
-inference on the projected parameters, and the forward map stays covariant; what the bound breaks is the gauge
-invariance of the training trajectory (the constraint set is not invariant under :math:`U_i 	o g_iU_i`), so the run's
-pure-path report shows ``no_phi_mstep_chart_cap`` false whenever the bound is set. Set it to None for the strictly
-covariant route.
+inference on the projected parameters, and the forward map stays covariant. The training trajectory is gauge dependent
+already without the bound: the frame M-step is chart AdamW (``m_phi_update_mode='adamw'``, set by the gauge switch) on
+the exponential coordinates of the frame table, whose transformation :math:`X \mapsto \log(g e^X)` under the left
+action is nonlinear and whose second-moment normalization is coordinatewise, so one step does not commute with
+:math:`U_i \to g_iU_i`. The bound adds a constraint set that is not invariant under that action either, so the run's
+pure-path report shows ``no_phi_mstep_chart_cap`` false whenever the bound is set. Set it to None for the route whose
+forward map and constraints are covariant; no setting here makes the optimizer's trajectory covariant.
 
 Each layer is then exact inference in a declared per-agent model, collapsed to the stored Gaussian once per step:
 attention conditions the receiver on its peers' records, and the memory conditions the result on the cue record. The
 collapses (assumed-density filtering over heads and to one Gaussian, and the diagonal M-projection of the family) are
 the declared approximations; nothing else in the chain is a neural map. Training still uses the outer next-token
 gradient. Not touched: the regression rank and result noise of the memory, the regime trust :math:`\beta` and stay
-probability, the routing prior, the predictive covariance floor, the learning rates, the shape and the numerics.
+probability, the routing prior, the predictive covariance floor (:math:`f\Sigma_p`, a declared approximation of the
+posterior covariance kept as configured; the ceiling is turned off), the learning rates, the shape and the numerics.
 
 The local-diagonal family ``gaussian_diagonal`` is not used: its diagonal projection in local coordinates does not
 commute with frame changes, and the memory would need the dense :math:`C_i = U_i^{-1}\operatorname{diag}(\sigma_i)U_i^{-\top}`.
@@ -47,10 +55,12 @@ EXACT_ROUTE_SETTINGS: Mapping[str, Any] = {
     "predictive_readout":      "minimal_agent",
     "minimal_agent_inference": "exact",
     "predictive_covariance":   "moment_matched",
+    "predictive_covariance_ceiling": None,
     "family":                  "gaussian_frame_diagonal",
     "decode_mode":             "diagonal_chunked",
     "untie_decode_bank":       True,
     "decode_tau":              1.0,
+    "decode_covariance":       "belief",
     "decode_second_order":     False,
     "norm_type_block":         "none",
     "block_coordinates":       "reference",

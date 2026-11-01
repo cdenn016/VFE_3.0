@@ -16,7 +16,10 @@ torch normalizes, :math:`\log w_{ia} = \ell_{ia} - \operatorname{LSE}_b\ell_{ib}
 tiles, so the variance is a sum of non-negative terms with no cancellation.
 
 The log weights are formed relative to the row maximum, :math:`(\ell_{ia} - s_i) - \log l_i`, never by subtracting
-the absolute log evidence (audit 2026-10-25 F01).
+the absolute log evidence (audit 2026-10-25 F01). The kernel's :math:`\ell_{ia}` omits the common constant
+:math:`-\tfrac K2\log 2\pi`, which cancels there; the log evidence :math:`(s_i + \log l_i) - \tfrac K2\log 2\pi` is
+formed in torch in the route's dtype, since a compiled launch would type a Python float argument fp32 (audit
+2026-10-31 A089). No Python float reaches a launch.
 
 Backward, for incoming :math:`\bar g^m, \bar g^v` (rows, K), :math:`\bar g^{\log w}` (rows, M) and
 :math:`\bar g^{\log Z}` (rows,): with :math:`\bar m = w(\bar g^m + 2\bar g^v(m^Y - \bar m_{ik}))` and
@@ -53,14 +56,20 @@ which is also :math:`\partial L/\partial\log\hat\pi_{ia}`. With :math:`a = \sum_
 The :math:`\bar p` and :math:`\bar V` forms are the leave-one-out adjoints written with the full :math:`\bar G` minus
 the coordinate's own term :math:`\iota\bar vU_rU_s`; their rounding error is relative to the self terms they contain,
 not to the variance. (``cr_bwd_rows_kernel`` owns :math:`\bar\xi, \bar c`; ``cr_bwd_cols_kernel`` owns the parameter sums, one partial per
-row split, summed in torch). Rows are processed in chunks of ``row_chunk`` so the planes stay bounded. The kernels use
-no atomics, so results are bitwise reproducible for a fixed GPU, shape and dtype. ``triton`` is imported only when
-this route launches; CPU tensors run the torch route.
+row split, summed in torch). The indicator :math:`\iota` is computed once, in ``cr_bwd_pairs_kernel``, and the rows
+and column kernels read its packed bits (audit 2026-10-31 A087). Where the forward recomputed an off-axis sum directly
+(rank two or more, the leave-one-out contraction below
+:math:`2^{12}\epsilon\lvert U_k\rvert^2\operatorname{tr}G^{(-k)}`; A085), the value is a sum of nonnegative terms and
+:math:`\iota = 1`, while the adjoints keep the Gram forms above: :math:`2G^{(-k)}U_k` there is accurate to about
+:math:`\epsilon\lvert G^{(-k)}\rvert\lvert U_k\rvert/\lvert G^{(-k)}U_k\rvert` (the torch route differentiates the
+direct sum). Rows are processed in chunks of ``row_chunk`` so the planes stay bounded. The kernels use no atomics, so results are bitwise reproducible for a fixed GPU, shape and dtype. ``triton``
+is imported only when this route launches; CPU tensors run the torch route.
 """
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
-from torch.autograd.function import once_differentiable
+
+from vfe3.kernels._autograd import strict_once_differentiable
 
 _KERNELS: Any = None
 MAX_RANK = 4                                     # ranks above this run the torch route's register budget out
@@ -95,26 +104,46 @@ def _rank_pad(rank: int) -> int:
 
 
 def _tile_k() -> int:
-    r"""The coordinate tile width BK shared by every kernel (the Gram partials are stored per tile of this width)."""
+    r"""The coordinate tile width BK shared by every kernel (the Gram partials are stored per tile of this width).
+
+    At most 32: the pairs kernel packs a tile's clamp indicators into one int32 per (tile, row, component), bit
+    k - k0, and the rows and column kernels unpack them with a shift by the lane, which is undefined at 32 and above
+    (in practice every lane past 31 would read lane 31's indicator; audit 2026-10-31 A341)."""
     widths = {cfg["BK"] for cfg in _kernels().launch_config().values()}
     if len(widths) != 1:
         raise RuntimeError(f"the fused cue/result kernels must share one BK, got {sorted(widths)}")
-    return widths.pop()
+    bk = widths.pop()
+    if not 1 <= bk <= 32:
+        raise RuntimeError(f"the fused cue/result kernels pack one coordinate tile's indicator bits into an int32, so "
+                           f"BK must be at most 32; got {bk}")
+    return bk
 
 
-def plane_count(rank: int, K: int, bk: int = 32) -> int:
+def _weights_kernel(tk: Any, cfg: Dict[str, Dict[str, Any]]) -> Any:
+    r"""The weights kernel ``launch_config()["fwd_weights"]`` selects: the register accumulation of the exclusive Gram
+    tile sums (default), or the two-scan form (``scan_tile_sums``; audit 2026-10-31 A200). The forward and the
+    backward's rerun read the same configuration, so they build the same planes."""
+    scan = cfg["fwd_weights"].get("scan_tile_sums", False)
+    return tk.cr_fwd_weights_scan_kernel if scan else tk.cr_fwd_weights_kernel
+
+
+def plane_count(rank: int, K: int, bk: Optional[int] = None) -> int:
     r"""(rows, M)-sized buffers per row the route holds at once: in the backward, t and tbar (RP each), the
     exclusive Gram tile sums (RP^2 per coordinate tile of width ``bk``) and Gbar (RP^2), with a factor two of slack,
-    plus the log weights, their scratch, wbar and the int32 indicator bits (one per coordinate tile)."""
+    plus the log weights, their scratch, wbar and the int32 indicator bits (one per coordinate tile). ``bk`` defaults
+    to the kernels' shared tile width (:func:`_tile_k`, which imports the kernels), so the budget follows a change of
+    ``launch_config`` (audit 2026-10-31 A343)."""
     RP = _rank_pad(rank)
-    nkt = _cdiv(K, bk)
+    nkt = _cdiv(K, _tile_k() if bk is None else bk)
     return 2 * (2 * RP + RP * RP * (nkt + 1)) + 3 + nkt
 
 
 class CueResultDiagonalLowRank(torch.autograd.Function):
     r"""The fused exact posterior on diagonal records with :math:`F_a = I + U_aV_a^\top`; see the module docstring.
 
-    The backward is ``once_differentiable``: its planes are Triton writes autograd does not track.
+    The backward is once differentiable: its planes are Triton writes autograd does not track, so a second
+    derivative through it raises, also toward a leaf upstream of an input (``strict_once_differentiable``; audit
+    2026-10-31 triton-kernels-2).
     """
 
     @staticmethod
@@ -140,6 +169,9 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
         acc = not tk.INTERPRETED
         cfg = tk.launch_config()
         NKT = _cdiv(K, _tile_k())
+        weights_kernel = _weights_kernel(tk, cfg)
+        # Added to the log evidence in torch, in the route's dtype: a Python float kernel argument is typed fp32 in a
+        # compiled launch, which rounded it on the float64 route (audit 2026-10-31 A089). It cancels in the weights.
         half_k_log2pi = 0.5 * K * float(torch.log(torch.tensor(2.0 * torch.pi, dtype=torch.float64)))
         mean = torch.empty(R, K, dtype=dtype, device=device)
         var = torch.empty(R, K, dtype=dtype, device=device)
@@ -157,8 +189,8 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 GP = torch.empty(RP * RP * NKT, Rc, M, dtype=dtype, device=device)   # (RP^2 NKT, Rc, M) Gram partials
                 logw = torch.empty(Rc, M, dtype=dtype, device=device)
                 f = cfg["fwd_weights"]
-                tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
-                    xs, cs, nu, lam, V, lps, logw, T, GP, Rc, M, K, NKT, M if per_token else 0, half_k_log2pi,
+                weights_kernel[(Rc, _cdiv(M, f["BA"]))](
+                    xs, cs, nu, lam, V, lps, logw, T, GP, Rc, M, K, NKT, M if per_token else 0,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=True, NKTP=_rank_pad(NKT),
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 # Shift and scaled mass kept apart: subtracting the absolute log evidence rounds its log l increment
@@ -168,7 +200,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 logw.sub_(shift.unsqueeze(-1))                                  # l - s, formed once (rank 15)
                 log_l = torch.log(torch.exp(logw).sum(-1))                                  # (Rc,)
                 torch.sub(logw, log_l.unsqueeze(-1), out=logwn[r0:r1])
-                log_ev[r0:r1] = shift + log_l
+                log_ev[r0:r1] = (shift + log_l) - half_k_log2pi
                 f = cfg["fwd_moments"]
                 tk.cr_fwd_moments_kernel[(Rc, _cdiv(K, f["BK"]))](
                     xs, cs, nu, lam, omega, q, U, V, logwn[r0:r1], T, GP, mean[r0:r1], var[r0:r1], Rc, M, K, NKT,
@@ -179,11 +211,10 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
         # zero tensors, and the backward skips their terms (docs/perf-investigation_2026-10-28.md, rank 11).
         ctx.set_materialize_grads(False)
         ctx.row_chunk = row_chunk
-        ctx.half_k_log2pi = half_k_log2pi
         return mean, var, logwn, log_ev
 
     @staticmethod
-    @once_differentiable
+    @strict_once_differentiable
     def backward(ctx: Any, g_mean: Optional[torch.Tensor], g_var: Optional[torch.Tensor],
                  g_logw: Optional[torch.Tensor], g_lev: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
@@ -196,6 +227,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
         acc = not tk.INTERPRETED
         cfg = tk.launch_config()
         NKT = _cdiv(K, _tile_k())
+        weights_kernel = _weights_kernel(tk, cfg)
         zeros = lambda *shape: torch.zeros(*shape, dtype=dtype, device=device)       # noqa: E731
         g_mean = zeros(R, K) if g_mean is None else g_mean.contiguous()
         g_var = zeros(R, K) if g_var is None else g_var.contiguous()
@@ -215,13 +247,14 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 T, GP = empty(RP, Rc, M), empty(RP * RP * NKT, Rc, M)
                 TB, GB = empty(RP, Rc, M), empty(RP * RP, Rc, M)
                 wbar = torch.empty(Rc, M, dtype=dtype, device=device)
-                ind_bits = torch.empty(NKT, Rc, M, dtype=torch.int32, device=device)   # pairs -> rows (rank 2)
+                # pairs -> rows (rank 2) and cols (audit 2026-10-31 A087): one clamp indicator for every kernel
+                ind_bits = torch.empty(NKT, Rc, M, dtype=torch.int32, device=device)
                 # The weights kernel rewrites the t and Gram partial planes of these rows; it writes no log weights
                 # (the saved normalized ones are used; rank 13), so LOGW is an unused pointer.
                 f = cfg["fwd_weights"]
-                tk.cr_fwd_weights_kernel[(Rc, _cdiv(M, f["BA"]))](
+                weights_kernel[(Rc, _cdiv(M, f["BA"]))](
                     x[r0:r1], c[r0:r1], nu, lam, V, lp[r0:r1] if per_token else lp, wbar, T, GP, Rc, M, K, NKT,
-                    M if per_token else 0, ctx.half_k_log2pi,
+                    M if per_token else 0,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc, WRITE_LOGW=False, NKTP=_rank_pad(NKT),
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 f = cfg["bwd_pairs"]
@@ -258,7 +291,7 @@ class CueResultDiagonalLowRank(torch.autograd.Function):
                 # Every split stores every (a, k) of its partials, an empty split its zero accumulators (rank 3).
                 parts = [empty(splits, M, K) for _ in range(4)] + [empty(splits, M, K, rank) for _ in range(2)]
                 tk.cr_bwd_cols_kernel[(_cdiv(M, f["BA"]), _cdiv(K, f["BK"]), splits)](
-                    *args_rows, T, GP, TB, GB, lbar, *parts, Rc, M, K, NKT, per_split,
+                    *args_rows, T, GP, TB, GB, lbar, ind_bits, *parts, Rc, M, K, NKT, per_split,
                     BA=f["BA"], BK=f["BK"], RANK=rank, RP=RP, ACC=acc,
                     num_warps=f["num_warps"], num_stages=f["num_stages"])
                 for total, part in zip((dnu, dlam, domega, dq, dU, dV), parts):

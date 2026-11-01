@@ -22,7 +22,10 @@ def set_fp32_matmul_precision(policy: Optional[str]) -> None:
 
     ``torch.use_deterministic_algorithms(True)`` does NOT constrain TF32, so this is a genuinely
     independent axis and not implied by ``deterministic``. Setting it CAN change training numerics
-    on a TF32-capable card, which is why the default leaves it alone.
+    on a TF32-capable card. Runs set it through ``VFE3Config.fp32_matmul_precision``, which the model
+    constructor applies (:class:`vfe3.model.model.VFEModel`); its default is ``"highest"`` (IEEE fp32,
+    no TF32), and None leaves the card as it is. The ``fp32_matmul_precision`` argument of
+    :func:`seed_everything` is for library callers; no launcher passes it.
     """
     if policy is None:
         return
@@ -44,12 +47,15 @@ def ieee_fp32_matmul() -> Iterator[None]:
     r"""Run the enclosed fp32 GEMMs under IEEE fp32 (``"highest"``), then restore the process policy.
 
     For code whose accuracy contract assumes IEEE fp32 multiplication, unit roundoff
-    :math:`u = 2^{-23}`: TF32 (``"high"``) or bf16 (``"medium"``) inputs round to :math:`2^{-10}` or
-    :math:`2^{-7}` and void it. The policy is restored on every exit path, including exceptions, and
+    :math:`u = 2^{-23}`: TF32 inputs round to :math:`2^{-10}` and void it. ``"high"`` and ``"medium"`` both set
+    cuBLAS to TF32 (``torch.backends.cuda.matmul.fp32_precision``); ``"medium"`` lets only oneDNN CPU GEMMs use
+    bf16 (:math:`2^{-7}`). The policy is restored on every exit path, including exceptions, and
     the context also works as a function decorator. Only the GEMMs it encloses are pinned: the autograd
     backward of a pinned forward runs later under the caller's policy, unless the code pins its own backward
-    (``vfe3.relational_scoring._GramPrecision``, and ``_IEEEFP32Recompute`` for the pair-KL GEMMs of
-    ``projected_gaussian_kl``, run their backward inside this context).
+    (``vfe3.relational_scoring._GramPrecision``, ``_IEEEFP32Recompute`` for the pair-KL GEMMs of
+    ``projected_gaussian_kl`` and the minimal agent's label-spread tiles, and
+    ``vfe3.model.minimal_agent._IEEEFP32TileRecompute`` for its exact tiles run their backward inside this context),
+    and a checkpointed callable pins its recompute only if it carries this context itself.
     """
     previous = torch.get_float32_matmul_precision()
     if previous == "highest":
@@ -121,9 +127,9 @@ def _fp32_matmul_precision() -> Dict[str, object]:
 
     RECORDING is unconditional and cannot change numerics -- it reads the backend BACK rather than
     echoing whatever was requested, so a request that a torch version silently ignored still shows up
-    here as the effective policy. SETTING is opt-in through ``cfg.fp32_matmul_precision`` /
-    :func:`set_fp32_matmul_precision`, defaulting to None ("leave the card as it is"), because on a
-    TF32-capable card pinning it would change results mid-project.
+    here as the effective policy. SETTING goes through ``cfg.fp32_matmul_precision``, which the model
+    constructor applies (default ``"highest"``, IEEE fp32; None leaves the card as it is), or through
+    :func:`set_fp32_matmul_precision` directly.
     """
     state: Dict[str, object] = {}
     try:                                   # torch >= 2.9 typed accessor

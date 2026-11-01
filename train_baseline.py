@@ -107,7 +107,8 @@ LABEL: Optional[str] = None         # stable run-folder label; None -> <dataset>
 # The baseline's peak lr (6e-4) was set for a 30,000-step run; the budget here is five times longer, so
 # select it on validation. Each launch sweeps its own arm (with PER_TYPE_TABLE="block_read" the read-map
 # lr follows the swept lr) and trains the winner. A short schedule favors larger lr, so a winner at the
-# top of the grid (3e-3) means the grid should be extended, not trusted. Set () to skip the sweep.
+# top of the grid (its largest rate) means the grid should be extended, not trusted; main() warns on a
+# winner at either edge. Set () to skip the sweep.
 LR_SWEEP: Sequence[float] = (7e-4, 1e-3, 3e-3, 5e-3, 6e-3)    # validation-only selection
 LR_SWEEP_STEPS = 6000
 
@@ -236,9 +237,16 @@ def _select_loader(
 
 
 def _default_label(cfg: BaselineConfig, dataset: str) -> str:
+    r"""``<dataset>_K<K>_baseline[_<per_type_table>][_post_shared]_s<seed>``: every arm type has its own label.
+
+    A ``block_read`` arm keeps its historical label; ``block_rw`` and the shared post-norm layout are named
+    too, so those arms launched through ``OVERRIDES`` are not filed as the plain baseline (audit 2026-10-31,
+    baseline-generation-7).
+    """
     _validate_path_component(dataset, "dataset")
-    table = "_block_read" if cfg.per_type_table == "block_read" else ""
-    return f"{dataset}_K{cfg.embed_dim}_baseline{table}_s{cfg.seed}"
+    table = f"_{cfg.per_type_table}" if cfg.per_type_table != "none" else ""
+    norm = "_post_shared" if cfg.norm_placement == "post_shared" else ""
+    return f"{dataset}_K{cfg.embed_dim}_baseline{table}{norm}_s{cfg.seed}"
 
 
 def run_baseline(

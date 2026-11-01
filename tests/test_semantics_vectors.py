@@ -1102,7 +1102,8 @@ def test_analogy_macro_average_weights_categories_equally() -> None:
     assert macro["n_categories"] == 2 and macro["category_n"] == {"family": 90, "gram8-plural": 30}
     only_b = macro["methods"]["only_b"]["acc"]
     assert only_b["mean"] == pytest.approx(0.25) and only_b["ci_lo"] < 0.25 < only_b["ci_hi"]
-    assert only_b["ci_method"] == "bootstrap over pairs"
+    # the zero-hit category's ratio is drawn from its Beta posterior (audit 2026-10-31 semantics-vectors-1)
+    assert only_b["ci_method"].startswith("bootstrap over pairs; 1 category")
     assert overall["largest_category"] == "family" and overall["largest_category_share"] == pytest.approx(0.75)
     for m in bench["methods"]:
         for stat in ("acc", "hits5", "mrr"):
