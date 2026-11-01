@@ -284,11 +284,17 @@ def test_noisy_score_key_volume_and_capture_match_the_dense_route(monkeypatch: p
     assert new[2].keys() == old[2].keys() == ({"key_log_volume"} if reference == "query_shifted" else set())
     for key in new[2]:
         torch.testing.assert_close(new[2][key], old[2][key], rtol=1e-12, atol=1e-12)
-    assert "score_term_medians_pre" not in new[1] and "score_term_medians_pre" not in old[1]
+    # The dense route forms no cost terms; the diagonal noisy_key route records those of its broadened key law
+    # g_j + n_h (audit 2026-10-31 A255), and noisy_query, which is not a Gaussian KL, none.
+    assert "score_term_medians_pre" not in old[1]
+    assert ("score_term_medians_pre" in new[1]) == (routing == "noisy_key")
+    # The diagonal route captures diag P(G) (audit 2026-10-31 A142); the old dense route captured the matrix.
+    assert new[1]["projected_covariance_diagonal_pre"] is True and old[1]["projected_covariance_diagonal_pre"] is False
     for key in ("projected_covariance_pre", "projected_key_covariance_pre", "score_query_constant_pre"):
         assert (key in new[1]) == (key in old[1])
         if key in new[1]:
-            torch.testing.assert_close(new[1][key], old[1][key], rtol=1e-12, atol=1e-12)
+            value = torch.diag_embed(new[1][key]) if key != "score_query_constant_pre" else new[1][key]
+            torch.testing.assert_close(value, old[1][key], rtol=1e-12, atol=1e-12)
 
 
 def test_diagonal_noisy_query_tiles_match_one_tile(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,8 +339,8 @@ def _per_edge_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
     r"""The previous context: the sender coefficient broadcast to every edge and zeroed on unrouted pairs."""
     original = el.edge_coefficients
 
-    def broadcast(A: torch.Tensor, B_: torch.Tensor, beta: torch.Tensor, mode: str) -> Any:
-        Phi, g_phi, mask = original(A, B_, beta, mode)
+    def broadcast(A: torch.Tensor, B_: torch.Tensor, beta: torch.Tensor, mode: str, causal: bool = False) -> Any:
+        Phi, g_phi, mask = original(A, B_, beta, mode, causal)
         if mode == "pure_gauge":
             Phi = torch.where(mask[..., None, None], Phi.unsqueeze(-4), Phi.new_zeros(()))   # (..., N, N, r, r)
         return Phi, g_phi, mask

@@ -715,7 +715,8 @@ def plot_numerics(run: RunRecord, out_dir: Path, *, stem: str = "s1_numerics") -
                 ax.plot(entry["step"], entry["scale_rms"], color=color, label=f"layer {layer}", **style())
                 ax.plot(entry["step"], entry["M_sigma_max"], color=color, **style("--", "s"))
             ax.set_yscale("log")
-            ax.set_ylabel(r"common scale (o), $\sigma_{\max}(O_hT_h)$ (s)")
+            # M_h is the head transfer: the chart's receiving map times T_h (O_h T_h under the affine chart only).
+            ax.set_ylabel(r"common scale (o), $\sigma_{\max}(M_h)$ (s)")
             ax.set_title("Map scales (head median)")
             _step_axis(ax, figs, last_step)
             ax.legend(frameon=False, ncol=2, loc="center left")

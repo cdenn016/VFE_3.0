@@ -15,10 +15,11 @@ EVERY one of those across seeds and emits the full figure + data set in one pass
 Click-to-run (project policy: no argparse): edit ``CONFIG`` below, then ``python multiseed_analysis.py``.
 ``run_root`` resolves a bare run-folder name under ``vfe3_runs/`` (so ``"K=20_GL(10)"`` just works).
 
-Caveat carried into every output: the per-run reseed (train_vfe3) currently shares the data-shuffle
-order across seeds, so this SD is the init+optimization spread only -- a LOWER BOUND on deployment
-variance. A fixed data-order generator (model-init RNG varies, batch order held) is the companion fix;
-see docs/experiments/2026-06-21-experiment-readiness.md (S6).
+Caveat carried into every output: the seeds share one training data order only when ``train_vfe3.DATA_SEED``
+is an explicit integer common to every seed, and then this SD is the init+optimization spread only, a LOWER
+BOUND on deployment variance. ``DATA_SEED = None`` seeds each run's training-order generator from its own
+model seed, so the seeds train on different orders and the SD includes data-order variance. The digest
+reads each seed's recorded ``data_seed`` and states which case holds (``_data_order_status``).
 """
 from __future__ import annotations
 
@@ -350,6 +351,10 @@ def _provenance_contract(run_dir: Path) -> Dict[str, object]:
         "git_dirty": git_dirty,
         "git_dirty_fingerprint": dirty_fingerprint,
     }
+    for key in _EXECUTABLE_IDENTITY_KEYS:
+        identity = provenance.get(key)
+        if isinstance(identity, str) and re.fullmatch(r"[0-9a-fA-F]{64}", identity) is not None:
+            contract[key] = identity.lower()
     for split in ("train", "val", "test"):
         digest = provenance.get(f"{split}_data_sha256")
         n_tokens = provenance.get(f"{split}_data_n_tokens")
@@ -480,6 +485,22 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
 
 
 _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
+# The executable-source identities of vfe3.run_artifacts._package_code_identity (the package sources and the root
+# drivers' executable logic): the digest at run start and the one the process imported. A seed that records them is
+# compared by them alone, so an edit to an untracked or non-source file between seeds (notes, media, a tracked log)
+# leaves the cohort comparable, while the Git triple stays descriptive; a record without them is compared by the Git
+# triple (audit 2026-10-31 artifacts-finalize-2).
+_EXECUTABLE_IDENTITY_KEY = "code_identity_sha256"
+_EXECUTABLE_IDENTITY_KEYS = (_EXECUTABLE_IDENTITY_KEY, "process_code_identity_sha256")
+
+
+def _comparable_code_identity(contract: Mapping[str, object]) -> Dict[str, object]:
+    r"""The code identity seeds are compared by: the executable-source digests when recorded, else the Git triple."""
+    if isinstance(contract.get(_EXECUTABLE_IDENTITY_KEY), str):
+        return {key: contract[key] for key in _EXECUTABLE_IDENTITY_KEYS if key in contract}
+    return {key: contract[key] for key in _CODE_IDENTITY_KEYS}
+
+
 # The data-order seed is reported through ``_data_order_status``, the digest and the noise-band caption;
 # it is not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
 # aggregates, with the 'distinct' status recorded.
@@ -560,17 +581,19 @@ def _requested_seed_design(
                 cells.append({"seed": seed, "status": "complete", "run_dir": str(matches[0])})
     mixed_code_allowed = _mixed_code_identity_allowed()
     code_identities = {
-        seed: {key: contract[key] for key in _CODE_IDENTITY_KEYS}
+        seed: {key: contract[key] for key in (*_CODE_IDENTITY_KEYS, *_EXECUTABLE_IDENTITY_KEYS) if key in contract}
         for seed, contract in provenance_contracts.items()
     }
     n_code_identities = len({
-        json.dumps(identity, sort_keys=True) for identity in code_identities.values()
+        json.dumps(_comparable_code_identity(contract), sort_keys=True)
+        for contract in provenance_contracts.values()
     })
     fingerprints = {
         json.dumps(
-            {key: value for key, value in contract.items()
-             if key not in _DATA_ORDER_KEYS
-             and not (mixed_code_allowed and key in _CODE_IDENTITY_KEYS)},
+            {**{key: value for key, value in contract.items()
+                if key not in _DATA_ORDER_KEYS
+                and key not in (*_CODE_IDENTITY_KEYS, *_EXECUTABLE_IDENTITY_KEYS)},
+             **({} if mixed_code_allowed else {"code_identity": _comparable_code_identity(contract)})},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         )
         for contract in provenance_contracts.values()
@@ -663,8 +686,10 @@ def _aggregate_requested_metric(
     *,
     sources: tuple,
     seed_file: str = "config.json",
+    design:    Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    design = _requested_seed_design(root, seed_file=seed_file)
+    if design is None:
+        design = _requested_seed_design(root, seed_file=seed_file)
     values: List[float] = []
     value_seeds: List[int] = []
     cells: List[Dict[str, Any]] = []
@@ -744,14 +769,19 @@ def aggregate_scalar(
 
     *,
     sources: tuple = ("summary.json", "test_results.json", "research.json"),
+    design:  Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     r"""Across-seed summary of one (possibly dotted) scalar ``key``, searching ``sources`` in order
     per seed dir. Returns ``{n, mean, sd, noise_floor, cv, values, seeds}`` plus the seed-design and
     per-cell records. Handles ``research.json`` keys
     (ECE, ``corpus_freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
+
+    ``design`` is the :func:`_requested_seed_design` of the resolved ``run_root``, built here when None.
+    :func:`main` builds it once for every key, since each build rereads and revalidates every seed run
+    (audit 2026-10-31 analysis-statistics-10).
     """
     root = _resolve_run_root(run_root)
-    return _aggregate_requested_metric(root, key, sources=sources)
+    return _aggregate_requested_metric(root, key, sources=sources, design=design)
 
 
 def _read_csv_columns(path: Path) -> Dict[str, List[Optional[float]]]:
@@ -788,6 +818,7 @@ def aggregate_seed_curves(
     filename: str = "metrics.csv",
     x:        str = "step",
     withheld: Optional[Dict[str, str]] = None,
+    design:   Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     r"""Across-seed per-step curves from each seed's ``metrics.csv``.
 
@@ -803,9 +834,12 @@ def aggregate_seed_curves(
     ``withheld`` (a dict the caller owns) switches to per-column withholding: a column that is
     absent for every seed, or not finite for every seed at its active steps, is left out and
     recorded as ``withheld[column] = reason`` instead of emptying the whole curve set.
+
+    ``design`` is the :func:`_requested_seed_design` of the resolved ``run_root``, built here when None.
     """
     root = _resolve_run_root(run_root)
-    design = _requested_seed_design(root)
+    if design is None:
+        design = _requested_seed_design(root)
     if not design["complete"]:
         return {}
     per_seed = []                                                # list of (steps[np], {col: vals[np]})
@@ -890,6 +924,7 @@ def aggregate_per_layer(
     filename: str = "metrics_per_layer.csv",
     layer_col: str = "layer",
     withheld: Optional[Dict[str, str]] = None,
+    design:   Optional[Mapping[str, Any]] = None,
 ) -> Dict[int, Dict[str, Dict[str, Any]]]:
     r"""Across-seed per-layer diagnostics from each seed's ``metrics_per_layer.csv``.
     Returns ``{layer: {column: {mean, sd, n, values}}}`` with the ddof=1 SD across seeds.
@@ -898,9 +933,12 @@ def aggregate_per_layer(
     its own, with its reason in ``withheld`` when given, when it is absent from a seed or not a finite
     number at some (seed, layer): a text column such as ``relational_semantics``, or a column NaN on the
     route (audit 2026-10-10 round 2, #24).
+
+    ``design`` is the :func:`_requested_seed_design` of the resolved ``run_root``, built here when None.
     """
     root = _resolve_run_root(run_root)
-    design = _requested_seed_design(root)
+    if design is None:
+        design = _requested_seed_design(root)
     if not design["complete"]:
         return {}
     per_seed: List[Dict[tuple[int, str], Optional[float]]] = []
@@ -1017,6 +1055,15 @@ CV_RATIO_SCALE_KEYS = frozenset({
     "test_ppl", "best_val_ppl", "final_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "train_sample_ce_final", "train_sample_ce_best",
     "wall_time_s", "overall_ce",
+    "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
+})
+# The ratio-scale losses in nats or bits per token or character, linear in a cross-entropy, among which the
+# digest ranks seed stability. A perplexity is exp(CE), so CV(PPL) ~= CE * CV(CE), about 4.5 times larger
+# at CE 4.5, and wall time is not a loss; ranking either beside a CE compares scales, not seed stability
+# (audit 2026-10-31 analysis-statistics-11).
+CV_CE_SCALE_KEYS = frozenset({
+    "test_ce", "test_bits_per_token", "test_bpc", "test_best_ce",
+    "train_sample_ce_final", "train_sample_ce_best", "overall_ce",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
 })
 
@@ -1178,12 +1225,15 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
     if data_order is not None:
         L += [f"Seed data order: `{data_order.get('status')}`. {data_order.get('caveat', '')}".rstrip(), ""]
     if code_identity is not None and code_identity.get("mixed"):
-        L += [f"**Mixed code identity:** {code_identity['n_distinct']} distinct git_sha / "
-              "dirty-tree fingerprints across seeds, accepted by `allow_mixed_code_identity=True`. "
+        L += [f"**Mixed code identity:** {code_identity['n_distinct']} distinct executable-source identities "
+              "(`code_identity_sha256`, or the git_sha / dirty-tree fingerprint of a record without it) across "
+              "seeds, accepted by `allow_mixed_code_identity=True`. "
               "The across-seed SD includes any effect of those code differences.", ""]
         for seed, ident in code_identity["per_seed"].items():
+            code = ident.get(_EXECUTABLE_IDENTITY_KEY)
             L.append(f"- seed {seed}: `{ident['git_sha'][:10]}` dirty={ident['git_dirty']} "
-                     f"fingerprint=`{(ident['git_dirty_fingerprint'] or '-')[:12]}`")
+                     f"fingerprint=`{(ident['git_dirty_fingerprint'] or '-')[:12]}`"
+                     + (f" code=`{code[:12]}`" if code else ""))
         L.append("")
     L += ["## Headline scalars (across-seed)", "",
           "| metric | n | mean | SD (ddof=1) | noise floor, t(n-1, 0.975)*sqrt(2)*SD | CV% |",
@@ -1195,19 +1245,22 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
     L += ["", "The noise floor is the 95% half-width for the difference of two single-seed runs; "
           "a single-seed ablation difference below it is within seed noise."]
     finite = {k: v for k, v in scalars.items() if math.isfinite(v["cv"])}
+    ce_scale = {k: v for k, v in finite.items() if k in CV_CE_SCALE_KEYS}
     if finite:
-        most = min(finite.items(), key=lambda kv: kv[1]["cv"])
-        least = max(finite.items(), key=lambda kv: kv[1]["cv"])
         L += ["", "## Key findings", ""]
         if "test_ppl" in scalars:
             t = scalars["test_ppl"]
             vals = [round(x, 3) for x in t["values"]]
             L.append(f"- test PPL = {_fnum(t['mean'], '.3f')} +/- {_fnum(t['sd'], '.3f')} "
                      f"(single-seed noise floor = {_fnum(t['noise_floor'], '.3f')}); per-seed {vals}.")
-        L.append(f"- Most seed-stable ratio-scale metric: `{most[0]}` (CV {100 * most[1]['cv']:.3f}%).")
-        L.append(f"- Least seed-stable ratio-scale metric: `{least[0]}` "
-                 f"(CV {100 * least[1]['cv']:.3f}%). Signed or near-zero metrics carry no CV; "
-                 "read their SD on their own scale.")
+        if len(ce_scale) >= 2:
+            most = min(ce_scale.items(), key=lambda kv: kv[1]["cv"])
+            least = max(ce_scale.items(), key=lambda kv: kv[1]["cv"])
+            L.append(f"- Most seed-stable cross-entropy-scale metric: `{most[0]}` (CV {100 * most[1]['cv']:.3f}%).")
+            L.append(f"- Least seed-stable cross-entropy-scale metric: `{least[0]}` "
+                     f"(CV {100 * least[1]['cv']:.3f}%). The ranking compares losses in nats or bits only: a "
+                     "perplexity is exp(CE), so its CV is about CE times the CV of its CE, and wall time is not "
+                     "a loss. Signed or near-zero metrics carry no CV; read their SD on their own scale.")
     divergence = _divergence_lines(scalars)
     if divergence:
         L += ["", "## Divergence indicators", "", *divergence, "",
@@ -1309,16 +1362,18 @@ def main() -> int:
         f"{request_design['n_observed_runs']} observed runs: {observed_seeds}) ===\n"
     )
 
+    # One request design for every aggregator: each build rereads and revalidates every seed run, which
+    # cost 25 designs and 77 config builds for a three-seed group (audit 2026-10-31 analysis-statistics-10).
     scalar_candidates = {
-        key: aggregate_scalar(root, key)
+        key: aggregate_scalar(root, key, design=request_design)
         for key in dict.fromkeys([CONFIG["key"], *SCALAR_KEYS])
     }
     headline = scalar_candidates[CONFIG["key"]]
     curve_x = _curve_x()
     withheld_curves: Dict[str, str] = {}
-    curves = aggregate_seed_curves(root, x=curve_x, withheld=withheld_curves)
+    curves = aggregate_seed_curves(root, x=curve_x, withheld=withheld_curves, design=request_design)
     withheld_per_layer: Dict[str, str] = {}
-    per_layer = aggregate_per_layer(root, withheld=withheld_per_layer)
+    per_layer = aggregate_per_layer(root, withheld=withheld_per_layer, design=request_design)
     per_layer_requested = False
     for cell in request_design["cells"]:
         run_dir_value = cell.get("run_dir")

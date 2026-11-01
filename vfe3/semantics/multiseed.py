@@ -23,8 +23,11 @@ coefficient of variation of :math:`\mathrm{tr}\,\Sigma` and the SimLex-999 :math
 :math:`-\lVert\Delta\mu\rVert`. φ: group-analogy chart accuracy, ONLY-B and their margin, and the
 positional :math:`R^2` of the offset grouping with its position-permutation null mean. Contextual:
 the logit-lens CE at the final layer and the unigram readout, and the final-layer distilled field
-purity, 3CosAdd, ONLY-B and margin. Across seeds each metric gets the mean, the unbiased SD
-(:math:`n - 1`), the minimum and the maximum over the seeds that report it.
+purity, 3CosAdd, ONLY-B and margin. Across seeds each metric gets the mean, the sample SD
+(:math:`n - 1` denominator, which makes the variance unbiased; the SD itself is biased low by the factor
+:math:`c_4(n)`, 0.798 at two seeds and 0.886 at three), the minimum and the maximum over the seeds that
+report it. The view metrics come from each view's candidate-vocabulary battery (the ``max_candidates``
+most frequent whole words plus the resource words).
 
 Cross-seed stability (:func:`stability_analysis`). For each channel -- the causal decode view
 (``decode_W_causal`` for a linear decode, ``decode_natural_causal`` for a Gaussian KL decode), the
@@ -63,19 +66,23 @@ coordinate permutation); for the Gaussian decode the natural parameters
 rescaling, with the same conclusion. (2) The frame chart :math:`L_v = \log(D_0 e^{X_v} m^{-1}
 D_0^{-1})` is invariant under the split redundancy :math:`e^{X_v} \to e^{X_v} k` and the diagonal
 rescaling at the barycenter fixed point (up to the barycenter residual otherwise), so a seed's rows do
-not depend on its trivialization at all. (3) The raw prior means change under the diagonal rescaling
-as :math:`\mu \to D\mu`, which is outside the invariance class: when that rescaling is an exact or
-assumed redundancy of the configuration (:func:`~vfe3.semantics.common.diagonal_redundancy_status`),
-the ``mu_raw`` stability depends on each seed's arbitrary diagonal scale; when a LayerNorm breaks it,
-the raw coordinates are not a gauge choice. The outputs state which case applies. Neighbor tables
-of one seed remain single-seed illustrations (Antoniak and Mimno 2018; Wendlandt et al. 2018).
+not depend on its global trivialization; where the token frame is pure gauge
+(:func:`vfe3.semantics.frames.token_frame_gauge`) a per-type reparametrization is a redundancy as well,
+which the chart does not remove, and the channel's note says so. (3) The raw prior means change under
+the diagonal rescaling as :math:`\mu \to D\mu`, which is outside the invariance class: when that
+rescaling is an exact or assumed redundancy of the configuration
+(:func:`~vfe3.semantics.common.diagonal_redundancy_status`), the ``mu_raw`` stability depends on each
+seed's arbitrary diagonal scale; when a LayerNorm breaks it, the raw coordinates are not a gauge
+choice. The outputs state which case applies. Neighbor tables of one seed remain single-seed
+illustrations (Antoniak and Mimno 2018; Wendlandt et al. 2018).
 
 Homogeneity and data order (:func:`config_homogeneity`, :func:`data_order_status`). The checkpoint
-configurations must agree in every field except ``seed``; differing fields are reported, never
-silently averaged over. The effective training data seed comes from each run's
-``provenance.json``: when every seed shares it, the across-seed SD measures initialization and
-optimization only, a lower bound on the variance over data orders. The caveat is written into the
-JSON, the markdown and the headline figures.
+configurations must agree in every field except ``seed`` and the fields that do not determine the
+selected weights (resume bookkeeping, log and checkpoint cadence), with integral floats equal to their
+ints; differing fields are reported, never silently averaged over. The effective training data seed
+comes from each run's ``provenance.json``: when every seed shares it, the across-seed SD measures
+initialization and optimization only, a lower bound on the variance over data orders. The caveat is
+written into the JSON, the markdown and the headline figures.
 """
 
 from __future__ import annotations
@@ -87,6 +94,7 @@ import math
 import tempfile
 import time
 import traceback
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +103,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from vfe3.semantics import stats
 from vfe3.semantics.common import (
     OKABE_ITO,
     apply_style,
@@ -250,22 +259,43 @@ def _labels(records: Sequence[SeedRecord]) -> List[str]:
 # Homogeneity and data order
 # ----------------------------------------------------------------------------------------------
 
+def _selection_exempt_fields() -> frozenset:
+    r"""Config fields that do not determine the selected weights, as
+    :func:`vfe3.run_artifacts._selection_semantic_config` drops them (resume bookkeeping and output cadence)."""
+    from vfe3.config import VFE3Config
+    from vfe3.run_artifacts import _selection_semantic_config
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                 # the default config's inert-setting notices
+        reference = VFE3Config()
+    return frozenset(set(dataclasses.asdict(reference)) - set(_selection_semantic_config(reference)))
+
+
 def config_homogeneity(cfgs: Sequence[Any], labels: Sequence[str]) -> Dict[str, Any]:
-    r"""Fields of the (dataclass) configs that differ across seeds, ``seed`` exempt.
+    r"""Fields of the (dataclass) configs that differ across seeds.
+
+    Exempt are ``seed`` and ``data_seed`` (:data:`_CONFIG_EXEMPT`) and the fields that do not determine the
+    selected weights (:func:`_selection_exempt_fields`: ``resume_from``, the log and checkpoint cadence and the
+    like). Values are compared after integral floats are written as ints
+    (:func:`vfe3.paper.runs._canonical`), since ``VFE3Config`` does not coerce numbers and ``1`` and ``1.0`` are one
+    setting (audit 2026-10-08 general-C#7). Differences are reported with the values as stored.
 
     Returns ``{"homogeneous", "differences": {field: {label: value}}, "exempt": [...]}``.
     """
+    from vfe3.paper.runs import _canonical
+
+    exempt = _CONFIG_EXEMPT | _selection_exempt_fields()
     dicts = [dataclasses.asdict(c) if dataclasses.is_dataclass(c) else dict(c) for c in cfgs]
     keys = sorted(set().union(*dicts)) if dicts else []
     differences: Dict[str, Dict[str, Any]] = {}
     for key in keys:
-        if key in _CONFIG_EXEMPT:
+        if key in exempt:
             continue
         values = [d.get(key, "<absent>") for d in dicts]
-        if any(json.dumps(v, sort_keys=True, default=repr) != json.dumps(values[0], sort_keys=True, default=repr)
-               for v in values[1:]):
+        first = _canonical(values[0])
+        if any(_canonical(v) != first for v in values[1:]):
             differences[key] = {label: v for label, v in zip(labels, values)}
-    return {"homogeneous": not differences, "differences": differences, "exempt": sorted(_CONFIG_EXEMPT)}
+    return {"homogeneous": not differences, "differences": differences, "exempt": sorted(exempt)}
 
 
 def option_differences(options: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> Dict[str, Dict[str, Any]]:
@@ -399,8 +429,9 @@ SECTION_METRICS: Tuple[Tuple[str, str, str, Extractor], ...] = (
 
 
 def summarize(values: Sequence[Optional[float]]) -> Dict[str, Any]:
-    r"""``{n, mean, sd, min, max}`` over the finite values; ``sd`` is the unbiased
-    :math:`\sqrt{\sum_s (x_s - \bar x)^2/(n-1)}` (``None`` for :math:`n < 2`)."""
+    r"""``{n, mean, sd, min, max}`` over the finite values; ``sd`` is the sample SD with the :math:`n - 1`
+    denominator, :math:`\sqrt{\sum_s (x_s - \bar x)^2/(n-1)}` (``None`` for :math:`n < 2`), whose square is the
+    unbiased variance (the SD itself is biased low by :math:`c_4(n)`)."""
     x = np.array([v for v in (_num(v) for v in values) if v is not None], dtype=np.float64)
     n = int(x.size)
     if n == 0:
@@ -569,36 +600,23 @@ def jaccard_chance(n: int, k: int = STABILITY_K) -> float:
 
 
 def _cka_self_terms(X: torch.Tensor) -> Dict[str, Any]:
-    r"""Per-seed CKA terms of centered rows (computed in float64): :math:`\lVert X^\top X\rVert_F^2`,
-    the row sums of squares and their total."""
-    X = X.double()
-    ssr = (X * X).sum(dim=1)                                             # (n,)
-    return {"xtx": float(torch.linalg.matrix_norm(X.T @ X) ** 2), "ssr": ssr, "sq": float(ssr.sum())}
-
-
-def _debiased_dot(xty: float, ssr_x: torch.Tensor, ssr_y: torch.Tensor, sq_x: float, sq_y: float, n: int) -> float:
-    r""":math:`n(n-3)\,\mathrm{HSIC}_u = \lVert X^\top Y\rVert_F^2 - \frac{n}{n-2}\langle \mathrm{diag}\,K,
-    \mathrm{diag}\,L\rangle + \frac{\lVert X\rVert_F^2\lVert Y\rVert_F^2}{(n-1)(n-2)}` for centered rows
-    (the unbiased HSIC of Song et al. 2012, as in :func:`vfe3.semantics.stats.linear_cka`)."""
-    return float(xty - n / (n - 2.0) * float(ssr_x @ ssr_y) + sq_x * sq_y / ((n - 1.0) * (n - 2.0)))
+    r"""Per-seed CKA terms of centered rows (float64): :func:`vfe3.semantics.stats.cka_self_terms`, so the
+    pairwise CKA here and :func:`vfe3.semantics.stats.linear_cka` share one implementation."""
+    return stats.cka_self_terms(X)
 
 
 def cka_pair(Xa: torch.Tensor, Xb: torch.Tensor, ta: Mapping[str, Any], tb: Mapping[str, Any],
              perm: Optional[np.ndarray] = None) -> Tuple[float, float]:
     r"""``(biased, debiased)`` linear CKA of two centered row-matched tables (rows of ``Xb`` permuted by
-    ``perm`` when given), in float64, reusing the per-seed terms of :func:`_cka_self_terms`."""
+    ``perm`` when given), in float64, reusing the per-seed terms of :func:`_cka_self_terms`; the arithmetic is
+    :func:`vfe3.semantics.stats.cka_from_terms` (NaN where a form is undefined)."""
     n = int(Xa.shape[0])
     ssr_b = tb["ssr"]
     if perm is not None:
         index = torch.as_tensor(perm, device=Xb.device)
         Xb, ssr_b = Xb[index], ssr_b[index]
     xty = float(torch.linalg.matrix_norm(Xa.double().T @ Xb.double()) ** 2)       # ||X_b^T X_a||_F^2
-    biased = xty / math.sqrt(ta["xtx"] * tb["xtx"])
-    den_a = _debiased_dot(ta["xtx"], ta["ssr"], ta["ssr"], ta["sq"], ta["sq"], n)
-    den_b = _debiased_dot(tb["xtx"], tb["ssr"], tb["ssr"], tb["sq"], tb["sq"], n)
-    num = _debiased_dot(xty, ta["ssr"], ssr_b, ta["sq"], tb["sq"], n)
-    debiased = num / math.sqrt(den_a * den_b) if den_a > 0.0 and den_b > 0.0 else float("nan")
-    return biased, debiased
+    return stats.cka_from_terms(xty, dict(ta), dict(tb), n, ssr_y=ssr_b)
 
 
 def _pair_summary(M: np.ndarray) -> Dict[str, Optional[float]]:
@@ -695,9 +713,18 @@ def stability_analysis(records: Sequence[SeedRecord], labels: Sequence[str], *, 
             if channel == "mu_raw":
                 rec["gauge_note"] = _MU_RAW_NOTE[d_status].format(reason=d_reason)
             elif channel == "phi_log":
-                rec["gauge_note"] = ("φ log chart: invariant under the split redundancy and the diagonal rescaling "
-                                     "(at the barycenter fixed point), so each seed's rows do not depend on its "
-                                     "trivialization")
+                from vfe3.semantics.frames import token_frame_gauge
+
+                if token_frame_gauge(records[0].run.cfg)["status"] == "gauge":
+                    rec["gauge_note"] = ("φ log chart: invariant under the split redundancy and the diagonal "
+                                         "rescaling (at the barycenter fixed point), but on this configuration the "
+                                         "token frame is pure gauge (a per-type reparametrization of the tables leaves "
+                                         "every logit unchanged), so each seed's rows also carry the per-type gauge "
+                                         "its training selected and the stability compares gauges as well as content")
+                else:
+                    rec["gauge_note"] = ("φ log chart: invariant under the split redundancy and the diagonal rescaling "
+                                         "(at the barycenter fixed point), so each seed's rows do not depend on its "
+                                         "trivialization")
                 if not all(bool(info.get("barycenter_converged_all", True)) for _, _, info in rows):
                     rec["gauge_note"] += ("; the barycenter did not converge in every block of some seed, so this "
                                           "holds there only up to the barycenter residual")
@@ -816,9 +843,12 @@ def _render_markdown(payload: Mapping[str, Any], labels: Sequence[str], out: Pat
     add(f"**Data order.** {payload['data_order']['caveat']}\n")
     hom = payload["config_homogeneity"]
     if hom["homogeneous"]:
-        add("**Configuration.** The checkpoint configurations agree in every field except the seed.\n")
+        add("**Configuration.** The checkpoint configurations agree in every field except the seed and the fields "
+            "that do not determine the selected weights (resume bookkeeping, log and checkpoint cadence); integral "
+            "floats compare equal to their ints.\n")
     else:
-        add("**Configuration differs across runs** (fields other than the seed): "
+        add("**Configuration differs across runs** (fields other than the seed, the resume bookkeeping and the "
+            "log and checkpoint cadence): "
             + "; ".join(f"`{k}`: " + ", ".join(f"{lab} {v!r}" for lab, v in vals.items())
                         for k, vals in hom["differences"].items())
             + ". The across-seed statistics below mix these configurations.\n")
@@ -838,9 +868,10 @@ def _render_markdown(payload: Mapping[str, Any], labels: Sequence[str], out: Pat
                         "semantics"]))
 
     add("## Headline metrics across seeds\n")
-    add("Mean, unbiased SD (n − 1), minimum and maximum over the seeds that report the metric; view "
-        "metrics are the full-vocabulary battery of each view, contextual distilled metrics retrieve among "
-        "the collected words only.\n")
+    add("Mean, sample SD (n − 1 denominator), which is biased low for few seeds by the factor c4(n) (0.798 at "
+        "two seeds, 0.886 at three), minimum and maximum over the seeds that report the metric; view metrics are the "
+        "candidate-vocabulary battery of each view (the max_candidates most frequent whole words plus the resource "
+        "words), contextual distilled metrics retrieve among the collected words only.\n")
     rows = []
     for key, entry in payload["metrics"].items():
         s = entry["summary"]

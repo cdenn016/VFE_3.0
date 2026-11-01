@@ -189,7 +189,9 @@ def test_single_seed_points_take_the_pooled_pure_error_weight() -> None:
     st = _scaling_point_stats(points)
     assert st["pooled_log_var"] == pytest.approx(s2, rel=1e-12)
     w = _scaling_sem_weights(st["mean"], st["sem"], n_seeds=st["n"], pooled_log_variance=st["pooled_log_var"])
-    np.testing.assert_allclose(w[:3], (st["mean"][:3] / st["sem"][:3]) ** 2, rtol=1e-12)
+    # The replicated points take the pooled weight n_i / s^2 too (audit 2026-10-31 analysis-statistics-1: their
+    # own-SEM weights on two degrees of freedom miscalibrated both scaling F-tests).
+    np.testing.assert_allclose(w[:3], 3.0 / s2, rtol=1e-12)
     assert w[3] == pytest.approx(1.0 / s2, rel=1e-12)
     assert w[3] / w[:3].max() > 0.05                                           # no longer a vanishing weight
     assert _scaling_sem_weights(st["mean"], st["sem"])[3] == 1.0              # legacy call unchanged

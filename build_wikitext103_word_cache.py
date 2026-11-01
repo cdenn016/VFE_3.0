@@ -3,7 +3,7 @@ r"""Build the WORD-level WikiText-103 token cache consumed by ``vfe3.data.datase
 Produces, in the shared cache directory, for ``DATASET`` (``wikitext-103-word`` or
 ``wikitext-103-word-eos``):
 
-  ``{DATASET}_{train,validation,test}_word_tokens.pt``   int64 id streams
+  ``{DATASET}_{train,validation,test}_word_tokens.pt``   id streams in ``TOKEN_DTYPE`` (int32; int64 before 2026-10-31)
   ``..._tokens.pt.meta.json``                            per-split build provenance
   ``{DATASET}_word_vocab.json``                          the id-to-word table
   ``..._tokens.pt.provenance.json``                      per-split tokenizer-provenance manifest
@@ -39,6 +39,12 @@ rather than bound to a manifest of the payload it replaced.
 
 The corpus is fetched from the Hugging Face hub at the pinned revision on first run (about 500 MB
 of parquet) and re-read from the local hub cache afterwards.
+
+The ids are stored as int32 (``TOKEN_DTYPE``): every id fits (the largest is 267,734), the loader reads any integer
+cache and casts each window to int64 when it is read, and int32 halves the page cache and the hashing of an int64
+cache. The caches built before 2026-10-31 are int64. The dtype is part of the payload bytes, so its digest, and the
+data identity of the runs trained on it, changes when a cache is rebuilt in the other dtype: a ``FORCE`` rebuild of an
+existing cache that runs still resume from needs ``TOKEN_DTYPE = "int64"``.
 """
 
 import hashlib
@@ -72,6 +78,9 @@ DATASET: str = WORD_DATASET               # "wikitext-103-word" | "wikitext-103-
 MIN_COUNT: int = DEFAULT_MIN_COUNT        # keep types occurring STRICTLY MORE than this many times
 CACHE_DIR: Optional[Path] = None          # None -> ~/.cache/tokenized_cache
 FORCE: bool = False                       # True overwrites existing token caches
+TOKEN_DTYPE: str = "int32"                # "int32" (new builds; half the page cache) | "int64" (the caches before 2026-10-31)
+
+TOKEN_DTYPES = ("int32", "int64")
 
 WORD_DATASETS = (WORD_DATASET, WORD_EOS_DATASET)
 DATASET_ID = "Salesforce/wikitext"
@@ -174,6 +183,15 @@ def _encode_split(split: str, vocabulary: WordVocabulary) -> "tuple[np.ndarray, 
     return ids, n_rows, n_chars
 
 
+def _stored_ids(ids: np.ndarray, token_dtype: str) -> np.ndarray:
+    r"""``ids`` in the stored dtype; int32 only when every id fits (int64 ids from :func:`_encode_split`)."""
+    if token_dtype == "int64":
+        return ids
+    if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= 2 ** 31):
+        raise ValueError(f"ids span [{int(ids.min())}, {int(ids.max())}], outside int32; use TOKEN_DTYPE='int64'")
+    return ids.astype(np.int32)
+
+
 def _atomic_publish(target: Path, write: Callable[[Path], None]) -> None:
     r"""Write through ``write`` to a sibling temporary file, then ``os.replace`` it onto ``target``."""
     handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
@@ -192,15 +210,20 @@ def build(
     cache_dir: Path | None = None,
     force: bool = False,
     dataset: Optional[str] = None,
+    token_dtype: Optional[str] = None,
 ) -> Dict[str, object]:
     r"""Build the vocabulary and every split's token cache; return a provenance summary.
 
     ``dataset`` (default: the module-level ``DATASET``) is ``wikitext-103-word`` or
-    ``wikitext-103-word-eos``; the latter ends every row in ``<eos>`` (id 1).
+    ``wikitext-103-word-eos``; the latter ends every row in ``<eos>`` (id 1). ``token_dtype`` (default: the
+    module-level ``TOKEN_DTYPE``) is the stored id dtype, ``"int32"`` or ``"int64"``.
     """
     dataset = DATASET if dataset is None else dataset
     if dataset not in WORD_DATASETS:
         raise SystemExit(f"DATASET={dataset!r} is not a word dataset; expected one of {WORD_DATASETS}")
+    token_dtype = TOKEN_DTYPE if token_dtype is None else token_dtype
+    if token_dtype not in TOKEN_DTYPES:
+        raise ValueError(f"token_dtype must be one of {TOKEN_DTYPES}, got {token_dtype!r}")
     eos = appends_eos(dataset)
     root = default_cache_dir() if cache_dir is None else Path(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -282,6 +305,7 @@ def build(
             "tokenizer": "word",
             "min_count": min_count,
             "vocab_size": vocabulary.vocab_size,
+            "token_dtype": token_dtype,
             "n_tokens": int(ids.size),
             "n_chars_source": int(n_chars_source),
             "tokens_per_char": (float(ids.size) / n_chars_source) if n_chars_source else None,
@@ -302,7 +326,8 @@ def build(
         _atomic_publish(meta_target, lambda path: path.write_text(meta_text, encoding="utf-8"))
         # The manifest of the payload being replaced goes first; the new one follows the sidecar below.
         Path(str(target) + ".provenance.json").unlink(missing_ok=True)
-        _atomic_publish(target, lambda path: torch.save(torch.from_numpy(ids), path))
+        stored = _stored_ids(ids, token_dtype)
+        _atomic_publish(target, lambda path: torch.save(torch.from_numpy(stored), path))
         summary["splits"][split] = {
             "rows": n_rows,
             "n_tokens": int(ids.size),
@@ -324,7 +349,7 @@ def build(
 
 def main() -> int:
     r"""Click-to-run entry point: build ``DATASET`` with the module-level ``MIN_COUNT``/``CACHE_DIR``/``FORCE``."""
-    summary = build(min_count=MIN_COUNT, cache_dir=CACHE_DIR, force=FORCE, dataset=DATASET)
+    summary = build(min_count=MIN_COUNT, cache_dir=CACHE_DIR, force=FORCE, dataset=DATASET, token_dtype=TOKEN_DTYPE)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

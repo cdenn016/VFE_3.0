@@ -5,9 +5,14 @@ OLD_MAgent_Model-main/Manuscripts-Theory/GL(K)_attention.tex:2118; the current
 GL(K)_attention_v2.tex carries no such term) has a self-coupling term
 alpha_hat * sum_i KL(q_i*||p_i) at the final block's returned belief against the
 per-block prior. It is wired as an OPT-IN, DEFAULT-OFF scalar coefficient
-``cfg.mstep_self_coupling_weight`` (alpha_hat). These tests pin the two contracts:
-(1) at weight 0 the term is absent (loss == ce), and (2) at weight w the loss is
-exactly ce + w * mean KL(q*||p), with the self-divergence ``sc`` recomputed independently by the same recipe ``forward`` uses.
+``cfg.mstep_self_coupling_weight`` (w). These tests pin two contracts: (1) at weight 0 the term
+is absent (loss == ce), and (2) at weight w the loss is ce plus w times the precision-weighted
+self-divergence, with D recomputed independently by the same recipe ``forward`` uses. The
+self-divergences here are far below b0, where the weight alpha* = c0/(b0 + D) is within a relative
+D/b0 of c0/b0, so to the tolerance the value is w (c0/b0) mean KL(q*||p) there (w mean KL for the
+profile's b0 = c0 = 1) and the tests cannot tell alpha* D from the profiled energy
+c0 log(1 + D/b0). The gradient carried by the detached alpha* is pinned at D comparable to b0 in
+tests/test_audit_20261031_tests_infra_routes.py (audit 2026-10-31 gap-mstep-self-coupling-handoff-8).
 """
 
 from tests.profiles import test_config
@@ -48,7 +53,8 @@ def test_noop_at_weight_zero():
 
 
 def test_linear_in_weight():
-    # Pins the term: loss == ce + w * mean KL(q*||p), with sc recomputed independently.
+    # loss == ce + w * mean KL(q*||p) to 1e-6 at this small D, where alpha* = c0/(b0 + D) is within D of 1
+    # (b0 = c0 = 1); sc is recomputed independently. It does not resolve the weighting (module docstring).
     w = 0.5
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.5,

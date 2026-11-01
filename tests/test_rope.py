@@ -2,7 +2,7 @@ from tests.profiles import test_config
 
 import torch
 
-from vfe3.geometry.rope import build_rope_rotation, get_pos_rotation
+from vfe3.geometry.rope import build_rope_rotation
 
 
 def test_rope_rotation_is_orthogonal_and_block_diagonal():
@@ -23,9 +23,11 @@ def test_rope_position_zero_is_identity():
     assert torch.allclose(R[0], torch.eye(4), atol=1e-6)   # position 0 -> angle 0 -> I
 
 
-def test_pos_rotation_none_registered():
-    assert get_pos_rotation("none")(torch.arange(3), [4], base=100.0,
-                                    device=torch.device("cpu"), dtype=torch.float32) is None
+def test_pos_rotation_registry_is_retired():
+    # The registry keyed by the retired pos_rotation field could never be selected by a configuration
+    # (audit 2026-10-31, dead-code-4); frame RoPE calls build_rope_rotation directly.
+    import vfe3.geometry.rope as rope
+    assert not hasattr(rope, "get_pos_rotation") and not hasattr(rope, "register_pos_rotation")
 
 
 from vfe3.geometry.transport import RopeTransport

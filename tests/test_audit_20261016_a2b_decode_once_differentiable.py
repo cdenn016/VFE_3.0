@@ -3,8 +3,12 @@ r"""Audit 2026-10-16 F49: the fused decode Functions refuse a double backward.
 ``KLDecodeCE.backward`` and ``ExpectedLikelihoodCE.backward`` write their pair weights with Triton, which
 autograd does not track, so a ``create_graph=True`` first gradient carried a truncated graph (through the
 saved operands only) and its second derivative came back finite and wrong without an error. Both are now
-``once_differentiable``, so the second backward raises. The check runs the Triton interpreter on CPU tensors
-in a subprocess (skipped where triton is missing), as the other fused-kernel tests do.
+once differentiable through ``vfe3.kernels._autograd.strict_once_differentiable`` (audit 2026-10-31
+triton-kernels-2), which attaches its error node whenever the backward runs in grad mode, so the second
+backward raises the once-differentiable error itself, also under a constant cotangent (before, these leaves
+met a generic "does not require grad" error, and leaves upstream of a nonlinear map got a truncated value;
+``tests/test_audit_20261031_decode_triton.py`` checks those). The check runs the Triton interpreter on CPU
+tensors in a subprocess (skipped where triton is missing), as the other fused-kernel tests do.
 """
 import json
 import os
@@ -93,8 +97,10 @@ def test_double_backward_through_the_fused_decode_raises() -> None:
     results = _run_script(_SCRIPT)
     # Before the fix the second derivatives of the KL route and the EL temperature "returned" finite wrong values
     # with no error, and the KL first create_graph backward with the tables requiring grad raised from an out= GEMM.
+    # Since audit 2026-10-31 triton-kernels-2 the plain-cotangent cases raise the once_differentiable error too.
     expected = {}
     for name in ("kl_keepFalse", "kl_keepTrue", "el"):
-        expected.update({f"{name}_query": "raised", f"{name}_tau": "raised", f"{name}_backward": "once_differentiable"})
+        expected.update({f"{name}_query": "once_differentiable", f"{name}_tau": "once_differentiable",
+                         f"{name}_backward": "once_differentiable"})
     expected.update({"kl_keepFalse_tables_first": "returned", "kl_keepTrue_tables_first": "returned"})
     assert results == expected, results

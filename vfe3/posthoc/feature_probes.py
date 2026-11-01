@@ -4,9 +4,10 @@ Both probes replay the trained model once on report token batches (eval mode, no
 entry point on the module instance for that replay only, so the comparison runs at exactly the inputs the trained
 forward produced.
 
-* :func:`minimal_agent_gap`: every ``RelationalOperators.minimal_agent_update`` call is re-run under both
-  ``minimal_agent_inference`` modes at the same input. Per layer and head it reports the total variation between
-  the two label sets; per layer the input-whitened mean shift
+* :func:`minimal_agent_gap`: ``RelationalOperators.minimal_agent_update`` is re-run under both
+  ``minimal_agent_inference`` modes at the same input, on whole sequences of each call until ``gap_tokens`` tokens of
+  a layer are covered (the exact posterior is the expensive mode). Per layer and head it reports the total variation
+  between the two label sets; per layer the input-whitened mean shift
   :math:`\bigl(\delta_i^\top\Sigma_i^{-1}\delta_i/K\bigr)^{1/2}`, :math:`\delta_i = \mu_i^{+,\mathrm{exact}} - \mu_i^{+,\mathrm{mf}}`,
   and the covariance ratio :math:`(\log\det\Sigma_i^{+,\mathrm{mf}} - \log\det\Sigma_i^{+,\mathrm{exact}})/K` (negative:
   the mean field is the more confident), together with the exact spread share
@@ -56,13 +57,40 @@ def _label_tv(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
     return tv.reshape(-1, *tv.shape[-2:]).mean(dim=(0, 2)) if tv.dim() >= 3 else tv.mean(-1)
 
 
+def _gap_sequences(
+    mu:         torch.Tensor,                   # (B, N, K) layer input of one call, or (N, K)
+    gap_tokens: Optional[int],                  # the layer's token budget; None replays every token
+    measured:   int,                            # tokens of the layer already measured
+) -> int:
+    r"""Leading sequences of the call to replay so the layer's measured tokens reach ``gap_tokens`` (rounded up)."""
+    sequences = int(mu.shape[0]) if mu.dim() >= 3 else 1
+    if gap_tokens is None:
+        return sequences
+    remaining = int(gap_tokens) - int(measured)
+    if remaining <= 0:
+        return 0
+    per_sequence = max(1, int(mu.shape[:-1].numel()) // sequences)
+    return min(sequences, -(-remaining // per_sequence))
+
+
 @torch.no_grad()
 def minimal_agent_gap(
     model:         torch.nn.Module,
     token_batches: Iterable[torch.Tensor],      # (B, N) token ids
     device:        torch.device,
+
+    *,
+    gap_tokens:    Optional[int] = 2048,
 ) -> Optional[Dict[str, Any]]:
-    r"""Exact-versus-mean-field gap of every minimal-agent layer at the trained inputs; None without such a layer."""
+    r"""Exact-versus-mean-field gap of every minimal-agent layer at the trained inputs; None without such a layer.
+
+    The gap reruns the readout in both inference modes, so per layer it is measured on the leading sequences of the
+    calls until ``gap_tokens`` tokens are covered (rounded up to whole sequences, since a sequence's labels couple its
+    positions; ``None`` measures every token), as :func:`prototype_probe` bounds its replay: the exact posterior is
+    an extreme opt-in cost (audit 2026-10-31 A197). ``tokens`` of a layer row is the number of tokens measured.
+    """
+    from vfe3.contracts import CanonicalFrameContext
+
     layers = list(getattr(model, "relational_operators_by_layer", None) or [])
     targets = [(index, ops) for index, ops in enumerate(layers)
                if getattr(ops, "predictive_readout", "kernel") == "minimal_agent"]
@@ -75,23 +103,35 @@ def minimal_agent_gap(
 
         def wrapper(mu, sigma, frame, log_prior=None, *, _layer=layer, _ops=ops, _original=original, **kwargs):
             result = _original(mu, sigma, frame, log_prior, **kwargs)
+            entry = sums.setdefault(_layer, {"tv": 0.0, "spread": 0.0, "shift": 0.0, "logdet": 0.0,
+                                             "tokens": 0, "calls": 0})
+            n = _gap_sequences(mu, gap_tokens, entry["tokens"])
+            if n == 0:
+                return result
+            # The layer prior when the caller passed it (moment_matched), else the input covariance (passthrough passes
+            # None): the floor f Sigma_p is common to both modes and does not enter the mean.
+            anchor = kwargs.get("floor_anchor")
+            anchor = sigma if anchor is None else anchor
+            prior = log_prior
+            if mu.dim() >= 3 and n < mu.shape[0]:                               # the first n sequences only
+                mu, sigma, anchor = mu[:n], sigma[:n], anchor[:n]
+                frame = CanonicalFrameContext(forward=frame.forward[:n], inverse=frame.inverse[:n],
+                                              block_diagonal=frame.block_diagonal)
+                if isinstance(prior, torch.Tensor) and prior.dim() == 4:        # a per-sequence (B, H, N, N) prior
+                    prior = prior[:n]
             configured = _ops.minimal_agent_inference
             outputs = {}
             try:
                 for mode in ("exact", "mean_field"):
                     _ops.minimal_agent_inference = mode
                     capture: dict = {}
-                    # The layer prior when the caller passed it (moment_matched), else the input covariance: the
-                    # floor f Sigma_p is common to both modes and does not enter the mean.
-                    mean, cov = _original(mu, sigma, frame, log_prior, return_covariance=True, capture=capture,
-                                          floor_anchor=kwargs.get("floor_anchor", sigma))
+                    mean, cov = _original(mu, sigma, frame, prior, return_covariance=True, capture=capture,
+                                          floor_anchor=anchor)
                     outputs[mode] = (mean, cov, capture)
             finally:
                 _ops.minimal_agent_inference = configured
             (m_ex, c_ex, cap_ex), (m_mf, c_mf, cap_mf) = outputs["exact"], outputs["mean_field"]
             K = mu.shape[-1]
-            entry = sums.setdefault(_layer, {"tv": 0.0, "spread": 0.0, "shift": 0.0, "logdet": 0.0,
-                                             "tokens": 0, "calls": 0})
             entry["tv"] = entry["tv"] + _label_tv(cap_ex["beta_pre"], cap_mf["beta_pre"]).cpu()
             entry["spread"] = entry["spread"] + cap_ex["relational_minimal_agent_spread_share"].double().cpu()
             shift = _whitened_shift(m_ex - m_mf, sigma)                         # (..., N)
@@ -113,8 +153,11 @@ def minimal_agent_gap(
             module.training = was_training
         for _, ops in targets:
             del ops.minimal_agent_update
-    out: Dict[str, Any] = {"configured_inference": targets[0][1].minimal_agent_inference, "layers": []}
+    out: Dict[str, Any] = {"configured_inference": targets[0][1].minimal_agent_inference, "layers": [],
+                           "gap_tokens": gap_tokens}
     for layer, entry in sorted(sums.items()):
+        if entry["calls"] == 0:                                     # a zero budget measured nothing
+            continue
         calls, tokens = max(1, entry["calls"]), max(1, entry["tokens"])
         out["layers"].append({
             "layer": layer,

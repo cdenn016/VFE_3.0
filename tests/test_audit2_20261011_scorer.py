@@ -114,7 +114,9 @@ def test_pair_kl_gemm_equals_plain_autograd_bitwise_on_cpu() -> None:
 def test_pair_kl_gemm_saves_only_its_inputs_and_supports_retained_graphs() -> None:
     inputs = _gemm_inputs(F64, seed=3)
     out = scoring._projected_kl_gemm(*inputs)
-    assert type(out.grad_fn).__name__.startswith("_IEEEFP32Recompute")
+    # _PairKLExpansion saves only the token-linear inputs and forms no pair grid in backward (audit 2026-10-31
+    # attention-scoring-1); it replaced the _IEEEFP32Recompute route here.
+    assert type(out.grad_fn).__name__.startswith("_PairKLExpansion")
     first = torch.autograd.grad(out.sum(), inputs, retain_graph=True)
     second = torch.autograd.grad(out.sum(), inputs)
     for x, y in zip(first, second):
@@ -203,9 +205,12 @@ def test_diagonal_route_matches_dense_route_and_direct_reference(monkeypatch: py
         assert (x is None) == (y is None)
         if x is not None:
             torch.testing.assert_close(x, y, rtol=1e-10, atol=1e-10 * float(y.abs().max()))
+    # The diagonal route captures diag P(G) (audit 2026-10-31 A142); it equals the dense route's matrix P(G).
+    assert capture["projected_covariance_diagonal_pre"] is True
+    assert capture_dense["projected_covariance_diagonal_pre"] is False
     for key in ("projected_covariance_pre", "projected_key_covariance_pre"):
-        assert capture[key].shape == capture_dense[key].shape == (2, 5, heads, d, d)
-        torch.testing.assert_close(capture[key], capture_dense[key], rtol=1e-13, atol=1e-13)
+        assert capture[key].shape == (2, 5, heads, d) and capture_dense[key].shape == (2, 5, heads, d, d)
+        torch.testing.assert_close(torch.diag_embed(capture[key]), capture_dense[key], rtol=1e-13, atol=1e-13)
 
 
 def _route_record(monkeypatch: pytest.MonkeyPatch, ops: torch.nn.Module) -> Dict[str, Any]:

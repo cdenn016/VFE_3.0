@@ -137,7 +137,10 @@ def covariance_ceiling(
 
     A diagonal layout is clamped elementwise, :math:`\min(\sigma^+, c\sigma_p)`, the same bound for diagonal
     matrices. ``head_dims`` (``gaussian_block``) clamps each diagonal head block against the matching block of the
-    anchor and keeps the zero off-head blocks, so the result stays in the head-block family.
+    anchor and keeps the zero off-head blocks, so the result stays in the head-block family. The head blocks of one
+    width are stacked into one ``(..., n, d, d)`` call of :func:`_dense_ceiling`, so a layer makes one certificate
+    launch and one host read per distinct head width instead of per head; the clamp acts matrix by matrix, so the
+    result and its gradient are those of the per-head calls bit for bit (audit 2026-10-31 A177).
 
     The anchor enters as a constant (detached). Differentiated through, a binding clamp would route the whole
     upstream gradient of every clamped entry into the token's own prior-variance row at gain :math:`c` while the
@@ -153,10 +156,17 @@ def covariance_ceiling(
     if head_dims is None:
         return _dense_ceiling(sigma, anchor, ceiling)
     anchor = torch.broadcast_to(anchor.to(sigma.dtype), sigma.shape)
-    out = sigma.clone()
+    starts: List[int] = []
     start = 0
     for d in head_dims:
-        block = slice(start, start + d)
-        out[..., block, block] = _dense_ceiling(sigma[..., block, block], anchor[..., block, block], ceiling)
+        starts.append(start)
         start += d
+    out = sigma.clone()
+    for width in dict.fromkeys(head_dims):                                      # distinct widths, first-seen order
+        heads = [s for s, d in zip(starts, head_dims) if d == width]
+        blocks = torch.stack([sigma[..., s:s + width, s:s + width] for s in heads], dim=-3)    # (..., n, d, d)
+        anchors = torch.stack([anchor[..., s:s + width, s:s + width] for s in heads], dim=-3)
+        clamped = _dense_ceiling(blocks, anchors, ceiling)                       # one call per head width
+        for k, s in enumerate(heads):
+            out[..., s:s + width, s:s + width] = clamped[..., k, :, :]
     return out

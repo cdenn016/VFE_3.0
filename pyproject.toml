@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Gauge-theoretic VFE transformer, clean-room rebuild (V3)"
 requires-python = ">=3.10"
 # numpy/matplotlib are HARD deps (audit 2026-07-05 m16): vfe3/viz/figures.py imports both
-# unconditionally and finalize-time figure generation is ON by default (generate_figures=True),
+# unconditionally and finalization always attempts figure generation (no setting skips it),
 # so a torch-only install would complete a full training run and then crash at finalize.
 dependencies = ["torch", "numpy", "matplotlib"]
 
@@ -47,7 +47,7 @@ markers = [
     "cuda: test that requires a CUDA device",
     "external: test that requires externally supplied artifacts or bundles",
     "registry_mutation: test that temporarily changes a process-global registry",
-    "xdist_group(name): resource group used to serialize shared execution resources",
+    "triton: test in a file that runs the Triton interpreter or tests for triton (set by tests/pytest_policy.py)",
 ]
 
 [tool.coverage.run]

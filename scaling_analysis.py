@@ -66,6 +66,20 @@ from vfe3.metric_contracts import (  # noqa: E402
     perplexity_matches_ce,
 )
 from vfe3.path_utils import portable_path_component_key
+# The scaling cell contract is declared once, in vfe3.scaling_contract, for this reader and its writer
+# scaling.py (audit 2026-10-31, A356); the private names below are kept for existing callers.
+from vfe3.scaling_contract import (
+    PACKAGE_CODE_FIELD,
+    SCALING_CELL_SCHEMA_VERSION as _SCALING_CELL_SCHEMA_VERSION,
+    SOURCE_SPLITS as _SCALING_SOURCE_SPLITS,
+    accepted_config_sha256,
+    digest_binding_failure,
+    is_sha256 as _is_sha256,
+    is_valid_code_identity,
+    package_code_binding_failure,
+    provenance_code_identity,
+    validated_data_source_identities,
+)
 
 
 def _min_testable_sizes() -> int:
@@ -110,9 +124,11 @@ _CSV_COLUMNS = [
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
     "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
     "data_seed", "tokens_seen", "est_flops_6ND",
-    "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
+    "est_flops_analytic", "est_train_flops_measured_3x", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
     "best_val_ppl",
+    # validation-selected weights beside the final-weight headline (audit 2026-10-31 analysis-statistics-8)
+    "test_best_ce", "best_step", "final_val_ppl", "evaluated_step",
     # realized updates (audit 2026-10-17 item 29): a run with rejected updates trained on another schedule
     "skipped_steps", "accepted_update_frac", "skipped_updates_flag",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
@@ -125,10 +141,6 @@ _ROUTE_NOTES = {
     "blocks_K48_tied_2x": "tied structural ablation; not a strict full-covariance pure control",
 }
 
-_SCALING_CELL_SCHEMA_VERSION = 2
-_SCALING_REUSE_DIGEST_FIELD = "reuse_contract_sha256"
-_SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
-_SCALING_SOURCE_SPLITS = ("train", "validation", "test")
 _SCALING_STRUCTURAL_FIELDS = (
     "n_params", "scale_knob", "embed_dim", "n_heads", "n_layers", "n_e_steps",
     "n_gen", "gauge_group", "family", "tokens_seen",
@@ -154,15 +166,6 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _is_exact_nonnegative_seed(value: Any) -> bool:
     """Whether ``value`` is a plain Python ``int`` seed in the supported domain."""
     return type(value) is int and value >= 0
-
-
-def _is_sha256(value: object) -> bool:
-    """Whether ``value`` is one lowercase hexadecimal SHA-256 digest."""
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
 
 
 def _validated_scaling_metrics(summary: Mapping[str, object]) -> Optional[Dict[str, object]]:
@@ -246,19 +249,13 @@ def _validated_bound_scaling_run(
                 source=str(run / "config.json"),
             )
         effective_config = asdict(migrated)
-        # Digest the strict-JSON serialized form exactly as scaling.run_cell and
-        # _cell_resume_status do; raw asdict carries kl_max=inf, which strict JSON refuses.
-        # A cell written before a schema migration hashed the saved form of its config.json.
-        expected_config_sha256 = {
-            _canonical_json_sha256(json.loads(json.dumps(serialize_config(migrated), default=str))),
-            _canonical_json_sha256(dict(config))}
-        saved_digest = cell.get(_SCALING_REUSE_DIGEST_FIELD)
+        # Digest the strict-JSON serialized form exactly as scaling.run_cell and _cell_resume_status do
+        # (vfe3.scaling_contract); raw asdict carries kl_max=inf, which strict JSON refuses. A cell written
+        # before a schema migration hashed the saved form of its config.json.
+        expected_config_sha256 = accepted_config_sha256(config, migrated)
     except (TypeError, ValueError):
         return reject("config could not be migrated or digested")
-    if (not isinstance(saved_digest, str)
-            or len(saved_digest) != 64
-            or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_digest
-            or cell.get("config_sha256") not in expected_config_sha256):
+    if digest_binding_failure(cell, summary, expected_config_sha256) is not None:
         return reject("reuse digest or config_sha256 mismatch")
     scaling_point = summary.get("scaling_point")
     if not isinstance(scaling_point, Mapping):
@@ -279,30 +276,13 @@ def _validated_bound_scaling_run(
     provenance_git_sha = provenance.get("git_sha")
     provenance_git_dirty = provenance.get("git_dirty")
     provenance_dirty_fingerprint = provenance.get("git_dirty_fingerprint")
-    cell_identity_valid = (
-        isinstance(git_sha, str)
-        and bool(git_sha)
-        and type(git_dirty) is bool
-        and (
-            (git_dirty and isinstance(dirty_fingerprint, str) and bool(dirty_fingerprint))
-            or (not git_dirty and dirty_fingerprint is None)
-        )
-    )
-    provenance_identity_valid = (
-        isinstance(provenance_git_sha, str)
-        and bool(provenance_git_sha)
-        and type(provenance_git_dirty) is bool
-        and (
-            (provenance_git_dirty
-             and isinstance(provenance_dirty_fingerprint, str)
-             and bool(provenance_dirty_fingerprint))
-            or (not provenance_git_dirty and provenance_dirty_fingerprint is None)
-        )
-    )
-    if (not cell_identity_valid
-            or not provenance_identity_valid
+    if (not is_valid_code_identity(code_identity)
+            or not is_valid_code_identity(provenance_code_identity(provenance))
             or provenance_git_sha != git_sha):
         return reject("invalid code identity, or git_sha differs between scaling_cell and provenance")
+    package_failure = package_code_binding_failure(cell, provenance)
+    if package_failure is not None:
+        return reject(package_failure)
     code_identity_forced = (
         provenance_git_dirty != git_dirty
         or provenance_dirty_fingerprint != dirty_fingerprint
@@ -317,24 +297,20 @@ def _validated_bound_scaling_run(
     sources = cell.get("data_sources")
     if not isinstance(sources, Mapping) or set(sources) != set(_SCALING_SOURCE_SPLITS):
         return reject("data_sources missing or incomplete")
-    source_identities: Dict[str, str] = {}
-    for split in _SCALING_SOURCE_SPLITS:
-        source = sources[split]
-        if (not isinstance(source, Mapping)
-                or not isinstance(source.get("format"), str)
-                or not source["format"]
-                or type(source.get("size_bytes")) is not int
-                or source["size_bytes"] < 0
-                or not isinstance(source.get("sha256"), str)
-                or not source["sha256"]):
-            return reject("malformed data source record")
-        source_identities[split] = json.dumps(
-            dict(source),
+    try:
+        validated_sources = validated_data_source_identities(sources)
+    except (TypeError, ValueError):
+        return reject("malformed data source record")
+    source_identities: Dict[str, str] = {
+        split: json.dumps(
+            validated_sources[split],
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
             allow_nan=False,
         )
+        for split in _SCALING_SOURCE_SPLITS
+    }
 
     seeds = (cell.get("seed"), effective_config.get("seed"), provenance.get("seed"))
     if (not all(_is_exact_nonnegative_seed(seed) for seed in seeds)
@@ -353,7 +329,11 @@ def _validated_bound_scaling_run(
         "data_seed": cell.get("data_seed"),
         "max_tokens": cell.get("max_tokens"),
         "sources": source_identities,
-        "code_identity": [git_sha, git_dirty, dirty_fingerprint],
+        # The package code digest when the cell records it (bound to provenance above): the Git fingerprint also
+        # hashes notes and untracked files, so two runs of one executable on either side of such an edit are one
+        # run identity (audit 2026-10-31, A050). An older cell keeps its Git identity.
+        "code_identity": ({PACKAGE_CODE_FIELD: cell[PACKAGE_CODE_FIELD]} if PACKAGE_CODE_FIELD in cell
+                          else [git_sha, git_dirty, dirty_fingerprint]),
     })
     return {
         **metrics,
@@ -558,12 +538,19 @@ def harvest(
             "tokens_seen": sp.get("tokens_seen"),
             "est_flops_6ND":           sp.get("est_flops_6ND"),
             "est_flops_analytic":      sp.get("est_flops_analytic"),
+            # 3 x the counted forward FLOPs per token x tokens (run_artifacts._measured_forward_flops)
+            "est_train_flops_measured_3x": sp.get("est_train_flops_measured_3x"),
             "active_params_per_token": sp.get("active_params_per_token"),
             "test_ce":     verified["test_ce"],
             "test_ppl":    verified["test_ppl"],
             "test_bits_per_token": verified["test_bits_per_token"],
             "test_bpc": verified["test_bpc"],
             "best_val_ppl": summ.get("best_val_ppl"),
+            # test CE at the validation-selected weights, and the final validation; absent on older runs
+            "test_best_ce": summ.get("test_best_ce"),
+            "best_step": summ.get("best_step"),
+            "final_val_ppl": summ.get("final_val_ppl"),
+            "evaluated_step": summ.get("evaluated_step"),
             "skipped_steps": summ.get("skipped_steps"),
             "accepted_update_frac": summ.get("accepted_update_frac"),
             "skipped_updates_flag": _skipped_count(summ.get("skipped_steps")) > 0,
@@ -1044,6 +1031,28 @@ def _pooled_status(
     return "clean", []
 
 
+def _mup_arm(point: Mapping[str, Any]) -> Optional[str]:
+    r"""The learning-rate arm (``"fixed"`` or ``"mup"``) of a ``grow_K_mup`` point, read from its label suffix.
+
+    None for every other route. The two arms share their route tag and, at each width, their parameter count,
+    but train under two learning-rate rules, so no fit or test may pool them as one curve or count them as
+    replicates of one size (audit 2026-10-31, A073).
+    """
+    if point.get("route") != "grow_K_mup":
+        return None
+    label = str(point.get("label", ""))
+    return "fixed" if label.endswith("_fixed") else "mup" if label.endswith("_mup") else None
+
+
+def _fit_series(point: Mapping[str, Any]) -> str:
+    r"""The curve a parameter point belongs to: its route, or ``route/arm`` for a muP arm (:func:`_mup_arm`).
+
+    The key of the per-route fits, of the frontier-collapse partition and of ``kmup_stability.png``.
+    """
+    arm = _mup_arm(point)
+    return str(point.get("route")) if arm is None else f"{point.get('route')}/{arm}"
+
+
 def _lack_of_fit_test(
     points: List[Dict[str, Any]],
     fit:    Mapping[str, Any],
@@ -1053,8 +1062,9 @@ def _lack_of_fit_test(
 ) -> Dict[str, Any]:
     r"""Pure-error lack-of-fit F-test of a fitted L(N) law, in log-CE space.
 
-    Seeds at one distinct size are replicates. With :math:`y_{ij} = \log \mathrm{CE}` of seed j at
-    size i (:math:`n_i` seeds, m sizes, n observations), the fitted curve
+    Seeds at one distinct size are replicates, and the two learning-rate arms of ``grow_K_mup`` are
+    separate sizes (:func:`_mup_arm`; audit 2026-10-31, A073). With :math:`y_{ij} = \log \mathrm{CE}` of
+    seed j at size i (:math:`n_i` seeds, m sizes, n observations), the fitted curve
     :math:`\hat y_i = \log(E + A N_i^{-\alpha})` and p fitted parameters (2, or 3 with the offset),
 
     .. math::
@@ -1062,18 +1072,21 @@ def _lack_of_fit_test(
         SS_{LOF} = \sum_i n_i (\bar y_i - \hat y_i)^2, \quad
         F = \frac{SS_{LOF} / (m - p)}{SS_{PE} / (n - m)} \sim F_{m-p,\, n-m}
 
-    under the null that the law's form is right (Draper and Smith 1998, Sec. 2.1). The headline fit is
-    SEM-weighted, so the test is approximate; it is untestable without a residual degree of freedom
+    under the null that the law's form is right (Draper and Smith 1998, Sec. 2.1). That reference law
+    presumes the n_i-weighted least-squares fit, so the headline fit weights every size by :math:`n_i / s^2`
+    with the pooled pure error (``_scaling_sem_weights``); per-size SEM weights on two degrees of freedom made
+    a true law reject at about 12 percent (audit 2026-10-31 analysis-statistics-1). The F law is
+    asymptotic for the offset law, fit in CE space; it is untestable without a residual degree of freedom
     (m <= p) or without replicate seeds (n = m or zero pure error)."""
-    groups: Dict[float, List[float]] = {}
+    groups: Dict[Tuple[float, Optional[str]], List[float]] = {}
     for p in points:
         size = _as_float(p.get(x_key))
         if not (np.isfinite(size) and size > 0.0):
             continue
-        groups.setdefault(size, []).extend(
+        groups.setdefault((size, _mup_arm(p)), []).extend(
             math.log(c) for c in (_as_float(v) for v in p.get("ce_seeds", ()))
             if np.isfinite(c) and c > 0.0)
-    groups = {size: ys for size, ys in groups.items() if ys}
+    groups = {key: ys for key, ys in groups.items() if ys}
     m = len(groups)
     n = sum(len(ys) for ys in groups.values())
     n_fit_parameters = 3 if fit.get("form") == "offset_power_law" else 2
@@ -1088,7 +1101,7 @@ def _lack_of_fit_test(
         return out
     alpha, A, E = (_as_float(fit.get(key)) for key in ("alpha", "A", "E"))
     ss_pe = ss_lof = 0.0
-    for size, ys in groups.items():
+    for (size, _arm), ys in groups.items():
         ybar = sum(ys) / len(ys)
         ss_pe += sum((y - ybar) ** 2 for y in ys)
         predicted = E + A * size ** (-alpha)
@@ -1154,6 +1167,12 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         bpc = [c for c in (_as_float(g.get("test_bpc")) for g in grp) if np.isfinite(c)]
         # F1/EXP-6: per-seed test PPL for the muP K-stability figure (CE is the L(N) fit quantity above).
         ppl = [c for c in (_as_float(g.get("test_ppl")) for g in grp) if np.isfinite(c) and c > 0]
+        # Validation-selected weights (audit 2026-10-31 analysis-statistics-8): per-seed test CE at the best
+        # validation step, final validation CE and final-versus-best validation gap (nats).
+        ce_best = [c for c in (_as_float(g.get("test_best_ce")) for g in grp) if np.isfinite(c) and c > 0]
+        final_val = [v for v in (_final_validation_ppl(g) for g in grp) if np.isfinite(v) and v > 0]
+        gaps = [v for v in (_final_validation_gap(g) for g in grp) if np.isfinite(v)]
+        measured = [_as_float(g.get("est_train_flops_measured_3x")) for g in grp]
         points.append({
             "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
             "n_params": npars[0] if npars else float("nan"),
@@ -1167,6 +1186,9 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "tokens_seen": _as_float(grp[0].get("tokens_seen")),
             "est_flops_6ND": _as_float(grp[0].get("est_flops_6ND")),
             "est_flops_analytic": _as_float(grp[0].get("est_flops_analytic")),
+            # the seed mean when every seed records a finite positive count, else NaN
+            "est_train_flops_measured_3x": (
+                float(np.mean(measured)) if all(np.isfinite(v) and v > 0.0 for v in measured) else float("nan")),
             "n_e_steps": _as_float(grp[0].get("n_e_steps")),
             "n_layers": _as_float(grp[0].get("n_layers")),
             "ce_seeds": ce, "n_seeds": len(ce),
@@ -1182,8 +1204,97 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "bpc_mean": float(np.mean(bpc)) if bpc else float("nan"),
             "ppl_mean": float(np.mean(ppl)) if ppl else float("nan"),
             "ppl_sem": float(np.std(ppl, ddof=1) / np.sqrt(len(ppl))) if len(ppl) > 1 else 0.0,
+            "ce_best_seeds": ce_best, "n_best_seeds": len(ce_best),
+            "final_val_ce_seeds": [math.log(v) for v in final_val],
+            "final_val_gap_seeds": gaps,
         })
     return points
+
+
+def _final_validation_ppl(row: Mapping[str, Any]) -> float:
+    r"""A run's validation PPL at its final weights: ``final_val_ppl``, else ``best_val_ppl`` when the best
+    step is the final evaluated step (the final weights were validated and are the best), else NaN."""
+    final = _as_float(row.get("final_val_ppl"))
+    if np.isfinite(final) and final > 0.0:
+        return final
+    best_step = row.get("best_step")
+    if type(best_step) is int and best_step == row.get("evaluated_step"):
+        return _as_float(row.get("best_val_ppl"))
+    return float("nan")
+
+
+def _final_validation_gap(row: Mapping[str, Any]) -> float:
+    r"""How far a run's final weights sit above its best validation point, in nats (NaN when not recorded):
+
+    .. math:: g = \ln \mathrm{PPL}_{\mathrm{val}}(\text{final}) - \ln \mathrm{PPL}_{\mathrm{val}}(\text{best}) \ge 0.
+    """
+    final = _final_validation_ppl(row)
+    best = _as_float(row.get("best_val_ppl"))
+    if not (np.isfinite(final) and final > 0.0 and np.isfinite(best) and best > 0.0):
+        return float("nan")
+    return math.log(final) - math.log(best)
+
+
+def _final_vs_best_validation(points: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    r"""Flag the cells whose final weights sit further above their best validation point than seed noise.
+
+    The L(N) fit reads ``test_ce`` at the final weights. With :math:`g_s` the
+    :func:`_final_validation_gap` of seed s, a cell is flagged when :math:`\bar g` exceeds the across-seed SD
+    (ddof 1) of its final validation CE :math:`\ln \mathrm{PPL}_{\mathrm{val}}(\text{final})`, so the choice
+    between the final and the validation-selected weights moves that cell by more than its seed spread and the
+    final-weight curve is biased at its size (audit 2026-10-31 analysis-statistics-8). A cell is assessed only
+    when it has two or more seeds and every seed records both numbers (``final_val_ppl``, or a best step that
+    is the final step)."""
+    cells: List[Dict[str, Any]] = []
+    for p in points:
+        name = f"{p['route']}/{p['label']}"
+        n_seeds = int(p.get("n_seeds", 0))
+        gaps = list(p.get("final_val_gap_seeds") or [])
+        finals = list(p.get("final_val_ce_seeds") or [])
+        if n_seeds < 2 or len(gaps) != n_seeds or len(finals) != n_seeds:
+            cells.append({"cell": name, "assessed": False, "flagged": None,
+                          "reason": ("fewer than two seeds" if n_seeds < 2
+                                     else "a seed records no final validation")})
+            continue
+        mean_gap, seed_sd = float(np.mean(gaps)), float(np.std(finals, ddof=1))
+        cells.append({"cell": name, "assessed": True, "mean_gap": mean_gap, "seed_sd": seed_sd,
+                      "flagged": bool(mean_gap > seed_sd)})
+    return {
+        "rule": ("mean ln(final_val_ppl / best_val_ppl) over seeds exceeds the seed SD (ddof 1) of "
+                 "ln(final_val_ppl)"),
+        "n_cells": len(cells),
+        "n_assessed": sum(cell["assessed"] for cell in cells),
+        "flagged": sorted(cell["cell"] for cell in cells if cell["flagged"]),
+        "cells": cells,
+    }
+
+
+def _best_weight_fit(points: Sequence[Mapping[str, Any]], *, with_offset: bool) -> Dict[str, Any]:
+    r"""The headline L(N) estimator refit to the test CE at the validation-selected weights.
+
+    The headline fits ``test_ce`` at the final weights (``evaluation_weights = "final"``). At a budget of
+    several epochs a large cell can pass its best validation point before the end, which raises the large-N
+    end of the final-weight curve and is absorbed into E and alpha, so the same form and weighting
+    (:math:`n_i / s^2` with the pooled pure error of log ``test_best_ce``) are fit to ``test_best_ce`` beside
+    it (audit 2026-10-31 analysis-statistics-8). Descriptive, with no interval or lack-of-fit test; withheld
+    unless every seed of every point records ``test_best_ce``."""
+    missing = sorted(f"{p['route']}/{p['label']}" for p in points
+                     if not p.get("n_best_seeds") or int(p["n_best_seeds"]) != int(p.get("n_seeds", 0)))
+    if missing:
+        return {"status": "withheld", "reason": "test_best_ce not recorded for every seed of " + ", ".join(missing)}
+    from vfe3.viz.figures import _fit_power_law, _scaling_pooled_log_variance, _scaling_sem_weights
+    xs = np.array([p["n_params"] for p in points], dtype=float)
+    ys = np.array([float(np.mean(p["ce_best_seeds"])) for p in points], dtype=float)
+    weights = _scaling_sem_weights(
+        ys, np.zeros_like(ys), n_seeds=[len(p["ce_best_seeds"]) for p in points],
+        pooled_log_variance=_scaling_pooled_log_variance([p["ce_best_seeds"] for p in points]))
+    fit = _fit_power_law(xs, ys, weights=weights, with_offset=with_offset)
+    if not np.isfinite(_as_float(fit.get("alpha"))):
+        return {"status": "withheld", "reason": "the estimator returned no finite exponent"}
+    testable = int(fit["n_distinct_sizes"]) >= _min_testable_sizes()
+    return {"status": "fitted", "evaluation_weights": "validation_selected", "form": fit["form"],
+            "alpha": fit["alpha"], "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"] if testable else None,
+            "n_points": fit["n_points"], "n_distinct_sizes": fit["n_distinct_sizes"], "testable": testable}
 
 
 def _collapse_identical_points(
@@ -1254,16 +1365,39 @@ def _kmup_series(param_points: List[Dict[str, Any]]) -> Dict[str, List[Dict[str,
             continue
         if not (np.isfinite(_as_float(p.get("embed_dim"))) and np.isfinite(_as_float(p.get("ppl_mean")))):
             continue
-        key = p["route"]
-        if p["route"] == "grow_K_mup":
-            lab = str(p.get("label", ""))
-            key = ("grow_K_mup/fixed" if lab.endswith("_fixed")
-                   else "grow_K_mup/mup" if lab.endswith("_mup") else "grow_K_mup")
+        key = _fit_series(p)
         out.setdefault(key, []).append({
             "embed_dim": _as_float(p["embed_dim"]), "ppl_mean": _as_float(p["ppl_mean"]),
             "ppl_sem": _as_float(p.get("ppl_sem", 0.0)), "n": int(p.get("n_seeds", 1)),
         })
     return out
+
+
+# Training-compute axes of scaling_ce_vs_flops.png as (point key, axis label, title), in order of preference
+# (audit 2026-10-31 analysis-statistics-9). The measured count is three times the forward FLOPs that
+# torch.utils.flop_counter counts per token (matrix products only, a lower bound) times the tokens seen;
+# est_flops_analytic is None on the projected routes; 6ND counts every lookup-table parameter at 6 FLOPs per
+# token although a token reads one row of each table, and at a fixed token budget it is N rescaled.
+_COMPUTE_AXES: Tuple[Tuple[str, str, str], ...] = (
+    ("est_train_flops_measured_3x", "training FLOPs (3 x measured forward FLOPs x tokens; matrix products only)",
+     "Scaling vs compute (measured forward FLOPs x 3, a lower bound)"),
+    ("est_flops_analytic", "training FLOPs (analytic per-token proxy x tokens)",
+     "Scaling vs compute (analytic proxy)"),
+    ("est_flops_6ND", "est FLOPs (6ND proxy, total parameters)",
+     "Scaling vs compute (6ND proxy: N rescaled at fixed tokens)"),
+)
+
+
+def _compute_axis(points: Sequence[Mapping[str, Any]]) -> Optional[Tuple[str, str, str]]:
+    r"""The first :data:`_COMPUTE_AXES` entry that every point records as a finite positive value, else None.
+
+    One cost model spans every plotted point, so a point that lacks the measured count moves the whole
+    figure to the next axis instead of mixing two cost models on one x axis."""
+    for axis in _COMPUTE_AXES:
+        values = [_as_float(p.get(axis[0])) for p in points]
+        if values and all(np.isfinite(value) and value > 0.0 for value in values):
+            return axis
+    return None
 
 
 # =============================================================================
@@ -1280,11 +1414,9 @@ def bootstrap_exponent_ci(
 ) -> Tuple[float, float, float]:
     r"""Bootstrap the power-law exponent with the same estimator form as the point estimate.
 
-    Ordinary power-law replicates resample size clusters and their seed CEs. A successful offset-law
-    fit keeps the distinct-size design fixed (cluster resampling usually makes that three-parameter
-    fit underdetermined) and draws the size means from the pooled pure-error model in log-CE space,
-    the same model the lack-of-fit test uses. With :math:`y_{ij} = \log \mathrm{CE}_{ij}` (seed j of
-    size i, :math:`n_i` seeds, m sizes, n runs) and
+    Both forms keep the distinct-size design fixed and draw the size means from the pooled pure-error
+    model in log-CE space, the same model the lack-of-fit test uses. With
+    :math:`y_{ij} = \log \mathrm{CE}_{ij}` (seed j of size i, :math:`n_i` seeds, m sizes, n runs) and
     :math:`s^2 = \sum_{ij} (y_{ij} - \bar y_i)^2 / (n - m)`, each replicate draws
 
     .. math::
@@ -1292,18 +1424,33 @@ def bootstrap_exponent_ci(
         \bar y_i^* = \bar y_i + (\sigma^* / \sqrt{n_i}) z_i, \quad z_i \sim N(0, 1),
 
     the posterior of the size means under the noninformative prior for a normal model with a
-    common variance (Gelman et al. 2013, *Bayesian Data Analysis*, 3rd ed., Sec. 3.2). For
-    any linear functional of the means this reproduces the Student-t interval on n - m degrees of
-    freedom exactly, so the interval carries the uncertainty of the estimated seed variance. The
-    previous seed-only resampling had variance :math:`(n_i - 1)/n_i` of :math:`s_i^2/n_i` and no
-    small-df correction; at 4 sizes x 3 seeds its nominal 95% interval covered the true exponent
-    in 0.73 to 0.78 of replicates in two 200-replicate checks (audit 2026-10-08 gap-stats#1).
-    Replicates whose realized fit form differs from the point estimate are rejected. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points; degenerate or no
-    same-form replicates -> NaNs.
+    common variance (Gelman et al. 2013, *Bayesian Data Analysis*, 3rd ed., Sec. 3.2), and refits.
+    For any linear functional of the means, such as the plain-law exponent, this reproduces the
+    Student-t interval on n - m degrees of freedom exactly, so the interval carries the uncertainty of
+    the estimated seed variance. The previous seed-only resampling of the offset law had variance
+    :math:`(n_i - 1)/n_i` of :math:`s_i^2/n_i` and no small-df correction; at 4 sizes x 3 seeds its
+    nominal 95% interval covered the true exponent in 0.73 to 0.78 of replicates in two 200-replicate
+    checks (audit 2026-10-08 gap-stats#1). The plain law's previous pairs bootstrap resampled size
+    clusters, so most replicates held two to four distinct sizes over a shorter log N span, and its
+    nominal 95% interval was about 1.45 times too wide and covered 0.995 to 0.998 (audit 2026-10-31
+    analysis-statistics-4).
+
+    The replicates refit the realized estimator: the offset law when the point fit converged to it, and
+    otherwise the plain law, whose exponent a solver or design fallback reports, so a fallback is not
+    bootstrapped from the subset of replicates whose own offset solve also failed. Replicates whose realized
+    fit form differs are rejected. Without replicate seeds there is no pure error: the offset law then
+    withholds its interval (as it does when any size has a single seed) and the plain law reports the
+    residual t interval of :func:`_plain_law_residual_interval`. Returns (alpha_hat, lo2.5, hi97.5). Needs
+    >= 2 points; degenerate or no same-form replicates -> NaNs.
+
+    The generator is seeded with 0, so every call on one design shares one Monte Carlo realization; for the
+    plain law the interval is :math:`[\hat\alpha - a\,\mathrm{SE}, \hat\alpha + b\,\mathrm{SE}]` with (a, b)
+    set by ``n_boot`` alone. On five sizes with three seeds, 2000 draws give a coverage of 0.952 and 200 to
+    300 draws about 0.90, so ``n_boot`` should not go far below 2000.
 
     ``weights`` (per-point, same order as ``points``) MUST match the headline fit's weighting so the
     point estimate and the CI come from ONE estimator -- otherwise a weighted headline alpha can sit
-    outside its own unweighted CI (audit r2 id10). Resampled per replicate as ``weights[idx]``."""
+    outside its own unweighted CI (audit r2 id10). Every replicate uses them as given."""
     from vfe3.viz.figures import _fit_power_law
     xs = np.array([p["n_params"] for p in points], dtype=float)
     if xs.size < 2:
@@ -1315,36 +1462,30 @@ def bootstrap_exponent_ci(
     point_form = point_fit.get("form")
     if point_form == "offset_power_law" and any(a.size < 2 for a in seed_arrays):
         return alpha_hat, float("nan"), float("nan")
+    replicate_offset = point_form == "offset_power_law"
+    replicate_form = "offset_power_law" if replicate_offset else "power_law"
     rng = np.random.default_rng(0)                           # fixed -> reproducible CI
     boot: List[float] = []
     n = len(points)
-    if point_form == "offset_power_law":
-        if np.any(np.concatenate(seed_arrays) <= 0.0):
+    if np.any(np.concatenate(seed_arrays) <= 0.0):
+        return alpha_hat, float("nan"), float("nan")
+    log_seeds = [np.log(a) for a in seed_arrays]
+    n_i = np.array([a.size for a in log_seeds], dtype=float)
+    df_pe = int(n_i.sum()) - n
+    ss_pe = float(sum(np.sum((a - a.mean()) ** 2) for a in log_seeds))
+    if df_pe < 1 or not ss_pe > 0.0:
+        if replicate_offset or not np.isfinite(alpha_hat):
             return alpha_hat, float("nan"), float("nan")
-        log_seeds = [np.log(a) for a in seed_arrays]
-        n_i = np.array([a.size for a in log_seeds], dtype=float)
-        df_pe = int(n_i.sum()) - n
-        ss_pe = float(sum(np.sum((a - a.mean()) ** 2) for a in log_seeds))
-        if df_pe < 1 or not ss_pe > 0.0:
-            return alpha_hat, float("nan"), float("nan")
-        log_means = np.log(means)
-        s2_pe = ss_pe / df_pe
+        return (alpha_hat, *_plain_law_residual_interval(xs, means, weights, point_fit))
+    log_means = np.log(means)
+    s2_pe = ss_pe / df_pe
     for _ in range(n_boot):
-        if point_form == "offset_power_law":
-            # Fixed design; size means from the pooled pure-error posterior (see the docstring).
-            sigma2 = s2_pe * df_pe / rng.chisquare(df_pe)
-            bx = xs
-            by = np.exp(log_means + np.sqrt(sigma2 / n_i) * rng.standard_normal(n))
-            bw = weights
-        else:
-            idx = rng.integers(0, n, n)
-            bx = xs[idx]
-            by = np.array([float(rng.choice(seed_arrays[i], size=seed_arrays[i].size).mean())
-                           for i in idx])
-            bw = weights[idx] if weights is not None else None
-        fit = _fit_power_law(bx, by, weights=bw, with_offset=with_offset)
+        # Fixed design; size means from the pooled pure-error posterior (see the docstring).
+        sigma2 = s2_pe * df_pe / rng.chisquare(df_pe)
+        by = np.exp(log_means + np.sqrt(sigma2 / n_i) * rng.standard_normal(n))
+        fit = _fit_power_law(xs, by, weights=weights, with_offset=replicate_offset)
         a = fit["alpha"]
-        if np.isfinite(a) and fit.get("form") == point_form:
+        if np.isfinite(a) and fit.get("form") == replicate_form:
             boot.append(a)
     if not boot:
         return alpha_hat, float("nan"), float("nan")
@@ -1352,6 +1493,48 @@ def bootstrap_exponent_ci(
     if np.isclose(lo, hi, rtol=8. * np.finfo(float).eps, atol=0.):
         return alpha_hat, float("nan"), float("nan")
     return alpha_hat, lo, hi
+
+
+def _plain_law_residual_interval(
+    xs:        np.ndarray,                   # (m,) sizes N_i
+    means:     np.ndarray,                   # (m,) mean CE per size
+    weights:   Optional[np.ndarray],         # (m,) the point fit's WLS weights; None -> unit
+    point_fit: Mapping[str, Any],            # the plain-law fit of (xs, means) under those weights
+) -> Tuple[float, float]:
+    r"""Student-t interval of the plain-law exponent from the residuals of its own weighted line.
+
+    Without replicate seeds there is no pure-error estimate, so the scale of the line
+    :math:`\log \mathrm{CE}_i = \log A - \alpha x_i`, :math:`x_i = \log N_i`, comes from its residuals
+    :math:`r_i` under the fit weights :math:`w_i`, the textbook straight-line interval (Draper and Smith
+    1998, *Applied Regression Analysis*, 3rd ed., Ch. 1) over the m points of positive weight:
+
+    .. math::
+        \hat\sigma^2 = \frac{\sum_i w_i r_i^2}{m - 2}, \quad
+        \mathrm{SE}(\hat\alpha) = \frac{\hat\sigma}{\sqrt{\sum_i w_i (x_i - \bar x_w)^2}}, \quad
+        \hat\alpha \pm t_{m-2,\, 0.975}\, \mathrm{SE}(\hat\alpha),
+
+    with :math:`\bar x_w` the weighted mean of x. It is exact when the law holds and
+    :math:`\mathrm{Var}(\log \mathrm{CE}_i) \propto 1 / w_i`; lack of fit widens it. NaN below three points
+    of positive weight or without scipy."""
+    x = np.log(np.asarray(xs, dtype=float))
+    y = np.log(np.asarray(means, dtype=float))
+    w = np.ones_like(x) if weights is None else np.asarray(weights, dtype=float).reshape(-1)
+    m = int(np.count_nonzero(w > 0.0)) if w.size == x.size else 0
+    if m < 3 or not np.all(np.isfinite(w)) or np.any(w < 0.0):
+        return float("nan"), float("nan")
+    alpha_hat = float(point_fit["alpha"])
+    residual = y - (math.log(float(point_fit["A"])) - alpha_hat * x)
+    x_bar = float((w * x).sum() / w.sum())
+    sxx = float((w * (x - x_bar) ** 2).sum())
+    if not sxx > 0.0:
+        return float("nan"), float("nan")
+    se = math.sqrt(float((w * residual ** 2).sum()) / (m - 2) / sxx)
+    try:
+        from scipy.stats import t as t_dist
+        half = float(t_dist.ppf(0.975, m - 2)) * se
+    except Exception:
+        return float("nan"), float("nan")
+    return alpha_hat - half, alpha_hat + half
 
 
 def _loglog_rss(x: np.ndarray, y: np.ndarray) -> float:
@@ -1365,10 +1548,10 @@ def _loglog_rss(x: np.ndarray, y: np.ndarray) -> float:
 def _offset_rss(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> Tuple[float, str]:
     r"""Weighted RSS of the offset law :math:`E + A N^{-\alpha}` and the realized fit form.
 
-    The fit is the headline estimator (``_fit_power_law(with_offset=True)`` with the SEM weights
-    ``w``, i.e. ``curve_fit`` with :math:`\sigma_i = y_i / \sqrt{w_i}`), and the RSS is that fit's
-    own objective :math:`\sum_i ((y_i - \hat y_i) / \sigma_i)^2`. A solver fallback to the log-log
-    form is reported through the returned form string."""
+    The fit is the headline estimator (``_fit_power_law(with_offset=True)`` with the pooled-variance
+    weights :math:`w_i = n_i / s^2`, i.e. ``curve_fit`` with :math:`\sigma_i = y_i / \sqrt{w_i}`), and the
+    RSS is that fit's own objective :math:`\sum_i ((y_i - \hat y_i) / \sigma_i)^2`. A solver fallback to
+    the log-log form is reported through the returned form string."""
     from vfe3.viz.figures import _fit_power_law
     fit = _fit_power_law(x, y, weights=w, with_offset=True)
     if fit.get("form") != "offset_power_law":
@@ -1394,8 +1577,9 @@ def ancova_frontier_collapse(
         F = \frac{(RSS_{pooled} - RSS_{full}) / (3R - 3)}{RSS_{full} / (n - 3R)}
         \sim F_{3R-3, n-3R},
 
-    on the residuals of the headline SEM-weighted fit (Bates and Watts 1988, *Nonlinear Regression Analysis
-    and Its Applications*; Seber and Wild 1989, *Nonlinear Regression*; the F
+    on the residuals of the headline fit, weighted by the pooled pure error as :math:`n_i / s^2` (Bates and
+    Watts 1988, *Nonlinear Regression Analysis and Its Applications*; Seber and Wild 1989, *Nonlinear
+    Regression*; the F
     law is asymptotic for a nonlinear model). A log-log line is not the headline curve: the local
     log-log slope of :math:`E + A N^{-\alpha}` changes with N, so routes sampling one offset law
     over different N ranges would otherwise be reported as diverging. The offset test needs four
@@ -1410,7 +1594,8 @@ def ancova_frontier_collapse(
     and dropped from the others; ``n_identical_points_dropped`` counts the copies. Counting a copy
     under each route doubled its residual: under one shared offset law (5 widths x 4 depths, 3 seeds)
     the duplicated design rejected 0 of 150 replicates (audit 2026-10-16 F55). Any partition of the
-    distinct runs into routes gives the F law under the null."""
+    distinct runs into routes gives the F law under the null. The two learning-rate arms of ``grow_K_mup``
+    are separate routes of the partition (:func:`_fit_series`; audit 2026-10-31, A073)."""
     points, collapsed = _collapse_identical_points(
         sorted(points, key=lambda p: (str(p["route"]), str(p.get("label", "")))))
     n_dropped = sum(len(group["dropped_as_identical"]) for group in collapsed)
@@ -1419,7 +1604,7 @@ def ancova_frontier_collapse(
         n_params = _as_float(p.get("n_params"))
         ce_mean = _as_float(p.get("ce_mean"))
         if np.isfinite(n_params) and n_params > 0.0 and np.isfinite(ce_mean) and ce_mean > 0.0:
-            by_route.setdefault(p["route"], []).append(p)
+            by_route.setdefault(_fit_series(p), []).append(p)
     route_sizes = {r: {float(p["n_params"]) for p in ps} for r, ps in by_route.items()}
     routes = {r: ps for r, ps in by_route.items() if len(route_sizes[r]) >= min_points}
     out: Dict[str, Any] = {
@@ -1511,6 +1696,91 @@ def _offset_frontier_collapse(
     return out
 
 
+# Share of bound-pinned bootstrap refits above which an endpoint of the 95% percentile interval rests on a bound.
+_OFFSET_BOUND_TAIL = 0.025
+
+
+def offset_law_identification(
+    points:  List[Dict[str, Any]],
+    fit:     Mapping[str, Any],           # the offset point fit of these points (_fit_power_law)
+
+    *,
+    weights: Optional[np.ndarray] = None,  # (m,) the point fit's weights, one per point
+    n_boot:  int = 2000,
+) -> Dict[str, Any]:
+    r"""Whether the offset law :math:`L = E + A N^{-\alpha}` is identified, and a bootstrap interval for E.
+
+    ``curve_fit`` boxes the fit to :math:`0 \le E \le \min L`, :math:`A \ge 10^{-12}` and
+    :math:`10^{-3} \le \alpha \le 3`, and ``fit["at_bound"]`` lists the parameters left on a bound. Sizes
+    without curvature put :math:`E` on 0 in the point fit or in many refits. A percentile bootstrap is
+    inconsistent for a parameter on the boundary of its space (Andrews 2000, *Econometrica* 68, 399-405), and
+    here it is biased too, because any :math:`E > 0` forces a larger :math:`\alpha`. On a pure power law at the
+    five shipped widths with three seeds the nominal 95% exponent interval covered 0.72 of 100 replicates;
+    withholding it only when the point fit sat on a bound left the reported intervals covering 0.56, since the
+    intervals that miss belong to interior point fits. Withholding it also when more than
+    :data:`_OFFSET_BOUND_TAIL` of the refits sit on a bound reported 4 of those 100 intervals, and every
+    interval (100 of 100, coverage 0.95) of an identified law with :math:`E = 3` (audit 2026-10-31
+    analysis-statistics-2).
+
+    The refits are those of :func:`bootstrap_exponent_ci` for the offset law: the fixed design, size means
+    drawn from the pooled pure-error posterior, generator seed 0, so the exponent percentiles ``alpha_ci``
+    equal its interval. The law is identified when the point fit is interior and at most
+    :data:`_OFFSET_BOUND_TAIL` of the same-form refits sit on a bound; ``E_ci`` then holds the 2.5 and 97.5
+    percent points of the refit :math:`E`. Returns ``{identified, reason, at_bound, n_replicates,
+    bound_fraction, alpha_ci, E_ci}``; ``identified`` is None when the fit is not the offset law or no
+    refit can be drawn (a size with one seed, no seed spread), where :func:`bootstrap_exponent_ci` withholds
+    its interval as well.
+    """
+    from vfe3.viz.figures import _fit_power_law
+    out: Dict[str, Any] = {"identified": None, "reason": None, "at_bound": list(fit.get("at_bound") or []),
+                           "n_replicates": 0, "bound_fraction": None, "alpha_ci": None, "E_ci": None}
+    if fit.get("form") != "offset_power_law":
+        out["reason"] = f"realized form {fit.get('form')}: no offset to identify"
+        return out
+    if out["at_bound"]:
+        out.update(identified=False, reason=f"point fit on its box bound ({', '.join(out['at_bound'])})")
+        return out
+    seed_arrays = [np.asarray(p["ce_seeds"], dtype=float) for p in points]
+    if (len(seed_arrays) < 2 or any(a.size < 2 for a in seed_arrays)
+            or np.any(np.concatenate(seed_arrays) <= 0.0)):
+        out["reason"] = "no pure error: a size without replicate seeds"
+        return out
+    xs = np.array([p["n_params"] for p in points], dtype=float)               # (m,) sizes N_i
+    log_seeds = [np.log(a) for a in seed_arrays]
+    n_i = np.array([a.size for a in log_seeds], dtype=float)                  # (m,) seeds per size
+    log_means = np.log(np.array([a.mean() for a in seed_arrays]))             # (m,) log mean CE
+    df_pe = int(n_i.sum()) - len(points)
+    ss_pe = float(sum(np.sum((a - a.mean()) ** 2) for a in log_seeds))
+    if df_pe < 1 or not ss_pe > 0.0:
+        out["reason"] = "no pure error: zero seed spread"
+        return out
+    s2_pe = ss_pe / df_pe
+    rng = np.random.default_rng(0)                                            # bootstrap_exponent_ci's draws
+    alphas: List[float] = []
+    offsets: List[float] = []
+    pinned = 0
+    for _ in range(int(n_boot)):
+        sigma2 = s2_pe * df_pe / rng.chisquare(df_pe)
+        by = np.exp(log_means + np.sqrt(sigma2 / n_i) * rng.standard_normal(len(points)))
+        refit = _fit_power_law(xs, by, weights=weights, with_offset=True)
+        if np.isfinite(refit["alpha"]) and refit.get("form") == "offset_power_law":
+            alphas.append(float(refit["alpha"]))
+            offsets.append(float(refit["E"]))
+            pinned += bool(refit.get("at_bound"))
+    out["n_replicates"] = len(alphas)
+    if not alphas:
+        out["reason"] = "no bootstrap refit converged to the offset law"
+        return out
+    out["bound_fraction"] = pinned / len(alphas)
+    out["alpha_ci"] = [float(np.percentile(alphas, 2.5)), float(np.percentile(alphas, 97.5))]
+    if out["bound_fraction"] > _OFFSET_BOUND_TAIL:
+        out.update(identified=False, reason=(f"{out['bound_fraction']:.1%} of the bootstrap refits on a box bound "
+                                             f"(more than {_OFFSET_BOUND_TAIL:.1%})"))
+        return out
+    out.update(identified=True, E_ci=[float(np.percentile(offsets, 2.5)), float(np.percentile(offsets, 97.5))])
+    return out
+
+
 # =============================================================================
 # REPORT + FIGURES
 # =============================================================================
@@ -1524,11 +1794,37 @@ def _print_points_table(points: List[Dict[str, Any]]) -> None:
               f"{p['n_seeds']:>7}{p['ce_mean']:>11.4f}{p['ce_sem']:>10.4f}")
 
 
+def _manifest_search(input_dir: Path) -> List[Path]:
+    r"""Where the analysis looks for ``scaling_design.json``: in ``input_dir``, in its parent (``input_dir`` is one
+    route of a sweep), and in its direct children (``input_dir`` holds sweeps), in that order."""
+    children = (sorted(child / "scaling_design.json" for child in input_dir.iterdir() if child.is_dir())
+                if input_dir.is_dir() else [])
+    return [input_dir / "scaling_design.json", input_dir.parent / "scaling_design.json", *children]
+
+
+def _resolved_input_dir(input_dir: Path) -> Path:
+    r"""The sweep directory to analyze for the configured ``input_dir``.
+
+    ``input_dir`` itself when it or its parent holds ``scaling_design.json``, else its one direct child that holds
+    one. The shipped defaults pair through the child: ``scaling.CONFIG["output_dir"]`` is
+    ``vfe3_scaling_results/standard`` and this analyzer reads ``vfe3_scaling_results`` (audit 2026-10-31, A109),
+    and analyzing the child keeps sibling experiments out of ``scaling_points.csv``. With several such children
+    the choice is ambiguous and ``input_dir`` is kept, so the design is unverifiable and the candidates are printed.
+    """
+    candidates = [path for path in _manifest_search(input_dir) if path.is_file()]
+    if candidates and candidates[0].parent in (input_dir, input_dir.parent):
+        return input_dir
+    return candidates[0].parent if len(candidates) == 1 else input_dir
+
+
 def analyze() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    input_dir = Path(CONFIG["input_dir"])
-    if not input_dir.exists():
-        raise FileNotFoundError(f"input_dir {input_dir} does not exist; run scaling.py first")
+    configured_input_dir = Path(CONFIG["input_dir"])
+    if not configured_input_dir.exists():
+        raise FileNotFoundError(f"input_dir {configured_input_dir} does not exist; run scaling.py first")
+    input_dir = _resolved_input_dir(configured_input_dir)
+    if input_dir != configured_input_dir:
+        print(f"\n{configured_input_dir} holds no scaling_design.json; analyzing its sweep {input_dir}")
 
     force_code_drift = CONFIG.get("force_accept_code_identity_drift") is True
     rows = harvest(
@@ -1543,6 +1839,16 @@ def analyze() -> None:
     if not rows and not design["available"]:
         print(f"No runs (with summary.json) under {input_dir}; run scaling.py first.")
         return
+    if design.get("status") == "unverifiable_design":
+        searched = _manifest_search(input_dir)
+        found = [path for path in searched if path.is_file()]
+        if not found:
+            print("\nno scaling_design.json was found, so every fit is withheld; searched "
+                  + ", ".join(str(path) for path in searched)
+                  + ". Set CONFIG['input_dir'] to the output_dir of scaling.py (audit 2026-10-31, A109).")
+        elif len(found) > 1 and found[0].parent not in (input_dir, input_dir.parent):
+            print("\nseveral sweeps hold a scaling_design.json, so every fit is withheld; set CONFIG['input_dir'] "
+                  "to one of " + ", ".join(str(path.parent) for path in found))
     fig_dir = input_dir / "figures"
     fig_dir.mkdir(exist_ok=True)
     write_csv(rows, input_dir / "scaling_points.csv")
@@ -1625,6 +1931,8 @@ def analyze() -> None:
         logger.warning("harvested parameter runs span multiple token budgets -- data budget confounds the fit")
 
     routes = sorted({p["route"] for p in fit_param_points})
+    # One fitted curve per route, with the grow_K_mup learning-rate arms as two (audit 2026-10-31, A073).
+    series = sorted({_fit_series(p) for p in fit_param_points})
     # Identical training runs reached through two routes enter the pooled estimators once.
     pooled_param_points, collapsed_cells = _collapse_identical_points(fit_param_points)
     pooled_ids = {id(p) for p in pooled_param_points}
@@ -1664,8 +1972,9 @@ def analyze() -> None:
         from vfe3.viz.figures import _scaling_pooled_log_variance, _scaling_sem_weights
         all_means = np.array([p["ce_mean"] for p in param_points], dtype=float)
         all_sem = np.array([p["ce_sem"] for p in param_points], dtype=float)
-        # Points without their own SEM (single seeds) take the pooled pure-error variance of the
-        # distinct runs, the model of the lack-of-fit test and bootstrap (audit 2026-10-10 #52).
+        # Every point takes the pooled pure-error variance of the distinct runs, weight n_i / s^2: the model
+        # of the lack-of-fit test, the bootstrap and the frontier test (audit 2026-10-10 #52; 2026-10-31
+        # analysis-statistics-1, where per-point SEM weights made both F-tests reject a true law at ~12%).
         pooled_log_var = _scaling_pooled_log_variance([p["ce_seeds"] for p in pooled_param_points])
         all_weights = _scaling_sem_weights(all_means, all_sem, n_seeds=[len(p["ce_seeds"]) for p in param_points],
                                            pooled_log_variance=pooled_log_var)
@@ -1698,21 +2007,43 @@ def analyze() -> None:
         ys = np.array([p["ce_mean"] for p in pooled_param_points], dtype=float)
         fit = _fit_power_law(xs, ys, weights=pooled_weights, with_offset=CONFIG["with_offset"])
         lo = hi = None
-        if fit_testable:
+        # An offset law with a parameter on its box bound, in the point fit or in more than 2.5% of the refits,
+        # is not identified: its exponent interval is withheld (status unassessed) and the two-parameter law is
+        # reported beside it (audit 2026-10-31 analysis-statistics-2).
+        identification = (offset_law_identification(pooled_param_points, fit, weights=pooled_weights,
+                                                    n_boot=CONFIG["n_bootstrap"])
+                          if fit_testable and fit["form"] == "offset_power_law" else None)
+        ci_withheld = identification is not None and identification["identified"] is False
+        two_parameter: Optional[Dict[str, Any]] = None
+        if fit_testable and not ci_withheld:
             _a_hat, lo, hi = bootstrap_exponent_ci(
                 pooled_param_points,
                 weights=pooled_weights,
                 n_boot=CONFIG["n_bootstrap"],
                 with_offset=CONFIG["with_offset"],
             )
+        if ci_withheld:
+            plain = _fit_power_law(xs, ys, weights=pooled_weights, with_offset=False)
+            _p_hat, plain_lo, plain_hi = bootstrap_exponent_ci(
+                pooled_param_points, weights=pooled_weights, n_boot=CONFIG["n_bootstrap"], with_offset=False)
+            two_parameter = {"form": plain["form"], "alpha": plain["alpha"], "alpha_ci": [plain_lo, plain_hi],
+                             "A": plain["A"], "r2": plain["r2"]}
         if np.isfinite(_as_float(fit.get("alpha"))):
             n_fit_parameters = 3 if fit["form"] == "offset_power_law" else 2
             if fit_testable:
                 lack_of_fit = _lack_of_fit_test(pooled_param_points, fit)
+                e_ci = (identification or {}).get("E_ci")
                 print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
-                      f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
+                      + ("[95% CI withheld: offset law not identified]   " if ci_withheld
+                         else f"[95% CI {lo:.4f}, {hi:.4f}]   ")
+                      + f"A = {fit['A']:.4g}   "
                       + (f"E = {fit['E']:.4f}   " if fit["form"] == "offset_power_law" else "")
+                      + (f"[95% CI {e_ci[0]:.4f}, {e_ci[1]:.4f}]   " if e_ci else "")
                       + f"R^2 = {fit['r2']:.4f}   over {fit['n_distinct_sizes']} distinct sizes")
+                if ci_withheld:
+                    print(f"  offset law not identified: {identification['reason']}")
+                    print(f"  two-parameter law A N^-alpha:  alpha = {two_parameter['alpha']:.4f}  "
+                          f"[95% CI {plain_lo:.4f}, {plain_hi:.4f}]")
                 if lack_of_fit.get("testable"):
                     print(f"  lack-of-fit F({lack_of_fit['df_lof']},{lack_of_fit['df_pe']}) = "
                           f"{lack_of_fit['F']:.3f}  p = {lack_of_fit['p_value']:.4g}")
@@ -1725,7 +2056,14 @@ def analyze() -> None:
                       f"NOT TESTABLE (< {_min_testable_sizes()} sizes): R^2 and CI withheld")
             summary["pooled_fit"] = {
                 "form": fit["form"], "alpha": fit["alpha"],
-                "alpha_ci": [lo, hi] if fit_testable else None,
+                "alpha_ci": [lo, hi] if fit_testable and not ci_withheld else None,
+                "alpha_ci_status": ("not_testable" if not fit_testable
+                                    else "assessed" if np.isfinite(_as_float(lo)) and np.isfinite(_as_float(hi))
+                                    else "unassessed"),
+                "at_bound": list(fit.get("at_bound") or []),
+                "offset_identification": identification,
+                "two_parameter": two_parameter,
+                "E_ci": (identification or {}).get("E_ci"),
                 "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"] if fit_testable else None,
                 "n_points": fit["n_points"], "n_distinct_sizes": fit["n_distinct_sizes"],
                 "n_fit_parameters": n_fit_parameters,
@@ -1756,14 +2094,14 @@ def analyze() -> None:
                     "n_points": ne_fit["n_points"], "n_distinct_sizes": ne_fit["n_distinct_sizes"],
                     "testable": ne_testable,
                 }
-        # ---- per-route fits use exact slices of the one pooled SEM-weight vector ----
-        if routes:
+        # ---- per-route fits use exact slices of the one pooled-variance weight vector ----
+        if series:
             print("\nper-route exponents:")
-            for r in routes:
-                pr = [p for p in fit_param_points if p["route"] == r]
+            for r in series:
+                pr = [p for p in fit_param_points if _fit_series(p) == r]
                 route_sizes = {float(p["n_params"]) for p in pr}
                 if len(route_sizes) >= 2:
-                    route_mask = np.array([p["route"] == r for p in fit_param_points], dtype=bool)
+                    route_mask = np.array([_fit_series(p) == r for p in fit_param_points], dtype=bool)
                     route_weights = fit_weights[route_mask]
                     fr = _fit_power_law(np.array([p["n_params"] for p in pr], dtype=float),
                                         np.array([p["ce_mean"] for p in pr], dtype=float),
@@ -1808,7 +2146,7 @@ def analyze() -> None:
             provenance,
             frontier,
             has_fit=summary["pooled_fit"] is not None,
-            n_routes=len(routes),
+            n_routes=len(series),
             n_distinct_sizes=n_fit_param_sizes,
             lack_of_fit=lack_of_fit,
         )
@@ -1819,6 +2157,23 @@ def analyze() -> None:
     if summary["pooled_fit"] is not None:
         detail = f" ({', '.join(confounds)})" if confounds else ""
         print(f"pooled fit status: {status.upper()}{detail}")
+
+    # ---- the validation-selected weights beside the final-weight headline (audit 2026-10-31
+    # analysis-statistics-8): the same estimator on test_best_ce, and the cells whose final weights sit
+    # further above their best validation point than their seed spread ----
+    summary["pooled_fit_best_weights"] = summary["final_vs_best_validation"] = None
+    if summary["pooled_fit"] is not None:
+        best_fit = _best_weight_fit(pooled_param_points, with_offset=CONFIG["with_offset"])
+        selection = _final_vs_best_validation(pooled_param_points)
+        summary["pooled_fit_best_weights"], summary["final_vs_best_validation"] = best_fit, selection
+        if best_fit["status"] == "fitted":
+            print(f"L(N) at the validation-selected weights ({best_fit['form']}):  alpha = {best_fit['alpha']:.4f}"
+                  f"   (final weights: {summary['pooled_fit']['alpha']:.4f})")
+        else:
+            print(f"L(N) at the validation-selected weights withheld ({best_fit['reason']})")
+        if selection["flagged"]:
+            print("WARNING: the final weights sit further above the best validation point than the seed spread "
+                  f"in {', '.join(selection['flagged'])}; the final-weight fit is biased at those sizes")
 
     # ---- persist the analysis summary (json + a human-readable markdown report); best-effort so a
     # serialization/render error never suppresses the figure pass below ----
@@ -1832,7 +2187,10 @@ def analyze() -> None:
 
     # ---- figures (best-effort, never fatal) ----
     figure_param_points = param_points if allow_parameter_fit else []
+    # The pooled figure fits take the summary's points (identical runs once) and weights.
     _make_figures(figure_param_points, fit_infer_points, fig_dir, weights_by_route=weights_by_route,
+                  pooled_points=pooled_param_points if allow_parameter_fit else [],
+                  pooled_weights=pooled_weights if allow_parameter_fit else None,
                   validation_points=validation_points,
                   axis_routes=_axis_routes(validation_points or []),
                   budget_points=budget_points if allow_parameter_fit else [])
@@ -1907,18 +2265,32 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     if pf:
         n_sizes = pf.get("n_distinct_sizes", pf.get("n_points"))
         alpha_ci = pf.get("alpha_ci")
-        ci_text = (f"95% CI [{alpha_ci[0]:.4f}, {alpha_ci[1]:.4f}]"
-                   if alpha_ci is not None and None not in alpha_ci
-                   else f"CI withheld: not testable below {_min_testable_sizes()} distinct sizes")
+        identification = pf.get("offset_identification") or {}
+        if alpha_ci is not None and None not in alpha_ci:
+            ci_text = f"95% CI [{alpha_ci[0]:.4f}, {alpha_ci[1]:.4f}]"
+        elif pf.get("alpha_ci_status") == "unassessed":
+            ci_text = f"CI withheld: offset law not identified, {identification.get('reason')}"
+        else:
+            ci_text = f"CI withheld: not testable below {_min_testable_sizes()} distinct sizes"
+        e_ci = pf.get("E_ci")
+        e_text = ("" if pf.get("form") != "offset_power_law" or pf.get("E") is None
+                  else f", E = {pf['E']:.4f}" + (f" (95% CI [{e_ci[0]:.4f}, {e_ci[1]:.4f}])" if e_ci
+                                                 else " (not identified)" if identification.get("identified") is False
+                                                 else ""))
         r2_text = (f"R^2 = {pf['r2']:.4f}" if pf.get("r2") is not None
                    else f"R^2 withheld (not testable below {_min_testable_sizes()} distinct sizes)")
         L += ["## Pooled L(N) power law", "",
               status_line,
               f"- realized fit form: `{pf.get('form', 'unknown')}`",
               f"- exponent alpha = {pf['alpha']:.4f}  ({ci_text})",
-              f"- A = {pf['A']:.4g}" + (f", E = {pf['E']:.4f}"
-                                        if pf.get("form") == "offset_power_law" and pf.get("E") is not None else ""),
+              f"- A = {pf['A']:.4g}" + e_text,
               f"- {r2_text} over {n_sizes} distinct sizes ({pf['n_points']} points)"]
+        two_parameter = pf.get("two_parameter")
+        if two_parameter:
+            plain_ci = two_parameter.get("alpha_ci") or [None, None]
+            L.append(f"- two-parameter law A N^-alpha: alpha = {two_parameter['alpha']:.4f}"
+                     + (f" (95% CI [{plain_ci[0]:.4f}, {plain_ci[1]:.4f}])"
+                        if None not in plain_ci and all(np.isfinite(plain_ci)) else " (CI withheld)"))
         if pf.get("residual_dof") is not None:
             L.append(f"- residual degrees of freedom: {pf['residual_dof']} "
                      f"({pf.get('n_fit_parameters')} fitted parameters)")
@@ -1974,6 +2346,22 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
               for group in collapsed]
         L += [f"- training-budget cell (fixed N; tokens axis only): `{label}`" for label in budget]
         L.append("")
+    best_fit = summary.get("pooled_fit_best_weights")
+    selection = summary.get("final_vs_best_validation")
+    if best_fit or selection:
+        L += ["## Final versus validation-selected weights", "",
+              "- the headline fits the test CE at the final weights"]
+        if best_fit and best_fit.get("status") == "fitted":
+            L.append(f"- L(N) on the test CE at the validation-selected weights: alpha = {best_fit['alpha']:.4f} "
+                     f"(`{best_fit.get('form')}`, {best_fit.get('n_distinct_sizes')} distinct sizes)")
+        elif best_fit:
+            L.append(f"- L(N) at the validation-selected weights withheld ({best_fit.get('reason')})")
+        if selection:
+            flagged = ", ".join(f"`{cell}`" for cell in selection.get("flagged") or []) or "none"
+            L.append(f"- cells whose final weights sit further above their best validation point than the seed "
+                     f"SD of their final validation CE: {flagged} ({selection.get('n_assessed')} of "
+                     f"{selection.get('n_cells')} cells assessed)")
+        L.append("")
     path.write_text("\n".join(L), encoding="utf-8")
 
 
@@ -1984,10 +2372,20 @@ def _make_figures(
 
     *,
     weights_by_route:  Optional[Mapping[str, np.ndarray]]       = None,
+    pooled_points:     Optional[List[Dict[str, Any]]]           = None,
+    pooled_weights:    Optional[np.ndarray]                     = None,
     validation_points: Optional[List[Dict[str, Any]]]           = None,
     axis_routes:       Optional[Mapping[str, str]]              = None,
     budget_points:     Optional[List[Dict[str, Any]]]           = None,
 ) -> None:
+    r"""Write the scaling figures; each is best-effort and a failure skips only that figure.
+
+    The pooled fits (the headline, non-embedding and compute figures and the dashed line of the routes
+    overlay) use ``pooled_points``, the parameter points with identical training runs counted once, and
+    ``pooled_weights`` (one per pooled point), the estimator of ``scaling_summary.json``; without them they
+    fall back to ``param_points`` and recomputed weights."""
+    if pooled_points is None:
+        pooled_points, pooled_weights = param_points, None
     try:
         from vfe3.viz import figures as figs
         figs.set_publication_style()
@@ -2028,27 +2426,31 @@ def _make_figures(
 
     if len(param_points) >= 2:
         _try("scaling_ce_vs_params.png", lambda: figs.plot_scaling_law(
-            param_points, x_key="n_params", xlabel="parameters N",
-            with_offset=CONFIG["with_offset"], path=str(fig_dir / "scaling_ce_vs_params.png")))
+            pooled_points, x_key="n_params", xlabel="parameters N",
+            with_offset=CONFIG["with_offset"], weights=pooled_weights,
+            path=str(fig_dir / "scaling_ce_vs_params.png")))
         # Same law against non-embedding parameters when every point records them.
-        if all(np.isfinite(_as_float(p.get("n_non_embedding_params"))) for p in param_points):
+        if all(np.isfinite(_as_float(p.get("n_non_embedding_params"))) for p in pooled_points):
             _try("scaling_ce_vs_non_embedding_params.png", lambda: figs.plot_scaling_law(
-                param_points, x_key="n_non_embedding_params",
+                pooled_points, x_key="n_non_embedding_params",
                 xlabel="non-embedding parameters (N minus lookup tables)",
-                with_offset=CONFIG["with_offset"],
+                with_offset=CONFIG["with_offset"], weights=pooled_weights,
                 title="Scaling law (test CE vs non-embedding parameters)",
                 path=str(fig_dir / "scaling_ce_vs_non_embedding_params.png")))
         if len({p["route"] for p in param_points}) > 1:
             _try("scaling_routes_overlay.png", lambda: figs.plot_scaling_routes(
                 param_points, x_key="n_params", xlabel="parameters N",
                 with_offset=CONFIG["with_offset"], weights_by_route=weights_by_route,
+                pooled_points=pooled_points, pooled_weights=pooled_weights,
                 path=str(fig_dir / "scaling_routes_overlay.png")))
-        # compute axis (a proxy): CE vs estimated FLOPs across the size grid (tokens fixed -> compute
-        # grows with N). Labeled a proxy; uses the 6ND column.
-        if any(np.isfinite(p["est_flops_6ND"]) for p in param_points):
+        # Compute axis: CE against the training compute of each size (tokens fixed, so compute grows with
+        # N). The measured forward count leads; at a fixed token budget 6ND is N rescaled (_compute_axis).
+        compute_axis = _compute_axis(pooled_points)
+        if compute_axis is not None:
+            compute_key, compute_label, compute_title = compute_axis
             _try("scaling_ce_vs_flops.png", lambda: figs.plot_scaling_law(
-                param_points, x_key="est_flops_6ND", xlabel="est FLOPs (6ND proxy)",
-                with_offset=CONFIG["with_offset"], title="Scaling vs compute (6ND proxy)",
+                pooled_points, x_key=compute_key, xlabel=compute_label,
+                with_offset=CONFIG["with_offset"], weights=pooled_weights, title=compute_title,
                 path=str(fig_dir / "scaling_ce_vs_flops.png")))
         # data axis: only meaningful if tokens_seen actually varies (the fixed-N budget cells
         # of a max_steps route, when present, are the data axis; they never enter L(N)).
@@ -2059,13 +2461,16 @@ def _make_figures(
                 data_points, x_key="tokens_seen", xlabel="tokens seen (data)",
                 with_offset=CONFIG["with_offset"], title="Scaling vs data",
                 path=str(fig_dir / "scaling_ce_vs_tokens.png")))
-        # Pooled PPL offset law vs width (the June-27 headline result): PPL = E + A K^{-b} over ALL
-        # parameter points, distinct from the per-arm kmup_stability split below. Uses the per-point
-        # ppl_mean from aggregate_points; gated on >= 2 distinct widths.
-        if len({_as_float(p.get("embed_dim")) for p in param_points
+        # Pooled PPL offset law vs width (the June-27 headline result): PPL = E + A K^{-b} over the routes
+        # whose scale knob is embed_dim, at the operating point's learning rates, so neither depth nor the
+        # muP rate arm (kmup_stability below) enters a width law as noise (audit 2026-10-31, A073). Uses the
+        # per-point ppl_mean from aggregate_points; gated on >= 2 distinct widths.
+        width_points = [p for p in param_points
+                        if p.get("scale_knob") == "embed_dim" and _mup_arm(p) != "mup"]
+        if len({_as_float(p.get("embed_dim")) for p in width_points
                 if np.isfinite(_as_float(p.get("embed_dim")))}) > 1:
             _try("ppl_vs_embed_dim_offset.png", lambda: figs.plot_ppl_offset(
-                param_points, path=str(fig_dir / "ppl_vs_embed_dim_offset.png")))
+                width_points, path=str(fig_dir / "ppl_vs_embed_dim_offset.png")))
 
     # F1/EXP-6: muP width-stability -- grow_K (width-fixed) vs grow_K_mup's matched _fixed/_mup arms on
     # the shared K=embed_dim axis (test PPL per K + offset power-law fit, b annotated per arm). The

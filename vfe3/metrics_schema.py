@@ -348,7 +348,10 @@ del _column
 
 
 def unregistered_columns(columns: Iterable[str]) -> List[str]:
-    r"""The names in ``columns`` that :data:`METRIC_COLUMNS` does not declare, sorted."""
+    r"""The names in ``columns`` that :data:`METRIC_COLUMNS` does not declare, sorted.
+
+    Test hook: referenced only by the tests.
+    """
     return sorted({name for name in columns if name not in METRIC_COLUMNS})
 
 

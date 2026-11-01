@@ -36,7 +36,8 @@ reproducible run to run for a fixed GPU, shape and dtype. ``triton`` is imported
 from typing import Any, Optional, Tuple
 
 import torch
-from torch.autograd.function import once_differentiable
+
+from vfe3.kernels._autograd import strict_once_differentiable
 
 _KERNELS: Any = None
 
@@ -73,8 +74,9 @@ def _map_splits(tk: Any, device: torch.device, n_tiles: int, n_groups: int) -> i
 class DiagonalRootSquareSums(torch.autograd.Function):
     r"""g = sum over k of X^2 for X = S U^{-1} diag(rho) per token; see the module docstring.
 
-    The backward is ``once_differentiable``: it is a set of Triton writes autograd does not track, so a
-    ``create_graph=True`` gradient raises instead of returning a truncated second derivative.
+    The backward is once differentiable: it is a set of Triton writes autograd does not track, so a second
+    derivative through it raises instead of returning a truncated value, also toward a leaf upstream of S, U or the
+    root (``strict_once_differentiable``; audit 2026-10-31 triton-kernels-2).
     """
 
     @staticmethod
@@ -90,7 +92,9 @@ class DiagonalRootSquareSums(torch.autograd.Function):
         cfg = tk.launch_config(d, S.dtype == torch.float64)
         g = torch.empty(T, ROWS, dtype=S.dtype, device=S.device)
         if T > 0 and ROWS > 0:
-            grid = (-(-T // cfg["TB"]), -(-ROWS // cfg["BR_FWD"]))
+            # 1-D grid, row tile fastest: the programs sharing a token group's frame tiles run adjacently (audit
+            # 2026-10-31 triton-kernels-1); a 1-D axis also avoids the 65,535 limit of a second grid axis.
+            grid = (-(-T // cfg["TB"]) * -(-ROWS // cfg["BR_FWD"]),)
             tk.diag_moments_fwd_kernel[grid](
                 S, U, root, g, T, ROWS, K, M, d, BR=cfg["BR_FWD"], BD=cfg["BD"], TB=cfg["TB"],
                 num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
@@ -98,7 +102,7 @@ class DiagonalRootSquareSums(torch.autograd.Function):
         return g
 
     @staticmethod
-    @once_differentiable
+    @strict_once_differentiable
     def backward(ctx: Any, grad_g: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
         S, U, root = ctx.saved_tensors

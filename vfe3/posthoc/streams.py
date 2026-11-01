@@ -243,12 +243,22 @@ def eval_windows(tokens: torch.Tensor, seq_len: int, stride: int) -> Dataset:
 
 
 def evenly_spaced(n_total: int, n_select: Optional[int]) -> np.ndarray:
-    r"""``n_select`` distinct indices spread evenly over ``range(n_total)``; all indices when None."""
+    r"""All ``n_total`` window indices when ``n_select`` is None or at least ``n_total``, else a ``max_windows`` subset.
+
+    The subset is ``n_select`` distinct indices spread evenly over ``1, ..., n_total - 1``: window 0 is left out
+    (audit 2026-10-31 A113). Under the sliding protocol every later window scores its last ``s`` targets with at
+    least :math:`N - s + 1` tokens of context, while window 0 scores all :math:`N` targets at contexts
+    :math:`1, \dots, N`; in the full split it is one window of thousands, but in a subset of :math:`m` windows it
+    would be one in :math:`m` and over-weight short-context targets. Without window 0 every subset window scores
+    targets at the protocol's context. The callers (the post-hoc, re-scoring, checkpoint-averaging and shrinkage
+    ``max_windows`` subsets, and the covariance sample) all subset evaluation windows; where window 0 is like any
+    other (disjoint windows, the tail-scored training sample, a sample of positions) leaving it out is harmless.
+    """
     if n_select is None or n_select >= n_total:
         return np.arange(n_total, dtype=np.int64)
     if n_select <= 0:
         raise ValueError("n_select must be positive")
-    return np.unique(np.round(np.linspace(0, n_total - 1, n_select)).astype(np.int64))
+    return np.unique(np.round(np.linspace(1, n_total - 1, n_select)).astype(np.int64))
 
 
 class ScoredTailWindows(Dataset):

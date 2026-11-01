@@ -191,12 +191,20 @@ class _StopBeforeTraining(Exception):
 
 def test_scaling_failed_cell_is_terminal_unless_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import scaling
+    from vfe3.config import VFE3Config
 
     route = next(iter(scaling.ROUTES))
     cell = scaling.ROUTES[route][0]
     run_dir = scaling._trusted_scaling_run_dir(tmp_path, route, cell["label"], 6)
+    # The failure names the experiment it ran (audit 2026-10-31, A051); only that experiment is served it.
+    sources = {split: _fake_source("wikitext-103", split) for split in ("train", "validation", "test")}
+    monkeypatch.setattr(scaling, "_data_source_identities", lambda dataset: sources)
+    monkeypatch.setattr(scaling, "_current_package_code_identity", lambda: "c" * 64)
+    contract = scaling._scaling_attempt_contract(
+        VFE3Config(**scaling._cell_cfg_dict(cell["overrides"], 6, None)), dataset="wikitext-103",
+        max_tokens=None, source_identities=sources, package_code_sha256="c" * 64)
     failure = {"label": cell["label"], "route": route, "seed": 6, "status": "failed",
-               "error_kind": "train", "error": "synthetic divergence"}
+               "error_kind": "train", "error": "synthetic divergence", "attempt_contract": contract}
     for name in ("scaling_result.json", "scaling_failure.json"):
         (run_dir / name).write_text(json.dumps(failure), encoding="utf-8")
 
@@ -503,14 +511,16 @@ def test_cohort_duplicate_cell_is_reused_not_retrained(
     assert meta["status"] == "complete"
 
 
-def test_baseline_noise_floor(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_baseline_noise_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
     import ablation
 
+    admitted: Dict[str, List[Dict[str, Any]]] = {"a": [], "b": []}
     for sweep, seed, ppl in (("a", 6, 100.0), ("b", 6, 100.0), ("a", 23, 102.0), ("b", 54, 98.0)):
-        cell = tmp_path / sweep / f"baseline__s{seed}"
-        cell.mkdir(parents=True)
-        (cell / "ablation_result.json").write_text(json.dumps(
-            {"status": "success", "seed": seed, "overrides": {}, "primary_val_ppl": ppl}), encoding="utf-8")
+        admitted[sweep].append({"status": "success", "seed": seed, "overrides": {}, "primary_val_ppl": ppl})
+    # The floor reads the rows the collector admits, not raw markers (audit 2026-10-31, A347).
+    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d, **_: admitted[Path(d).name])
     floor = ablation._baseline_noise_floor([tmp_path / "a", tmp_path / "b"])
     assert floor["seeds"] == [6, 23, 54] and floor["n"] == 3
     ces = [math.log(100.0), math.log(102.0), math.log(98.0)]

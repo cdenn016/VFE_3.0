@@ -8,18 +8,29 @@ and the frame realized at sequence position ``p`` is :math:`U_{v,p} = e^{X_v} e^
 positional algebra element :math:`Y_p`. The trained model has exact global redundancies (package
 spec): (i) a split :math:`e^{X_v} \to e^{X_v} k`, :math:`e^{Y} \to k^{-1} e^{Y}` with one global
 block-GL ``k``; (ii) a global right ``h`` on :math:`e^{Y}` compensated in the relational operators;
-(iii) a global left positive diagonal ``D``: :math:`\mu \to D\mu`, :math:`\mathrm{var} \to D^2
-\mathrm{var}`, :math:`e^{X} \to D e^{X}` (whether (iii) is exact for a given configuration is decided
-by :func:`vfe3.semantics.common.diagonal_redundancy_status`; a LayerNorm, affine or not, breaks it).
-No function of a single raw :math:`\phi_v` is invariant, so every per-token frame statistic here is
-computed in the gauge-fixed chart
+(iii) a global left positive diagonal ``D``: :math:`\mu \to D\mu`, :math:`e^{X} \to D e^{X}`, with
+the local covariance diagonal :math:`\mathrm{var} \to D^2\mathrm{var}` (the stored log-variances of a
+local-diagonal table shift by :math:`2\log D`; the reference variances :math:`c_v` of
+``gaussian_frame_diagonal`` stay fixed). Whether (iii) is exact for a given configuration is decided
+by :func:`vfe3.semantics.common.diagonal_redundancy_status`. No function of a single raw
+:math:`\phi_v` is invariant, so every per-token frame statistic here is computed in the gauge-fixed chart
 
 .. math::  \hat U_v = D_0\, e^{X_v}\, m^{-1} D_0^{-1}, \qquad
            \log d_{0,k} = -\tfrac12\, \overline{\log \mathrm{var}_{\cdot k}}^{\,\mathrm{ref}},
 
-with ``m`` the bi-invariant (exponential) barycenter of the reference frames. ``U_hat`` is invariant
-under (i) and (iii) when ``m`` is the fixed point (up to the barycenter residual otherwise); statistics of the raw coordinates are labeled as statements about the trained
-trivialization. For ``transport_mode="flat"`` the transport :math:`\Omega_{ij} = U_i U_j^{-1}`
+with ``m`` the bi-invariant (exponential) barycenter of the reference frames and :math:`\mathrm{var}`
+the local covariance diagonal of the reference priors (for ``gaussian_frame_diagonal`` the diagonal of
+:math:`U_{v,0}\operatorname{diag}(c_v)U_{v,0}^\top` at position 0, :func:`canonical_frames`). ``U_hat`` is
+invariant under (i) and (iii) when ``m`` is the fixed point (up to the barycenter residual otherwise);
+statistics of the raw coordinates are labeled as statements about the trained trivialization.
+
+The chart quotients only these global redundancies. Where the forward map is gauge covariant and no
+decoder reads the prior tables in local coordinates (:func:`token_frame_gauge`; the fully gauge-covariant
+and principled exact routes), a per-type reparametrization :math:`U_v \to g_vU_v`, :math:`\mu_v \to
+g_v\mu_v` is a redundancy as well, so the token frame is pure gauge: the per-token statistics then describe
+the gauge training selected and are labeled so, while the reference content :math:`U_v^{-1}\mu_v` with
+:math:`c_v` (or :math:`C_v`) and the conjugacy classes of the positional frames stay invariant. With the
+flat cocycle of ``gauge_transport='on'`` the transport :math:`\Omega_{ij} = U_i U_j^{-1}`
 telescopes, so its loop holonomy is identically the identity and is never plotted; the relational content
 links are a separate connection whose triangle holonomy is not the identity in general and is not measured
 here (:func:`_frame_holonomy_note`).
@@ -62,13 +73,18 @@ _BRANCH_TOL = 1e-8            # |arg lambda| >= pi - tol counts as on the closed
 _ISS_RADIUS = 0.25            # inverse scaling and squaring stops once ||B - I||_F < 0.25
 _ISS_TERMS = 18               # atanh series terms: ||Z||_2 <= 0.143 => truncation < 1e-29
 _PAR_MIN_ROWS = 64           # smallest per-worker share of a batch worth a thread (see _pmap)
+# Barycenter iterates: eigenvector condition number kappa_1(V) above which the eigen-log is reconstruction-checked
+# (_logm_screened). Its forward error is O(kappa_1(V) u), u = 1.1e-16, far below logm_real's tol at 1e4.
+_EIGVEC_COND_SCREEN = 1e4
 
 # run_phi_section budgets; every key is overridable through ctx.options
 PHI_DEFAULTS: Dict[str, Any] = {
     "frame_ref_count":          4096,   # barycenter and D0 reference set (top frequency; id order without counts)
     "frame_rerank":             100,    # group-analogy rerank pool
     "frame_rerank_questions":   500,    # benchmark questions reranked (seeded sample; curated: all)
-    "frame_null":               500,    # relation-transport permutation-null draws
+    "frame_null":               2000,   # relation-transport permutation-null draws: the Holm-adjusted p of R tested
+                                        # relations is at least R/(1 + frame_null), 10/2001 < 0.01 for the ten curated
+                                        # relations (each draw only indexes the precomputed cosine Gram)
     "frame_commutator_pairs":   500,    # random token pairs for commutator / BCH diagnostics
     "frame_max_positions":      None,   # positional analysis window (None -> cfg.max_seq_len)
     "frame_positional_null":    200,    # position-permutation null draws of the relative-position R^2
@@ -328,6 +344,53 @@ def logm_real(
     return L.reshape(A.shape), res.reshape(batch_shape), ok.reshape(batch_shape)
 
 
+def _logm_screened(
+    A: Any,                  # (n, d, d) real matrices
+
+    *,
+    cond_max:   float = _EIGVEC_COND_SCREEN,
+    tol:        float = 1e-9,
+    accept_tol: float = 1e-6,
+    chunk:      int   = _CHUNK,
+    counts:     Optional[Dict[str, int]] = None,   # out-param: adds the rows routed to logm_real ("rows_checked")
+) -> Tuple[Tensor, Tensor]:
+    r"""Principal real log of the iterates of :func:`bi_invariant_mean`, reconstruction-checked only where needed.
+
+    The eigen-decomposition log :math:`L = \mathrm{Re}\, V\log\Lambda\, V^{-1}` has a forward error of
+    order :math:`\kappa_1(V)\, u` (``u`` the unit roundoff), so for :math:`\kappa_1(V) =
+    \lVert V\rVert_1\lVert V^{-1}\rVert_1 \le` ``cond_max`` the reconstruction residual of
+    :func:`logm_real` stays far below its ``tol`` and its inverse-scaling fallback never fires; those rows
+    skip the residual's matrix exponential. Every other row (an ill-conditioned, singular or non-finite
+    eigenvector matrix, or a non-finite log) goes through :func:`logm_real` with its reconstruction check
+    and fallback. Rows with an eigenvalue on the closed negative real axis have no real principal log and
+    are NaN. Returns ``(L, ok)``; ``L`` is NaN where ``ok`` is False.
+    """
+    A = _t(A)
+    n = A.shape[0]
+    L = torch.full_like(A, float("nan"))
+    ok = torch.zeros(n, dtype=torch.bool)
+    for s in range(0, n, chunk):
+        Ac = A[s:s + chunk]
+        lam, V = _pmap(torch.linalg.eig, Ac)                           # (m, d), (m, d, d) complex
+        on_cut = ((lam.abs() == 0) | (lam.angle().abs() >= math.pi - _BRANCH_TOL)).any(-1)
+        Vinv, info = _pmap(torch.linalg.inv_ex, V)
+        cond = torch.linalg.matrix_norm(V, ord=1) * torch.linalg.matrix_norm(Vinv, ord=1)   # kappa_1(V), (m,)
+        Lc = ((V * torch.log(lam).unsqueeze(-2)) @ Vinv).real.contiguous()          # V diag(log lambda) V^{-1}
+        screened = ((~on_cut) & (info == 0) & torch.isfinite(cond) & (cond <= cond_max)
+                    & torch.isfinite(Lc).flatten(-2).all(-1))
+        okc = screened.clone()
+        check = (~on_cut) & (~screened)
+        if counts is not None:
+            counts["rows_checked"] = counts.get("rows_checked", 0) + int(check.sum())
+        if bool(check.any()):
+            Lk, _, okk = logm_real(Ac[check], tol=tol, accept_tol=accept_tol, chunk=chunk)
+            Lc[check] = Lk
+            okc[check] = okk
+        Lc[~okc] = float("nan")
+        L[s:s + chunk], ok[s:s + chunk] = Lc, okc
+    return L, ok
+
+
 def bi_invariant_mean(
     U: Any,                  # (n, d, d) group elements
 
@@ -336,6 +399,7 @@ def bi_invariant_mean(
     tol:          float            = 1e-10,
     log_U:        Optional[Any]    = None,     # (n, d, d) known logs of U (init only), e.g. X when U = e^X
     max_iter_cap: Optional[int]    = None,     # hard cap of the adaptive extension (None -> 4 max_iter)
+    screen_cond:  Optional[float]  = _EIGVEC_COND_SCREEN,   # None: reconstruction-check every iterate's log
 ) -> Tuple[Tensor, Dict[str, Any]]:
     r"""Exponential (bi-invariant) barycenter of group elements (Pennec & Arsigny 2013).
 
@@ -353,10 +417,18 @@ def bi_invariant_mean(
     long as each step still contracts the residual by at least a factor 0.9 (a slowly converging
     iteration is finished rather than abandoned; a stagnating one stops at ``max_iter``).
 
+    Each iterate's logs come from :func:`_logm_screened`, which reconstruction-checks (and, where needed,
+    recomputes by inverse scaling and squaring) only the rows whose eigenvector matrix has
+    :math:`\kappa_1(V) >` ``screen_cond``; the returned iterate is then checked in full by
+    :func:`logm_real`. ``screen_cond=None`` checks every iterate in full.
+
     Returns ``(m, info)``; ``info`` has ``iterations``, ``residual`` (:math:`\|\overline{\log(m^{-1}U)}\|_F`
-    at the returned ``m``), ``converged``, ``extended`` (ran past ``max_iter``), ``n_log_failed``,
-    ``history`` and ``returned`` (``"fixed_point"``, or ``"best_iterate"`` -- the iterate with the
-    smallest residual, which may be the initialization -- when the iteration stopped unconverged).
+    at the returned ``m``, from the iteration), ``residual_checked`` (the same norm from the fully
+    reconstruction-checked logs), ``converged``, ``extended`` (ran past ``max_iter``), ``n_log_failed``
+    (at the returned ``m``, from the full check), ``history``, ``screen`` (``cond_max`` and the rows the
+    iterations routed to the full check; ``None`` without screening) and ``returned``
+    (``"fixed_point"``, or ``"best_iterate"``, the iterate with the smallest residual, which may be the
+    initialization, when the iteration stopped unconverged).
     """
     cap = max(int(max_iter), 4 * int(max_iter) if max_iter_cap is None else int(max_iter_cap))
     U = _t(U)
@@ -373,8 +445,13 @@ def bi_invariant_mean(
     history: List[float] = []
     best_norm, best_m, best_failed = float("inf"), m, 0
     converged, n_failed, it = False, 0, 0
+    screen: Dict[str, int] = {"rows_checked": 0}
     for it in range(cap + 1):
-        Lr, _, okr = logm_real(_pmap(lambda U_: torch.linalg.solve(m, U_), U))   # log(m^{-1} U_a)
+        A = _pmap(lambda U_: torch.linalg.solve(m, U_), U)                      # m^{-1} U_a, (n, d, d)
+        if screen_cond is None:
+            Lr, _, okr = logm_real(A)                                           # log(m^{-1} U_a)
+        else:
+            Lr, okr = _logm_screened(A, cond_max=float(screen_cond), counts=screen)
         n_failed = int((~okr).sum())
         if not bool(okr.any()):
             break
@@ -390,10 +467,16 @@ def bi_invariant_mean(
         if it >= cap or (it >= max_iter and not contracting):
             break
         m = m @ torch.matrix_exp(step)
-    info = {"iterations": it, "residual": best_norm, "converged": converged, "extended": it > max_iter,
-            "n_log_failed": best_failed if not converged else n_failed, "history": history,
-            "returned": "fixed_point" if converged else "best_iterate"}
-    return (m if converged else best_m), info
+    m_out = m if converged else best_m
+    info = {"iterations": it, "residual": best_norm, "residual_checked": best_norm, "converged": converged,
+            "extended": it > max_iter, "n_log_failed": best_failed if not converged else n_failed,
+            "history": history, "screen": None, "returned": "fixed_point" if converged else "best_iterate"}
+    if screen_cond is not None:                                                 # the full check at the returned m
+        Lf, _, okf = logm_real(_pmap(lambda U_: torch.linalg.solve(m_out, U_), U))
+        info["residual_checked"] = float(_fro(Lf[okf].mean(0))) if bool(okf.any()) else float("nan")
+        info["n_log_failed"] = int((~okf).sum())
+        info["screen"] = {"cond_max": float(screen_cond), "rows_checked": int(screen["rows_checked"])}
+    return m_out, info
 
 
 # ----------------------------------------------------------------------------------------------
@@ -456,9 +539,16 @@ def canonical_frames(
 
     :math:`D_0 = \mathrm{diag}(e^{\log d_0})`, :math:`\log d_{0,k} = -\tfrac12 \mathrm{mean}_{v \in \mathrm{ref}}
     \log \mathrm{var}_{vk}`; :math:`m` = :func:`bi_invariant_mean` of the raw reference frames per block.
+    ``log_var_ref`` is ``run.log_var(ref_ids)``. Under ``gaussian_frame_diagonal`` (``run.reference_variances``)
+    that is :math:`\log c_v`, which the global positive diagonal leaves fixed, so :math:`\mathrm{var}` is taken as
+    the local covariance diagonal of the reference priors at position 0 instead (:func:`_local_log_variances`),
+    :math:`\mathrm{var}_{vk} = \sum_m (U_{v,0})_{km}^2 c_{vm}`, :math:`U_{v,0} = e^{X_v}e^{Y_0}`
+    (``diagnostics["d0_variances"]`` records which).
     Invariance: under :math:`U_v \to U_v k` the barycenter maps to :math:`m k`; under
     :math:`(\log\mathrm{var} \to \log\mathrm{var} + 2\log D,\ U_v \to D U_v)` it maps to :math:`D m` and
-    :math:`D_0 \to D_0 D^{-1}`; in both cases :math:`\hat U_v` is unchanged. On the reference set the
+    :math:`D_0 \to D_0 D^{-1}`; in both cases :math:`\hat U_v` is unchanged (the local diagonal of the
+    frame-diagonal family maps by :math:`D^2` under :math:`U \to DU`, :math:`c` fixed, and is unchanged by the
+    split, which leaves :math:`U_{v,0}` fixed). On the reference set the
     barycenter of :math:`\hat U` is the identity. Both statements hold for the fixed point of the
     barycenter iteration; when a block returns its best iterate instead, they hold only up to
     :math:`O(r)` with ``r`` the barycenter residual (``diagnostics["barycenter_residual_max"]``).
@@ -472,11 +562,14 @@ def canonical_frames(
         raise ValueError("canonical_frames needs non-empty ids and ref_ids")
     if lv_ref.ndim != 2 or lv_ref.shape[0] != ref_ids.size:
         raise ValueError(f"log_var_ref must be (n_ref, K) with n_ref={ref_ids.size}; got {lv_ref.shape}")
-    log_d0 = -0.5 * lv_ref.mean(axis=0)                                   # (K,)
     slices = list(run.block_slices)
     n = ids.size
 
     X_ref = run.phi_blocks(ref_ids)
+    reference_variances = bool(getattr(run, "reference_variances", False))
+    if reference_variances:                                               # log c_v -> local log diag at p = 0
+        lv_ref = _local_log_variances(run, X_ref, lv_ref)
+    log_d0 = -0.5 * lv_ref.mean(axis=0)                                   # (K,)
     m_list: List[Tensor] = []
     bary: List[Dict[str, Any]] = []
     for b, sl in enumerate(slices):
@@ -520,15 +613,39 @@ def canonical_frames(
     diagnostics = {
         "n": int(n), "n_ref": int(ref_ids.size), "n_ok": int(ok.sum()),
         "ok_fraction": float(ok.mean()), "log_d0": _summary(log_d0), "blocks": blocks_diag,
+        "d0_variances": ("local diagonal of U_v0 diag(c_v) U_v0^T at position 0 (reference variances c_v)"
+                         if reference_variances else "prior covariance diagonal"),
         "barycenter_converged_all": all(bool(x["converged"]) for x in bary),
         "barycenter_residual_max": max(float(x["residual"]) for x in bary),
+        "barycenter_residual_checked_max": max(float(x.get("residual_checked", x["residual"])) for x in bary),
     }
     return CanonicalFrames(ids=ids, log_d0=log_d0, m=m_list, U_hat=U_hat, L=L_list, ok=ok,
                            diagnostics=diagnostics, ref_ids=ref_ids, block_slices=slices, residual=res_list)
 
 
+def _local_log_variances(run: Any, X_ref: Sequence[Any], log_c: np.ndarray) -> np.ndarray:
+    r"""(n_ref, K) :math:`\log\operatorname{diag}(U_{v,0}\operatorname{diag}(c_v)U_{v,0}^\top)` of a frame-diagonal run.
+
+    :math:`U_{v,0} = e^{X_v}e^{Y_0}` is the realized frame at position 0 (:math:`Y_0 = 0` without positional frames),
+    blockwise over ``run.block_slices``: :math:`\mathrm{var}_{vk} = \sum_m (U_{v,0})_{km}^2 c_{vm}`. Under the global
+    positive diagonal :math:`U \to DU` (:math:`c` fixed) it maps to :math:`D^2\mathrm{var}`, and under the split
+    :math:`e^{X_v} \to e^{X_v}k`, :math:`e^{Y} \to k^{-1}e^{Y}` it is unchanged.
+    """
+    pos = getattr(run, "pos_phi_blocks", None)
+    Y0 = pos(np.zeros(1, dtype=np.int64)) if pos is not None else None
+    out = np.array(log_c, dtype=np.float64)                                # coordinates outside every block kept
+    for b, sl in enumerate(run.block_slices):
+        U = torch.matrix_exp(_t(X_ref[b]))                                 # (n_ref, d, d) e^{X_v}
+        if Y0 is not None:
+            U = U @ torch.matrix_exp(_t(Y0[b][0]))                         # e^{X_v} e^{Y_0}
+        c = torch.exp(_t(log_c[:, sl]))                                    # (n_ref, d)
+        out[:, sl] = torch.log((U * U) @ c.unsqueeze(-1)).squeeze(-1).numpy()
+    return out
+
+
 def invariant_scalars(cf: CanonicalFrames) -> Dict[str, np.ndarray]:
-    r"""Per-token scalars of the gauge-fixed chart (each invariant under redundancies (i) and (iii)).
+    r"""Per-token scalars of the gauge-fixed chart (each invariant under the global redundancies (i) and (iii);
+    not under a per-type reparametrization where that is a redundancy too, :func:`token_frame_gauge`).
 
     * ``trace`` :math:`= \sum_b \log\det \hat U^b_v = \sum_b \mathrm{tr}\, L^b_v` (from ``slogdet``, so
       defined for every row); ``trace_block`` (n, B).
@@ -853,7 +970,7 @@ def relation_transports(
     cf:        CanonicalFrames,
     relations: Mapping[str, Sequence[Tuple[int, int]]],
     rng:       np.random.Generator,
-    n_null:    int = 500,
+    n_null:    int = 2000,
 
     *,
     min_pairs:   int = 3,
@@ -1316,6 +1433,71 @@ def _frame_holonomy_note(cfg: Any) -> str:
 def minimal_agent_readout_route(cfg: Any) -> bool:
     r"""Whether the run's readout is the minimal agent, which has no content map ``O`` (no head-sum link)."""
     return getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
+
+
+# Gauge flags of the pure-path report that constrain only the M-step, so the trained trajectory, and not the
+# forward map: the chart-norm ball and frame condition bound, and the pullback trust region of the frame update.
+_MSTEP_ONLY_GAUGE_FLAGS = frozenset({"no_phi_mstep_chart_cap", "no_pullback_trust_region"})
+
+
+def token_frame_gauge(cfg: Any) -> Dict[str, Any]:
+    r"""Whether the token frame of ``cfg`` is pure gauge, so the per-token frame statistics are gauge-dependent.
+
+    The token frame is pure gauge when a per-type reparametrization of the tables,
+    :math:`\phi_v \to \mathrm{Log}(g_v e^{X_v})`, :math:`\mu_v \to g_v\mu_v` (with :math:`c_v` fixed for
+    ``gaussian_frame_diagonal``, or :math:`\Sigma_v \to g_v\Sigma_vg_v^\top` where the covariance table can carry
+    it), leaves every logit unchanged. That holds when (1) the forward map is covariant under
+    :math:`U_i \to g_iU_i`: every gauge flag of the pure-path report
+    (:func:`vfe3.gauge_covariant.gauge_covariance_failures`) holds apart from
+    :data:`_MSTEP_ONLY_GAUGE_FLAGS`, which shape the training trajectory only; and (2) no decoder reads the prior
+    tables in local coordinates (a tied prior-bank decode reads ``mu_embed`` as its decode means). The
+    gauge-fixed chart quotients only global redundancies, so on such a configuration it still carries the
+    gauge training selected.
+
+    Returns ``{"status", "reason", "forward_gauge_failures", "mstep_gauge_failures"}`` with ``status``
+    ``"gauge"`` (pure gauge), ``"content"`` (the per-type action changes the logits, so the frames carry model
+    content) or ``"unknown"`` (the gauge flags could not be derived from ``cfg``).
+    """
+    try:
+        from vfe3.gauge_covariant import gauge_covariance_failures
+
+        failures = list(gauge_covariance_failures(cfg))
+        tied_decode = getattr(cfg, "decode_mode") != "linear" and not bool(getattr(cfg, "untie_decode_bank"))
+    except Exception as exc:                          # an incomplete or foreign config: undecided, and said so
+        return {"status": "unknown", "forward_gauge_failures": None, "mstep_gauge_failures": None,
+                "reason": f"the gauge flags could not be derived from the config ({type(exc).__name__}: {exc})"}
+    forward = sorted(f for f in failures if f not in _MSTEP_ONLY_GAUGE_FLAGS)
+    mstep = sorted(f for f in failures if f in _MSTEP_ONLY_GAUGE_FLAGS)
+    out: Dict[str, Any] = {"forward_gauge_failures": forward, "mstep_gauge_failures": mstep}
+    if forward:
+        out.update(status="content", reason="the forward map is not gauge covariant (gauge flags "
+                   + ", ".join(forward) + " are false), so a per-type reparametrization of the tables changes "
+                   "the logits and the token frames carry model content")
+    elif tied_decode:
+        out.update(status="content", reason="the tied decode bank reads the prior means mu_embed as its decode "
+                   "means, so a per-type reparametrization of the tables moves the decode rows")
+    else:
+        out.update(status="gauge", reason="the forward map is gauge covariant" + (
+            f" (only the M-step flags {', '.join(mstep)} are false, which constrain the training trajectory, not "
+            "the forward map)" if mstep else "") + " and no decoder reads the prior tables in local coordinates, "
+            "so a per-type reparametrization of the tables leaves every logit unchanged")
+    return out
+
+
+def _frame_gauge_note(gauge: Mapping[str, Any]) -> Optional[str]:
+    r"""Report sentence on what the per-token frame statistics describe, given :func:`token_frame_gauge`."""
+    if gauge["status"] == "gauge":
+        return ("On this configuration the token frame is pure gauge: " + gauge["reason"] + ". The gauge-fixed "
+                "chart quotients only the global redundancies, so the per-token frame statistics of this section (the "
+                "invariant scalars and their frequency correlations, the canonical commutators, the group analogies, "
+                "the relation transports) and the phi_log embedding view describe the gauge training selected "
+                "(initialization, any frame bound, phi weight decay), not model content. The invariant content is the "
+                "reference content U_v^-1 mu_v with c_v (or C_v), reported by the xi_ref view, and the conjugacy "
+                "classes of the positional frames.")
+    if gauge["status"] == "unknown":
+        return ("Whether the token frame is pure gauge on this configuration could not be decided ("
+                + gauge["reason"] + "); the per-token frame statistics assume it is not.")
+    return None
 
 
 def reference_set_phrase(n_ref: int, *, by_count: bool) -> str:
@@ -1792,6 +1974,7 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     ref_by_count = ctx.counts is not None
     cfg = run.cfg
     d_status, d_reason = diagonal_redundancy_status(cfg)
+    frame_gauge = token_frame_gauge(cfg)
 
     cf = step("canonical_frames", lambda: canonical_frames(run, ids, ref_ids, run.log_var(ref_ids)))
     if cf is not None:
@@ -1800,7 +1983,7 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         res.notes.append(
             f"Per-token frame statistics use the gauge-fixed chart U_hat = D0 e^X m^-1 D0^-1 (m = bi-invariant "
             f"barycenter of {reference_set_phrase(n_ref, by_count=ref_by_count)}, D0 from their mean "
-            f"log-variance), which is "
+            f"log local variance), which is "
             f"invariant{qual} under the split redundancy e^X -> e^X k and the global positive-diagonal rescaling. "
             "Norms, commutators and BCH gaps of the raw coordinates describe the trained trivialization only.")
         if qual:
@@ -1813,6 +1996,9 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
             res.notes.append(f"{cf.n - cf.diagnostics['n_ok']} of {cf.n} gauge-fixed frames have no real principal "
                              "log (eigenvalue on the closed negative real axis) and are excluded from log-chart "
                              "statistics.")
+    gauge_note = _frame_gauge_note(frame_gauge)
+    if gauge_note is not None:
+        res.notes.append(gauge_note)
     res.notes.append(_diagonal_note(d_status, d_reason))
     res.notes.append(_frame_holonomy_note(cfg))
     if getattr(run, "phi_frozen", False):
@@ -1924,6 +2110,9 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         "chart": cf.diagnostics if cf is not None else None,
         "n_tokens": int(ids.size), "n_ref": n_ref, "ref_order": "frequency" if ref_by_count else "token_id",
         "diagonal_redundancy": {"status": d_status, "reason": d_reason},
+        "token_frame_gauge": {**frame_gauge, "per_token_statistics": (
+            "gauge-dependent" if frame_gauge["status"] == "gauge" else
+            "model content" if frame_gauge["status"] == "content" else "undecided")},
         "invariants": ({k: {"summary": _summary(scalars[k]),
                             "spearman_log_count": None if spear is None else spear[k]}
                         for k, _ in _SCALAR_LABELS} if scalars is not None else None),
@@ -1947,6 +2136,9 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     }
 
     head: Dict[str, Any] = {}
+    if frame_gauge["status"] == "gauge":
+        head["phi: per-token frame statistics"] = ("gauge-dependent: the token frame is pure gauge on this "
+                                                   "configuration (see the notes)")
     if comm is not None:
         head["phi: median ||X_v^b||_F (raw chart)"] = float(np.median(comm["norm_block"]))
     if cf is not None:

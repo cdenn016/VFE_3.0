@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 _MIN_AXIS_POINTS   = 2                                        # a capacity-scaling axis needs >= 2 sizes
 _MIN_PARETO_POINTS = 2                                        # a Pareto frontier needs >= 2 points
 _INFERENCE_ROUTE   = "inference"                              # flat-N runs are not a parameter frontier
+# Scale knobs that change the training budget rather than the parameter count, as scaling_analysis.NON_PARAMETER_KNOBS
+# (the two sets are pinned equal by tests): their cells are fixed-N points, never parameter-frontier points.
+NON_PARAMETER_KNOBS = frozenset({"max_steps"})
 
 
 def _as_float(x: Any) -> float:
@@ -165,14 +168,18 @@ def capacity_scaling_kwargs(
 
 def pareto_frontier_kwargs(points: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     r"""Build ``plot_pareto_frontier``'s ``points`` kwarg from aggregated PARAMETER points -- the
-    flat-N ``inference`` route is excluded, mirroring ``scaling_analysis``'s own
-    ``param_points`` / ``INFERENCE_ROUTE`` split: a Pareto frontier over parameter count is not
-    meaningful for cells whose parameter count never varies. Needs >= ``_MIN_PARETO_POINTS`` points
-    carrying both a finite ``val_bits_per_token_mean`` and a finite ``n_params``; otherwise ``None``.
+    flat-N ``inference`` route and the training-budget cells (``scale_knob`` in
+    :data:`NON_PARAMETER_KNOBS`) are excluded, mirroring ``scaling_analysis``'s own ``param_points``
+    split (``INFERENCE_ROUTE`` and ``NON_PARAMETER_KNOBS``): a Pareto frontier over parameter count is
+    not meaningful for cells whose parameter count never varies, and a longer-trained cell at a fixed
+    N would draw a training-budget effect as a parameter effect (audit 2026-10-31 viz-pipeline-2).
+    Needs >= ``_MIN_PARETO_POINTS`` points carrying both a finite ``val_bits_per_token_mean`` and a
+    finite ``n_params``; otherwise ``None``.
     """
     eligible = [
         p for p in points
         if p["route"] != _INFERENCE_ROUTE
+        and p.get("scale_knob") not in NON_PARAMETER_KNOBS
         and np.isfinite(p.get("val_bits_per_token_mean", float("nan")))
         and np.isfinite(p.get("n_params", float("nan")))
     ]
@@ -292,6 +299,14 @@ def _cell_eval_window(marker: Mapping[str, Any]) -> Optional[int]:
     return window
 
 
+def _seed_suffix(label: str) -> Optional[str]:
+    r"""The ``<seed>`` of a multi-seed cell label ``<base>__s<seed>`` (``ablation.run_sweep``), or ``None``.
+
+    The same rule as ``ablation._base_label``: a label without that suffix is an unseeded cell."""
+    base, _, tail = label.rpartition("__s")
+    return tail if base and tail.lstrip("-").isdigit() else None
+
+
 def ablation_forest_kwargs(
     sweep_dir:      Path,
     baseline_label: str,
@@ -304,10 +319,13 @@ def ablation_forest_kwargs(
     The named baseline arm must exist and load; every arm must be aligned (same token length) with
     it; each arm's delta / lo / hi is the paired SEQUENCE-cluster bootstrap band (``seed=0``, whole
     evaluation windows of the baseline cell's ``max_seq_len`` tokens resampled) converted from nats to BITS per token (divided by ``ln 2``). Tokens
-    of one window share context, so a token-iid resample would undercover. ``n_seeds`` counts the
-    distinct training seeds among the admitted cells, which sets the single-seed caption. A missing
-    baseline, a missing window length, a shape mismatch, or a token file whose identity no longer
-    verifies withholds the whole figure (returns ``None``).
+    of one window share context, so a token-iid resample would undercover. A multi-seed sweep names
+    its cells ``<label>__s<seed>``; when ``baseline_label`` names no cell, each cell is paired with
+    the baseline cell of its own seed, ``<baseline_label>__s<seed>``, so every row is one cell's band
+    against the same-seed baseline (the per-cell rows of the multi-seed caption). ``n_seeds`` counts
+    the distinct training seeds among the admitted cells, which sets the single-seed caption. A
+    missing baseline (for any seed), a missing window length, a shape mismatch, or a token file whose
+    identity no longer verifies withholds the whole figure (returns ``None``).
     """
     if admitted_rows is None:
         markers = _successful_markers_by_label(sweep_dir)
@@ -322,28 +340,43 @@ def ablation_forest_kwargs(
                 )
                 return None
             markers[label] = dict(row)
-    baseline_marker = markers.get(baseline_label)
-    if baseline_marker is None:
-        logger.warning("ablation_forest withheld: no successful %r baseline cell under %s",
-                       baseline_label, sweep_dir)
-        return None
-    baseline = _load_token_vector(sweep_dir, baseline_marker)
-    if baseline is None:
-        logger.warning("ablation_forest withheld: baseline token vector failed identity verification")
-        return None
-    window = _cell_eval_window(baseline_marker)
-    if window is None:
-        logger.warning("ablation_forest withheld: the baseline cell records no evaluation window "
-                       "length, so the sequence-cluster bootstrap cannot be formed")
-        return None
+    if baseline_label in markers:
+        references = {label: baseline_label for label in markers}
+    else:
+        # A multi-seed sweep names its cells <label>__s<seed>, so the declared base label names one baseline cell
+        # per seed; looked up directly it never matched (audit 2026-10-31 viz-pipeline-5). Each cell is paired with
+        # the baseline cell of its own seed, the seed pairing of the runner's paired tables.
+        suffixes = {label: _seed_suffix(label) for label in markers}
+        references = ({label: f"{baseline_label}__s{seed}" for label, seed in suffixes.items()}
+                      if markers and None not in suffixes.values() else {})
+        missing = sorted({reference for reference in references.values() if reference not in markers})
+        if not references or missing:
+            logger.warning("ablation_forest withheld: no successful %r baseline cell under %s%s",
+                           baseline_label, sweep_dir, f" (missing {', '.join(missing)})" if missing else "")
+            return None
+    baselines: Dict[str, torch.Tensor] = {}
+    windows: Dict[str, int] = {}
+    for reference in sorted(set(references.values())):
+        baseline = _load_token_vector(sweep_dir, markers[reference])
+        if baseline is None:
+            logger.warning("ablation_forest withheld: baseline token vector %r failed identity verification",
+                           reference)
+            return None
+        window = _cell_eval_window(markers[reference])
+        if window is None:
+            logger.warning("ablation_forest withheld: the baseline cell %r records no evaluation window "
+                           "length, so the sequence-cluster bootstrap cannot be formed", reference)
+            return None
+        baselines[reference], windows[reference] = baseline, window
     rows: List[Dict[str, Any]] = []
     for label in sorted(markers):
+        reference = references[label]
         arm = _load_token_vector(sweep_dir, markers[label])
-        if arm is None or arm.shape != baseline.shape:
+        if arm is None or arm.shape != baselines[reference].shape:
             logger.warning("ablation_forest withheld: arm %r has a missing or misaligned token vector",
                            label)
             return None
-        band = bootstrap_token_ce_band(arm, baseline, seed=0, block_len=window)
+        band = bootstrap_token_ce_band(arm, baselines[reference], seed=0, block_len=windows[reference])
         rows.append({"label": label, **{key: band[key] / math.log(2.0)
                                         for key in ("delta", "lo", "hi")}})
     n_seeds = len({marker.get("seed") for marker in markers.values()

@@ -6,13 +6,15 @@ Successful factorization always uses zero jitter and no spectral repair.
 """
 
 import math
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.autograd.function import once_differentiable
 from torch.utils.checkpoint import checkpoint
 
-from vfe3.contracts import describe_offending_entries, host_check, host_read
+from vfe3.contracts import (
+    CanonicalFrameContext, describe_offending_entries, gathered_frame_rows, host_check, host_read,
+)
 from vfe3.runtime import ieee_fp32_matmul
 from vfe3.numerics import (
     FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, triangular_condition_estimate,
@@ -47,7 +49,7 @@ def set_projection_tile_bytes(nbytes: int) -> int:
 
 
 def projection_tile_bytes() -> int:
-    r"""Return the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes."""
+    r"""Return the scorer tile budget ``_PROJECTION_TILE_BYTES``, in bytes. Test hook: referenced only by the tests."""
     return _PROJECTION_TILE_BYTES
 
 
@@ -61,6 +63,26 @@ def _tile_token_cap() -> int:
     a raised budget. A fixed 32 left every budget above about 64 MiB without effect on these two loops at the live
     shape (audit 2026-10-17 item 6); tiles are token independent, so the cap changes only the dispatch count."""
     return _TILE_TOKEN_CAP * max(1, _PROJECTION_TILE_BYTES // _CHECKPOINT_BYTES)
+
+
+# Scorer tile loops sized by _PROJECTION_TILE_BYTES that ran since the last reset (a host integer, no sync): the token
+# tiles of projected_moments and _projected_root_factor, the GEMM-fallback direct pair tiles, and the query-row tiles
+# of the mean-distance and diagonal noisy-query costs when they split their rows. On the CUDA diagonal comparison route
+# with the fused moments and pair_kl_gemm_tol=None none of them runs, so relational_tile_mib has no effect there
+# (audit 2026-10-31 attention-scoring-8). The routed spreads of a moment-matched covariance read the same budget in
+# vfe3.model.relational_operators and are not counted here.
+_PROJECTION_TILE_LOOPS: int = 0
+
+
+def projection_tile_loops() -> int:
+    r"""Scorer tile loops sized by the projection tile budget since the last reset (``_PROJECTION_TILE_LOOPS``)."""
+    return _PROJECTION_TILE_LOOPS
+
+
+def _count_tile_loop() -> None:
+    r"""Count one scorer tile loop sized by ``_PROJECTION_TILE_BYTES`` (a host integer)."""
+    global _PROJECTION_TILE_LOOPS
+    _PROJECTION_TILE_LOOPS += 1
 
 
 # Kernel of the diagonal comparison moments (config relational_diag_moments_kernel, installed by VFEModel):
@@ -87,7 +109,7 @@ def set_diagonal_moments_kernel(kernel: str) -> str:
 
 
 def diagonal_moments_kernel() -> str:
-    r"""Return the selected kernel of the diagonal comparison moments."""
+    r"""Return the selected kernel of the diagonal comparison moments. Test hook: referenced only by the tests."""
     return _DIAG_MOMENTS_KERNEL
 
 
@@ -97,10 +119,12 @@ def diagonal_moments_triton_calls() -> int:
 
 
 def reset_diagonal_moments_triton_calls() -> None:
-    r"""Zero the fused and the torch diagonal moments call counters."""
-    global _DIAG_MOMENTS_TRITON_CALLS, _DIAG_MOMENTS_TORCH_CALLS
+    r"""Zero the fused and the torch diagonal moments call counters and the scorer tile-loop counter
+    (:func:`projection_tile_loops`), which a run's :class:`vfe3.run_artifacts.RunArtifacts` records together."""
+    global _DIAG_MOMENTS_TRITON_CALLS, _DIAG_MOMENTS_TORCH_CALLS, _PROJECTION_TILE_LOOPS
     _DIAG_MOMENTS_TRITON_CALLS = 0
     _DIAG_MOMENTS_TORCH_CALLS = 0
+    _PROJECTION_TILE_LOOPS = 0
 
 
 def diagonal_moments_torch_calls() -> int:
@@ -124,6 +148,107 @@ def realized_diagonal_moments_kernel() -> Optional[str]:
 def _diagonal_moments_triton_active(*tensors: torch.Tensor) -> bool:
     r"""Whether the fused kernels are selected and every operand is a CUDA tensor (CPU tensors run torch)."""
     return _DIAG_MOMENTS_KERNEL == "triton" and all(tensor.is_cuda for tensor in tensors)
+
+
+class TypeRows(NamedTuple):
+    r"""The distinct token rows of one forward, for comparison moments that depend on the token type alone.
+
+    Built by :func:`declare_type_rows` from the transport's deduplicated frame pair; read by :func:`type_rows` and
+    the ``type_rows`` option of :func:`projected_moments` (config ``relational_type_moments``).
+    """
+
+    index:   torch.Tensor   # (T,) long: the distinct row u of each occurrence t, T = B N
+    first:   torch.Tensor   # (U,) long: the first occurrence of each row
+    order:   torch.Tensor   # (T,) long: the occurrences sorted stably by row
+    lengths: torch.Tensor   # (U,) long: the occurrence count of each row (every row occurs)
+    inverse: torch.Tensor   # (U, H, d, d): the rows' inverse frame blocks, of which the frame's occurrences are copies
+
+
+# Attribute of a covariance tensor declared per token type by declare_type_rows.
+_TYPE_ROWS_ATTR = "_vfe3_type_rows"
+
+
+def declare_type_rows(
+    sigma: torch.Tensor,             # (B, N, K) or (B, N, K, K): the forward's encoded per-type covariance
+    frame: CanonicalFrameContext,    # the forward's routing frame, compact (B, N, H, d, d)
+) -> bool:
+    r"""Declare ``sigma`` and ``frame`` type-determined, for type-level comparison moments (``relational_type_moments``).
+
+    The caller certifies that every occurrence row of ``sigma`` is a bitwise copy of its token type's encoded row (a
+    table lookup by the forward's token ids). The frame must be the transport's deduplicated pair, whose occurrence
+    rows copy the frame row of their type (:func:`vfe3.contracts.gathered_frame_rows`). The declaration records that
+    row index, the first occurrence of each row, the occurrences sorted stably by row and the row counts on ``sigma``,
+    and holds only for this tensor at its current version together with this frame (:func:`type_rows`): a seam that
+    returns another covariance tensor, another frame, or an in-place write voids it, and the router then evaluates
+    every occurrence (audit 2026-10-31 relational-operators-1). Returns whether a declaration was made; a frame
+    without a row record, an inference tensor or a shape mismatch make none. No host synchronization.
+    """
+    gathered = gathered_frame_rows(frame.forward, frame.inverse) if frame.block_diagonal else None
+    if gathered is None or sigma.is_inference():
+        return False
+    _, unique_inverse, index = gathered
+    occurrence_shape = frame.inverse.shape[:-3]                                    # (B, N)
+    occurrences = index.numel()
+    if tuple(sigma.shape[:len(occurrence_shape)]) != tuple(occurrence_shape) or math.prod(occurrence_shape) != occurrences:
+        return False
+    with torch.no_grad():
+        n_rows = unique_inverse.shape[0]
+        positions = torch.arange(occurrences, device=index.device, dtype=index.dtype)              # (T,)
+        first = torch.full((n_rows,), occurrences, device=index.device, dtype=index.dtype).scatter_reduce_(
+            0, index, positions, reduce="amin", include_self=True)                                  # (U,)
+        order = torch.argsort(index, stable=True)                                                  # (T,)
+        lengths = torch.zeros(n_rows, device=index.device, dtype=index.dtype).scatter_add_(
+            0, index, torch.ones_like(index))                                                      # (U,)
+    rows = TypeRows(index=index, first=first, order=order, lengths=lengths, inverse=unique_inverse)
+    setattr(sigma, _TYPE_ROWS_ATTR, (rows, sigma._version, frame.inverse))
+    return True
+
+
+def type_rows(
+    sigma: torch.Tensor,             # the covariance the router reads
+    frame: CanonicalFrameContext,    # the frame the router reads
+) -> Optional[TypeRows]:
+    r"""The :class:`TypeRows` that :func:`declare_type_rows` recorded on ``sigma`` with ``frame``, if both still hold.
+
+    ``None`` when ``sigma`` carries no declaration, was written in place since, or is read with another frame, or when
+    the frame's own row record no longer holds (:func:`vfe3.contracts.gathered_frame_rows`).
+    """
+    record = getattr(sigma, _TYPE_ROWS_ATTR, None)
+    if record is None:
+        return None
+    rows, version, frame_inverse = record
+    if sigma._version != version or frame.inverse is not frame_inverse:
+        return None
+    if gathered_frame_rows(frame.forward, frame.inverse) is None:
+        return None
+    return rows
+
+
+class _TypeRowGather(torch.autograd.Function):
+    r"""``rows[index]``: per-type rows gathered to the occurrences, with a deterministic segment-sum backward.
+
+    The backward sums each row's occurrence cotangents in ascending occurrence order (the stable ``order`` and a
+    ``segment_reduce`` sum over ``lengths``), with no atomics, so a type-level quantity stays bitwise reproducible run
+    to run, as the fused moment kernels are (audit 2026-10-31 relational-operators-1).
+    """
+
+    @staticmethod
+    def forward(
+        ctx:     Any,
+        rows:    torch.Tensor,   # (U, X)
+        index:   torch.Tensor,   # (T,) long
+        order:   torch.Tensor,   # (T,) long
+        lengths: torch.Tensor,   # (U,) long
+    ) -> torch.Tensor:           # (T, X)
+        ctx.save_for_backward(order, lengths)
+        return rows.index_select(0, index)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:   # (T, X) -> (U, X)
+        order, lengths = ctx.saved_tensors
+        summed = torch.segment_reduce(grad.index_select(0, order), "sum", lengths=lengths, axis=0, unsafe=True)
+        return summed, None, None, None
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float32 shifted CholeskyQR3, or float64 QR where the float32 retry fails, the input is
@@ -170,7 +295,7 @@ def reset_source_recovery_elements() -> None:
 # it is scored by the direct-difference tiles instead (audit 2026-10-09 #7). 1e-3 nats is a logit error of 1e-3 / tau:
 # below the bf16 resolution of a unit-scale logit (2^-8) and two orders under the routing gaps
 # that decide a softmax, while the direct tiles' own error on the audit sweep was 3e-6 to 8e-5.
-_GEMM_EXPANSION_TOL: float = 1e-3
+_GEMM_EXPANSION_TOL: float = 1e-3           # referenced only by the tests; the scorer uses the configured value
 
 # Cumulative (batch, head) slices routed from the GEMM to the direct tiles. The verdict is already on
 # the host (it joins the scorer's single decision read), so a host integer suffices.
@@ -227,13 +352,14 @@ def projected_condition_recovery() -> bool:
 
 
 # Factor route of projected_gaussian_kl ("cholesky_qr2" under config projected_factorization=
-# "cholesky_qr2_certified", installed by VFEModel;
-# optimization_plan.md WS1/WS2). "gram" factors the rounded Gram G = fl(X X^T), whose factor carries
-# whitened error O(eps kappa(X)^2). "cholesky_qr2" factors the source root X = S U^{-1} Sigma^{1/2}
+# "cholesky_qr2_certified", installed by VFEModel; workstreams WS1/WS2 of the 2026-09-24 precision plan, whose
+# Phase 0 measurements _factor_status records). "gram" factors the rounded Gram G = fl(X X^T), whose
+# factor carries whitened error O(eps kappa(X)^2). "cholesky_qr2" factors the source root X = S U^{-1} Sigma^{1/2}
 # by CholeskyQR2: the same Gaussian, whitened error O(eps kappa(X)). Its recovery certificate is
 # eps kappa_1(C) > FACTOR_CONDITION_TOL on the factor itself (see _factor_status); flagged and failed factors
 # are rebuilt in float64, by QR of the float64 source root, and their pairs take the float64 tiles
-# (see _strict_cholesky).
+# (see _strict_cholesky). An entry that passes it but fails the Gram certificate keeps its factor and its pairs take
+# the factor-trace tiles, since the centered GEMM would read the explicit Gram (_factor_gram_certificate).
 _FACTOR_ROUTES = ("gram", "cholesky_qr2")
 _FACTOR_ROUTE: str = "gram"
 
@@ -282,6 +408,8 @@ def projected_moments(
     head_dims:      Optional[Tuple[int, ...]] = None,  # caller-declared equal diagonal blocks of a full Sigma
     diagonal_only:  bool = False,                      # return diag(G_i), (..., N, H, r), instead of G_i
     identity_frame: bool = False,                      # caller-declared: inverse_blocks is the identity, not read
+    canonical_mean: Optional[torch.Tensor] = None,     # (..., N, H, d) caller's xi_i = U_i^{-1} mu_i
+    type_rows:      Optional[TypeRows] = None,         # caller-certified type-determined Sigma_i and U_i^{-1}
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return a_i = S U_i^{-1} mu_i and G_i = S U_i^{-1} Sigma_i U_i^{-T} S^T.
 
@@ -315,6 +443,13 @@ def projected_moments(
     :math:`(S_{sk}\sigma_k^{1/2})^2`, so it adds no cancellation, and it keeps that route's failure and zero-variance
     conventions. The fused Triton kernels are not used there: they would multiply a materialized identity block by
     block, about d times the FLOPs of the GEMM. A full covariance ignores the flag.
+    ``canonical_mean`` and ``type_rows`` act under ``diagonal_only`` with a diagonal covariance and a real frame
+    (:func:`_split_diagonal_moments`). ``canonical_mean`` is the caller's :math:`\xi_i = U_i^{-1}\mu_i`, head-broadcast
+    like ``mu_h``, from which :math:`a_i = S\xi_i` is read instead of forming :math:`U_i^{-1}\mu_i` again (config
+    ``relational_shared_canonical_mean``). ``type_rows`` (:func:`type_rows`) certifies that :math:`\Sigma_i` and
+    :math:`U_i^{-1}` depend on the token type alone, so :math:`\operatorname{diag}(G_i)` is evaluated once per distinct
+    type and gathered to the occurrences (config ``relational_type_moments``); the means stay per occurrence. Both
+    leave the forward values unchanged and the gradients at rounding level.
     Returns (..., N, H, r) and (..., N, H, r, r) for a single map (the second (..., N, H, r) under ``diagonal_only``).
     """
     if mu_h.ndim < 3 or S.ndim not in (3, 4):
@@ -350,6 +485,10 @@ def projected_moments(
     if diagonal_only and identity_frame:
         _DIAG_MOMENTS_TORCH_CALLS += 1
         return _identity_frame_diagonal(mu_h, Sigma_h, S, dtype)
+    if diagonal_only and diagonal and (canonical_mean is not None or type_rows is not None):
+        if canonical_mean is not None and canonical_mean.shape != mu_h.shape:
+            raise ValueError("canonical_mean must match the head-broadcast mean (..., N, H, d)")
+        return _split_diagonal_moments(mu_h, Sigma_h, inverse_blocks, S, dtype, batch, canonical_mean, type_rows)
     if diagonal_only and diagonal and _diagonal_moments_triton_active(mu_h, Sigma_h, inverse_blocks, S):
         fused = _fused_diagonal_moments(mu_h, Sigma_h, inverse_blocks, S, dtype, batch)
         if fused is not None:
@@ -360,6 +499,7 @@ def projected_moments(
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.
     if tokens * bytes_per_token > min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
+        _count_tile_loop()
         step = max(1, min(tokens, _tile_token_cap(), _PROJECTION_TILE_BYTES // bytes_per_token))
         means, covariances = [], []
         for start in range(0, tokens, step):
@@ -459,6 +599,123 @@ def _fused_diagonal_moments(
     if S.ndim == 3:
         return a.squeeze(-3), g.squeeze(-3)                                            # (..., N, H, r)
     return a.movedim(-3, 0).contiguous(), g.movedim(-3, 0).contiguous()               # (R, ..., N, H, r)
+
+
+def _split_diagonal_moments(
+    mu_h:           torch.Tensor,            # (..., N, H, K)
+    Sigma_h:        torch.Tensor,            # (..., N, H, K) diagonal variances
+    inverse_blocks: torch.Tensor,            # (..., N, M, d, d) compact or (..., N, H', K, K) dense U^{-1}
+    S:              torch.Tensor,            # (H, r, K) or (R, H, r, K)
+    dtype:          torch.dtype,
+    batch:          Tuple[int, ...],
+    canonical_mean: Optional[torch.Tensor],  # (..., N, H, K) xi_i = U_i^{-1} mu_i, or None
+    type_rows:      Optional[TypeRows],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""``diagonal_only`` moments of a diagonal covariance with the mean and the variance evaluated separately.
+
+    The projected means :math:`a_i = S\xi_i` are one GEMM over every occurrence, read from the caller's
+    :math:`\xi_i = U_i^{-1}\mu_i` (``canonical_mean``) or formed from :math:`\mu_i` and the frame as
+    :func:`_projected_root_mean` does. The variances
+
+    .. math::
+        g_i = \operatorname{diag}(S U_i^{-1}\operatorname{diag}(\sigma_i) U_i^{-\top} S^\top)
+
+    come from :func:`_diagonal_square_sums` (the fused kernels where they apply, else checkpointed torch tiles of the
+    same source-root formula): over every occurrence, or, with ``type_rows``, over the distinct token rows only, with
+    :math:`\sigma` read at each row's first occurrence and the frame at its distinct row, then gathered back to the
+    occurrences by :class:`_TypeRowGather`. Each occurrence's :math:`g_i` is the value the per-occurrence route gives
+    it; the gradients differ at rounding level, since the occurrence cotangents of a type are summed before the
+    moments' backward (audit 2026-10-31 relational-operators-1, perf-live-path-1).
+    """
+    tokens = mu_h.shape[-3]
+    with torch.autocast(device_type=mu_h.device.type, enabled=False):
+        maps = (S if S.ndim == 4 else S.unsqueeze(0)).to(dtype)                       # (R, H, r, K)
+        R, H, r, K = maps.shape
+        if canonical_mean is not None:
+            a = _projected_root_mean(_head_shared(canonical_mean).to(dtype), None, maps)  # (..., N, R, H, r)
+        else:
+            a = _projected_root_mean(_head_shared(mu_h).to(dtype), inverse_blocks.to(dtype), maps)
+        if type_rows is None:
+            g = _diagonal_square_sums(Sigma_h, inverse_blocks, maps, dtype, batch)   # (..., N, R, H, r)
+        else:
+            occurrences = math.prod(batch) * tokens
+            if type_rows.index.numel() != occurrences or type_rows.inverse.shape[1:] != inverse_blocks.shape[-3:]:
+                raise ValueError("type_rows do not describe the occurrences of these moments")
+            sigma = _head_shared(Sigma_h)                                             # (..., N, h, K)
+            rows = sigma.expand(*batch, tokens, *sigma.shape[-2:]).reshape(
+                occurrences, *sigma.shape[-2:]).index_select(0, type_rows.first)      # (U, h, K)
+            g_rows = _diagonal_square_sums(rows, type_rows.inverse, maps, dtype, ())  # (U, R, H, r)
+            g = _TypeRowGather.apply(g_rows.reshape(g_rows.shape[0], -1), type_rows.index, type_rows.order,
+                                     type_rows.lengths).reshape(*batch, tokens, R, H, r)   # (..., N, R, H, r)
+    if S.ndim == 3:
+        return a.squeeze(-3), g.squeeze(-3)                                            # (..., N, H, r)
+    return a.movedim(-3, 0).contiguous(), g.movedim(-3, 0).contiguous()               # (R, ..., N, H, r)
+
+
+def _diagonal_square_sums(
+    Sigma_h:        torch.Tensor,     # (..., N, h, K) diagonal variances, h = 1 (head-shared) or H
+    inverse_blocks: torch.Tensor,     # (..., N, M, d, d) compact or (..., N, H', K, K) dense U^{-1}
+    maps:           torch.Tensor,     # (R, H, r, K) role-stacked comparison maps in the working dtype
+    dtype:          torch.dtype,
+    batch:          Tuple[int, ...],
+) -> torch.Tensor:                    # (..., N, R, H, r)
+    r""":math:`g = \sum_k X_{\cdot k}^2`, :math:`X = S U^{-1}\operatorname{diag}(\sigma)^{1/2}`, without the projected means.
+
+    The variance half of :func:`projected_moments` under ``diagonal_only``: the fused kernels of
+    :func:`vfe3.kernels.diagonal_moments.diagonal_root_square_sums` on the shapes :func:`_fused_diagonal_moments` takes,
+    and otherwise the checkpointed torch token tiles of the same budget, each :func:`_diagonal_square_sums_tile`, so a
+    token's :math:`g` is the per-occurrence route's. Counted in the diagonal-moments kernel counters.
+    """
+    global _DIAG_MOMENTS_TRITON_CALLS, _DIAG_MOMENTS_TORCH_CALLS
+    from vfe3.kernels.diagonal_moments import MAX_BLOCK_WIDTH, diagonal_root_square_sums
+    tokens = Sigma_h.shape[-3]
+    R, H, r, K = maps.shape
+    M, d = inverse_blocks.shape[-3], inverse_blocks.shape[-1]
+    sigma = _head_shared(Sigma_h)
+    if (sigma.shape[-2] == 1 and M * d == K and d <= MAX_BLOCK_WIDTH
+            and _diagonal_moments_triton_active(sigma, inverse_blocks, maps)):
+        _DIAG_MOMENTS_TRITON_CALLS += 1
+        with torch.autocast(device_type=maps.device.type, enabled=False):
+            variance = sigma.to(dtype)                                                 # (..., N, 1, K)
+            zero = variance == 0
+            root = torch.where(zero, 0., torch.where(zero, 1., variance).sqrt())       # as _diagonal_root_moments
+            U = inverse_blocks.to(dtype).expand(*batch, tokens, M, d, d).reshape(-1, M, d, d)   # (T, M, d, d)
+            rho = root.squeeze(-2).expand(*batch, tokens, K).reshape(-1, K)            # (T, K)
+            g = diagonal_root_square_sums(maps.reshape(-1, K), U, rho)                 # (T, R H r)
+        return g.reshape(*batch, tokens, R, H, r)                                      # (..., N, R, H, r)
+    _DIAG_MOMENTS_TORCH_CALLS += 1
+    bytes_per_token = math.prod(batch) * R * H * r * K * (torch.finfo(dtype).bits // 8)
+    if tokens * bytes_per_token <= min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
+        return _diagonal_square_sums_tile(Sigma_h, inverse_blocks, maps)
+    _count_tile_loop()
+    step = max(1, min(tokens, _tile_token_cap(), _PROJECTION_TILE_BYTES // bytes_per_token))
+    parts = []
+    for start in range(0, tokens, step):
+        inverse = (inverse_blocks[..., start:start+step, :, :, :]
+                   if inverse_blocks.ndim >= 4 and inverse_blocks.shape[-4] == tokens else inverse_blocks)
+        args = (Sigma_h[..., start:start+step, :, :], inverse, maps)
+        if torch.is_grad_enabled() and any(x.requires_grad for x in args):
+            parts.append(checkpoint(_diagonal_square_sums_tile, *args, use_reentrant=False, preserve_rng_state=False))
+        else:
+            parts.append(_diagonal_square_sums_tile(*args))
+    return torch.cat(parts, dim=-4)                                                    # (..., N, R, H, r)
+
+
+@ieee_fp32_matmul()
+def _diagonal_square_sums_tile(
+    Sigma_h:        torch.Tensor,     # (..., n, h, K) diagonal variances
+    inverse_blocks: torch.Tensor,     # (..., n, M, d, d) or (..., n, H', K, K)
+    maps:           torch.Tensor,     # (R, H, r, K)
+) -> torch.Tensor:                    # (..., n, R, H, r)
+    r"""One token tile of :func:`_diagonal_square_sums`: the source root of :func:`_diagonal_root_moments`, squared
+    and summed. Pinned to IEEE fp32 itself, so a checkpointed recompute runs under the forward's policy."""
+    dtype = maps.dtype
+    with torch.autocast(device_type=maps.device.type, enabled=False):
+        sigma = _head_shared(Sigma_h).to(dtype)                                        # (..., n, h, K)
+        zero = sigma == 0
+        root = torch.where(zero, 0., torch.where(zero, 1., sigma).sqrt())
+        X = _diagonal_source_root(root, inverse_blocks.to(dtype), maps)                # (..., n, R, H, r, K)
+        return X.square().sum(-1)                                                      # (..., n, R, H, r)
 
 
 @ieee_fp32_matmul()
@@ -564,25 +821,35 @@ def _diagonal_root_moments(
     reaches the scorer's finiteness and positivity checks. ``inverse=None`` declares the identity frame:
     :math:`\xi_i = \mu_i` and :math:`X_i = S\operatorname{diag}(\sigma_i)^{1/2}`, with no frame product.
     """
-    R, H, r, K = S.shape
     zero = sigma == 0
     root = torch.where(zero, 0., torch.where(zero, 1., sigma).sqrt())              # (..., N, h, K)
     a = _projected_root_mean(mu, inverse, S)                                       # (..., N, R, H, r)
     if inverse is None:
         # Identity frame (audit 2026-10-20 item 46): X = S diag(sigma)^{1/2} column-scales the maps.
         X = S * root[..., None, :, None, :]                                        # (..., N, R, H, r, K)
-    elif inverse.shape[-2:] == (K, K):
+    else:
+        X = _diagonal_source_root(root, inverse, S)                                # (..., N, R, H, r, K)
+    return a, X
+
+
+def _diagonal_source_root(
+    root:    torch.Tensor,   # (..., N, h, K) zero-safe roots sigma^{1/2}, h = 1 for a head-shared variance or H
+    inverse: torch.Tensor,   # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1}
+    S:       torch.Tensor,   # (R, H, r, K) comparison maps, one per role
+) -> torch.Tensor:           # (..., N, R, H, r, K)
+    r"""Source roots :math:`X_i = S U_i^{-1}\operatorname{diag}(\rho_i)` of :func:`_diagonal_root_moments` for a real frame;
+    :math:`W = U^{-1}\operatorname{diag}(\rho)` keeps the block structure of compact blocks."""
+    R, H, r, K = S.shape
+    if inverse.shape[-2:] == (K, K):
         # Dense blocks (..., N, H', K, K): W = U^{-1} diag(sigma)^{1/2} column-scales each block.
         W = inverse * root.unsqueeze(-2)                                           # (..., N, h, K, K)
-        X = (_projected_linear_map(S.flatten(0, 1), W).unflatten(-3, (R, H)) if W.shape[-3] == 1
-             else _projected_linear_map(S, W.unsqueeze(-4)))                       # (..., N, R, H, r, K)
-    else:
-        M, d = inverse.shape[-3], inverse.shape[-1]
-        blocks = inverse.unsqueeze(-4)                                             # (..., N, 1, M, d, d)
-        W = blocks * root.unflatten(-1, (M, d)).unsqueeze(-2)                      # (..., N, h, M, d, d)
-        X = (_projected_linear_map(S.flatten(0, 1), W.squeeze(-4)).unflatten(-3, (R, H)) if W.shape[-4] == 1
-             else torch.einsum("Rhrmd,...hmde->...Rhrme", S.unflatten(-1, (M, d)), W).flatten(-2))
-    return a, X
+        return (_projected_linear_map(S.flatten(0, 1), W).unflatten(-3, (R, H)) if W.shape[-3] == 1
+                else _projected_linear_map(S, W.unsqueeze(-4)))                    # (..., N, R, H, r, K)
+    M, d = inverse.shape[-3], inverse.shape[-1]
+    blocks = inverse.unsqueeze(-4)                                                 # (..., N, 1, M, d, d)
+    W = blocks * root.unflatten(-1, (M, d)).unsqueeze(-2)                          # (..., N, h, M, d, d)
+    return (_projected_linear_map(S.flatten(0, 1), W.squeeze(-4)).unflatten(-3, (R, H)) if W.shape[-4] == 1
+            else torch.einsum("Rhrmd,...hmde->...Rhrme", S.unflatten(-1, (M, d)), W).flatten(-2))
 
 
 def _projected_root_mean(
@@ -751,6 +1018,105 @@ def _ieee_fp32_autograd(body: Callable[..., torch.Tensor], *inputs: torch.Tensor
 
 
 @ieee_fp32_matmul()
+def _pair_kl_grid(
+    query:        torch.Tensor,  # (..., H, Nq, w) token-linear query operand
+    key:          torch.Tensor,  # (..., H, Nk, w) token-linear key operand
+    key_constant: torch.Tensor,  # (..., H, Nk)
+    logdet_q:     torch.Tensor,  # (..., H, Nq)
+    r:            int,
+) -> torch.Tensor:               # (..., H, Nq, Nk)
+    r"""Pair grid :math:`\tfrac12(q_i^\top k_j + c_j - r - \ell_i)` of the pair-KL expansions, one GEMM per
+    (batch, head) at IEEE fp32 (:func:`_projected_kl_expansion`, :func:`_diagonal_kl_expansion`)."""
+    cross = query @ key.transpose(-1, -2)                                        # (..., H, Nq, Nk)
+    return .5 * (cross + key_constant.unsqueeze(-2) - r - logdet_q.unsqueeze(-1))
+
+
+class _PairKLExpansion(torch.autograd.Function):
+    r"""A pair-KL expansion whose IEEE fp32 backward forms no pair grid (audit 2026-10-31 attention-scoring-1).
+
+    ``operands(*inputs[:-1])`` returns the token-linear operands :math:`(q, k, c)` of the expansion and the last input
+    is the query log-determinant :math:`\ell`; the value is :func:`_pair_kl_grid`. The forward evaluates it without
+    autograd and saves only the inputs, as :class:`_IEEEFP32Recompute` does. With :math:`\bar D` the grid cotangent
+    and :math:`g = \tfrac12\bar D`, no adjoint of the grid's epilogue or GEMM reads the grid, so the backward forms only
+
+    .. math::
+        \bar q = g\,k, \qquad \bar k = g^\top q, \qquad \bar c_j = \sum_i g_{ij}, \qquad \bar\ell_i = -\sum_j g_{ij},
+
+    with the batched GEMMs on the views ``torch.matmul`` reshapes to and the broadcast sums autograd applies, inside
+    :func:`vfe3.runtime.ieee_fp32_matmul`, and differentiates the token-linear operands rebuilt from the saved inputs
+    with those cotangents. The forward grid and its four epilogue passes, which :class:`_IEEEFP32Recompute` rebuilds in
+    backward, are not formed: one (..., H, Nq, Nk) write and four read-write passes per call fewer. Values and
+    gradients are those of :class:`_IEEEFP32Recompute` bit for bit on the CPU (``tests/test_audit_20261031_scoring.py``),
+    since the same operations run on the same operands in the same order. Double backward is not supported.
+    """
+
+    @staticmethod
+    def forward(
+        ctx:      Any,
+        operands: Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        r:        int,
+        *inputs:  torch.Tensor,  # token inputs of ``operands``, then the query log-determinant (..., H, Nq)
+    ) -> torch.Tensor:           # (..., H, Nq, Nk)
+        ctx.operands, ctx.r = operands, r
+        ctx.save_for_backward(*inputs)
+        with ieee_fp32_matmul():
+            return _pair_kl_grid(*operands(*inputs[:-1]), inputs[-1], r)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:   # grad (..., H, Nq, Nk)
+        needs = ctx.needs_input_grad[2:]
+        saved = ctx.saved_tensors
+        leaves = [x.detach().requires_grad_(need) for x, need in zip(saved[:-1], needs[:-1])]
+        logdet_q = saved[-1]
+        token_grads: List[Optional[torch.Tensor]] = [None] * len(leaves)
+        d_logdet = None
+        with torch.enable_grad(), ieee_fp32_matmul():
+            g2 = grad * .5                                                     # MulBackward of .5 * (...)
+            if needs[-1]:
+                # SubBackward of - logdet_q.unsqueeze(-1), then the broadcast reduction autograd applies.
+                d_logdet = (-g2).sum_to_size(logdet_q.unsqueeze(-1).shape).squeeze(-1)
+            wanted = [x for x in leaves if x.requires_grad]
+            if wanted:
+                query, key, key_constant = ctx.operands(*leaves)
+                nq, w = query.shape[-2:]
+                nk = key.shape[-2]
+                batch = torch.broadcast_shapes(query.shape[:-2], key.shape[:-2])
+                if tuple(grad.shape[:-2]) == tuple(batch):
+                    # The bmm adjoints of torch.matmul(query, key^T), on the (B H, ., .) views it reshapes to.
+                    q3 = query.expand(*batch, nq, w).reshape(-1, nq, w)                # (B H, Nq, w)
+                    k3 = key.transpose(-1, -2).expand(*batch, w, nk).reshape(-1, w, nk)   # (B H, w, Nk)
+                    g3 = g2.reshape(-1, nq, nk)                                        # (B H, Nq, Nk)
+                    d_query = g3.bmm(k3.transpose(1, 2)).reshape(*batch, nq, w).sum_to_size(query.shape)
+                    d_key = (q3.transpose(1, 2).bmm(g3).reshape(*batch, w, nk)
+                             .sum_to_size(*key.shape[:-2], w, nk).transpose(-1, -2))   # (..., H, Nk, w)
+                    d_key_constant = g2.sum_to_size(key_constant.unsqueeze(-2).shape).squeeze(-2)
+                    pairs = [(t, g) for t, g in ((query, d_query), (key, d_key), (key_constant, d_key_constant))
+                             if t.requires_grad]
+                    found = torch.autograd.grad([t for t, _ in pairs], wanted, [g for _, g in pairs],
+                                                allow_unused=True) if pairs else (None,) * len(wanted)
+                else:
+                    # A grid broadcast beyond the operands' batch: differentiate the rebuilt grid itself.
+                    found = torch.autograd.grad(_pair_kl_grid(query, key, key_constant, logdet_q, ctx.r), wanted,
+                                                grad, allow_unused=True)
+                found = iter(found)
+                token_grads = [next(found) if x.requires_grad else None for x in leaves]
+        return (None, None, *token_grads, d_logdet)
+
+
+def _pair_kl_autograd(
+    operands: Callable[..., Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    r:        int,
+    *inputs:  torch.Tensor,      # token inputs of ``operands``, then the query log-determinant
+) -> torch.Tensor:
+    r"""The pair grid of ``operands`` through :class:`_PairKLExpansion` under autograd, or directly without it."""
+    if torch.is_grad_enabled() and any(x.requires_grad for x in inputs):
+        return _PairKLExpansion.apply(operands, r, *inputs)
+    with ieee_fp32_matmul():
+        return _pair_kl_grid(*operands(*inputs[:-1]), inputs[-1], r)
+
+
+@ieee_fp32_matmul()
 def _cholesky_status(
     G:         torch.Tensor,
     symmetric: bool = False,
@@ -858,6 +1224,7 @@ def _projected_root_factor(
     bytes_per_token = math.prod(batch[:-2]) * batch[-1] * r * width * (torch.finfo(dtype).bits // 8)
     if tokens * bytes_per_token <= min(_PROJECTION_TILE_BYTES, _CHECKPOINT_BYTES):
         return _projected_root_factor_tile(Sigma, inverse, S, dtype, diagonal)
+    _count_tile_loop()
     step = max(1, min(tokens, _tile_token_cap(), _PROJECTION_TILE_BYTES // bytes_per_token))
     factors, failures = [], []
     for start in range(0, tokens, step):
@@ -890,7 +1257,7 @@ def _factor_status(
     (only under :func:`projected_condition_recovery`) is
 
     .. math::
-        \varepsilon \, \hat\kappa_1(C) > \mathtt{\_FACTOR\_CONDITION\_TOL} = 3 \times 10^{-4},
+        \varepsilon \, \hat\kappa_1(C) > \mathtt{FACTOR\_CONDITION\_TOL} = 3 \times 10^{-4},
 
     with :math:`\hat\kappa_1` the Hager-Higham estimate (O(r^2) per entry, no eigensolver). The
     factor's whitened error is at most :math:`c\,\varepsilon\,\kappa_2(X)`, measured c <= 2.7, and
@@ -901,8 +1268,10 @@ def _factor_status(
     certificate that guaranteed a logit error of 1e-3 for every pair up to ``kl_max`` would need
     :math:`\varepsilon(\kappa_q + \kappa_k) \le 5 \times 10^{-6}` and would trip in the tail of the
     observed query conditioning while the measured error sits twenty times inside that guarantee.
-    The tolerance is set just above the observed maximum instead (see optimization_plan.md,
-    Phase 0 results). G's finiteness and symmetry are still checked, since the trace product reads it.
+    The tolerance is set just above the observed maximum instead: :math:`\varepsilon\hat\kappa_1(C)` reached
+    at most 1.3e-4 on the saved K = 64 and K = 128 runs. These are the 2026-09-24 Phase 0 measurements, kept here
+    rather than in the precision plan they came from (audit 2026-10-31, gap-certified-factorization-routes-7).
+    G's finiteness and symmetry are still checked, since the trace product reads it.
     """
     chol, failed = _projected_root_factor(projection, G.shape[:-2], G.dtype)
     with torch.no_grad():
@@ -913,6 +1282,27 @@ def _factor_status(
         status = torch.stack((torch.isfinite(G).all(), _symmetry_status(G, symmetric),
                               (failed | screen).any(), failed.any()))
     return chol, failed, screen, status
+
+
+@torch.no_grad()
+def _factor_gram_certificate(
+    G:      torch.Tensor,               # (..., N, H, r, r) explicit Gram the GEMM reads, working dtype
+    P:      torch.Tensor,               # (..., N, H, r, r) inverse from the entry's CholeskyQR2 factor
+    status: Tuple[torch.Tensor, ...],   # (chol, failed, screen, verdicts) of _factor_status
+) -> torch.Tensor:                      # (..., N, H) bool
+    r"""Factor-route entries that the factor certificate accepts but whose explicit Gram fails the Gram certificate.
+
+    .. math::
+        \varepsilon\,\lVert G\rVert_F\,\lVert P\rVert_F > \mathtt{GRAM\_CONDITION\_TOL}, \qquad P = (CC^\top)^{-1},
+
+    the certificate of :func:`_cholesky_status` with :math:`P` read from the CholeskyQR2 factor. The centered GEMM
+    forms the trace term from :math:`G_i` and :math:`P_j` and backpropagates through :math:`P = (CC^\top)^{-1}`, both of
+    which carry :math:`O(\varepsilon\kappa(X)^2)` relative error whatever the accuracy of :math:`C`; such an entry's pairs
+    take the factor-trace tiles instead (audit 2026-10-31 gap-certified-factorization-routes-1). Entries already failed
+    or flagged by :func:`_factor_status` are rebuilt in float64 and are excluded here.
+    """
+    certificate = torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * P.norm(dim=(-2, -1)) > GRAM_CONDITION_TOL
+    return certificate & ~status[1] & ~status[2]
 
 
 def _source_qr_factor(root: torch.Tensor) -> torch.Tensor:
@@ -977,12 +1367,17 @@ def _commutant_root_factor(
 @ieee_fp32_matmul()
 def _source_root(
     G:          torch.Tensor,                # (..., r, r) working-dtype projected covariance
-    projection: Tuple[torch.Tensor, ...],    # (Sigma_h, U^{-1} blocks, S[, mu_h])
+    projection: Tuple[torch.Tensor, ...],    # (Sigma_h, U^{-1} blocks, S[, mu_h[, n_h]])
     mask:       torch.Tensor,                # (...) entries whose source square root is rebuilt
-) -> torch.Tensor:                           # (n, r, d) float64 roots of the masked entries
+) -> torch.Tensor:                           # (n, r, d) or (n, r, d + r) float64 roots of the masked entries
     r"""Float64 source square root X = S U^{-1} Sigma^{1/2} of the masked entries (G = X X^T).
 
-    Index before promotion: only the flagged source square roots are formed.
+    Index before promotion: only the flagged source square roots are formed. A fifth tuple element ``n_h`` ``(H,)``
+    declares the broadened Gram :math:`G = XX^\top + n_hI_r` of the noisy-key law
+    (:func:`projected_noisy_key_cost`): the root is then the augmented
+    :math:`\tilde X = [X,\ \sqrt{n_h}\,I_r]`, with :math:`\tilde X\tilde X^\top = G` exactly, so every rebuild below
+    (shifted CholeskyQR3, the float64 QR and the commutant factor, since :math:`P(XX^\top + n_hI) = P(XX^\top) + n_hI`)
+    factors the broadened law from its source (audit 2026-10-31 gap-certified-factorization-routes-2).
     """
     Sigma, inverse, S = projection[:3]
     batch, r, d = G.shape[:-2], G.shape[-1], S.shape[-1]
@@ -1004,6 +1399,13 @@ def _source_root(
             root = L @ _strict_cholesky(Sigma[mask].double())[0]
         else:
             raise ValueError("source covariance shape does not match projected token/head dimensions")
+        if len(projection) > 4 and projection[4] is not None:
+            # Broadened law G = X X^T + n_h I: append sqrt(n_h) I_r, one noise per head (the last batch axis).
+            noise = projection[4].double().expand(batch)[mask]                       # (n,)
+            if not bool(torch.isfinite(noise).all()) or bool((noise <= 0).any()):
+                raise ValueError("the key noise of a broadened source root must be finite and positive")
+            eye = torch.eye(r, dtype=torch.float64, device=G.device)
+            root = torch.cat((root, noise.sqrt()[:, None, None] * eye), dim=-1)       # (n, r, d + r)
         if not bool(torch.isfinite(root).all()):
             raise ValueError("projected source square root must be finite")
     return root
@@ -1016,6 +1418,7 @@ def _strict_cholesky(
     prepared:   Optional[tuple] = None,
     factored:   bool = False,
     commutant_pairs: Optional[int] = None,   # G = P(X X^T), the RoPE-commutant projection with this many planes
+    safe_factor: bool = False,               # the prepared factor masks the gradient of its failed entries
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Factor G with zero jitter, optionally recovering its factor from source moments.
 
@@ -1047,6 +1450,14 @@ def _strict_cholesky(
     :math:`P(XX^\top)` from the source root (:func:`_commutant_root_factor`), by shifted CholeskyQR3 or in float64
     as above, instead of :math:`XX^\top` (audit 2026-10-10 round 2, item 12). The factor route never runs with it.
 
+    A rebuild overwrites only the rebuilt entries of the prepared factor whenever that factor differentiates safely:
+    on the factor route (a failed CholeskyQR2 entry factors the identity), for a ``safe_factor`` (the
+    :class:`_GramPrecision` factor, whose backward zeroes a failed entry's gradient), and whenever no entry failed (every
+    entry is then a finite factor). Its healthy entries are bitwise the factor a refactorization would return, so the
+    role is refactored, with its certificate and host read, only when a plain factor holds a failed entry, through
+    whose Cholesky backward no gradient may pass even with a zero cotangent (audit 2026-10-31
+    gap-certified-factorization-routes-5).
+
     Returns ``(chol, recover_mask)``. ``chol`` stays in ``G.dtype`` on the healthy
     path. When float64 source recovery is applied the whole factor tensor is promoted to
     float64 so the rebuilt entries keep their QR accuracy, and ``recover_mask``
@@ -1076,13 +1487,10 @@ def _strict_cholesky(
         if projection is None:
             if failed_any:
                 raise ValueError("projected covariance is not positive definite: zero-jitter Cholesky failed; no repair applied")
-            if working_recovery:
-                return chol, None
-            chol64, _ = _strict_cholesky(G.double())
-            # Whole-tensor float64 refactor: every entry takes the factor route.
-            recovered_all = torch.ones_like(failed)
-            _count_source_recovery(recovered_all)
-            return chol64, recovered_all
+            # Nothing can be rebuilt without a source tuple, so a certificate-flagged entry keeps its factor. Only a
+            # float32 entry is ever flagged (_cholesky_status), so a float64 input reaches here only by a failure,
+            # which raised above (audit 2026-10-31 A078).
+            return chol, None
         if working_recovery and not float64_rebuild:
             # Gram routes, and the uncertified factor route (``ill_conditioned`` empty: only failures rebuilt).
             rebuild = failed | ill_conditioned
@@ -1092,9 +1500,10 @@ def _strict_cholesky(
                     cholesky_qr2(root.to(G.dtype), shift=True) if commutant_pairs is None
                     else _commutant_root_factor(root.to(G.dtype), commutant_pairs, shift=True))
             if not bool(shifted_failed.any()):
-                if factored:
-                    # Failed CholeskyQR2 entries already factor the identity, so the prepared factor is
-                    # safe to differentiate and is overwritten only where rebuilt.
+                if factored or safe_factor or not failed_any:
+                    # Failed CholeskyQR2 entries already factor the identity, a _GramPrecision factor masks a failed
+                    # entry's gradient, and without a failure every entry is finite: the prepared factor is safe to
+                    # differentiate and is overwritten only where rebuilt.
                     base = chol
                 else:
                     # Never backpropagate through a failed Cholesky, even with zero cotangent.
@@ -1123,9 +1532,10 @@ def _strict_cholesky(
                 recovered = _commutant_root_factor(root, commutant_pairs, shift=False)[0]
             else:
                 recovered = _source_qr_factor(root)
-        if factored:
-            # Failed factor-route entries already factor the identity (guarded_cholesky), so the
-            # prepared factor is safe to differentiate and is overwritten only where recovered.
+        if factored or safe_factor or not failed_any:
+            # Failed factor-route entries already factor the identity (guarded_cholesky), a _GramPrecision factor
+            # masks a failed entry's gradient, and without a failure every entry is finite: the prepared factor is
+            # safe to differentiate and is overwritten only where recovered.
             chol = chol.double()
         else:
             # Never backpropagate through a failed Cholesky, even with zero cotangent.
@@ -1182,6 +1592,7 @@ def projected_gaussian_kl(
     commutant_pairs: Optional[int] = None,
     diagonal_covariance: bool = False,
     drop_query_constant: bool = False,
+    rotating_coordinates: int = 0,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute raw KL(q_i || k_j) = (tr(G_j^{-1}G_i) + delta^T G_j^{-1}delta - r + logdet(G_j/G_i))/2.
 
@@ -1208,14 +1619,24 @@ def projected_gaussian_kl(
     its float64 source root (:func:`_strict_cholesky`), and is counted in :func:`source_recovery_elements`. Its
     pairs take the float64 factor-route tiles of the float64 recovery below, with the means recomputed from the
     source in float64, and are rounded to the working dtype only at the end, so a touched pair's error falls to
-    the working dtype's rounding of the result plus its healthy partner's :math:`O(\varepsilon\kappa)`.
+    the working dtype's rounding of the result plus its healthy partner's :math:`O(\varepsilon\kappa)`. The GEMM
+    reads the explicit :math:`G_i` and :math:`P_j = (C_jC_j^\top)^{-1}`, which are conditioned by
+    :math:`\kappa(X)^2` whatever the factor's accuracy, so an entry that passes the factor certificate but fails the
+    Gram certificate :math:`\varepsilon\lVert G\rVert_F\lVert P\rVert_F \le` ``GRAM_CONDITION_TOL`` (:math:`P` from its
+    CholeskyQR2 factor) keeps that factor, is not counted as a recovery, and its pairs take the factor-trace tiles
+    :math:`\lVert C_j^{-1}C_i\rVert_F^2` in the working dtype (float64 when the call also rebuilt an entry), so its
+    gradients keep the factor's :math:`O(\varepsilon\kappa(X))` error (audit 2026-10-31
+    gap-certified-factorization-routes-1).
 
     The factor route is selected PER PAIR (audit 2026-09-23 low): a pair (b, h, i, j) takes
     it only when its own query entry (b, i, h) or key entry (b, j, h) was recovered. Every other
     pair is the working-dtype value of the healthy GEMM, bit-identical to the call in
     which no entry anywhere in the batch needed recovery, so an ill-conditioned token in another
     sequence or at a later position cannot change a healthy pair's arithmetic. The selection uses
-    the recovery masks already on the device and the host flags the recovery path already reads.
+    the recovery masks already on the device and the host flags the recovery path already reads. The factor tiles
+    evaluate only the rows of recovered query entries and the columns of recovered key entries of the gathered
+    slices, and a rebuild overwrites the prepared factor instead of refactoring the role where that factor
+    differentiates safely (:func:`_strict_cholesky`; audit 2026-10-31 gap-certified-factorization-routes-5).
 
     ``symmetric_inputs=True`` certifies that G_q and G_k are bitwise symmetric (the output of
     :func:`projected_moments`, or a rotated covariance re-symmetrized as 0.5 (G + G^T)) and skips
@@ -1245,6 +1666,8 @@ def projected_gaussian_kl(
     tuples and ``commutant_pairs`` are not read): its covariance needs no factorization, so the certificate is that
     every variance is finite and positive. ``gemm_expansion_tol`` acts there as on the dense route, with the diagonal
     error estimate of :func:`_diagonal_gemm_expansion_error` and direct-difference tiles (audit 2026-10-17 item 11).
+    ``rotating_coordinates`` (the diagonal route only; config ``pair_kl_gemm_shift``) centers its expansion at zero in
+    the leading coordinates the comparison RoPE rotates (:func:`_expansion_shift`).
 
     ``drop_query_constant=True`` returns :math:`D_{ij} + \tfrac12(r + \log\det G_i)`, the cost without its query-only
     row constant :math:`-\tfrac12(r + \log\det G_i)` (``routing_kl_max_reference='query_shifted'``, audit 2026-10-17
@@ -1266,7 +1689,8 @@ def projected_gaussian_kl(
             raise ValueError("diagonal projected covariances must match their means")
         return _projected_diagonal_kl(a_q, G_q, a_k, G_k, query_row_constant_grad,
                                       gemm_expansion_tol=gemm_expansion_tol,
-                                      drop_query_constant=drop_query_constant)
+                                      drop_query_constant=drop_query_constant,
+                                      rotating_coordinates=rotating_coordinates)
     if G_q.shape != (*a_q.shape, r) or G_k.shape != (*a_k.shape, r):
         raise ValueError("projected covariances must match their means with one additional matrix axis")
     if commutant_pairs is not None and (type(commutant_pairs) is not int or not 0 <= 2 * commutant_pairs <= r):
@@ -1276,9 +1700,12 @@ def projected_gaussian_kl(
         aq, ak = a_q.to(dtype), a_k.to(dtype)
         Gq, Gk = G_q.to(dtype), G_k.to(dtype)
         # The factor route factors the source roots; without both source tuples it has nothing to
-        # factor and the Gram route runs. A commutant projection P(X X^T) has no such root factor.
+        # factor and the Gram route runs. A commutant projection P(X X^T) has no such root factor, and the broadened
+        # noisy-key law X X^T + n_h I (a source tuple with a fifth element) takes the Gram route, whose recovery
+        # rebuilds it from the augmented root (_source_root).
         factored = (_FACTOR_ROUTE == "cholesky_qr2" and commutant_pairs is None
-                    and projection_q is not None and projection_k is not None)
+                    and projection_q is not None and projection_k is not None
+                    and len(projection_q) <= 4 and len(projection_k) <= 4)
         def _status(G: torch.Tensor, projection: Optional[Tuple[torch.Tensor, ...]]) -> Tuple[torch.Tensor, ...]:
             return (_factor_status(G, projection, symmetric_inputs) if factored
                     else _cholesky_status(G, symmetric_inputs))
@@ -1313,14 +1740,35 @@ def projected_gaussian_kl(
                                             None if k_logdet_prepared is None else k_logdet_prepared.detach()))
         else:
             q_logdet_prepared = None
+        # cholesky_qr2_certified: an entry whose CholeskyQR2 factor passes its own certificate but whose explicit Gram
+        # fails eps ||G||_F ||G^{-1}||_F <= GRAM_CONDITION_TOL would carry O(eps kappa(X)^2) through the GEMM, which
+        # reads G_i and P_j = (C_j C_j^T)^{-1}; its pairs take the factor-trace tiles with its factor instead
+        # (audit 2026-10-31 gap-certified-factorization-routes-1). gram_q, gram_k: (..., N, H) or None.
+        gram_q = gram_k = None
+        if factored and _CONDITION_RECOVERY and dtype == torch.float32 and r > 1:
+            gram_k = _factor_gram_certificate(Gk, k_prec_prepared, k_status)
+            if tied:
+                gram_q = gram_k
+            else:
+                with torch.no_grad(), ieee_fp32_matmul():
+                    q_prec = torch.cholesky_inverse(torch.where(
+                        q_status[1][..., None, None], torch.eye(r, device=Gq.device, dtype=dtype), q_status[0]))
+                gram_q = _factor_gram_certificate(Gq, q_prec, q_status)
         # Optional per-(batch, head) GEMM error estimate; its verdict joins the single decision read below.
         slice_shape = torch.broadcast_shapes(aq.shape[:-3], ak.shape[:-3]) + aq.shape[-2:-1]  # (..., H)
         verdicts = [(torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1), q_status[-1], k_status[-1]]
+        if gram_k is not None:
+            verdicts.append(torch.stack((gram_q.any(), gram_k.any())))
         if gemm_expansion_tol is not None:
-            # Key entries the recovery will rebuild leave the GEMM (their pairs take the factor route), so
-            # they leave the estimate too: failed or certificate-flagged entries, on either route.
-            recovered_k = k_status[1] | k_status[2]
-            fallback = ~(_gemm_expansion_error(aq, ak, k_prec_prepared, recovered_k) <= gemm_expansion_tol)
+            # Key entries whose pairs leave the GEMM leave the estimate too: the entries the recovery rebuilds
+            # (failed or certificate-flagged, and only where a key source tuple exists to rebuild them; without one a
+            # flagged entry keeps its factor and its pairs stay on the GEMM) and, on the certified factor route, the
+            # entries failing the Gram certificate (audit 2026-10-31 gap-certified-factorization-routes-2).
+            excluded_k = (k_status[1] | k_status[2] if projection_k is not None
+                          else torch.zeros_like(k_status[1]))
+            if gram_k is not None:
+                excluded_k = excluded_k | gram_k
+            fallback = ~(_gemm_expansion_error(aq, ak, k_prec_prepared, excluded_k) <= gemm_expansion_tol)
             verdicts.append(fallback.expand(slice_shape).reshape(-1))
         if (projection_q is None and projection_k is None and not _CONDITION_RECOVERY
                 and gemm_expansion_tol is None):
@@ -1339,21 +1787,31 @@ def projected_gaussian_kl(
             # One host transfer for both roles and the means on the healthy path.
             # host_read also resolves raise-only checks deferred by vfe3.contracts.deferred_host_checks.
             decisions = host_read(torch.cat(verdicts))
-            fallback_slices = [s for s, flag in enumerate(decisions[9:]) if flag]
+            gram_any = decisions[9:11] if gram_k is not None else [False, False]
+            fallback_slices = [s for s, flag in enumerate(decisions[(11 if gram_k is not None else 9):]) if flag]
             decisions = decisions[:9]
             if not decisions[0]:
                 raise ValueError("projected means must contain only finite values")
-            if not query_row_constant_grad and torch.is_grad_enabled() and (decisions[3] or decisions[7]):
-                # Recovery reads the query factor beyond its log-determinant: refactor it with autograd.
-                # The factorization is deterministic, so the factor, masks and decisions are unchanged.
+            if (not query_row_constant_grad and torch.is_grad_enabled()
+                    and (decisions[3] or decisions[7] or any(gram_any))):
+                # Recovery or the factor-trace tiles read the query factor beyond its log-determinant: refactor it
+                # with autograd. The factorization is deterministic, so the factor, masks and decisions are unchanged.
                 if tied:
                     q_status, q_logdet_prepared = k_status, k_logdet_prepared
                 else:
                     q_status = _status(Gq, projection_q)
+            # On the Gram route the key factor is _GramPrecision's (and so is the query's when tied), whose backward
+            # masks failed entries, so a rebuild overwrites it in place of refactoring the role.
             chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]), factored,
-                                             commutant_pairs)
+                                             commutant_pairs, safe_factor=tied and not factored)
             chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]), factored,
-                                             commutant_pairs)
+                                             commutant_pairs, safe_factor=not factored)
+            # Entries failing only the Gram certificate keep their CholeskyQR2 factor; their pairs join the factor
+            # tiles below like those of a rebuilt entry (gap-certified-factorization-routes-1).
+            if gram_any[0]:
+                rec_q = gram_q if rec_q is None else rec_q | gram_q
+            if gram_any[1]:
+                rec_k = gram_k if rec_k is None else rec_k | gram_k
         # Only tiles that touch a recovered query or key entry need the factor-route
         # triangular solves (float64 after a float64 recovery). Healthy pairs keep the centered GEMM
         # in the working dtype; the healthy factors round-trip bit-exactly through the cast.
@@ -1366,8 +1824,8 @@ def projected_gaussian_kl(
             if factor_fp64:
                 # Preserve source accuracy through means, triangular solves and the final scalar.
                 for role, projection in enumerate((projection_q, projection_k)):
-                    if projection is not None and len(projection) == 4:
-                        _, inverse, S, mu = projection
+                    if projection is not None and len(projection) >= 4 and projection[3] is not None:
+                        inverse, S, mu = projection[1:4]                      # a fifth element is the key noise
                         mean = (_projected_linear_map(S.double(), inverse.double())
                                 @ mu.double().unsqueeze(-1)).squeeze(-1)
                         if role == 0:
@@ -1383,9 +1841,11 @@ def projected_gaussian_kl(
             with ieee_fp32_matmul():                            # token-linear key precision
                 k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
             # Fold token-level recover flags into one host transfer, recovery path only.
-            def _token_recover_flags(mask: torch.Tensor, n_tokens: int) -> torch.Tensor:
+            def _token_recover_flags(mask: torch.Tensor, n_tokens: int) -> torch.Tensor:   # (..., N, H) -> (N,)
                 return mask.movedim(-2, 0).reshape(n_tokens, -1).any(dim=-1)
-            nq_flags, nk_flags = Gq.shape[-3], Gk.shape[-3]
+            # The token axis of G (..., N, H, r, r) is -4; the former -3 read the head count, so the flags described
+            # head-mixed groups instead of tokens (found with audit 2026-10-31 gap-certified-factorization-routes-5).
+            nq_flags, nk_flags = Gq.shape[-4], Gk.shape[-4]
             q_tok = (_token_recover_flags(rec_q, nq_flags) if rec_q is not None
                      else torch.zeros(nq_flags, dtype=torch.bool, device=Gq.device))
             k_tok = (_token_recover_flags(rec_k, nk_flags) if rec_k is not None
@@ -1425,13 +1885,13 @@ def projected_gaussian_kl(
             logdet_q_healthy = torch.full_like(logdet_q_healthy.detach(), -r)
         nq, nk = aq.shape[-2], ak.shape[-2]
 
-        def _tile_steps(element_size: int, per_pair: int, slices: int) -> Tuple[int, int]:
+        def _tile_steps(element_size: int, per_pair: int, slices: int, n_rows: int, n_cols: int) -> Tuple[int, int]:
             pair_budget = max(1, _RECOVERY_PAIR_TILE_BYTES // (element_size * slices * per_pair))
-            q_step = max(1, min(nq, 32, pair_budget))
-            return q_step, max(1, min(nk, pair_budget // q_step))
+            q_step = max(1, min(n_rows, 32, pair_budget))
+            return q_step, max(1, min(n_cols, pair_budget // q_step))
 
-        def _tile(args: tuple, ft: bool, q_step: int, k_step: int) -> torch.Tensor:
-            if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):
+        def _tile(args: tuple, ft: bool, checkpointed: bool) -> torch.Tensor:
+            if torch.is_grad_enabled() and checkpointed and any(x.requires_grad for x in args):
                 return checkpoint(_projected_kl_tile, *args, ft,
                                   use_reentrant=False, preserve_rng_state=False)
             return _projected_kl_tile(*args, ft)
@@ -1444,6 +1904,7 @@ def projected_gaussian_kl(
             # Slices whose GEMM error estimate exceeds gemm_expansion_tol take the direct tiles.
             global _GEMM_FALLBACK_SLICES
             _GEMM_FALLBACK_SLICES += len(fallback_slices)
+            _count_tile_loop()
             index = torch.tensor(fallback_slices, dtype=torch.long, device=healthy.device)
             grid = healthy.shape                                                # (..., H, Nq, Nk)
 
@@ -1498,23 +1959,38 @@ def projected_gaussian_kl(
         pair_rec = _gather(q_rec, 1).unsqueeze(-1) | _gather(k_rec, 1).unsqueeze(-2)   # (n, Nq, Nk)
         route = (_gather(aq, 2), _gather(ak, 2), _gather(q_factor, 3), _gather(k_factor, 3),
                  _gather(logdet_q, 1), _gather(logdet_k, 1))
-        current = _gather(healthy, 2)                                             # (n, Nq, Nk)
-        q_step, k_step = _tile_steps(aq.element_size(), r * r, len(recovered_slices))
-        rows = []
-        for i in range(0, nq, q_step):
-            columns = []
-            i_rec = any(q_needs[i:i+q_step])
-            for j in range(0, nk, k_step):
-                value = current[:, i:i+q_step, j:j+k_step]
-                if i_rec or any(k_needs[j:j+k_step]):
-                    args = (route[0][:, i:i+q_step], route[1][:, j:j+k_step],
-                            route[2][:, i:i+q_step], route[3][:, j:j+k_step],
-                            route[4][:, i:i+q_step], route[5][:, j:j+k_step])
-                    factor_value = _tile(args, True, q_step, k_step).to(dtype)
-                    value = torch.where(pair_rec[:, i:i+q_step, j:j+k_step], factor_value, value)
-                columns.append(value)
-            rows.append(torch.cat(columns, dim=-1))
-        return healthy.index_put(index, torch.cat(rows, dim=-2).to(healthy.dtype)).to(dtype)
+        value = _gather(healthy, 2)                                               # (n, Nq, Nk)
+        # Only the pairs that touch a tiled entry are evaluated (audit 2026-10-31 gap-certified-factorization-routes-5):
+        # every column of a query row holding one, then the key columns holding one in the remaining rows. Each pair's
+        # tile value is a per-pair function of its two entries, so the tile grouping does not select its arithmetic.
+        q_rows = [i for i, flag in enumerate(q_needs) if flag]
+        k_cols = [j for j, flag in enumerate(k_needs) if flag]
+        other_rows = [i for i, flag in enumerate(q_needs) if not flag]
+        n_slices = len(recovered_slices)
+        for row_ids, col_ids in ((q_rows, list(range(nk))), (other_rows, k_cols)):
+            if not row_ids or not col_ids:
+                continue
+            rows_at = torch.tensor(row_ids, dtype=torch.long, device=healthy.device)
+            cols_at = torch.tensor(col_ids, dtype=torch.long, device=healthy.device)
+            q_side = [route[k].index_select(1, rows_at) for k in (0, 2, 4)]          # aq, q_factor, logdet_q rows
+            k_side = [route[k].index_select(1, cols_at) for k in (1, 3, 5)]          # ak, k_factor, logdet_k columns
+            n_rows, n_cols = len(row_ids), len(col_ids)
+            q_step, k_step = _tile_steps(aq.element_size(), r * r, n_slices, n_rows, n_cols)
+            checkpointed = n_rows > q_step or n_cols > k_step
+            block_rows = []
+            for i in range(0, n_rows, q_step):
+                block_columns = []
+                for j in range(0, n_cols, k_step):
+                    args = (q_side[0][:, i:i+q_step], k_side[0][:, j:j+k_step],
+                            q_side[1][:, i:i+q_step], k_side[1][:, j:j+k_step],
+                            q_side[2][:, i:i+q_step], k_side[2][:, j:j+k_step])
+                    block_columns.append(_tile(args, True, checkpointed).to(dtype))
+                block_rows.append(torch.cat(block_columns, dim=-1))
+            block = torch.cat(block_rows, dim=-2)                                 # (n, n_rows, n_cols)
+            at = (torch.arange(n_slices, device=healthy.device)[:, None, None], rows_at[None, :, None],
+                  cols_at[None, None, :])
+            value = value.index_put(at, torch.where(pair_rec[at], block, value[at]))
+        return healthy.index_put(index, value.to(healthy.dtype)).to(dtype)
 
 
 def _healthy_kl_verdict(host: List[bool]) -> None:
@@ -1542,13 +2018,33 @@ def _projected_kl_gemm(
 ) -> torch.Tensor:           # (..., H, Nq, Nk)
     r"""Healthy pair KL grid as one centered expanded GEMM per (batch, head), forward and backward at IEEE fp32.
 
-    The value is :func:`_projected_kl_expansion`. Under autograd it runs through :class:`_IEEEFP32Recompute`,
-    which saves only these token-linear inputs and differentiates a recomputation of the expansion under
-    :func:`vfe3.runtime.ieee_fp32_matmul`, so the backward GEMMs, whose terms cancel to
-    :math:`\sum_i g_{ij}(G_i + \delta_{ij}\delta_{ij}^\top)` in :math:`\partial L/\partial P_j`, no longer run under
-    the caller's TF32 policy (audit 2026-10-10 round 2, item 2).
+    The value is :func:`_projected_kl_expansion`. Under autograd it runs through :class:`_PairKLExpansion`,
+    which saves only these token-linear inputs and forms the grid adjoints from the rebuilt token-linear operands
+    under :func:`vfe3.runtime.ieee_fp32_matmul`, so the backward GEMMs, whose terms cancel to
+    :math:`\sum_i g_{ij}(G_i + \delta_{ij}\delta_{ij}^\top)` in :math:`\partial L/\partial P_j`, do not run under
+    the caller's TF32 policy (audit 2026-10-10 round 2, item 2) and no pair grid is rebuilt in backward (audit
+    2026-10-31 attention-scoring-1).
     """
-    return _ieee_fp32_autograd(_projected_kl_expansion, aq, ak, q_cov, k_prec, logdet_q, logdet_k)
+    return _pair_kl_autograd(_projected_kl_operands, aq.shape[-1], aq, ak, q_cov, k_prec, logdet_k, logdet_q)
+
+
+def _projected_kl_operands(
+    aq:       torch.Tensor,  # (..., H, Nq, r) query means
+    ak:       torch.Tensor,  # (..., H, Nk, r) key means
+    q_cov:    torch.Tensor,  # (..., H, Nq, r, r) query covariances G_i
+    k_prec:   torch.Tensor,  # (..., H, Nk, r, r) key precisions P_j = G_j^{-1}
+    logdet_k: torch.Tensor,  # (..., H, Nk)
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # (..., H, Nq, r^2 + r), (..., H, Nk, r^2 + r), (..., H, Nk)
+    r"""Token-linear operands :math:`(q_i, k_j, c_j)` of :func:`_projected_kl_expansion`, in its operation order."""
+    c = ak[..., :1, :].detach()                                                  # (..., H, 1, r)
+    alpha, b = aq - c, ak - c                                                    # (..., H, N, r)
+    Pb = (k_prec @ b.unsqueeze(-1)).squeeze(-1)                                  # (..., H, Nk, r)
+    PTb = (k_prec.transpose(-1, -2) @ b.unsqueeze(-1)).squeeze(-1)               # (..., H, Nk, r)
+    second = q_cov + alpha.unsqueeze(-1) * alpha.unsqueeze(-2)                   # (..., H, Nq, r, r)
+    query = torch.cat((second.flatten(-2), alpha), dim=-1)                       # (..., H, Nq, r^2 + r)
+    key = torch.cat((k_prec.flatten(-2), -(Pb + PTb)), dim=-1)                   # (..., H, Nk, r^2 + r)
+    key_constant = (b * Pb).sum(-1) + logdet_k                                   # (..., H, Nk)
+    return query, key, key_constant
 
 
 @ieee_fp32_matmul()
@@ -1574,20 +2070,14 @@ def _projected_kl_expansion(
     mean, detached (the value is independent of :math:`c`, so its gradient is zero), which keeps
     :math:`\alpha` and :math:`b` at the scale of the means' spread instead of their offset and bounds
     the expansion's cancellation; a first-key shift also keeps every row independent of later keys.
+    Under comparison RoPE the scorer receives rotated means :math:`R_ia_i`, and a common offset of the unrotated
+    means becomes a position-dependent vector that no single shift removes, so the centering bounds the cancellation
+    only in the coordinates RoPE leaves unrotated (audit 2026-10-31 attention-scoring-3); the opt-in
+    ``pair_kl_gemm_tol`` estimate (:func:`_gemm_expansion_error`) still majorizes the error.
     The forward GEMMs run at IEEE fp32 (``vfe3.runtime.ieee_fp32_matmul``); TF32 would round the
     operands to :math:`2^{-10}`. :func:`_projected_kl_gemm` runs their backward at IEEE fp32 too.
     """
-    r = aq.shape[-1]
-    c = ak[..., :1, :].detach()                                                  # (..., H, 1, r)
-    alpha, b = aq - c, ak - c                                                    # (..., H, N, r)
-    Pb = (k_prec @ b.unsqueeze(-1)).squeeze(-1)                                  # (..., H, Nk, r)
-    PTb = (k_prec.transpose(-1, -2) @ b.unsqueeze(-1)).squeeze(-1)               # (..., H, Nk, r)
-    second = q_cov + alpha.unsqueeze(-1) * alpha.unsqueeze(-2)                   # (..., H, Nq, r, r)
-    query = torch.cat((second.flatten(-2), alpha), dim=-1)                       # (..., H, Nq, r^2 + r)
-    key = torch.cat((k_prec.flatten(-2), -(Pb + PTb)), dim=-1)                   # (..., H, Nk, r^2 + r)
-    cross = query @ key.transpose(-1, -2)                                        # (..., H, Nq, Nk)
-    key_constant = (b * Pb).sum(-1) + logdet_k                                   # (..., H, Nk)
-    return .5 * (cross + key_constant.unsqueeze(-2) - r - logdet_q.unsqueeze(-1))
+    return _pair_kl_grid(*_projected_kl_operands(aq, ak, q_cov, k_prec, logdet_k), logdet_q, aq.shape[-1])
 
 
 def _projected_diagonal_kl(
@@ -1600,6 +2090,7 @@ def _projected_diagonal_kl(
     *,
     gemm_expansion_tol: Optional[float] = None,
     drop_query_constant: bool = False,
+    rotating_coordinates: int = 0,
 ) -> torch.Tensor:                 # (..., H, Nq, Nk)
     r"""Diagonal route of :func:`projected_gaussian_kl` for structurally diagonal comparison covariances.
 
@@ -1611,9 +2102,12 @@ def _projected_diagonal_kl(
 
     which is the dense Gaussian KL of the diagonal matrices exactly. No Gram, Cholesky factorization or
     :math:`r^2 + r` GEMM runs: the pair grid is one GEMM of inner dimension :math:`2r` per (batch, head)
-    (:func:`_diagonal_kl_expansion`), forward and backward at IEEE fp32 through :class:`_IEEEFP32Recompute`, and
-    no (..., H, Nq, Nk, r) tensor is formed. This is the route of ``rope_mode='comparison_invariant'``
-    whenever every comparison coordinate but at most one rotates (audit 2026-10-10 round 2, item 30).
+    (:func:`_diagonal_kl_expansion`), forward and backward at IEEE fp32 through :class:`_PairKLExpansion`, whose
+    backward forms no pair grid, and no (..., H, Nq, Nk, r) tensor is formed. This is the route of
+    ``rope_mode='comparison_invariant'`` whenever every comparison coordinate but at most one rotates (audit 2026-10-10
+    round 2, item 30). ``rotating_coordinates`` :math:`m > 0` (config ``pair_kl_gemm_shift='rotation_aware'``) centers
+    the expansion at zero in the first :math:`m` coordinates, the planes the comparison RoPE rotates, and at the first
+    key in the rest (:func:`_expansion_shift`); 0 keeps the first-key shift in every coordinate.
 
     The diagonal analogue of the zero-jitter positivity certificate is that every variance is finite and positive;
     a diagonal covariance needs no factorization, so no recovery has anything to rebuild and the verdict can only
@@ -1630,13 +2124,12 @@ def _projected_diagonal_kl(
     """
     dtype = _compute_dtype(a_q, g_q, a_k, g_k)
     r = a_q.shape[-1]
+    if type(rotating_coordinates) is not int or not 0 <= rotating_coordinates <= r:
+        raise ValueError(f"rotating_coordinates must be an int in [0, {r}], got {rotating_coordinates!r}")
     with torch.autocast(device_type=a_q.device.type, enabled=False):
         aq, ak = a_q.to(dtype).movedim(-2, -3), a_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
         gq, gk = g_q.to(dtype).movedim(-2, -3), g_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
-        with torch.no_grad():
-            flags = torch.stack((torch.isfinite(aq).all() & torch.isfinite(ak).all(),
-                                 torch.isfinite(gq).all(), (gq > 0).all(),
-                                 torch.isfinite(gk).all(), (gk > 0).all()))
+        flags = _diagonal_route_flags(aq, ak, gq, gk)                           # (5,) bool
         fallback_slices: List[int] = []
         if gemm_expansion_tol is None:
             # On a failure only, the note names the count, minimum and first (batch, head, token, coordinate) of
@@ -1645,7 +2138,8 @@ def _projected_diagonal_kl(
                 describe_offending_entries(gq, label="query variances"),
                 describe_offending_entries(gk, label="key variances"))))
         else:
-            fallback = ~(_diagonal_gemm_expansion_error(aq, ak, gk) <= gemm_expansion_tol)   # (..., H)
+            fallback = ~(_diagonal_gemm_expansion_error(aq, ak, gk, rotating_coordinates)
+                         <= gemm_expansion_tol)                                 # (..., H)
             slice_shape = torch.broadcast_shapes(aq.shape[:-2], ak.shape[:-2])              # (..., H)
             decisions = host_read(torch.cat((flags, fallback.expand(slice_shape).reshape(-1))))
             _diagonal_kl_verdict(decisions[:5])
@@ -1656,11 +2150,14 @@ def _projected_diagonal_kl(
         else:
             with torch.set_grad_enabled(torch.is_grad_enabled() and query_row_constant_grad):
                 logdet_q = gq.log().sum(-1)                                      # (..., H, Nq)
-        healthy = _ieee_fp32_autograd(_diagonal_kl_expansion, aq, ak, gq, gk, logdet_q)   # (..., H, Nq, Nk)
+        operands = (_diagonal_kl_operands if not rotating_coordinates
+                    else lambda *x: _diagonal_kl_operands(*x, rotating_coordinates=rotating_coordinates))
+        healthy = _pair_kl_autograd(operands, r, aq, ak, gq, gk, logdet_q)     # (..., H, Nq, Nk)
         if not fallback_slices:
             return healthy
         global _GEMM_FALLBACK_SLICES
         _GEMM_FALLBACK_SLICES += len(fallback_slices)
+        _count_tile_loop()
         grid = healthy.shape                                                    # (..., H, Nq, Nk)
         nq, nk = grid[-2], grid[-1]
         index = torch.tensor(fallback_slices, dtype=torch.long, device=healthy.device)
@@ -1693,6 +2190,36 @@ def _projected_diagonal_kl(
         return healthy.reshape(-1, nq, nk).index_copy(0, index, direct.to(healthy.dtype)).reshape(grid)
 
 
+@torch.no_grad()
+def _finite_and_positive(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""``(isfinite(x).all(), (x > 0).all())`` from one ``aminmax`` pass (audit 2026-10-31 attention-scoring-9).
+
+    ``aminmax`` propagates NaN, so the minimum and maximum are both finite exactly when every entry is, and the
+    minimum is positive exactly when every entry is (a NaN fails both, as it fails the elementwise forms): the same
+    verdicts as the composite ``isfinite`` chain of four kernels per call, from one reduction. An empty tensor, which
+    ``aminmax`` refuses, passes both, as the elementwise forms do.
+    """
+    if x.numel() == 0:
+        true = torch.ones((), dtype=torch.bool, device=x.device)
+        return true, true
+    low, high = torch.aminmax(x)
+    return torch.isfinite(low) & torch.isfinite(high), low > 0
+
+
+@torch.no_grad()
+def _diagonal_route_flags(
+    aq: torch.Tensor,  # (..., H, Nq, r)
+    ak: torch.Tensor,  # (..., H, Nk, r)
+    gq: torch.Tensor,  # (..., H, Nq, r)
+    gk: torch.Tensor,  # (..., H, Nk, r)
+) -> torch.Tensor:     # (5,) bool: means finite, query finite and positive, key finite and positive
+    r"""The certificate flags of the diagonal routes (:func:`_diagonal_kl_verdict`), by :func:`_finite_and_positive`."""
+    q_finite, q_positive = _finite_and_positive(gq)
+    k_finite, k_positive = _finite_and_positive(gk)
+    return torch.stack((_finite_and_positive(aq)[0] & _finite_and_positive(ak)[0],
+                        q_finite, q_positive, k_finite, k_positive))
+
+
 def _diagonal_kl_verdict(host: List[bool]) -> None:
     r"""The raises of the diagonal route, in the dense route's order: means, query role, key role."""
     means, q_finite, q_positive, k_finite, k_positive = host
@@ -1713,11 +2240,14 @@ def _diagonal_kl_expansion(
     gq:       torch.Tensor,  # (..., H, Nq, r) query variances g_i
     gk:       torch.Tensor,  # (..., H, Nk, r) key variances g_j
     logdet_q: torch.Tensor,  # (..., H, Nq) sum_k log g_ik
+
+    *,
+    rotating_coordinates: int = 0,
 ) -> torch.Tensor:           # (..., H, Nq, Nk)
     r"""Diagonal pair KL grid as one centered GEMM of inner dimension 2r per (batch, head), at IEEE fp32.
 
-    With the detached first-key shift :math:`c` of :func:`_projected_kl_expansion`, :math:`\alpha_i = a_i - c` and
-    :math:`b_j = a_{k,j} - c`,
+    With the detached shift :math:`c` of :func:`_expansion_shift` (the first key, as in
+    :func:`_projected_kl_expansion`), :math:`\alpha_i = a_i - c` and :math:`b_j = a_{k,j} - c`,
 
     .. math::
         2\,\mathrm{KL}_{ij} = \bigl\langle [g_i + \alpha_i\circ\alpha_i,\ \alpha_i],\
@@ -1726,16 +2256,49 @@ def _diagonal_kl_expansion(
 
     the diagonal case of the dense expansion (:math:`P_j = \operatorname{diag}(g_j^{-1})`).
     """
-    r = aq.shape[-1]
+    return _pair_kl_grid(*_diagonal_kl_operands(aq, ak, gq, gk, rotating_coordinates=rotating_coordinates),
+                         logdet_q, aq.shape[-1])
+
+
+def _expansion_shift(
+    ak:                   torch.Tensor,  # (..., H, Nk, r) key means as scored
+    rotating_coordinates: int,           # the leading coordinates the comparison RoPE rotates; 0 = none
+) -> torch.Tensor:                       # (..., H, 1, r) detached
+    r"""Common shift :math:`c` of the diagonal pair-KL expansion: the first key's mean, detached.
+
+    The expansion's value does not depend on :math:`c` (so its gradient is zero), and a shift by the first key keeps
+    :math:`\alpha` and :math:`b` at the scale of the means' spread and every row independent of later keys. Under
+    comparison RoPE the means arrive rotated, :math:`R_ia_i`, so a common offset of the unrotated means becomes a
+    position-dependent vector of the offset's norm in the rotating planes, which no single shift removes, and a rotated
+    first key adds up to its norm to every :math:`\alpha_i` and :math:`b_j` there (audit 2026-10-31 numerics-5).
+    ``rotating_coordinates`` :math:`= m > 0` therefore shifts by zero in the first :math:`m` coordinates (the planes
+    :math:`(2k, 2k + 1)`, :math:`k < m/2`, of :func:`vfe3.geometry.rope.build_rope_rotation`) and by the first key in
+    the unrotated rest; values change at rounding level only.
+    """
     c = ak[..., :1, :].detach()                                                  # (..., H, 1, r)
+    if rotating_coordinates:
+        c = torch.cat((torch.zeros_like(c[..., :rotating_coordinates]), c[..., rotating_coordinates:]), dim=-1)
+    return c
+
+
+def _diagonal_kl_operands(
+    aq: torch.Tensor,  # (..., H, Nq, r) query means
+    ak: torch.Tensor,  # (..., H, Nk, r) key means
+    gq: torch.Tensor,  # (..., H, Nq, r) query variances g_i
+    gk: torch.Tensor,  # (..., H, Nk, r) key variances g_j
+
+    *,
+    rotating_coordinates: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # (..., H, Nq, 2r), (..., H, Nk, 2r), (..., H, Nk)
+    r"""Token-linear operands :math:`(q_i, k_j, c_j)` of :func:`_diagonal_kl_expansion`, in its operation order."""
+    c = _expansion_shift(ak, rotating_coordinates)                               # (..., H, 1, r)
     alpha, b = aq - c, ak - c                                                    # (..., H, N, r)
     inverse = gk.reciprocal()                                                    # (..., H, Nk, r)
     scaled = b * inverse                                                         # (..., H, Nk, r) b_j / g_j
     query = torch.cat((gq + alpha * alpha, alpha), dim=-1)                       # (..., H, Nq, 2r)
     key = torch.cat((inverse, -2 * scaled), dim=-1)                              # (..., H, Nk, 2r)
-    cross = query @ key.transpose(-1, -2)                                        # (..., H, Nq, Nk)
     key_constant = (b * scaled).sum(-1) + gk.log().sum(-1)                       # (..., H, Nk)
-    return .5 * (cross + key_constant.unsqueeze(-2) - r - logdet_q.unsqueeze(-1))
+    return query, key, key_constant
 
 
 @torch.no_grad()
@@ -1788,6 +2351,7 @@ def _diagonal_gemm_expansion_error(
     aq: torch.Tensor,  # (..., H, Nq, r) query means
     ak: torch.Tensor,  # (..., H, Nk, r) key means
     gk: torch.Tensor,  # (..., H, Nk, r) key variances g_j
+    rotating_coordinates: int = 0,   # the expansion's shift (_expansion_shift)
 ) -> torch.Tensor:     # (..., H) estimated max pair error of the diagonal GEMM, in nats
     r"""A-priori estimate of the excess forward error of :func:`_diagonal_kl_expansion`, maximized per (batch, head).
 
@@ -1804,11 +2368,13 @@ def _diagonal_gemm_expansion_error(
     computed in :math:`O(N r)` per slice with no pair grid. :math:`\sqrt r u` is the probabilistic scale of the
     accumulated rounding (Higham and Mary, SIAM J. Sci. Comput. 41 (2019) A2815), as on the dense route; the trace
     term :math:`\sum_k g_{ik}/g_{jk}` sums positive terms on both routes and is excluded. It is an estimate, not a
-    certificate.
+    certificate. ``rotating_coordinates`` is the expansion's own (:func:`_expansion_shift`), so :math:`\alpha` and
+    :math:`b` are the centered means the GEMM reads; under comparison RoPE with the first-key shift they keep the
+    rotated offset of the means, which the estimate then reports (audit 2026-10-31 attention-scoring-3).
     """
     r = aq.shape[-1]
     u = torch.finfo(aq.dtype).eps / 2
-    c = ak[..., :1, :]                                                           # (..., H, 1, r)
+    c = _expansion_shift(ak, rotating_coordinates)                               # (..., H, 1, r)
     A = (aq - c).norm(dim=-1).amax(dim=-1)                                       # (..., H)
     B = (ak - c).norm(dim=-1)                                                    # (..., H, Nk)
     rho = gk.reciprocal().amax(dim=-1)                                           # (..., H, Nk)
@@ -1948,7 +2514,9 @@ def projected_noisy_query_cost(
     source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
     route selected per pair, so healthy pairs are bit-identical to a call without recovery. The
     recovered factors come from float32 shifted CholeskyQR3 (float64 QR on its fallback), and these
-    pair tiles run in float64.
+    pair tiles run in float64, over only the (batch, head) slices that hold a recovered entry and, in them, the rows
+    of recovered query entries and the columns of recovered key entries. The pair tiles, healthy and recovered,
+    follow the scorer tile budget ``relational_tile_mib`` (audit 2026-10-31 gap-certified-factorization-routes-5).
     Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
     ``symmetric_inputs`` is the bitwise-symmetry certificate of :func:`projected_gaussian_kl`, and
@@ -1997,30 +2565,35 @@ def projected_noisy_query_cost(
         nq, nk = work[0].shape[-2], work[1].shape[-2]
         batch_heads = work[0].numel() // (nq * r)
 
-        def _tile_steps(element_size: int) -> Tuple[int, int]:
-            # Each pair holds W_ij and its factor: two r x r matrices.
-            pair_budget = max(1, (32 * 1024 ** 2) // (element_size * batch_heads * 2 * r * r))
-            q_step = max(1, min(nq, 32, pair_budget))
-            return q_step, max(1, min(nk, pair_budget // q_step))
+        def _tile_steps(element_size: int, slices: int, n_rows: int, n_cols: int) -> Tuple[int, int]:
+            # Each pair holds W_ij and its factor: two r x r matrices. The pair tiles follow the scorer tile budget
+            # (relational_tile_mib; audit 2026-10-31 gap-certified-factorization-routes-5); a pair's value does not
+            # depend on its tile.
+            pair_budget = max(1, _PROJECTION_TILE_BYTES // (element_size * slices * 2 * r * r))
+            q_step = max(1, min(n_rows, 32, pair_budget))
+            return q_step, max(1, min(n_cols, pair_budget // q_step))
 
         def _slice(route: tuple, i: int, j: int, q_step: int, k_step: int) -> tuple:
             return (route[0][..., i:i+q_step, :], route[1][..., j:j+k_step, :],
                     route[2][..., i:i+q_step, :, :], route[3][..., j:j+k_step, :, :],
                     route[4][..., i:i+q_step])
 
-        def _tile(args: tuple, q_step: int, k_step: int) -> Tuple[torch.Tensor, torch.Tensor]:
-            if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):
+        def _tile(args: tuple, checkpointed: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+            if torch.is_grad_enabled() and checkpointed and any(x.requires_grad for x in args):
                 return checkpoint(_noisy_query_tile, *args, use_reentrant=False, preserve_rng_state=False)
             return _noisy_query_tile(*args)
 
         failures = []
         # Working-dtype grid in the healthy tile geometry: exactly the no-recovery computation.
-        q_step, k_step = _tile_steps(aq.element_size())
+        q_step, k_step = _tile_steps(aq.element_size(), batch_heads, nq, nk)
+        checkpointed = nq > q_step or nk > k_step
+        if checkpointed:
+            _count_tile_loop()
         rows = []
         for i in range(0, nq, q_step):
             columns = []
             for j in range(0, nk, k_step):
-                value, failed = _tile(_slice(work, i, j, q_step, k_step), q_step, k_step)
+                value, failed = _tile(_slice(work, i, j, q_step, k_step), checkpointed)
                 columns.append(value)
                 failures.append(failed)
             rows.append(torch.cat(columns, dim=-1))
@@ -2030,8 +2603,8 @@ def projected_noisy_query_cost(
             # from float64 moments rebuilt from the (possibly recovered) factors and sources.
             means = [aq, ak]
             for role, projection in enumerate((projection_q, projection_k)):
-                if projection is not None and len(projection) == 4:
-                    _, inverse, S, mu = projection
+                if projection is not None and len(projection) >= 4 and projection[3] is not None:
+                    inverse, S, mu = projection[1:4]
                     means[role] = (_projected_linear_map(S.double(), inverse.double())
                                    @ mu.double().unsqueeze(-1)).squeeze(-1)
             factor_q, factor_k = chol_q.double(), chol_k.double()
@@ -2047,25 +2620,55 @@ def projected_noisy_query_cost(
             k_rec = (rec_k.movedim(-1, -2) if rec_k is not None                       # (..., H, Nk)
                      else torch.zeros(Gk.shape[:-4] + (Gk.shape[-3], Gk.shape[-4]),
                                       dtype=torch.bool, device=Gk.device))
-            pair_rec = q_rec.unsqueeze(-1) | k_rec.unsqueeze(-2)                      # (..., H, Nq, Nk)
-            # Fold token-level recovery flags into one host transfer, recovery path only.
+            grid = score.shape                                                        # (..., H, Nq, Nk)
+            # (batch, head) slices holding a recovered entry: only they are rescored in float64, and in them only the
+            # rows of recovered query entries and the columns of recovered key entries (audit 2026-10-31
+            # gap-certified-factorization-routes-5). Token and slice flags join one host transfer.
+            slice_rec = q_rec.any(-1).expand(grid[:-2]) | k_rec.any(-1).expand(grid[:-2])   # (..., H)
             flags = torch.cat((q_rec.movedim(-1, 0).reshape(nq, -1).any(dim=-1),
-                               k_rec.movedim(-1, 0).reshape(nk, -1).any(dim=-1))).tolist()
-            q_needs, k_needs = flags[:nq], flags[nq:]
-            q_step, k_step = _tile_steps(torch.finfo(torch.float64).bits // 8)
-            rows = []
-            for i in range(0, nq, q_step):
-                columns = []
-                for j in range(0, nk, k_step):
-                    value = score[..., i:i+q_step, j:j+k_step]
-                    if any(q_needs[i:i+q_step]) or any(k_needs[j:j+k_step]):
-                        exact_value, failed = _tile(_slice(exact, i, j, q_step, k_step), q_step, k_step)
-                        value = torch.where(pair_rec[..., i:i+q_step, j:j+k_step],
-                                            exact_value.to(dtype), value)
+                               k_rec.movedim(-1, 0).reshape(nk, -1).any(dim=-1), slice_rec.reshape(-1))).tolist()
+            q_needs, k_needs = flags[:nq], flags[nq:nq + nk]
+            recovered_slices = [s for s, flag in enumerate(flags[nq + nk:]) if flag]
+            index = torch.unravel_index(torch.tensor(recovered_slices, dtype=torch.long, device=score.device),
+                                        grid[:-2])
+
+            def _gather(t: torch.Tensor, tail: int) -> torch.Tensor:                 # (n_recovered, *tail)
+                trailing = t.shape[t.ndim - tail:]
+                return t.expand(*grid[:-2], *trailing)[index]
+
+            pair_rec = _gather(q_rec, 1).unsqueeze(-1) | _gather(k_rec, 1).unsqueeze(-2)   # (n, Nq, Nk)
+            route = (_gather(exact[0], 2), _gather(exact[1], 2), _gather(exact[2], 3), _gather(exact[3], 3),
+                     _gather(exact[4], 1))
+            value = _gather(score, 2)                                                 # (n, Nq, Nk)
+            q_rows = [i for i, flag in enumerate(q_needs) if flag]
+            k_cols = [j for j, flag in enumerate(k_needs) if flag]
+            other_rows = [i for i, flag in enumerate(q_needs) if not flag]
+            n_slices = len(recovered_slices)
+            for row_ids, col_ids in ((q_rows, list(range(nk))), (other_rows, k_cols)):
+                if not row_ids or not col_ids or not n_slices:
+                    continue
+                rows_at = torch.tensor(row_ids, dtype=torch.long, device=score.device)
+                cols_at = torch.tensor(col_ids, dtype=torch.long, device=score.device)
+                q_side = [route[k].index_select(1, rows_at) for k in (0, 2, 4)]      # means, G_q, log det G_q rows
+                k_side = [route[k].index_select(1, cols_at) for k in (1, 3)]         # means, G_k columns
+                n_rows, n_cols = len(row_ids), len(col_ids)
+                q_step, k_step = _tile_steps(torch.finfo(torch.float64).bits // 8, n_slices, n_rows, n_cols)
+                block_checkpointed = n_rows > q_step or n_cols > k_step
+                block_rows = []
+                for i in range(0, n_rows, q_step):
+                    block_columns = []
+                    for j in range(0, n_cols, k_step):
+                        exact_value, failed = _tile((q_side[0][:, i:i+q_step], k_side[0][:, j:j+k_step],
+                                                     q_side[1][:, i:i+q_step], k_side[1][:, j:j+k_step],
+                                                     q_side[2][:, i:i+q_step]), block_checkpointed)
+                        block_columns.append(exact_value.to(dtype))
                         failures.append(failed)
-                    columns.append(value)
-                rows.append(torch.cat(columns, dim=-1))
-            score = torch.cat(rows, dim=-2)
+                    block_rows.append(torch.cat(block_columns, dim=-1))
+                block = torch.cat(block_rows, dim=-2)                                 # (n, n_rows, n_cols)
+                at = (torch.arange(n_slices, device=score.device)[:, None, None], rows_at[None, :, None],
+                      cols_at[None, None, :])
+                value = value.index_put(at, torch.where(pair_rec[at], block, value[at]))
+            score = score.index_put(index, value)
         # One device-side reduction and one host check for every tile factorization.
         if bool(torch.stack(failures).any()):
             raise ValueError("noisy-query covariance G_q + G_k is not positive definite: "
@@ -2118,10 +2721,7 @@ def _projected_diagonal_noisy_query(
     with torch.autocast(device_type=a_q.device.type, enabled=False):
         aq, ak = a_q.to(dtype).movedim(-2, -3), a_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
         gq, gk = g_q.to(dtype).movedim(-2, -3), g_k.to(dtype).movedim(-2, -3)   # (..., H, N, r)
-        with torch.no_grad():
-            flags = torch.stack((torch.isfinite(aq).all() & torch.isfinite(ak).all(),
-                                 torch.isfinite(gq).all(), (gq > 0).all(),
-                                 torch.isfinite(gk).all(), (gk > 0).all()))
+        flags = _diagonal_route_flags(aq, ak, gq, gk)                           # (5,) bool
         host_check(flags, _diagonal_kl_verdict, detail=lambda: "; ".join((
             describe_offending_entries(gq, label="query variances"),
             describe_offending_entries(gk, label="key variances"))))
@@ -2133,6 +2733,8 @@ def _projected_diagonal_noisy_query(
         per_row = max(1, 3 * batch_heads * ak.shape[-2] * r * ak.element_size())
         step = max(1, min(nq, _PROJECTION_TILE_BYTES // per_row))
         checkpointed = step < nq or nq * per_row > _CHECKPOINT_BYTES
+        if step < nq:
+            _count_tile_loop()
         rows = []
         for i in range(0, nq, step):
             args = (aq[..., i:i + step, :], ak, gq[..., i:i + step, :], gk, logdet_q[..., i:i + step])
@@ -2184,10 +2786,16 @@ def projected_noisy_key_cost(
     no temperature :math:`\kappa\sqrt d`: the noise sets the sharpness. At :math:`n_h = 0` it is
     :func:`projected_gaussian_kl` at temperature 1.
 
-    The cost is :func:`projected_gaussian_kl` of the broadened key covariance. The key source tuple is not passed:
-    :math:`G_{k,j} + n_hI` is not the Gram matrix of a source root, so no key recovery or factor route applies (the
-    Gram route runs, and :math:`G_{k,j} + n_hI \succeq n_hI` needs none). The query keeps its source tuple and
-    recovery. ``kl_options`` (``query_row_constant_grad``, ``gemm_expansion_tol``) pass through. ``key_noise`` is
+    The cost is :func:`projected_gaussian_kl` of the broadened key covariance. :math:`G_{k,j} + n_hI_r` is the Gram
+    matrix of the augmented source root :math:`\tilde X_j = [X_j,\ \sqrt{n_h}\,I_r]`, an :math:`r\times(d + r)` matrix
+    with :math:`X_j = S_KU_j^{-1}\Sigma_j^{1/2}`: the key source tuple is passed with :math:`n_h` as its fifth
+    element, so the key role is certified and rebuilt like the query (a failed factorization, and under a certified
+    ``projected_factorization`` a flagged one, is rebuilt from :math:`\tilde X_j` by :func:`_strict_cholesky`, and
+    leaves the GEMM-fallback estimate only then). :math:`G_{k,j} + n_hI \succeq n_hI` guarantees positive
+    definiteness, not conditioning: a learned :math:`n_h` below about :math:`\lambda_{\max}(G_{k,j})/839` fails the
+    float32 Gram certificate (audit 2026-10-31 gap-certified-factorization-routes-2). The broadened law has no
+    CholeskyQR2 factor route, so ``cholesky_qr2_certified`` acts here as ``gram_certified``. ``kl_options``
+    (``query_row_constant_grad``, ``gemm_expansion_tol``, ``rotating_coordinates``) pass through. ``key_noise`` is
     required, so a caller that does not supply it fails instead of scoring the noise-free Gaussian KL.
 
     With ``diagonal_covariance=True`` (passed through ``kl_options``) the covariances are the diagonals of
@@ -2212,10 +2820,14 @@ def projected_noisy_key_cost(
     eye = torch.eye(r, dtype=dtype, device=G_k.device)
     # G_k + n_h I is exactly symmetric when G_k is: the shift touches only the diagonal.
     G_noisy = G_k.to(dtype) + key_noise.to(dtype)[:, None, None] * eye           # (..., Nk, H, r, r)
-    return projected_gaussian_kl(a_q, G_q, a_k, G_noisy, projection_q=projection_q, projection_k=None,
+    # The broadened key law's source tuple: the root X_k and the noise n_h (_source_root appends sqrt(n_h) I_r).
+    projection_noisy = (None if projection_k is None
+                        else (*projection_k[:3], projection_k[3] if len(projection_k) > 3 else None, key_noise))
+    return projected_gaussian_kl(a_q, G_q, a_k, G_noisy, projection_q=projection_q, projection_k=projection_noisy,
                                  symmetric_inputs=symmetric_inputs, commutant_pairs=commutant_pairs, **kl_options)
 
 
+@ieee_fp32_matmul()
 def relational_mixture_mean(
     xi:             torch.Tensor,  # (..., Nk, H, d)
     forward_blocks: torch.Tensor,  # (..., Nq, H, d, d)
@@ -2227,6 +2839,12 @@ def relational_mixture_mean(
 
     This is a mixture mean, not an E-step or a Gaussian covariance pushforward.
     Beta is supplied by the caller, including any support and normalization.
+
+    Test oracle: referenced only by the tests (``tests/test_relational_scoring.py``,
+    ``tests/test_relational_noisy_query.py``); the model reads its content through
+    :meth:`vfe3.model.relational_operators.RelationalOperators.predictive_content`. Its contractions run at IEEE fp32,
+    as the readout's do, so a comparison under ``fp32_matmul_precision='high'`` measures the readout and not TF32
+    (audit 2026-10-31 attention-scoring-10, numerics-7).
     """
     if xi.ndim < 3 or T.ndim != 3 or O.ndim != 3:
         raise ValueError("content requires headwise means and (H,s,d)/(H,d,s) factors")
@@ -2281,6 +2899,8 @@ def projected_mean_distance_cost(
         per_row = ak.numel() * ak.element_size()                              # one query row's (..., H, Nk, r)
         step = max(1, min(nq, _PROJECTION_TILE_BYTES // max(1, per_row)))
         checkpointed = step < nq or nq * per_row > _CHECKPOINT_BYTES
+        if step < nq:
+            _count_tile_loop()
         rows = []
         for i in range(0, nq, step):
             tile = aq[..., i:i + step, :]

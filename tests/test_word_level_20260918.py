@@ -248,7 +248,8 @@ def test_builder_writes_a_cache_the_loader_reads_back(tmp_path: Path,
 
     tokens = torch.load(cache_path(builder.DATASET, "train", suffix="pt", cache_dir=tmp_path),
                         weights_only=True)
-    assert tokens.dtype == torch.int64 and tokens.dim() == 1
+    # The stored dtype is the builder's TOKEN_DTYPE (int32 for new builds since audit 2026-10-31 A355).
+    assert tokens.dtype == getattr(torch, builder.TOKEN_DTYPE) and tokens.dim() == 1
     expected = vocabulary.encode(tokenize_row(" the cat sat ") + tokenize_row(" the cat , the dog . "))
     assert tokens.tolist() == expected
     assert summary["splits"]["train"]["n_tokens"] == len(expected)

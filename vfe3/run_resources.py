@@ -32,18 +32,29 @@ for the single shared block MLP; the aliases ``block_mlps.<l>.*`` (``l > 0``) ar
 ``block_mlps.0.*`` and counted once, as ``named_parameters()`` counts them, and are listed under
 ``tied_aliases``.
 
-Parameters read per token count what one scored token touches: one row of every per-type table the
-encoder looks up, every row of the tables the decoder reads (the softmax normalizes over the whole
+Parameters read per token count the UNIQUE parameters one scored token touches: one row of every per-type
+table the encoder looks up, every row of the tables the decoder reads (the softmax normalizes over the whole
 vocabulary, so a linear decoder reads all of ``W_out`` and ``b_out``), one positional row, and every
-context-processing parameter,
+context-processing parameter, each parameter once however many layers read it,
 
 .. math::
     P_{\mathrm{read}} = \sum_{t\in\mathrm{enc}} \frac{|t|}{V} + \sum_{t\in\mathrm{dec}} |t|
         + \frac{|Y|}{N_{\max}} + P_{\mathrm{ctx}}.
 
+A context-processing module that every layer applies is read :math:`L` times by each token: the block
+normalization (one module for all layers), the opt-in CG coupling, and the block MLP under
+``block_mlp_tie_layers=True``. With :math:`P_{\mathrm{shared}}` their parameters, the reads with layer reuse are
+
+.. math::
+    P_{\mathrm{read}}^{\mathrm{reuse}} = P_{\mathrm{read}} + (L - 1) P_{\mathrm{shared}},
+
+reported beside the unique count (audit 2026-10-31 posthoc-measurement-10); table rows count once in both. It is
+None when :math:`P_{\mathrm{shared}} > 0` and the configuration view records no ``n_layers``.
+
 :func:`optimizer_state_bytes` sizes the optimizer state of a training checkpoint from tensor
 metadata only (memory-mapped, no tensor data is read), and :func:`throughput_summary` reads the
-logged throughput, memory and wall time of a run directory.
+logged throughput, memory and wall time of a run directory. :func:`unique_tensor_bytes` counts the bytes of a
+state with each viewed storage region once, so the per-layer aliases of a tied block MLP count once.
 """
 
 from __future__ import annotations
@@ -289,7 +300,11 @@ def parameter_breakdown(
          "other":              {<leaf>: n, ..., "total", "share"},
          "frozen":             {<name>: n, ..., "total"},
          "total", "total_including_frozen", "parameters_read_per_token", "read_per_token_components",
-         "roles_by_name", "excluded_buffers", "tied_aliases", "definition", "model_family"}
+         "parameter_reads_per_token_with_layer_reuse", "roles_by_name", "excluded_buffers", "tied_aliases",
+         "definition", "model_family"}
+
+    ``parameters_read_per_token`` counts each parameter once and ``parameter_reads_per_token_with_layer_reuse`` once
+    per layer that applies it (module docstring; ``read_per_token_components["layer_shared_parameters"]``).
     """
     V = int(cfg.vocab_size)
     family = model_family_of(cfg)
@@ -363,7 +378,22 @@ def parameter_breakdown(
         "context_processing":       context,
         "decode_tables_read_in_full": decode_full,
     }
+    # Modules every layer applies (module docstring): read once per layer, counted once in the unique count above.
+    layer_shared = 0
+    if family == VFE_MODEL_FAMILY:
+        tied_mlp = (_cfg_value(cfg, "block_mlp_tie_layers", False) is True
+                    and bool(_cfg_value(cfg, "use_block_mlp", False)))
+        shared_roles = {"norm", "cg_coupling"} | ({"block_mlp"} if tied_mlp else set())
+        layer_shared = sum(entry["numel"] for entry in trainable.values()
+                           if entry["section"] == "context_processing" and entry["role"] in shared_roles)
+    n_layers = _cfg_value(cfg, "n_layers", None)
+    components["layer_shared_parameters"] = layer_shared
     out["parameters_read_per_token"] = encode_rows + decode_rows + decode_scalars + positional_row + context
+    # None when such a module exists but the config view records no layer count (a reduced record view).
+    out["parameter_reads_per_token_with_layer_reuse"] = (
+        out["parameters_read_per_token"] if layer_shared == 0
+        else None if type(n_layers) is not int or n_layers < 1
+        else out["parameters_read_per_token"] + (n_layers - 1) * layer_shared)
     out["read_per_token_components"] = components
     out["roles_by_name"] = roles_by_name
     out["excluded_buffers"] = excluded
@@ -373,9 +403,12 @@ def parameter_breakdown(
         out["definition"] = (
             "per-type tables are the vocabulary-indexed prior-bank tables (token frames, prior means and "
             "log-variances, decoder weights and biases); context processing is the relational comparison "
-            "and content maps, block MLPs and normalizations; parameters read per token are one row of "
-            "each encoder table, every row of the decoder tables (the softmax normalizes over the "
-            "vocabulary), one positional-frame row, and all context-processing parameters; frozen "
+            "and content maps, block MLPs and normalizations; parameters read per token count the unique "
+            "parameters one token reads: one row of each encoder table, every row of the decoder tables (the "
+            "softmax normalizes over the vocabulary), one positional-frame row, and all context-processing "
+            "parameters, each once although a module every layer applies (the block normalization, the CG "
+            "coupling, a block MLP tied across layers) is read in every layer; "
+            "parameter_reads_per_token_with_layer_reuse counts those modules once per layer; frozen "
             "(requires_grad=False) tables are run constants, listed apart and counted nowhere else")
     else:
         out["definition"] = (
@@ -423,6 +456,47 @@ def _tensor_bytes(obj: Any) -> int:
     return 0
 
 
+def tensor_storage_key(tensor: torch.Tensor) -> Optional[Tuple[object, ...]]:
+    r"""The element range a tensor views: equal keys mean the same elements of the same storage.
+
+    ``(device, storage pointer, storage offset, shape, stride, dtype)``, or None for a tensor without addressable
+    storage (``meta``, an empty storage), which is never taken for an alias. The per-layer state-dict entries of a
+    block MLP shared across layers (``block_mlp_tie_layers``) all carry one key. Metadata only (mmap-safe).
+    """
+    try:
+        pointer = tensor.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError, TypeError):
+        return None
+    if pointer == 0 or tensor.device.type == "meta":
+        return None
+    return (str(tensor.device), pointer, int(tensor.storage_offset()), tuple(tensor.shape), tuple(tensor.stride()),
+            tensor.dtype)
+
+
+def unique_tensor_bytes(
+    obj:  Any,
+    seen: Optional[set] = None,
+) -> int:
+    r"""Bytes of every tensor nested in ``obj``, each element range (:func:`tensor_storage_key`) counted once.
+
+    ``seen`` carries the counted ranges across calls, so a range two members share is counted under the first. A
+    tied block MLP then counts once, not once per layer (audit 2026-10-31 artifacts-finalize-4). Metadata only.
+    """
+    seen = set() if seen is None else seen
+    if isinstance(obj, torch.Tensor):
+        key = tensor_storage_key(obj)
+        if key is not None:
+            if key in seen:
+                return 0
+            seen.add(key)
+        return int(obj.numel()) * int(obj.element_size())
+    if isinstance(obj, Mapping):
+        return sum(unique_tensor_bytes(value, seen) for value in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(unique_tensor_bytes(value, seen) for value in obj)
+    return 0
+
+
 def optimizer_state_bytes(
     checkpoint: Union[str, Path, Mapping[str, Any]],
 ) -> Dict[str, Any]:
@@ -432,7 +506,10 @@ def optimizer_state_bytes(
     loaded mapping with ``optimizer_state`` (``{"state", "param_groups"}``) and, when present,
     ``optimizer_parameter_manifest`` (parameter id to name). Returns total bytes, bytes by state slot
     (``exp_avg``, ``exp_avg_sq``, ``step``), by optimizer group role tag, and by parameter section and
-    role (via :func:`parameter_role`), together with the bytes of the other checkpoint members.
+    role (via :func:`parameter_role`), together with the bytes of the other checkpoint members, where
+    each stored element range is counted once, under the first member that holds it
+    (:func:`unique_tensor_bytes`): the per-layer aliases of a tied block MLP count once, and a best-model
+    bundle embedded from the checkpoint's own weights adds nothing to ``model_state``.
     """
     path: Optional[Path] = None
     if isinstance(checkpoint, (str, Path)):
@@ -477,7 +554,8 @@ def optimizer_state_bytes(
             by_section[section] = by_section.get(section, 0) + n_bytes
             key = f"{section}.{role}"
             by_role[key] = by_role.get(key, 0) + n_bytes
-    members = {key: _tensor_bytes(value) for key, value in bundle.items() if key != "optimizer_state"}
+    counted: set = set()                                     # element ranges already counted under a member
+    members = {key: unique_tensor_bytes(value, counted) for key, value in bundle.items() if key != "optimizer_state"}
     return {
         "checkpoint":           str(path) if path is not None else None,
         "file_bytes":           (int(os.path.getsize(path)) if path is not None else None),

@@ -46,11 +46,13 @@ channel family, a filled marker for the raw chart and an open marker for a deriv
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 import math
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -78,6 +80,7 @@ _COSMUL_EPS = 1e-3                       # Levy & Goldberg (2014)
 _PAIRDIR_EPS = 1e-12                     # floor under ||x - b||^2 for unit rows
 _QUESTION_CHUNK = 256                    # questions scored per (chunk, n) block
 _BOOT_CHUNK = 250                        # bootstrap draws per (chunk, Q_category) weight block
+_MIN_BOOT_UNITS = 3                      # fewer resampling units: the unit bootstrap of a category is degenerate
 _PROBE_MAX_FEATURES = 512                # frequency probe runs on at most this many principal components
 _MARKERS = ("o", "s", "^", "D", "v", "P")
 _SECTION = "embeddings"
@@ -135,9 +138,47 @@ def prepare(view: VectorView, center: bool) -> np.ndarray:
     r"""Rows of ``view`` ready for its metric, float64 ``(n, D)``.
 
     ``"cosine"``: ``x_r <- (x_r - center*mean) / ||x_r - center*mean||`` so that the inner product
-    of prepared rows is the cosine similarity. ``"euclidean"``: the raw rows.
+    of prepared rows is the cosine similarity. ``"euclidean"``: the raw rows. Inside
+    :func:`prepared_rows_cache` the rows are computed once per ``center`` and the same array is returned
+    to every caller, which reads it and never writes it.
     """
-    return _prepare_array(view.X, view.metric, center)
+    cache = getattr(view, "_prepared", None)
+    if cache is None:
+        return _prepare_array(view.X, view.metric, center)
+    key = bool(center)
+    if key not in cache:
+        cache[key] = _prepare_array(view.X, view.metric, center)
+    return cache[key]
+
+
+@contextlib.contextmanager
+def prepared_rows_cache(view: VectorView) -> Iterator[VectorView]:
+    r"""Hold :func:`prepare`'s rows of ``view`` while the context is open, and release them on exit.
+
+    The battery and the per-view figures prepare the whole view about sixteen times (a float64 copy, its
+    centered copy and its normalized copy each time, about 3 GB per call for a 6144-wide view of 20,000 rows);
+    inside the context they share one array per ``center`` value (audit 2026-10-31 semantics-vectors-6). The
+    rows are those :func:`prepare` computes without the cache, so every result is unchanged. A nested context
+    on the same view keeps the outer one's cache.
+    """
+    if getattr(view, "_prepared", None) is not None:
+        yield view
+        return
+    view._prepared = {}
+    try:
+        yield view
+    finally:
+        view._prepared = None
+
+
+def views_with_prepared_rows(views: Mapping[str, VectorView]) -> Iterator[Tuple[str, VectorView]]:
+    r"""``views.items()``, each view inside :func:`prepared_rows_cache` while the caller's loop body runs for it.
+
+    The cache of a view is released when the loop moves to the next view or ends.
+    """
+    for name, view in views.items():
+        with prepared_rows_cache(view):
+            yield name, view
 
 
 def _rng(ctx: AnalysisContext, step: str) -> np.random.Generator:
@@ -530,12 +571,22 @@ def _benchmark_totals(totals: Optional[Mapping[str, Any]], given: Mapping[str, i
 
 def _interval(observed: float, hits: float, draws: np.ndarray, n: int, n_units: int, binary: bool,
               resampling: str) -> Dict[str, Any]:
-    r"""Point value with its 95% interval: percentile of the unit-bootstrap draws, or Wilson at 0 / all hits."""
+    r"""Point value with its 95% interval: percentile of the unit-bootstrap draws, or Wilson on the units.
+
+    A 0/1 statistic gets the Wilson interval on its ``n_units`` resampling units with
+    ``observed * n_units`` successes when its hit count is 0 or all (every draw repeats it) or when it has
+    fewer than :data:`_MIN_BOOT_UNITS` units: with two word-pair units every valid draw re-forms exactly the
+    observed questions, so the percentile interval has zero width (audit 2026-10-31 semantics-vectors-1). A
+    statistic that is not 0/1 (MRR) has no such fallback and gets no interval with that few units.
+    """
     record: Dict[str, Any] = {"mean": float(observed), "n": int(n), "n_boot_valid": int(draws.size)}
-    if binary and (hits == 0 or hits == n):
-        lo, hi = stats.wilson_interval(n_units if hits == n else 0, n_units)
+    if binary and (hits == 0 or hits == n or n_units < _MIN_BOOT_UNITS):
+        lo, hi = stats.wilson_interval(observed * n_units, n_units)
         unit = "pairs" if resampling == "pairs" else "units"
         record.update(ci_lo=lo, ci_hi=hi, ci_method=f"Wilson on {n_units} {unit}")
+    elif n_units < _MIN_BOOT_UNITS:
+        record.update(ci_lo=float("nan"), ci_hi=float("nan"),
+                      ci_method=f"none (fewer than {_MIN_BOOT_UNITS} resampling units)")
     elif draws.size:
         lo, hi = np.percentile(draws, [2.5, 97.5])
         record.update(ci_lo=float(lo), ci_hi=float(hi), ci_method=f"bootstrap over {resampling}")
@@ -571,8 +622,11 @@ def analogy_benchmark(view: VectorView, questions: Sequence[AnalogyQuestion], rn
 
     sums weights and hits over the group's categories within the same draw (a stratified bootstrap;
     a pair listed in two categories counts as two units). Every method and group uses the same
-    draws. A 0/1 statistic whose observed hit count is 0 or all questions gets the Wilson interval
-    on the number of resampling units instead of the degenerate percentile interval.
+    draws. A 0/1 statistic whose observed hit count is 0 or all questions, or whose group has fewer
+    than three resampling units (two word pairs re-form the observed two questions in every valid
+    draw), gets the Wilson interval on the number of resampling units instead of the degenerate
+    percentile interval; in the macro draws such categories' ratios come from a Beta posterior on their
+    units (``macro_record``), so they contribute their uncertainty to the macro interval.
 
     ``totals`` (``ctx.coverage["google_analogies"]``: ``n_total`` and ``per_category`` entries with
     ``n_total``) sets the full-benchmark denominators; without it ``n_total`` counts the questions
@@ -619,14 +673,51 @@ def analogy_benchmark(view: VectorView, questions: Sequence[AnalogyQuestion], rn
 
     def macro_record(present: Sequence[str], n: int, n_units: int, hits: np.ndarray,
                      resampling: str) -> Dict[str, Any]:
-        r"""Unweighted mean over ``present`` categories of every statistic, with its bootstrap interval."""
+        r"""Unweighted mean over ``present`` categories of every statistic, with its bootstrap interval.
+
+        A category whose unit bootstrap cannot vary a 0/1 statistic (0 or all hits, or fewer than
+        :data:`_MIN_BOOT_UNITS` units) would add no variance to the macro draws; in every draw its ratio is
+        drawn instead from :math:`\mathrm{Beta}(s + 1, u - s + 1)`, the posterior of its rate on its ``u``
+        units with :math:`s = u\,\hat a` successes under a uniform prior, whose central interval is close to
+        the Wilson interval on ``u`` units (audit 2026-10-31 semantics-vectors-1). A statistic that is not 0/1
+        gets no macro interval when a category has fewer than :data:`_MIN_BOOT_UNITS` units.
+        """
         observed = np.stack([H[plan[c]["index"]].mean(axis=0) for c in present]).mean(axis=0)   # (M,)
-        weights = np.stack([boot[c][0] for c in present])              # (C, B)
+        small = {c for c in present if plan[c]["n_units"] < _MIN_BOOT_UNITS}
+        regular = [c for c in present if c not in small]
+        weights = np.stack([boot[c][0] for c in regular]) if regular else np.ones((1, n_boot))   # (C_r, B)
         valid = (weights > 0).all(axis=0)                               # (B,)
-        ratios = np.stack([boot[c][1][valid] / boot[c][0][valid, None] for c in present])    # (C, B_valid, M)
+        n_valid = int(valid.sum())
+        ratios = np.full((len(present), n_valid, len(columns)), np.nan)  # (C, B_valid, M)
+        drawn = np.zeros(len(columns), dtype=np.int64)                  # categories drawn from the Beta posterior
+        unavailable = np.zeros(len(columns), dtype=bool)
+        for i, c in enumerate(present):
+            if c not in small:
+                ratios[i] = boot[c][1][valid] / boot[c][0][valid, None]
+            Hc = H[plan[c]["index"]]                                    # (Q_c, M)
+            rate, k_c, u_c = Hc.mean(axis=0), Hc.sum(axis=0), plan[c]["n_units"]
+            for k in range(len(columns)):
+                if binary[k] and (k_c[k] == 0 or k_c[k] == Hc.shape[0] or c in small):
+                    s = u_c * float(rate[k])                            # successes on the category's units
+                    ratios[i, :, k] = rng.beta(s + 1.0, u_c - s + 1.0, size=n_valid)
+                    drawn[k] += 1
+                elif c in small:
+                    unavailable[k] = True
         draws = ratios.mean(axis=0)                                     # (B_valid, M)
-        intervals = {key: _interval(observed[k], hits[k], draws[:, k], n, n_units, bool(binary[k]), resampling)
-                     for k, key in enumerate(columns)}
+        intervals: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for k, key in enumerate(columns):
+            if unavailable[k]:
+                intervals[key] = {"mean": float(observed[k]), "n": int(n), "n_boot_valid": 0,
+                                  "ci_lo": float("nan"), "ci_hi": float("nan"),
+                                  "ci_method": f"none (a category has fewer than {_MIN_BOOT_UNITS} resampling units)"}
+                continue
+            record = _interval(observed[k], hits[k], draws[:, k], n, n_units, bool(binary[k]), resampling)
+            if drawn[k] and record["ci_method"].startswith("bootstrap"):
+                one = drawn[k] == 1
+                record["ci_method"] += (f"; {drawn[k]} categor{'y' if one else 'ies'} at 0 or all hits or with fewer "
+                                        f"than {_MIN_BOOT_UNITS} units drawn from Beta(s + 1, u - s + 1) on "
+                                        f"{'its' if one else 'their'} units")
+            intervals[key] = record
         return {"n_categories": len(present),
                 "category_n": {c: int(plan[c]["index"].size) for c in present},
                 "methods": {method: {stat: intervals[(method, stat)] for stat in ("acc", "hits5", "mrr")}
@@ -679,7 +770,9 @@ def analogy_benchmark(view: VectorView, questions: Sequence[AnalogyQuestion], rn
     overall = summarize(categories, n_total_all, macro=True)
     n_single = overall["n_question_units"]
     note = (f"95% CIs resample the {overall['n_pairs']} word pairs within categories (question (i, j) "
-            "weighted c_i c_j); Wilson intervals on the unit count where a 0/1 statistic has 0 or all hits")
+            "weighted c_i c_j); Wilson intervals on the unit count where a 0/1 statistic has 0 or all hits or "
+            f"fewer than {_MIN_BOOT_UNITS} units, and the macro draws take those categories' ratios from "
+            "Beta(s + 1, u - s + 1) on their u units")
     if n_single:
         note += (f"; {n_single} of {Q} covered questions have a word pair that occurs in no other question of "
                  "their category and are resampled as single questions")
@@ -739,6 +832,21 @@ def _cyclic_derangement(m: int, rng: np.random.Generator) -> np.ndarray:
     return pi
 
 
+def _all_cyclic_derangements(m: int) -> np.ndarray:
+    r"""Every ``m``-cycle of ``range(m)``, ``((m - 1)!, m)``: the support of :func:`_cyclic_derangement`.
+
+    Row ``r`` is the cycle :math:`0 \to t_1 \to \dots \to t_{m-1} \to 0` of the ``r``-th permutation
+    :math:`(t_1, \dots, t_{m-1})` of ``1, ..., m - 1``, as ``pi[i]`` = the successor of ``i``.
+    """
+    rows = []
+    for tail in itertools.permutations(range(1, m)):
+        order = np.array((0,) + tail, dtype=np.int64)
+        pi = np.empty(m, dtype=np.int64)
+        pi[order] = order[(np.arange(m) + 1) % m]
+        rows.append(pi)
+    return np.stack(rows)
+
+
 def _offset_stats_from_gram(Gd: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray, float]:
     r"""OCS, LOO projections, LOO cosines and top-PC share from the offset Gram ``G_ij = <d_i, d_j>``.
 
@@ -768,9 +876,13 @@ def offset_consistency(view: VectorView, relations: Mapping[str, Sequence[Tuple[
     * ``ocs`` -- Offset Concentration Score: mean pairwise cosine of the offsets
       (Fournier, Dupoux & Dunbar 2020);
     * re-pairing null -- the same with partners re-paired by a random cyclic derangement,
-      ``delta'_i = x_{a*_{pi(i)}} - x_{a_i}``; ``z`` and one-sided ``p = (1 + #\{null >= obs\})/(1 + n_perm)``,
+      ``delta'_i = x_{a*_{pi(i)}} - x_{a_i}``; ``z`` and one-sided ``p = (1 + #\{null >= obs\})/(1 + n_null)``,
       and ``p_holm``, the Holm adjustment of ``p`` over the view's tested relations
-      (:func:`vfe3.semantics.stats.holm_adjust`);
+      (:func:`vfe3.semantics.stats.holm_adjust`). There are only :math:`(m-1)!` ``m``-cycles; when they
+      number at most ``n_perm`` the null enumerates every one (``null_method="exact"``,
+      ``n_null = (m - 1)!``, population sd), since ``n_perm`` draws with replacement from so small a
+      space give a p far below the attainable :math:`1/((m-1)! + 1)` (Phipson & Smyth 2010); otherwise it
+      draws ``n_null = n_perm`` cycles (``"monte_carlo"``);
     * ``loo_proj`` -- projection of each offset on the unit mean of the other offsets
       (Park, Choe & Veitch 2024, Fig. 2), with the pooled re-paired projections (``null_loo_proj``);
     * random-pair baseline (Park, Choe & Veitch 2024, Fig. 2) -- ``m`` random pairs ``(r_k, s_k)``
@@ -812,15 +924,30 @@ def offset_consistency(view: VectorView, relations: Mapping[str, Sequence[Tuple[
 
         identity = np.arange(m)
         ocs, proj, loo_cos, share = _offset_stats_from_gram(gram(identity))
-        null_ocs = np.empty(n_perm)
-        null_share = np.empty(n_perm)
         null_proj: List[np.ndarray] = []
-        for t in range(n_perm):
-            o, p, _, s = _offset_stats_from_gram(gram(_cyclic_derangement(m, rng)))
-            null_ocs[t], null_share[t] = o, s
-            if t < 50:
+        exact = 0 < math.factorial(m - 1) <= n_perm
+        if exact:
+            # every m-cycle once: the exact re-pairing null, whose p cannot fall below 1/((m - 1)! + 1)
+            # (audit 2026-10-31 semantics-vectors-3; Phipson & Smyth 2010)
+            cycles = _all_cyclic_derangements(m)                        # ((m - 1)!, m)
+            n_null = int(cycles.shape[0])
+            null_ocs = np.empty(n_null)
+            null_share = np.empty(n_null)
+            for t, pi in enumerate(cycles):
+                o, p, _, s = _offset_stats_from_gram(gram(pi))
+                null_ocs[t], null_share[t] = o, s
                 null_proj.append(p)
-        null_std = float(null_ocs.std(ddof=1)) if n_perm > 1 else float("nan")
+            null_std = float(null_ocs.std(ddof=0))                      # the population sd of the complete null
+        else:
+            n_null = int(n_perm)
+            null_ocs = np.empty(n_perm)
+            null_share = np.empty(n_perm)
+            for t in range(n_perm):
+                o, p, _, s = _offset_stats_from_gram(gram(_cyclic_derangement(m, rng)))
+                null_ocs[t], null_share[t] = o, s
+                if t < 50:
+                    null_proj.append(p)
+            null_std = float(null_ocs.std(ddof=1)) if n_perm > 1 else float("nan")
         pooled = np.concatenate(null_proj) if null_proj else np.zeros(0)
         # random-pair baseline: m random pairs of distinct view rows on the real LOO / mean directions
         d = B - A                                                       # (m, D) real offsets
@@ -834,13 +961,14 @@ def offset_consistency(view: VectorView, relations: Mapping[str, Sequence[Tuple[
             random_loo = np.where(rest_norm > 0.0, (e * rest).sum(axis=1) / rest_norm, np.nan)
         total_norm = float(np.linalg.norm(total))
         random_mean = e @ (total / total_norm) if total_norm > 0.0 else np.full(m, np.nan)
-        null_mean = float(null_ocs.mean()) if n_perm else float("nan")
+        null_mean = float(null_ocs.mean()) if n_null else float("nan")
         out["relations"][name] = {
             "n_pairs": m, "pairs": kept, "ocs": ocs,
             "effect_size": _effect_size(ocs, null_mean),
+            "null_method": "exact" if exact else "monte_carlo", "n_null": n_null,
             "null_mean": null_mean, "null_std": null_std,
-            "z": float((ocs - null_ocs.mean()) / null_std) if n_perm > 1 and null_std > 0 else float("nan"),
-            "p": float((1 + (null_ocs >= ocs).sum()) / (1 + n_perm)) if n_perm else float("nan"),
+            "z": float((ocs - null_ocs.mean()) / null_std) if n_null > 1 and null_std > 0 else float("nan"),
+            "p": float((1 + (null_ocs >= ocs).sum()) / (1 + n_null)) if n_null else float("nan"),
             "loo_proj": proj, "loo_cos": loo_cos, "loo_proj_mean": float(np.nanmean(proj)),
             "loo_proj_sd": float(np.nanstd(proj, ddof=1)),
             "null_loo_proj": pooled,
@@ -851,7 +979,7 @@ def offset_consistency(view: VectorView, relations: Mapping[str, Sequence[Tuple[
             "random_mean_proj_mean": float(np.nanmean(random_mean)),
             "random_mean_proj_sd": float(np.nanstd(random_mean, ddof=1)),
             "top_pc_share": share,
-            "null_top_pc_share_mean": float(null_share.mean()) if n_perm else float("nan"),
+            "null_top_pc_share_mean": float(null_share.mean()) if n_null else float("nan"),
         }
     names = list(out["relations"])
     for name, p_holm in zip(names, stats.holm_adjust([out["relations"][k]["p"] for k in names])):
@@ -1057,9 +1185,19 @@ def view_similarity_scores(view: VectorView, pairs: Sequence[Tuple[int, int, flo
     return scores, np.array([h for _, _, h in keep], dtype=np.float64)
 
 
+SIMILARITY_CI_METHOD = ("percentile bootstrap over word pairs, resampled as independent although benchmark words "
+                        "recur across pairs")
+
+
 def similarity_benchmark(scores: np.ndarray, human: np.ndarray, rng: np.random.Generator) -> Dict[str, Any]:
-    r"""Spearman ``rho`` between model and human similarity with a bootstrap 95% CI over pairs."""
-    return stats.spearman_ci(scores, human, rng)
+    r"""Spearman ``rho`` between model and human similarity with a bootstrap 95% CI over pairs.
+
+    The bootstrap resamples pairs as independent units (``ci_method``). Benchmark words recur across pairs
+    (SimLex-999: about 1.9 pairs per word), so the interval does not account for that dependence; a
+    word-level crossed bootstrap, as the analogy intervals use, over-covers here and would need calibration
+    before it replaced this one (audit 2026-10-31 semantics-vectors-7).
+    """
+    return {**stats.spearman_ci(scores, human, rng), "ci_method": SIMILARITY_CI_METHOD}
 
 
 def field_clustering(view: VectorView, lexicon: Mapping[str, Sequence[int]], rng: np.random.Generator,
@@ -1156,8 +1294,12 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
     axis it helped define, so it is scored on the unit axis built from the pairs that do not
     contain it (``held_out_pole_words``), and dropped when every pair contains it
     (``dropped_pole_words``; audit 2026-10-16 F75). ``loo_pair_accuracy`` is the fraction of pairs
-    whose positive pole scores above its negative pole on the axis built from the OTHER pairs (a
-    held-out validity check).
+    whose positive pole scores above its negative pole on the axis built from the OTHER pairs that
+    share no word with it (a held-out validity check). A pair that repeats a pole word of pair ``i``
+    carries the term :math:`\pm\lVert x_w\rVert^2` into pair ``i``'s score, which passes the check on
+    pure noise (the shipped size axis reads 5/7; audit 2026-10-31 semantics-vectors-2), so it is left
+    out; a pair with no word-disjoint partner is not scored. ``loo_n_pairs`` counts the scored pairs and
+    ``loo_axis_pairs`` gives, per scored pair, the number of pairs its held-out axis used.
     """
     ra, rb, kept = _row_pairs(view, [(int(n), int(p)) for n, p in axis["pairs"]])
     if not kept:
@@ -1171,12 +1313,17 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
         raise ValueError("axis direction has zero length")
     u = u / u_norm
     loo = None
+    loo_axis_pairs: List[int] = []
     if len(kept) >= 2:
         hits = []
-        for i in range(len(kept)):
-            rest = total - diff[i]
+        for i, pair in enumerate(kept):
+            shared = [j for j, other in enumerate(kept) if j != i and set(pair) & set(other)]
+            if len(shared) == len(kept) - 1:                            # no word-disjoint pair to hold out
+                continue
+            rest = total - diff[i] - diff[shared].sum(axis=0)           # (D,) axis of the word-disjoint pairs
             hits.append(float(diff[i] @ rest) > 0.0)
-        loo = float(np.mean(hits))
+            loo_axis_pairs.append(len(kept) - 1 - len(shared))
+        loo = float(np.mean(hits)) if hits else None
     pole_pairs: Dict[int, List[int]] = {}                               # pole word -> kept pairs containing it
     for i, pair in enumerate(kept):
         for w in set(pair):
@@ -1209,7 +1356,7 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
         "pair_words": [{"neg": a, "pos": b, "neg_score": float(Xp[r0] @ u), "pos_score": float(Xp[r1] @ u)}
                        for (a, b), r0, r1 in zip(kept, ra, rb)],
         "separation": float((Xp[rb] @ u).mean() - (Xp[ra] @ u).mean()),
-        "loo_pair_accuracy": loo,
+        "loo_pair_accuracy": loo, "loo_n_pairs": len(loo_axis_pairs), "loo_axis_pairs": loo_axis_pairs,
     }
 
 
@@ -1307,6 +1454,16 @@ def _google_totals(ctx: AnalysisContext) -> Optional[Mapping[str, Any]]:
     return None
 
 
+def _similarity_total(ctx: AnalysisContext, bench: str, pairs: Sequence[Any]) -> int:
+    r"""Pairs in similarity benchmark ``bench``: ``ctx.coverage["similarity"][bench]["n_total"]``, the full file,
+    when the coverage records it, else the resolved ``pairs`` (audit 2026-10-31 semantics-vectors-10)."""
+    coverage = ctx.coverage.get("similarity") if isinstance(ctx.coverage, Mapping) else None
+    entry = coverage.get(bench) if isinstance(coverage, Mapping) else None
+    if isinstance(entry, Mapping) and entry.get("available", True) and "n_total" in entry:
+        return int(entry["n_total"])
+    return len(pairs)
+
+
 def _battery_device(ctx: AnalysisContext, notes: List[str]) -> Any:
     r"""``ctx.device`` when it selects the torch path and is usable, else ``None`` (numpy); a fallback is noted."""
     try:
@@ -1348,7 +1505,14 @@ def run_vector_battery(view: VectorView, ctx: AnalysisContext) -> Dict[str, Any]
     null, both from ``ctx.log_count`` (skipped with a reason when counts are unavailable).
     ``ctx.device`` selects the compute backend (module docstring); ``backend`` records it.
     Options read: ``geometry_max_points`` (8000), ``cluster_top_words`` (5000), ``n_clusters`` (40).
+    The view's prepared rows are computed once for every step (:func:`prepared_rows_cache`).
     """
+    with prepared_rows_cache(view):
+        return _vector_battery(view, ctx)
+
+
+def _vector_battery(view: VectorView, ctx: AnalysisContext) -> Dict[str, Any]:
+    r"""The body of :func:`run_vector_battery`, run inside :func:`prepared_rows_cache` of ``view``."""
     notes: List[str] = []
     seconds: Dict[str, float] = {}
     device = _battery_device(ctx, notes)
@@ -1394,11 +1558,13 @@ def run_vector_battery(view: VectorView, ctx: AnalysisContext) -> Dict[str, Any]
         rng = _rng(ctx, "similarity")
         result: Dict[str, Any] = {}
         for bench, pairs in ctx.similarity.items():
+            # resolved: pairs whose two words resolve to candidate tokens; total: pairs in the benchmark file
+            totals = {"n_pairs_resolved": len(pairs), "n_pairs_total": _similarity_total(ctx, bench, pairs)}
             scores, human = view_similarity_scores(view, pairs)
             if scores.size < 3:
-                result[bench] = {**skipped(f"{scores.size} pair(s) in view"), "n_pairs_total": len(pairs)}
+                result[bench] = {**skipped(f"{scores.size} pair(s) in view"), **totals}
                 continue
-            result[bench] = {**similarity_benchmark(scores, human, rng), "n_pairs_total": len(pairs)}
+            result[bench] = {**similarity_benchmark(scores, human, rng), **totals}
         return result
 
     timed("similarity", similarity)
@@ -1428,7 +1594,8 @@ def run_vector_battery(view: VectorView, ctx: AnalysisContext) -> Dict[str, Any]
         "relations": {name: len(_row_pairs(view, pairs)[2]) for name, pairs in ctx.relations.items()},
         "similarity": {bench: int(sum(int(a) != int(b) and view.has(a) and view.has(b) for a, b, _ in pairs))
                        for bench, pairs in ctx.similarity.items()},
-        "similarity_total": {bench: len(pairs) for bench, pairs in ctx.similarity.items()},
+        "similarity_resolved": {bench: len(pairs) for bench, pairs in ctx.similarity.items()},
+        "similarity_total": {bench: _similarity_total(ctx, bench, pairs) for bench, pairs in ctx.similarity.items()},
     }
     battery["failed_steps"] = _failed_steps(battery)
     return battery
@@ -1634,10 +1801,10 @@ def plot_view_embedding(view: VectorView, ctx: AnalysisContext, battery: Dict[st
     if _ok(fields_result) and "purity" in fields_result:
         pur, sil = fields_result["purity"], fields_result["silhouette"]
         strat = pur.get("frequency_stratified")
-        strat_text = (f"; freq.-stratified null {strat['null_mean']:.3f}, z = {strat['z']:.1f}"
+        strat_text = (f"; freq.-stratified null {strat['null_mean']:.3f}, z = {_z_text(strat.get('z'))}"
                       if _ok(strat) and _is_number(strat.get("null_mean")) else "")
         quality = (f"silhouette {sil['silhouette']:.3f} · kNN purity@{pur['k']} {pur['purity']:.3f} "
-                   f"(null {pur['null_mean']:.3f}, z = {pur['z']:.1f}{strat_text}) · original space")
+                   f"(null {pur['null_mean']:.3f}, z = {_z_text(pur.get('z'))}{strat_text}) · original space")
     title = f"{view.label}: {rows.size} lexicon words, {len(fields)} fields"
     if quality:
         title += "\n" + quality
@@ -1815,8 +1982,10 @@ def write_view_tables(view: VectorView, ctx: AnalysisContext, battery: Dict[str,
             "re-paired: partners permuted within the relation by random cyclic derangements (Fournier, Dupoux & "
             "Dunbar 2020; keeps the two word sets, hence their group offset). effect size: (OCS − re-paired)/"
             "(1 − re-paired), comparable across views of different width (z is not: the null sd shrinks with "
-            "the dimension). p: one-sided permutation p of OCS; p (Holm): its Holm adjustment over the relations "
-            "of this view (family-wise error under any dependence). LOO proj: projection of each "
+            "the dimension). p: one-sided permutation p of OCS, exact over every m-cycle when there are at most "
+            f"{offsets.get('n_perm', 500)} of them ((m − 1)! for m pairs), else over that many random ones; p (Holm): "
+            "its Holm adjustment over the relations of this view (family-wise error under any dependence). LOO "
+            "proj: projection of each "
             "offset on the unit mean of the other offsets; random pairs: the same projection for as many random "
             "pairs of the view's words (mean and sd; the baseline of Park, Choe & Veitch 2024, Fig. 2).\n\n"
             + markdown_table(rows)))
@@ -1860,6 +2029,11 @@ def _get(result: Any, *keys: str) -> Any:
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float, np.floating)) and math.isfinite(float(value))
+
+
+def _z_text(z: Any) -> str:
+    r"""``z`` to one decimal, or ``n/a`` when the null has no spread (every draw ties) and no z exists."""
+    return f"{float(z):.1f}" if _is_number(z) else "n/a"
 
 
 def _headline_view(results: Results, ctx: AnalysisContext) -> Optional[str]:
@@ -2071,7 +2245,7 @@ def _compare_similarity(results: Results, views: Views, ctx: AnalysisContext,
     _panel_letters(axes[0])
     _dot_row_axes(axes[0, 0], [views[v].label for v in order])
     _suptitle(fig, "Word-similarity benchmarks (pairs covered by each view)")
-    _footnote(fig, _STYLE_NOTE, width=110)
+    _footnote(fig, f"95% CI: {SIMILARITY_CI_METHOD}. " + _STYLE_NOTE, width=110)
     return fig
 
 
@@ -2524,8 +2698,8 @@ def _compare_projections(results: Results, views: Views, ctx: AnalysisContext, h
     _suptitle(fig, f"{views[headline].label}: semantic projection")
     _footnote(fig, "Shaded: score range of the negative (vermillion) and positive (blue) pole words; a listed "
                    "word that is also a pole word is scored on the axis built from the pairs without it; LOO: "
-                   "fraction of pole pairs ordered correctly by the axis built from the other pairs "
-                   "(Grand et al. 2022).", width=60 if len(axes_ok) == 1 else 100)
+                   "fraction of pole pairs ordered correctly by the axis built from the other pairs that share no "
+                   "word with them (Grand et al. 2022).", width=60 if len(axes_ok) == 1 else 100)
     return fig
 
 

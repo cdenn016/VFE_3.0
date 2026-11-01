@@ -91,6 +91,12 @@ def _close(got: torch.Tensor, want: torch.Tensor, tol: float, what: str = "") ->
     torch.testing.assert_close(got, want, rtol=tol, atol=tol * scale, msg=lambda m: f"{what}\n{m}")
 
 
+def _on_support(cost: torch.Tensor, log_prior: torch.Tensor) -> torch.Tensor:
+    r"""A brute-force exact cost on the prior's support, 0 on the masked pairs, which the readout never factors (audit
+    2026-10-31 A090, A192)."""
+    return cost.masked_fill(~torch.isfinite(log_prior), 0.0)
+
+
 def _reference_moments(g: torch.Generator, N: int, K: int) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Reference moments :math:`\xi_i = U_i^{-1}\mu_i`, :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` of random local beliefs."""
     U = torch.eye(K, dtype=F64) + 0.3 * _randn(g, N, K, K)
@@ -393,7 +399,7 @@ def test_single_head_equals_generic_conditioning_of_the_record_model(K: int, d: 
     result = ma.minimal_agent_readout(xi, C, S, T, noise.log(), lp, "exact", diagnostics=True)
     ref = _sequential_reference(xi, C, xi, C, S, T, noise, lp)   # one head: the per-pair brute force itself
     _close(result.weights, ref.weights, 1e-10, "source posterior w_ij")
-    _close(result.cost, ref.cost, 1e-10, "per-pair cost -log N(b_j; a_i, W_ij) - (d/2) log 2 pi")
+    _close(result.cost, _on_support(ref.cost, lp), 1e-10, "per-pair cost -log N(b_j; a_i, W_ij) - (d/2) log 2 pi")
     _close(result.xi, ref.xi, 1e-10, "posterior mean")
     _close(_reference_posterior_covariance(C, result), ref.C, 1e-10, "posterior covariance (mixture)")
     _close(result.gain_fraction, ref.gain_fraction, 1e-10, "gain fraction tr(A Lambda_bar)/d")
@@ -512,7 +518,7 @@ def test_two_coupled_heads_equal_the_sequential_brute_force_and_differ_from_the_
     result = ma.minimal_agent_readout(xi, C, S, T, noise.log(), lp, "exact", diagnostics=True)
     ref = _sequential_reference(xi, C, xi, C, S, T, noise, lp)
     _close(result.weights, ref.weights, 1e-10, "labels of head 1 at the input and of head 2 at the collapsed moments")
-    _close(result.cost, ref.cost, 1e-10)
+    _close(result.cost, _on_support(ref.cost, lp), 1e-10)
     _close(result.xi, ref.xi, 1e-10)
     _close(_reference_posterior_covariance(C, result), ref.C, 1e-10)
     _close(result.gain_fraction, ref.gain_fraction, 1e-10)
@@ -793,7 +799,8 @@ def test_operator_local_update_matches_the_brute_force_through_the_frames(infere
         _close(mean[bidx], want_mean, 1e-10, f"local mean, batch {bidx}")
         _close(cov[bidx], want_cov, 1e-10, f"local covariance plus floor, batch {bidx}")
         _close(capture["beta_pre"][bidx], labels, 1e-10, "captured labels")
-        _close(capture["score_energy_pre"][bidx], cost, 1e-10, "captured costs")
+        _close(capture["score_energy_pre"][bidx],
+               _on_support(cost, data.log_prior) if inference == "exact" else cost, 1e-10, "captured costs")
     _close(capture["beta_pre"].sum(-1), torch.ones(2, 2, 4, dtype=F64), 1e-12)
     assert torch.equal(capture["relational_minimal_agent_channel_noise"], noise)
     assert capture["relational_minimal_agent_gain_fraction"].shape == (2,)
@@ -1137,8 +1144,8 @@ def test_model_state_dict_optimizer_roles_counts_and_run_record() -> None:
     assert record["factorization_fallback"] == "fp32_failure_or_certificate_layer_fp64_recompute"
     assert record["routing_state"] == "pre_update_sources_adf_receiver"
     mean_field = _relational_artifact_fields(_agent_model("mean_field").cfg)["relational_operators"]
-    assert mean_field["factorization_fallback"] == (
-        "fp32_failure_or_certificate_layer_fp64_recompute_kl_certificate_fp64_refactor")
+    assert mean_field["factorization_fallback"] == (   # no KL refactor (audit 2026-10-31 A078)
+        "fp32_failure_or_certificate_layer_fp64_recompute")
     assert mean_field["routing_state"] == "pre_update"
     kernel = _relational_artifact_fields(default.cfg)["relational_operators"]
     assert "predictive_readout" not in kernel and kernel["per_layer_parameter_counts"] == {"score": 2 * K * K,

@@ -225,8 +225,12 @@ def reduced_free_energy(
     # with the head axis at -2 of lz. (H,1) right-aligns correctly for both (H,N) and (B,H,N).
     # Scalar tau passes through unchanged. The .to() mirrors _broadcast_tau's device hop (a
     # scalar-kappa x unequal-irrep-dims tau is born on CPU). A >= 2-d tensor tau with a trailing
-    # singleton key axis drops that axis to align with lz's rows.
-    if isinstance(tau, torch.Tensor) and tau.dim() == 1:
+    # singleton key axis drops that axis to align with lz's rows. A length-one tau is a scalar
+    # wearing a head axis, collapsed to 0-d as _broadcast_tau collapses it, so a headless (N, N)
+    # energy keeps its (N,) shape (audit 2026-10-31, attention-scoring-7).
+    if isinstance(tau, torch.Tensor) and tau.dim() == 1 and tau.shape[0] == 1:
+        _tau = tau.to(device=lz.device).reshape(())
+    elif isinstance(tau, torch.Tensor) and tau.dim() == 1:
         _tau = tau.to(device=lz.device).reshape(tau.shape[0], 1)
     elif isinstance(tau, torch.Tensor) and tau.dim() >= 2:
         _tau = tau.squeeze(-1)

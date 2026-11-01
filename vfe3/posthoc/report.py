@@ -17,13 +17,21 @@ per-layer self-weights), the final-weight ``routing_split`` pass is handed to th
 :mod:`vfe3.posthoc.routing` (imported lazily, skipped with the reason when missing or failing), each
 loaded checkpoint gets the v2:872 covariance analysis, and the full test passes give the
 word-normalized perplexity of ``tab:placeholder_calibration`` after the text audit. Every section that
-is not defined for the run's route is recorded with its reason rather than failing the report.
+is not defined for the run's route is recorded with its reason rather than failing the report, and an
+optional section or writer that raises (maps, resources, latency, a table or a figure) is recorded as
+failed, so ``posthoc.json`` is always written. Every evaluation forward runs on the replay ladder of
+``vfe3.train.evaluate`` (:func:`vfe3.posthoc.evaluate.ladder_call`); a pass whose batches were replayed
+records them under ``precision_replays`` and is checked at the fp32-replay tolerance. With
+``ema_weights`` the weight-EMA shadow of the latest training checkpoint is evaluated as the
+pseudo-checkpoint ``ema_weights`` against the run's ``val_ema_ce`` and ``test_ema_ce``.
 
 Outputs under ``out_dir`` (default ``<run_dir>/posthoc``): ``posthoc.json``; ``tables/*.md``
 (M5, ``tab:relational_run``, ``tab:placeholder_resources``, KL cap, attention statistics, map
 invariants, residual ratios, covariance gap and temperature, calibration); ``csv/*.csv`` (and the
 per-pair covariance ``.npz``); ``figures/*.png|pdf`` (including CE by context length);
-``nll/*.npz`` per-target dumps with article ids.
+``nll/*.npz`` per-target dumps with article ids. The M4 decomposition writes its own
+``m4_routing_decomposition.{md,json}``, ``m4_routing_samples.npz`` and figures in ``out_dir`` itself
+(:func:`vfe3.posthoc.routing.write_routing_outputs`).
 """
 
 from __future__ import annotations
@@ -66,10 +74,10 @@ class PosthocOptions:
     checkpoints:                Tuple[str, ...] = ("final_model.pt", "best_model.pt")
     splits:                     Tuple[str, ...] = SPLIT_KEYS
     batch_size:                 Optional[int] = None      # None -> cfg.batch_size (the run's loaders)
-    max_windows:                Optional[int] = None      # None -> the full split; n -> evenly spaced subset
+    max_windows:                Optional[int] = None      # None -> the full split; n -> evenly spaced, no window 0
     window_indices:             Optional[Sequence[int]] = None   # explicit validation/test windows
     cross_check:                bool = True               # also run vfe3.train.evaluate on the same windows
-    interventions:              Optional[Sequence[str]] = None   # None -> rows 1-12; () -> none
+    interventions:              Optional[Sequence[str]] = None   # None -> rows 1-13; () -> none
     intervention_checkpoint:    str = "final_model.pt"
     intervention_split:         str = "validation"
     klcap_splits:               Tuple[str, ...] = ("validation", "test")   # at the final weights
@@ -90,6 +98,7 @@ class PosthocOptions:
     word_stream_path:           Optional[str] = None      # word-level test text; None -> pinned HF cache, offline
     routing:                    bool = True               # M4 via vfe3.posthoc.routing (lazily imported)
     routing_split:              Optional[str] = "validation"   # at the final weights
+    ema_weights:                bool = False              # also the weight-EMA shadow of the latest checkpoints/step_*.pt
 
 
 def baseline_posthoc_options(
@@ -163,16 +172,7 @@ def _checkpoint_step(info: st.RunInfo, checkpoint: str) -> Optional[int]:
 
 
 def _latest_training_checkpoint(run_dir: Path) -> Optional[Path]:
-    directory = run_dir / "checkpoints"
-    if not directory.is_dir():
-        return None
-    found = []
-    for path in directory.glob("step_*.pt"):
-        try:
-            found.append((int(path.stem.split("_", 1)[1]), path))
-        except ValueError:
-            continue
-    return max(found)[1] if found else None
+    return ev.latest_training_checkpoint(run_dir)
 
 
 def _recorded_reference(info: st.RunInfo, checkpoint: str, split: str) -> Optional[Dict[str, Any]]:
@@ -217,6 +217,21 @@ def _replay_matches_run(loaded: Any, cfg: Any, device: torch.device) -> bool:
     same_matmul = (getattr(loaded.cfg, "fp32_matmul_precision", None)
                    == getattr(cfg, "fp32_matmul_precision", None))
     return bool(same_amp and same_matmul)
+
+
+def _pass_arithmetic_matched(matched: bool, result: ev.TargetNLL) -> bool:
+    r"""Whether one pass ran the run's own arithmetic: the replay matches the run and no batch was replayed.
+
+    A batch the replay ladder completed at a stricter fp32 matmul policy (:func:`vfe3.posthoc.evaluate.ladder_call`)
+    no longer has the run's reduced-policy arithmetic, so its pass is checked at the fp32-replay tolerance.
+    """
+    return bool(matched and not result.precision_replays)
+
+
+def _replay_record(result: ev.TargetNLL) -> Dict[str, Any]:
+    r"""``{n_batches, replayed_batches, completed_at}`` of one pass (``completed_at``: policy -> replayed batches)."""
+    return {"n_batches": int(result.n_batches), "replayed_batches": int(sum(result.precision_replays.values())),
+            "completed_at": dict(result.precision_replays)}
 
 
 def _reproduction(
@@ -335,11 +350,12 @@ def _alias_checkpoint(
         if entry.get("status") == "ok" and split in kept:
             result, indices, full = kept[split]
             reference = _recorded_reference(info, checkpoint, split)
+            pass_matched = _pass_arithmetic_matched(matched, result)
             if split in reproduction_windows:
                 alias["reproduction"] = _subsample_reproduction(
-                    result, indices, reproduction_windows[split], reference, matched=matched)
+                    result, indices, reproduction_windows[split], reference, matched=pass_matched)
             else:
-                alias["reproduction"] = _reproduction(alias, reference, full=full, matched=matched)
+                alias["reproduction"] = _reproduction(alias, reference, full=full, matched=pass_matched)
         report["passes"].append(alias)
     for section in ("residual", "covariance"):
         if target in report[section]:
@@ -382,29 +398,42 @@ def measure_latency(
     *,
     n_warmup:   int = 2,
 ) -> Dict[str, Any]:
-    r"""Wall time of the inference forward with logits at the declared batch and context."""
+    r"""Wall time of the inference forward with logits at the declared batch and context.
+
+    Each forward runs as the evaluation forwards do, on the replay ladder inside deferred host checks
+    (:func:`vfe3.posthoc.evaluate.ladder_call`). A timed batch that needed a replay at a stricter fp32 matmul policy
+    timed more than one forward, so it is left out of the statistics and counted in ``replayed_batches``, by the
+    policy it completed at in ``replay_policies``.
+    """
     indices = np.arange(min(len(dataset), batch_size * (n_batches + n_warmup)), dtype=np.int64)
     times: List[float] = []
     n_tokens = 0
+    replays: Dict[str, int] = {}
     with torch.no_grad():
         for k, (_, inputs, _) in enumerate(ev.iter_batches(dataset, indices, batch_size)):
             tokens = inputs.to(device)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             started = time.perf_counter()
-            model.forward_beliefs(tokens, return_logits=True)
+            _, policies = ev.ladder_call(model, lambda: model.forward_beliefs(tokens, return_logits=True),
+                                         "post-hoc latency forward")
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            if k >= n_warmup:
-                times.append(time.perf_counter() - started)
-                n_tokens += int(tokens.numel())
+            if k < n_warmup:
+                continue
+            if len(policies) > 1:
+                replays[policies[-1]] = replays.get(policies[-1], 0) + 1
+                continue
+            times.append(time.perf_counter() - started)
+            n_tokens += int(tokens.numel())
+    record = {"replayed_batches": int(sum(replays.values())), "replay_policies": replays}
     if not times:
-        return {"status": "not_measured"}
+        return {"status": "not_measured", **record}
     arr = np.asarray(times)
     return {"status": "ok", "batch_size": int(batch_size), "context": int(dataset.seq_len),
             "n_batches": int(arr.size), "seconds_per_batch_median": float(np.median(arr)),
             "seconds_per_batch_mean": float(arr.mean()),
-            "tokens_per_s": float(n_tokens / arr.sum()), "device": str(device)}
+            "tokens_per_s": float(n_tokens / arr.sum()), "device": str(device), **record}
 
 
 def _device_name(device: torch.device) -> str:
@@ -424,17 +453,21 @@ def _fmt(value: Any, digits: int = 4) -> str:
 
 
 def interventions_table(rows: Sequence[Mapping[str, Any]], *, n_units: Optional[int], unit: str,
-                        n_targets: Optional[int], subset: bool) -> str:
-    r"""Markdown of Table M5 (``tab:placeholder_interventions``), rows 1-12.
+                        n_targets: Optional[int], subset: bool, split: str = "validation",
+                        restoration: Optional[Mapping[str, Any]] = None) -> str:
+    r"""Markdown of Table M5 (``tab:placeholder_interventions``), rows 1-12 and the extension arms (row 13), on the
+    ``split`` targets.
 
     An arm that scored a different target set than the baseline (a full-covariance decode can exclude
     degenerate positions per pass) is paired on the targets both passes scored: its CE and
     :math:`\Delta\mathrm{CE}` are over that aligned subset, so :math:`\mathrm{CE}_{\mathrm{arm}} -
     \mathrm{CE}_{\mathrm{base}}` with the baseline row's all-target CE need not equal the printed
     :math:`\Delta\mathrm{CE}`. Such a row's CE carries a dagger, and a note gives its target count and the
-    baseline CE on the aligned subset (audit 2026-10-16 F69).
+    baseline CE on the aligned subset (audit 2026-10-16 F69). ``restoration`` (row 0, the baseline re-run after
+    every arm) is printed under the table with its verdict, so a patch that was not undone is visible in the
+    markdown as well as in the JSON (audit 2026-10-31 A369).
     """
-    lines = ["| Frozen intervention on every validation target | CE | $\\Delta$CE | 95% interval |",
+    lines = [f"| Frozen intervention on every {split} target | CE | $\\Delta$CE | 95% interval |",
              "|---|---|---|---|"]
     aligned: List[str] = []
     for r in sorted(rows, key=lambda r: int(r["row"])):
@@ -455,8 +488,19 @@ def interventions_table(rows: Sequence[Mapping[str, Any]], *, n_units: Optional[
     note = (f"\nCE in nats per scored target over {n_targets} targets; intervals are 2.5/97.5 percentiles of a "
             f"paired {unit} bootstrap over {n_units} {unit}s")
     if subset:
-        note += "; SUBSET of the validation split (not the manuscript number)"
-    return "\n".join(lines) + note + ".\n" + "".join(f"\n{line}\n" for line in aligned)
+        note += f"; SUBSET of the {split} split (not the manuscript number)"
+    check = ""
+    if restoration is not None:
+        verdict = restoration.get("status")
+        check = (f"\nRestoration check (the baseline re-run on its first {RESTORATION_CHECK_WINDOWS} windows after "
+                 f"every arm): {verdict}")
+        if restoration.get("error"):
+            check += f" ({restoration['error']})"
+        else:
+            check += (f", max |change in per-target NLL| {_fmt(restoration.get('max_abs_nll_change'))} over "
+                      f"{restoration.get('n_targets')} targets (tolerance {ev.CROSS_CHECK_TOL:g})")
+        check += ".\n"
+    return "\n".join(lines) + note + ".\n" + check + "".join(f"\n{line}\n" for line in aligned)
 
 
 def relational_run_table(passes: Sequence[Mapping[str, Any]], info: st.RunInfo) -> str:
@@ -471,16 +515,22 @@ def relational_run_table(passes: Sequence[Mapping[str, Any]], info: st.RunInfo) 
               ("best", "test"): "Test, best-validation weights",
               ("best", "validation"): "Validation, best-validation weights (replay)",
               ("final", "train_sample"): "Training-split sample, evaluation protocol",
-              ("best", "train_sample"): "Training-split sample, evaluation protocol (best weights)"}
+              ("best", "train_sample"): "Training-split sample, evaluation protocol (best weights)",
+              (ev.EMA_CHECKPOINT, "validation"): "Validation, EMA weights",
+              (ev.EMA_CHECKPOINT, "test"): "Test, EMA weights",
+              (ev.EMA_CHECKPOINT, "train_sample"): "Training-split sample, evaluation protocol (EMA weights)"}
     order = [("best", "validation"), ("final", "validation"), ("final", "test"), ("best", "test"),
-             ("final", "train_sample"), ("best", "train_sample")]
+             ("final", "train_sample"), ("best", "train_sample"), (ev.EMA_CHECKPOINT, "validation"),
+             (ev.EMA_CHECKPOINT, "test"), (ev.EMA_CHECKPOINT, "train_sample")]
     by_key = {(_stem(p["checkpoint"]), p["split"]): p for p in passes if p.get("status") == "ok"}
     for key in order:
         p = by_key.get(key)
         if p is None:
             continue
         ci = p.get("ce_interval", {})
-        source = "post-hoc" + (" (subset)" if p.get("subset") else "")
+        replayed = (p.get("precision_replays") or {}).get("replayed_batches")
+        source = ("post-hoc" + (" (subset)" if p.get("subset") else "")
+                  + (f"; {replayed} batches replayed at a stricter matmul policy" if replayed else ""))
         lines.append(f"| {labels[key]} | {p.get('step')} | {math.exp(p['ce']):.4f} | {p['ce']:.6f} | "
                      f"[{_fmt(ci.get('lo'))}, {_fmt(ci.get('hi'))}] | {source} |")
     return "\n".join(lines) + "\n"
@@ -507,7 +557,12 @@ def resources_table(resources: Mapping[str, Any]) -> str:
         ("Per-type tables (token frames, prior means and covariances, decoder)", count("per_type_tables")),
         ("Positional frame generators", count("positional_frames")),
         ("Context-processing parameters (interface maps, MLP, normalization)", count("context_processing")),
-        ("Parameters read per token", f"{int(pb['parameters_read_per_token']):,}" if pb else "–"),
+        # Unique parameters, and the reads of the modules every layer applies once per layer (run_resources).
+        ("Parameters read per token (unique)",
+         (f"{int(pb['parameters_read_per_token']):,}"
+          + (f" ({int(pb['parameter_reads_per_token_with_layer_reuse']):,} with layer reuse)"
+             if pb.get("parameter_reads_per_token_with_layer_reuse") not in (None, pb["parameters_read_per_token"])
+             else "")) if pb else "–"),
         ("Optimizer state and peak device memory",
          (f"{opt_bytes / 2**30:.2f} GiB optimizer state" if opt_bytes else "– optimizer state")
          + (f"; peak {peak / 1000:.2f} GB" if peak else "; peak –")),   # peak_mem_mb is bytes / 1e6
@@ -554,9 +609,14 @@ def attention_table(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def map_invariants_table(rows: Sequence[Mapping[str, Any]]) -> str:
-    r"""Per layer, the range over heads of the S1 panel B quantities."""
+    r"""Per layer, the range over heads of the S1 panel B quantities.
+
+    Where the common scale is a signal-to-noise coordinate (noisy-key routing, the minimal agent; ``scale_rms`` NaN)
+    the column gives the scale in noise units, ``scale_rms_noise_units`` (:mod:`vfe3.posthoc.maps`), marked so.
+    """
     lines = ["| Layer | Common scale | Relative gains (min-max) | Median principal angle (deg) | "
              "sigma_max(O T) | Own-block share S_Q / S_K / T / O |", "|---|---|---|---|---|---|"]
+    noise_units = False
     for layer in sorted({int(r["layer"]) for r in rows}):
         mine = [r for r in rows if int(r["layer"]) == layer]
 
@@ -565,9 +625,14 @@ def map_invariants_table(rows: Sequence[Mapping[str, Any]]) -> str:
             return f"{min(values):{spec}}–{max(values):{spec}}" if values else "–"
         shares = " / ".join(span(f"{m}_own_block_share", ".2f") for m in ("S_Q", "S_K", "T", "O"))
         gains = [v for r in mine for v in (r["gain_min"], r["gain_max"])]
-        lines.append(f"| {layer} | {span('scale_rms')} | {min(gains):.3g}–{max(gains):.3g} | "
+        scale = span("scale_rms")
+        if scale == "–" and span("scale_rms_noise_units") != "–":
+            scale, noise_units = f"{span('scale_rms_noise_units')} (noise units)", True
+        lines.append(f"| {layer} | {scale} | {min(gains):.3g}–{max(gains):.3g} | "
                      f"{span('angle_median_deg', '.1f')} | {span('M_sigma_max')} | {shares} |")
-    return "\n".join(lines) + "\n"
+    note = ("\nNoise units: the scale divided by sqrt(n_h), the routing signal-to-noise coordinate of a noisy-key or "
+            "minimal-agent layer, where the common scale is not a symmetry coordinate.\n") if noise_units else ""
+    return "\n".join(lines) + "\n" + note
 
 
 # ----------------------------------------------------------------------------------------------
@@ -739,8 +804,15 @@ def run_posthoc(
     aliases = _checkpoint_aliases(run_dir, options, final_ckpt)
     kept: Dict[str, Tuple[ev.TargetNLL, np.ndarray, bool]] = {}     # final_ckpt's passes, for the aliases
     kept_matched = False
-    for checkpoint in options.checkpoints:
-        if not (run_dir / checkpoint).is_file():
+    steps: Dict[str, Optional[int]] = {}                             # checkpoint -> step, the EMA shadow's included
+    # The weight-EMA shadow of the latest training checkpoint is evaluated after the requested checkpoints, labeled
+    # ev.EMA_CHECKPOINT, with val_ema_ce / test_ema_ce as its reference (audit 2026-10-31 A340).
+    extra = [ev.EMA_CHECKPOINT] if options.ema_weights and ev.EMA_CHECKPOINT not in options.checkpoints else []
+    if options.ema_weights:
+        report["ema_weights"] = {"status": "skipped", "reason": "not reached"}
+    for checkpoint in [*options.checkpoints, *extra]:
+        is_ema = checkpoint == ev.EMA_CHECKPOINT
+        if not is_ema and not (run_dir / checkpoint).is_file():
             report["notes"].append(f"{checkpoint} not found; skipped")
             continue
         if checkpoint in aliases:
@@ -749,18 +821,34 @@ def run_posthoc(
             report["notes"].append(f"{checkpoint}: {report['checkpoint_aliases'][checkpoint]['reason']}")
             log(f"[posthoc] {checkpoint}: model state identical to {aliases[checkpoint]}; its results are reused")
             continue
-        loaded = ev.load_model(run_dir, checkpoint, device=device, precision=options.precision,
-                               drop_unknown_config_fields=options.drop_unknown_config_fields)
+        try:
+            loaded = ev.load_model(run_dir, checkpoint, device=device, precision=options.precision,
+                                   drop_unknown_config_fields=options.drop_unknown_config_fields)
+        except (FileNotFoundError, ValueError) as exc:
+            if not is_ema:
+                raise
+            report["ema_weights"] = {"status": "skipped", "reason": f"{type(exc).__name__}: {exc}"}
+            report["notes"].append(f"{checkpoint} skipped: {exc}")
+            log(f"[posthoc] {checkpoint} skipped: {exc}")
+            continue
         model = loaded.model
         matched = _replay_matches_run(loaded, cfg, device)
         report["notes"].extend(f"{checkpoint}: {n}" for n in loaded.notes)
-        step = _checkpoint_step(info, checkpoint)
+        step = (loaded.ema or {}).get("step") if is_ema else _checkpoint_step(info, checkpoint)
+        steps[checkpoint] = step
+        if is_ema:
+            report["ema_weights"] = {"status": "evaluated", "source": loaded.source, **(loaded.ema or {})}
         is_final = checkpoint == final_ckpt
         if is_final:
             kept_matched = matched
             report["alibi_slopes"] = ev.alibi_slopes(model, info.seq_len)
             if options.latency_batches > 0 and "validation" in datasets:
-                latency = measure_latency(model, datasets["validation"], batch_size, device, options.latency_batches)
+                try:
+                    latency = measure_latency(model, datasets["validation"], batch_size, device,
+                                              options.latency_batches)
+                except Exception as exc:                      # recorded; the passes and the report continue
+                    latency = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+                    log(f"[posthoc] latency measurement FAILED: {latency['error']}")
                 latency.update(device_name=_device_name(device), precision=loaded.amp_dtype or "fp32")
         for split in options.splits:
             dataset = datasets.get(split)
@@ -795,7 +883,8 @@ def run_posthoc(
             entry: Dict[str, Any] = {"checkpoint": checkpoint, "step": step, "split": split,
                                      "n_windows": int(indices.size), "n_windows_total": len(dataset),
                                      "subset": not full, "precision": loaded.amp_dtype or "fp32",
-                                     "fp32_matmul_precision": torch.get_float32_matmul_precision()}
+                                     "fp32_matmul_precision": torch.get_float32_matmul_precision(),
+                                     "weights": loaded.weights}
             try:
                 result = ev.nll_pass(model, dataset, indices, batch_size=batch_size, device=device,
                                      observers=observers)
@@ -823,8 +912,11 @@ def run_posthoc(
                 context_series[f"{split}, {_stem(checkpoint)} weights"] = ce_by_context(result.context, result.nll)
             units = _units_for(result, split, stream_units.get(split))
             entry.update(status="ok", ce=result.ce, n_scored=result.n, expected=result.expected,
-                         excluded=result.excluded, seconds=result.seconds,
+                         excluded=result.excluded, seconds=result.seconds, precision_replays=_replay_record(result),
                          ce_interval=ev.ce_interval(result.nll, units, n_resamples=options.bootstrap_resamples))
+            if result.precision_replays:
+                log(f"[posthoc]   {sum(result.precision_replays.values())} of {result.n_batches} batches replayed "
+                    f"at a stricter fp32 matmul policy ({result.precision_replays}); checked as an fp32 replay")
             if options.cross_check:
                 protocol = ev.protocol_evaluate(model, dataset, indices, batch_size=batch_size, device=device)
                 delta = result.ce - float(protocol["ce"])
@@ -833,12 +925,19 @@ def run_posthoc(
                                         "delta_ce": delta, "tolerance": ev.CROSS_CHECK_TOL,
                                         "ok": abs(delta) <= ev.CROSS_CHECK_TOL
                                         and int(protocol.get("scored_targets") or -1) == result.n}
-            reference = _recorded_reference(info, checkpoint, split)
+            reason = None
+            if is_ema:
+                reference, reason = _ema_reference(info, loaded.ema, split, source=loaded.source)
+            else:
+                reference = _recorded_reference(info, checkpoint, split)
+            pass_matched = _pass_arithmetic_matched(matched, result)
             if split in reproduction_windows:
                 entry["reproduction"] = _subsample_reproduction(
-                    result, indices, reproduction_windows[split], reference, matched=matched)
+                    result, indices, reproduction_windows[split], reference, matched=pass_matched)
             else:
-                entry["reproduction"] = _reproduction(entry, reference, full=full, matched=matched)
+                entry["reproduction"] = _reproduction(entry, reference, full=full, matched=pass_matched)
+            if reason is not None:
+                entry["reproduction"]["reason"] = reason
             if options.save_nll:
                 path = out / "nll" / f"{_stem(checkpoint)}_{split}.npz"
                 ev.save_nll(path, result, units)
@@ -881,22 +980,68 @@ def run_posthoc(
     report["reproduction"] = _reproduction_summary(report, info)
     if options.calibration:
         report["calibration"] = _calibration(info, options, tokens_by_split.get("test"), test_passes,
-                                             final_ckpt=final_ckpt, log=log)
+                                             final_ckpt=final_ckpt, log=log, steps=steps)
     if context_series:
         report["ce_by_context"] = {"series": context_series,
                                    "definition": "mean NLL of the scored targets per context length (tokens up "
                                                  "to and including the query position)"}
 
+    # The optional sections and the table and figure writers are guarded as _routing is: a failure is recorded
+    # (in its section, or in notes) and posthoc.json is still written (audit 2026-10-31 A369).
     if options.maps:
-        report["maps"] = _maps(run_dir, options.checkpoints, cfg, out, options.figures, report)
+        report["maps"] = _guarded_section("map invariants", lambda: _maps(
+            run_dir, options.checkpoints, cfg, out, options.figures, report), log)
     if options.resources:
-        report["resources"] = _resources(run_dir, final_ckpt, cfg, latency)
-
-    _write_outputs(report, info, out, options)
+        report["resources"] = _guarded_section("resources", lambda: _resources(run_dir, final_ckpt, cfg, latency),
+                                               log)
+    try:
+        _write_outputs(report, info, out, options)
+    except Exception as exc:                                  # recorded; posthoc.json is written below
+        report["notes"].append(f"table and figure outputs failed: {type(exc).__name__}: {exc}")
+        log(f"[posthoc] table and figure outputs FAILED: {type(exc).__name__}: {exc}")
     report["seconds"] = time.perf_counter() - started
     write_json(out / "posthoc.json", report)
     log(f"[posthoc] wrote {out / 'posthoc.json'} in {report['seconds']:.1f}s")
     return report
+
+
+def _guarded_section(label: str, build: Callable[[], Dict[str, Any]], log: Callable[[str], None]) -> Dict[str, Any]:
+    r"""``build()``, or ``{"status": "failed", "error": ...}`` when it raises (the report continues)."""
+    try:
+        return build()
+    except Exception as exc:                                  # recorded; the other sections are written
+        log(f"[posthoc] {label} FAILED: {type(exc).__name__}: {exc}")
+        return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _ema_reference(
+    info:   st.RunInfo,
+    ema:    Optional[Mapping[str, Any]],
+    split:  str,
+
+    *,
+    source: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    r"""``(reference, reason)`` of the EMA pass: the CE finalize recorded at the EMA weights, or why there is none.
+
+    Finalize evaluates the shadow it holds at the end of training (``val_ema_ce``, ``test_ema_ce``); the shadow of a
+    step checkpoint is that one only when its update count and start step are the summary's (the shadow changes
+    exactly when ``updates`` grows), so an earlier checkpoint has no reference.
+    """
+    s = info.summary
+    key = {"validation": "val_ema_ce", "test": "test_ema_ce"}.get(split)
+    if key is None or s.get(key) is None:
+        return None, f"summary.json records no EMA CE for the {split} split"
+    recorded = (s.get("weight_ema_updates"), s.get("weight_ema_initialized_step"))
+    found = ((ema or {}).get("updates"), (ema or {}).get("initialized_step"))
+    if recorded != found:
+        return None, (f"the shadow of {source} (weight_ema_updates={found[0]}, started at step {found[1]}) is not the "
+                      f"one finalize evaluated (summary weight_ema_updates={recorded[0]}, started at step "
+                      f"{recorded[1]})")
+    scored = (s.get("final_val_scored_targets", s.get("val_scored_targets")) if split == "validation"
+              else s.get("test_scored_targets"))
+    return {"source": f"summary.json {key}", "ce": float(s[key]), "scored_targets": scored,
+            "kind": "final evaluation"}, None
 
 
 def _run_interventions(
@@ -915,7 +1060,8 @@ def _run_interventions(
     log:         Callable[[str], None],
     save_to:     Optional[Path],
 ) -> List[Dict[str, Any]]:
-    r"""Rows 1-12 of M5 on the baseline's windows, paired with the baseline per target (inapplicable rows recorded)."""
+    r"""Rows 1-12 of M5 and the extension arms (row 13) on the baseline's windows, paired with the baseline per target
+    (inapplicable rows recorded)."""
     rows: List[Dict[str, Any]] = []
     arrays: Dict[str, np.ndarray] = {"baseline": base.nll}
     base_interval = ev.ce_interval(base.nll, units, n_resamples=n_resamples)
@@ -923,7 +1069,14 @@ def _run_interventions(
     # has the same batch composition (under CUDA autocast a different batch shape can pick different
     # kernels and move per-target NLL by ~1e-2 without any patch leaking).
     check = indices[:RESTORATION_CHECK_WINDOWS]
-    reference = ev.nll_pass(model, dataset, check, batch_size=batch_size, device=device)
+    # Both restoration passes are guarded like the arms: a failure is the restoration row's verdict, not an abort
+    # of run_posthoc before posthoc.json is written (audit 2026-10-31 A048).
+    reference: Optional[ev.TargetNLL] = None
+    restoration_error: Optional[str] = None
+    try:
+        reference = ev.nll_pass(model, dataset, check, batch_size=batch_size, device=device)
+    except Exception as exc:
+        restoration_error = f"the pre-arm reference pass failed: {type(exc).__name__}: {exc}"
     for intervention in iv.by_key(keys):
         row: Dict[str, Any] = {"row": intervention.row, "key": intervention.key, "label": intervention.label}
         if intervention.key == "baseline":
@@ -953,12 +1106,22 @@ def _run_interventions(
             + (f" dCE {row['delta_ce']:+.4f} [{row['lo']:+.4f}, {row['hi']:+.4f}]" if row["status"] == "ok" else
                f" ({row.get('reason') or row.get('error')})"))
     # Every patch must have been undone: the check windows reproduce their pre-arm reference.
-    again = ev.nll_pass(model, dataset, check, batch_size=batch_size, device=device)
-    restored = (float(np.max(np.abs(again.nll - reference.nll)))
-                if again.n and again.n == reference.n else (0.0 if again.n == reference.n else float("inf")))
-    rows.append({"row": 0, "key": "restoration_check", "label": "baseline re-run after all arms",
-                 "status": "ok" if restored <= ev.CROSS_CHECK_TOL else "failed",
-                 "max_abs_nll_change": restored, "n_targets": again.n})
+    again: Optional[ev.TargetNLL] = None
+    if reference is not None:
+        try:
+            again = ev.nll_pass(model, dataset, check, batch_size=batch_size, device=device)
+        except Exception as exc:
+            restoration_error = f"the post-arm re-run failed: {type(exc).__name__}: {exc}"
+    if again is None or reference is None:
+        rows.append({"row": 0, "key": "restoration_check", "label": "baseline re-run after all arms",
+                     "status": "failed", "error": restoration_error, "max_abs_nll_change": None, "n_targets": None})
+        log(f"[posthoc]   M5 restoration check FAILED: {restoration_error}")
+    else:
+        restored = (float(np.max(np.abs(again.nll - reference.nll)))
+                    if again.n and again.n == reference.n else (0.0 if again.n == reference.n else float("inf")))
+        rows.append({"row": 0, "key": "restoration_check", "label": "baseline re-run after all arms",
+                     "status": "ok" if restored <= ev.CROSS_CHECK_TOL else "failed",
+                     "max_abs_nll_change": restored, "n_targets": again.n})
     for row_index, key, label in iv.NOT_IMPLEMENTED:
         if keys is None:
             rows.append({"row": row_index, "key": key, "label": label, "status": "not implemented",
@@ -1113,6 +1276,7 @@ def _calibration(
     *,
     final_ckpt: str,
     log:        Callable[[str], None],
+    steps:      Optional[Mapping[str, Optional[int]]] = None,   # checkpoint -> step (the EMA shadow's included)
 ) -> Dict[str, Any]:
     r"""``tab:placeholder_calibration`` from the full test passes (skipped with a reason otherwise)."""
     from vfe3.posthoc.calibration import calibration_for_run
@@ -1123,7 +1287,7 @@ def _calibration(
         result = calibration_for_run(
             info.dataset, tokens, test_passes, seq_len=info.seq_len, stride=info.eval_stride,
             headline_checkpoint=headline, word_stream_path=options.word_stream_path,
-            steps={c: _checkpoint_step(info, c) for c in test_passes})
+            steps={c: (steps or {}).get(c, _checkpoint_step(info, c)) for c in test_passes})
     except Exception as exc:
         result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
     head = (result.get("checkpoints") or {}).get(headline) or {}
@@ -1159,6 +1323,13 @@ def _maps(run_dir: Path, checkpoints: Sequence[str], cfg: Any, out: Path, figure
 
     if len(set(getattr(cfg, "head_dims", None) or [0])) > 1:
         return {"status": "not_applicable", "reason": "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"}
+
+    def figure(label: str, draw: Callable[[], Sequence[Path]]) -> None:
+        try:                                                  # a failed figure keeps the computed invariants
+            report["figures"] += [str(p) for p in draw()]
+        except Exception as exc:
+            report["notes"].append(f"{label} figure failed: {type(exc).__name__}: {exc}")
+
     result: Dict[str, Any] = {}
     for checkpoint in checkpoints:
         path = run_dir / checkpoint
@@ -1181,20 +1352,20 @@ def _maps(run_dir: Path, checkpoints: Sequence[str], cfg: Any, out: Path, figure
         _write_csv(out / "csv" / f"head_block_norms_{stem}.csv", long_rows)
         result[checkpoint] = {"invariants": rows}
         if figures:
-            report["figures"] += [str(p) for p in fg.plot_head_block_norms(norms, out / "figures",
-                                                                           f"s2a_head_block_shares_{stem}")]
-            report["figures"] += [str(p) for p in fg.plot_map_invariants(rows, out / "figures",
-                                                                         f"s1b_map_invariants_{stem}")]
+            figure(f"s2a_head_block_shares_{stem}", lambda n=norms, s=stem: fg.plot_head_block_norms(
+                n, out / "figures", f"s2a_head_block_shares_{s}"))
+            figure(f"s1b_map_invariants_{stem}", lambda r=rows, s=stem: fg.plot_map_invariants(
+                r, out / "figures", f"s1b_map_invariants_{s}"))
             if eig_rows:
-                report["figures"] += [str(p) for p in fg.plot_link_spectrum(eig_rows, out / "figures",
-                                                                            f"s1b_link_spectrum_{stem}")]
+                figure(f"s1b_link_spectrum_{stem}", lambda e=eig_rows, s=stem: fg.plot_link_spectrum(
+                    e, out / "figures", f"s1b_link_spectrum_{s}"))
     snapshots = run_dir / "map_snapshots"
     if mp.snapshot_files(snapshots):
         curves = mp.snapshot_curves(snapshots, cfg)
         _write_csv(out / "csv" / "map_invariant_curves.csv", curves)
         result["snapshot_curves"] = {"n_snapshots": len(mp.snapshot_files(snapshots)), "n_rows": len(curves)}
         if figures and curves:
-            report["figures"] += [str(p) for p in fg.plot_map_invariant_curves(curves, out / "figures")]
+            figure("s1b_map_invariant_curves", lambda: fg.plot_map_invariant_curves(curves, out / "figures"))
     else:
         result["snapshot_curves"] = {"n_snapshots": 0,
                                      "note": "no map_snapshots/ in the run directory (runs before 2026-09-28)"}
@@ -1222,39 +1393,68 @@ def _resources(run_dir: Path, checkpoint: str, cfg: Any, latency: Optional[Dict[
 
 
 def _write_outputs(report: Dict[str, Any], info: st.RunInfo, out: Path, options: PosthocOptions) -> None:
+    r"""The tables, CSVs and figures of every section; a failing writer is recorded in ``notes`` (audit 2026-10-31 A369)."""
     from vfe3.posthoc import figures as fg
 
     tables: Dict[str, str] = {}
+
+    def guarded(label: str, write: Callable[[], None]) -> None:
+        try:
+            write()
+        except Exception as exc:                              # recorded; the other outputs are written
+            report["notes"].append(f"{label} outputs failed: {type(exc).__name__}: {exc}")
+
     iv_report = report.get("interventions")
     if iv_report:
         rows = [r for r in iv_report["rows"] if r["row"] > 0]
-        tables["interventions"] = interventions_table(
-            rows, n_units=iv_report["n_units"], unit=iv_report["unit"], n_targets=iv_report["n_targets"],
-            subset=iv_report["subset"])
-        _write_csv(out / "csv" / "interventions.csv", iv_report["rows"])
+        restoration = next((r for r in iv_report["rows"] if r.get("key") == "restoration_check"), None)
+
+        def interventions() -> None:
+            tables["interventions"] = interventions_table(
+                rows, n_units=iv_report["n_units"], unit=iv_report["unit"], n_targets=iv_report["n_targets"],
+                subset=iv_report["subset"], split=iv_report.get("split", "validation"), restoration=restoration)
+            _write_csv(out / "csv" / "interventions.csv", iv_report["rows"])
+
+        guarded("interventions", interventions)
         if options.figures:
-            report["figures"] += [str(p) for p in fg.plot_interventions(rows, out / "figures",
-                                                                        unit=iv_report["unit"])]
+            guarded("interventions figure", lambda: report["figures"].extend(
+                str(p) for p in fg.plot_interventions(rows, out / "figures", unit=iv_report["unit"])))
     if report["passes"]:
-        tables["relational_run"] = relational_run_table(report["passes"], info)
-        _write_csv(out / "csv" / "passes.csv", [
-            {k: v for k, v in p.items() if not isinstance(v, dict)} | {
-                "ce_lo": (p.get("ce_interval") or {}).get("lo"), "ce_hi": (p.get("ce_interval") or {}).get("hi")}
-            for p in report["passes"]])
-    if report.get("resources"):
-        tables["resources"] = resources_table(report["resources"])
+        def passes() -> None:
+            tables["relational_run"] = relational_run_table(report["passes"], info)
+            _write_csv(out / "csv" / "passes.csv", [
+                {k: v for k, v in p.items() if not isinstance(v, dict)} | {
+                    "ce_lo": (p.get("ce_interval") or {}).get("lo"), "ce_hi": (p.get("ce_interval") or {}).get("hi"),
+                    "replayed_batches": (p.get("precision_replays") or {}).get("replayed_batches")}
+                for p in report["passes"]])
+
+        guarded("passes", passes)
+    if report.get("resources") and report["resources"].get("status") != "failed":
+        def resources() -> None:
+            tables["resources"] = resources_table(report["resources"])
+
+        guarded("resources", resources)
     for split, entry in (report.get("klcap") or {}).items():
-        tables[f"klcap_{split}"] = klcap_table(entry["summary"])
-        _write_csv(out / "csv" / f"klcap_{split}.csv", entry["rows"])
+        def klcap(split: str = split, entry: Dict[str, Any] = entry) -> None:
+            tables[f"klcap_{split}"] = klcap_table(entry["summary"])
+            _write_csv(out / "csv" / f"klcap_{split}.csv", entry["rows"])
+
+        guarded(f"klcap {split}", klcap)
     if report.get("attention"):
-        tables["attention_stats"] = attention_table(report["attention"]["rows"])
-        _write_csv(out / "csv" / "attention_stats.csv", report["attention"]["rows"])
+        def attention() -> None:
+            tables["attention_stats"] = attention_table(report["attention"]["rows"])
+            _write_csv(out / "csv" / "attention_stats.csv", report["attention"]["rows"])
+
+        guarded("attention statistics", attention)
         if options.figures:
-            report["figures"] += [str(p) for p in fg.plot_attention_stats(report["attention"]["rows"],
-                                                                          out / "figures")]
+            guarded("attention statistics figure", lambda: report["figures"].extend(
+                str(p) for p in fg.plot_attention_stats(report["attention"]["rows"], out / "figures")))
     for checkpoint, entry in (report.get("maps") or {}).items():
         if isinstance(entry, dict) and "invariants" in entry:
-            tables[f"map_invariants_{_stem(checkpoint)}"] = map_invariants_table(entry["invariants"])
+            def invariants(checkpoint: str = checkpoint, entry: Dict[str, Any] = entry) -> None:
+                tables[f"map_invariants_{_stem(checkpoint)}"] = map_invariants_table(entry["invariants"])
+
+            guarded(f"map invariants {checkpoint}", invariants)
     for name, text in tables.items():
         path = out / "tables" / f"{name}.md"
         path.write_text(text, encoding="utf-8")

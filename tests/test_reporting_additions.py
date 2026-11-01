@@ -559,8 +559,8 @@ def _write_scaling_analysis_run(
 
 def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
     # Two routes, four sizes each, and two seeds per cell give every table and
-    # overlay enough sizes for the requested offset estimator.  With symmetric
-    # seed values mean +/- 0.05, SEM is exactly 0.05 at every point.  The routes differ in
+    # overlay enough sizes for the requested offset estimator.  The seed values are
+    # mean +/- 0.05, two seeds per point.  The routes differ in
     # n_e_steps: the fixture config does not depend on the size, so equal configs would make the
     # two routes' cells identical training runs, which the frontier test counts once (audit
     # 2026-10-16 F55).
@@ -603,8 +603,13 @@ def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
     assert len(calls) >= 8
     assert all(call["with_offset"] is True for call in calls)
     assert all(call["weights"] is not None for call in calls)
+    # Every fit weights each point by n_i / s^2, the pooled pure-error variance of log CE over the eight
+    # distinct cells (audit 2026-10-31 analysis-statistics-1 replaced the per-point (mean / SEM)^2).
+    seed_groups = [[2.0 + (5.0 + route_i) * n ** -0.3 + delta for delta in (-0.05, 0.05)]
+                   for route_i in (0, 1) for n in (100, 200, 400, 800)]
+    s2 = figs._scaling_pooled_log_variance(seed_groups)
     for call in calls:
-        np.testing.assert_allclose(call["weights"], (call["L"] / 0.05) ** 2, rtol=1e-12)
+        np.testing.assert_allclose(call["weights"], 2.0 / s2, rtol=1e-12)
 
     summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
     assert summary["pooled_fit"]["form"] == "offset_power_law"

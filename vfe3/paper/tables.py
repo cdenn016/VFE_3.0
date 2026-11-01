@@ -12,8 +12,9 @@ carries the same cells plus the source of every number; ``rows`` is the machine-
 * :func:`decision_rule_table`: the registered decision rule of the frame claim, from seed-paired
   test-CE differences (mean, paired standard error and the margin :math:`\max(2\,\mathrm{SE}, 0.03)`,
   with the one-sided paired-t p-value and the t-based 95% interval reported beside it); a clause whose
-  arms the manifest flags (unverified, stale, failed, non-homogeneous) is undetermined; runs on other code or
-  another training-window protocol are noted beside it. Clause (c),
+  arms the manifest flags (unverified, stale, failed, non-homogeneous), that would drop a listed run or a
+  planned seed pair, or whose data or evaluation protocol differs from the evaluated arm's is
+  undetermined; runs on other code or another training-window protocol are noted beside it. Clause (c),
   the equal-size per-type table, is the dated amendment of October 9, 2026.
 * :func:`per_seed_table`: ``tab:placeholder_per_seed``. Per run: model and data-order seed, selected
   step, validation CE, test CE and PPL under the declared selection rule.
@@ -63,7 +64,7 @@ RESOURCE_ROWS: Tuple[str, ...] = (
     "Per-type tables (token frames, prior means and covariances, decoder)",
     "Positional frame generators",
     "Context-processing parameters (interface maps, MLP, normalization)",
-    "Parameters read per token",
+    "Parameters read per token (unique)",
     "Optimizer state and peak device memory",
     "Training throughput and device-hours",
     "Inference latency at declared batch and context",
@@ -150,14 +151,37 @@ def md_mean_sd(values: Sequence[float], digits: int) -> str:
     return f"{mean:.{digits}f} ± {sd:.{digits}f}" if sd is not None else f"{mean:.{digits}f}"
 
 
+def _count_mantissa(scaled: float) -> str:
+    r"""Two decimals, or one from 100 up, judged after rounding (``99.996 -> '100.0'``)."""
+    text = f"{scaled:.2f}"
+    return f"{scaled:.1f}" if abs(float(text)) >= 100 else text
+
+
 def count_short(value: Any) -> str:
-    r"""Compact count: ``5252608 -> '5.25M'``, ``456654162 -> '456.7M'``, ``1.2e9 -> '1.20B'``."""
+    r"""Compact count: ``5252608 -> '5.25M'``, ``456654162 -> '456.7M'``, ``1.2e9 -> '1.20B'``.
+
+    The suffix is chosen after rounding, so a count just below a power of 1000 takes the next suffix
+    (``999_950 -> '1.00M'``, not ``'1000.0k'``; audit 2026-10-31, paper-claims-6).
+    """
     value = float(value)
-    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
-        if abs(value) >= scale:
-            scaled = value / scale
-            return f"{scaled:.1f}{suffix}" if abs(scaled) >= 100 else f"{scaled:.2f}{suffix}"
-    return f"{value:.0f}"
+    if abs(round(value)) < 1000:
+        return f"{value:.0f}"
+    for scale, suffix in ((1e3, "k"), (1e6, "M")):
+        text = _count_mantissa(value / scale)
+        if abs(float(text)) < 1000:
+            return text + suffix
+    return _count_mantissa(value / 1e9) + "B"
+
+
+def hours_digits(value: Optional[float]) -> int:
+    r"""Decimals that print ``value`` with at least two significant figures and at least one decimal.
+
+    :math:`\max(1,\ 1 - \lfloor \log_{10} |h| \rfloor)`: ``0.133 -> 0.13``, ``1.38 -> 1.4``, ``13.8 -> 13.8``, so
+    a sub-hour GPU-hours cell keeps the ratios between runs (audit 2026-10-31, paper-claims-6).
+    """
+    if value is None or not math.isfinite(value) or value == 0:
+        return 1
+    return max(1, 1 - int(math.floor(math.log10(abs(value)))))
 
 
 class Code(str):
@@ -234,13 +258,21 @@ def _arm_record(arm: Arm, rule: str, *, read_checkpoints: bool) -> Dict[str, Any
 
 
 def _param_cell(params: Mapping[str, Any], latex: bool) -> str:
+    r"""``context / total`` trainable parameters, with a stored frozen table added as ``(+n frozen)``.
+
+    :func:`vfe3.paper.runs.parameter_counts` leaves frozen tables (frozen random frames) out of every section
+    and of ``total``; the cell names them, so an arm whose fixed tables act in every layer does not read as a
+    model of its trainable size alone (audit 2026-10-31, paper-claims-6).
+    """
     total = params.get("total")
     context = (params.get("context_processing") or {}).get("total")
+    frozen = (params.get("frozen") or {}).get("total")
     if total is None:
         return PENDING
-    if context is None:
-        return f"{count_short(total)} total"
-    return f"{count_short(context)} / {count_short(total)}"
+    cell = f"{count_short(total)} total" if context is None else f"{count_short(context)} / {count_short(total)}"
+    if isinstance(frozen, int) and not isinstance(frozen, bool) and frozen > 0:
+        cell += f" (+{count_short(frozen)} frozen)"
+    return cell
 
 
 def main_results_table(
@@ -253,9 +285,12 @@ def main_results_table(
 
     Test CE and PPL are the mean :math:`\pm` SD (ddof = 1) over the runs whose selected test value
     exists, with :math:`\mathrm{PPL}_s = e^{\mathrm{CE}_s}` per seed; one run shows the value alone.
-    Parameters are context-processing / total (``count_short``); GPU-hours are the mean training-only
+    Parameters are context-processing / total trainable (``count_short``), with a stored frozen table added
+    as ``(+n frozen)``; GPU-hours are the mean training-only
     device-hours per run (:func:`vfe3.paper.runs.train_device_hours`, evaluation excluded, the quantity
-    the compute-matched arm matches), with the mean wall time beside them in the markdown. A config
+    the compute-matched arm matches) to at least two significant figures (:func:`hours_digits`), with the
+    mean wall time beside them in the markdown. An arm whose recorded data or evaluation protocol differs
+    from the evaluated arm's (:func:`_protocol_mismatches`) carries a note in the markdown. A config
     difference within an arm is written as a LaTeX comment above its row, marks the arm label with
     :data:`CONFIG_DIFF_MARK` (the fields in a note row under the table) and is listed in the markdown.
     When the runs with a test value all share one data order (:func:`shared_data_order`), the seed count
@@ -269,6 +304,7 @@ def main_results_table(
     shared_arms: List[str] = []
     differing: List[str] = []                     # LaTeX note text per non-homogeneous arm
     current_group: Optional[str] = None
+    evaluated_arm = next((arm for arm in manifest.arms if arm.label == _evaluated_label(manifest)), None)
     for index, arm in enumerate(manifest.arms):
         if arm.group and arm.group != current_group:
             if body:
@@ -304,6 +340,11 @@ def main_results_table(
             notes.append("config differs across runs in: " + ", ".join(v["field"] for v in violations))
         if arm.homogeneity.get("duplicate_seed_pairs"):
             notes.append(f"duplicate (seed, data seed): {arm.homogeneity['duplicate_seed_pairs']}")
+        protocol = (_protocol_mismatches(evaluated_arm, arm)
+                    if evaluated_arm is not None and arm is not evaluated_arm else [])
+        if protocol:
+            notes.append("data or evaluation protocol differs from the evaluated arm in: "
+                         + "; ".join(protocol))
         wall_fallback = [r["run"].name for r in record["runs"]
                          if r["hours"] is not None and "wall time" in str(r["hours_source"])]
         if wall_fallback:
@@ -327,13 +368,15 @@ def main_results_table(
             label_tex, seeds + (SHARED_ORDER_MARK if shared is not None else ""),
             _param_cell(params, True) if params else PENDING,
             tex_mean_sd(ces, CE_DIGITS), tex_mean_sd(ppls, PPL_DIGITS_MAIN),
-            tex_float(hours_mean, 1),
+            tex_float(hours_mean, hours_digits(hours_mean)),
         ]) + r" \\")
         md.append(_md_row([arm.label, seeds + ("\u2020" if shared is not None else ""),
                            _param_cell(params, False) if params else PENDING,
                            md_mean_sd(ces, CE_DIGITS), md_mean_sd(ppls, PPL_DIGITS_MAIN),
-                           (f"{hours_mean:.2f}" if hours_mean is not None else PENDING) + " / "
-                           + (f"{wall_mean:.2f}" if wall_mean is not None else PENDING),
+                           (f"{hours_mean:.{max(2, hours_digits(hours_mean))}f}" if hours_mean is not None
+                            else PENDING) + " / "
+                           + (f"{wall_mean:.{max(2, hours_digits(wall_mean))}f}" if wall_mean is not None
+                              else PENDING),
                            "; ".join(notes)]))
         rows.append({
             "arm": arm.label, "group": arm.group, "n_runs": len(arm.runs), "n_selected": len(ok),
@@ -348,9 +391,11 @@ def main_results_table(
                       "parameters_source": r["params"].get("source")} for r in record["runs"]],
         })
     caption = (f"\nSelection rule: '{manifest.selection}'. Test CE/PPL: mean ± SD (ddof = 1) over seeds; "
-               "PPL is exp(CE) per seed. Parameters: context-processing / total. GPU-hours: mean "
+               "PPL is exp(CE) per seed. Parameters: context-processing / total trainable; a stored frozen "
+               "table (fixed, not trained) is added in parentheses. GPU-hours: mean "
                "training-only device-hours per run (one device; logged optimizer-step time, evaluation "
-               "excluded), the quantity the compute-matched arm matches; the LaTeX column carries it, and "
+               "excluded), the quantity the compute-matched arm matches, to at least two significant "
+               "figures; the LaTeX column carries it, and "
                "the mean wall time including evaluation follows the slash here."
                + (" \u2020 One shared data order across the seeds of the arm: the SD is initialization and "
                   "optimization variance only." if shared_arms else "") + "\n")
@@ -506,13 +551,102 @@ def _unverified_reasons(arm: Arm) -> List[str]:
         reasons.append(f"{arm.label!r}: {len(arm.stale)} stale complete run(s) whose config is not the plan's")
     if arm.failed:
         reasons.append(f"{arm.label!r}: {len(arm.failed)} seed pair run(s) finished without a finite test CE "
-                       "(failed); deciding on the surviving pairs would select over seeds")
+                       "or a test value under the selection rule (failed); deciding on the surviving pairs "
+                       "would select over seeds")
     if arm.homogeneity and not arm.homogeneity.get("homogeneous", True):
         fields = [v["field"] for v in arm.homogeneity.get("violations") or []]
         duplicates = arm.homogeneity.get("duplicate_seed_pairs") or []
         reasons.append(f"{arm.label!r}: runs are not homogeneous (config differs in {fields}"
                        + (f"; duplicate seed pairs {duplicates}" if duplicates else "") + ")")
     return reasons
+
+
+def _unselected_reasons(arm: Arm, rule: str) -> List[str]:
+    r"""Listed runs of ``arm`` the rule cannot pair: no selected test value under ``rule``, no recorded seed
+    pair, or a duplicate pair (audit 2026-10-31, paper-claims-1). Deciding on the other pairs would drop a
+    listed run after its result is known, the selection over seeds the failed-pair rule closes."""
+    _, unpaired = _selected_by_pair(arm, rule)
+    if not unpaired:
+        return []
+    return [f"{arm.label!r}: {len(unpaired)} listed run(s) with no selected test value under rule {rule!r} or no "
+            f"unique seed pair ({', '.join(unpaired)}); deciding on the surviving pairs would select over seeds"]
+
+
+def _missing_planned_pairs(arm: Arm, rule: str, planned: Sequence[Tuple[int, int]]) -> List[str]:
+    r"""Planned seed pairs (``paper_arms.seeds``) without a run of ``arm`` that has a selected test value.
+
+    A clause decided before the registered design is complete would be optional stopping (audit 2026-10-31,
+    paper-claims-1); empty when the manifest records no planned pairs.
+    """
+    if not planned:
+        return []
+    selected, _ = _selected_by_pair(arm, rule)
+    missing = [list(pair) for pair in planned if tuple(pair) not in selected]
+    if not missing:
+        return []
+    return [f"{arm.label!r}: planned seed pair(s) {missing} (paper_arms.seeds) have no run with a selected test "
+            "value; the registered design is incomplete"]
+
+
+# The data and evaluation protocol a seed-paired difference assumes its two arms share (audit 2026-10-31,
+# paper-claims-7): provenance data identity and tokenizer, the evaluation windows, the validation cadence that
+# selects the checkpoint, the training-token budget and the scored test targets.
+PAIRED_PROVENANCE_FIELDS: Tuple[str, ...] = (
+    "tokenizer_tag", "max_tokens", "val_data_sha256", "val_data_n_tokens", "test_data_sha256",
+    "test_data_n_tokens")
+PAIRED_CONFIG_FIELDS: Tuple[str, ...] = ("max_seq_len", "eval_stride", "eval_interval")
+_UNRECORDED = object()
+
+
+def _protocol_values(run: RunRecord) -> Dict[str, Any]:
+    r"""The recorded protocol of one run; :data:`_UNRECORDED` where the run's records lack the field."""
+    values: Dict[str, Any] = {
+        f"provenance:{key}": run.provenance[key] if key in run.provenance else _UNRECORDED
+        for key in PAIRED_PROVENANCE_FIELDS}
+    for key in PAIRED_CONFIG_FIELDS:
+        values[key] = run.config_raw[key] if key in run.config_raw else _UNRECORDED
+    steps, tokens_per_step = run.raw("max_steps"), run.tokens_per_step()
+    values["training_tokens"] = (int(steps) * tokens_per_step
+                                 if isinstance(steps, int) and not isinstance(steps, bool) and tokens_per_step
+                                 else _UNRECORDED)
+    scored = run.summary.get("test_scored_targets")
+    values["summary:test_scored_targets"] = scored if scored is not None else _UNRECORDED
+    return values
+
+
+def _protocol_mismatches(evaluated: Arm, other: Arm) -> List[str]:
+    r"""Protocol fields whose recorded values differ between the runs of ``evaluated`` and ``other``.
+
+    A field is compared when both arms record it; a field one arm does not record cannot be checked and is not
+    a mismatch. Each entry reads ``field: <evaluated values> vs <other values>``.
+    """
+    from vfe3.paper.runs import _canonical
+
+    if not evaluated.runs or not other.runs:
+        return []
+    per_run = {id(run): _protocol_values(run) for run in (*evaluated.runs, *other.runs)}
+    out: List[str] = []
+    for key in per_run[id(evaluated.runs[0])]:
+        sides = [{_canonical(per_run[id(run)][key]) for run in arm.runs
+                  if per_run[id(run)][key] is not _UNRECORDED} for arm in (evaluated, other)]
+        if sides[0] and sides[1] and sides[0] != sides[1]:
+            out.append(f"{key}: {', '.join(sorted(sides[0]))} vs {', '.join(sorted(sides[1]))}")
+    return out
+
+
+def _protocol_reasons(evaluated: Arm, other: Arm) -> List[str]:
+    r"""The undetermined reason of a clause whose arm was trained, selected or scored unlike the evaluated arm."""
+    mismatches = _protocol_mismatches(evaluated, other)
+    if not mismatches:
+        return []
+    return [f"{other.label!r} and {evaluated.label!r} differ in their data or evaluation protocol "
+            f"({'; '.join(mismatches)}); a paired difference needs both on one test stream and protocol"]
+
+
+def _evaluated_label(manifest: Manifest) -> Optional[str]:
+    r"""The evaluated arm's label: ``manifest.decision['evaluated']``, else the first starting with ``"Evaluated"``."""
+    return manifest.decision.get("evaluated") or next(
+        (arm.label for arm in manifest.arms if arm.label.startswith(DECISION_EVALUATED_PREFIX)), None)
 
 
 def _code_identity_notes(arm: Arm) -> List[str]:
@@ -566,7 +700,12 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
 
     A clause is undetermined (``holds`` None, the reasons under ``undetermined``) when an arm it reads
     has runs listed without a config check (``reuse_verified`` False), stale complete runs, finished runs
-    without a finite test CE (``failed``), runs whose configs differ (``homogeneity``); its statistics are still
+    without a finite test CE (``failed``), runs whose configs differ (``homogeneity``), a listed run without a
+    selected test value or a unique seed pair, or a planned seed pair (``Manifest.planned_seed_pairs``, from
+    ``paper_arms.seeds``) without a run with a selected value, so the rule never decides on the surviving pairs
+    of a design (audit 2026-10-31, paper-claims-1); and when the clause arm's recorded data or evaluation
+    protocol differs from the evaluated arm's (:func:`_protocol_mismatches`: data identity, tokenizer, context,
+    stride, validation cadence, token budget, scored test targets; paper-claims-7). Its statistics are still
     reported. Runs trained on code other than the tree that wrote the manifest (``code_identity_mismatch``) are
     listed under ``code_identity_notes``, and reused runs trained under another training-window protocol
     (``window_protocol_mismatch``) under ``window_protocol_notes``, without changing the verdict. ``shared_data_order`` is the one data seed all
@@ -574,8 +713,7 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
     then excludes data-order variance; it is reported and does not change the verdict.
     """
     by_label = {arm.label: arm for arm in manifest.arms}
-    evaluated_label = manifest.decision.get("evaluated") or next(
-        (arm.label for arm in manifest.arms if arm.label.startswith(DECISION_EVALUATED_PREFIX)), None)
+    evaluated_label = _evaluated_label(manifest)
     labels = {"evaluated": evaluated_label,
               "comparator": manifest.decision.get("comparator", DECISION_COMPARATOR),
               "frozen": manifest.decision.get("frozen", DECISION_FROZEN),
@@ -603,6 +741,13 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
             continue
         stats = paired_difference(evaluated, other, manifest.selection)
         undetermined = [reason for arm in (evaluated, other) for reason in _unverified_reasons(arm)]
+        # Audit 2026-10-31 (paper-claims-1, paper-claims-7): every listed run and every planned pair enters
+        # the clause, and both arms share one data and evaluation protocol.
+        undetermined += [reason for arm in (evaluated, other)
+                         for reason in (*_unselected_reasons(arm, manifest.selection),
+                                        *_missing_planned_pairs(arm, manifest.selection,
+                                                                manifest.planned_seed_pairs))]
+        undetermined += _protocol_reasons(evaluated, other)
         code_notes = [note for arm in (evaluated, other) for note in _code_identity_notes(arm)]
         window_notes = [note for arm in (evaluated, other) for note in _window_protocol_notes(arm)]
         holds = None if stats["margin"] is None or undetermined else (
@@ -830,6 +975,11 @@ def _resource_cells(record: Optional[Mapping[str, Any]], latex: bool) -> List[st
         return f"{num(entry['total'])} ({pct(share)})" if share is not None else num(entry["total"])
 
     read = params.get("parameters_read_per_token")
+    # vfe3.run_resources counts each parameter once; a module every layer applies (the block norm, a tied block
+    # MLP) is read once per layer, which the parenthetical count adds (audit 2026-10-31 posthoc-measurement-10).
+    reuse = params.get("parameter_reads_per_token_with_layer_reuse")
+    read_cell = (NOT_RECORDED if read is None else
+                 num(read) + (f" ({num(reuse)} with layer reuse)" if reuse is not None and reuse != read else ""))
     opt, peak = record["optimizer_state_bytes"], record["peak_memory_mb"]
     memory = "; ".join([f"{opt / 1e9:.2f} GB optimizer state" if opt else f"optimizer state {NOT_RECORDED}",
                         f"peak {peak / 1e3:.2f} GB" if peak else f"peak {NOT_RECORDED}"])
@@ -841,7 +991,7 @@ def _resource_cells(record: Optional[Mapping[str, Any]], latex: bool) -> List[st
     latency = (f"{1000 * lat['seconds_per_batch_median']:.1f} ms per batch of {lat['batch_size']} x "
                f"{lat['context']} ({lat.get('precision')})" if lat else NOT_RECORDED)
     cells = [section("per_type_tables"), section("positional_frames"), section("context_processing"),
-             num(read) if read is not None else NOT_RECORDED, memory, throughput, latency]
+             read_cell, memory, throughput, latency]
     return [c if not latex or c.startswith("$") or "$" in c else tex_escape(c) for c in cells]
 
 
@@ -908,7 +1058,10 @@ def _source_items(run: RunRecord) -> List[Item]:
         items.append(("Git revision at start", Hash(p["git_sha"])))
         items.append(("dirty tree", "yes" if dirty else "no" if dirty is False else NOT_RECORDED))
         final = p.get("final_git_identity") or {}
-        if p.get("source_identity_drift") and isinstance(final.get("git_sha"), str):
+        # Drift of the executable sources: a record written before 2026-10-31 also set source_identity_drift for a
+        # Git working-tree change no executed byte depends on (audit 2026-10-31 artifacts-finalize-2).
+        drifted = p["code_identity_drift"] if "code_identity_drift" in p else p.get("source_identity_drift")
+        if drifted and isinstance(final.get("git_sha"), str):
             items.append(("source drifted; final revision", Hash(final["git_sha"])))
     retired = sorted(run.dropped_config_fields)
     if retired:

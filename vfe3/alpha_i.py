@@ -111,8 +111,14 @@ def alpha_state_dependent_per_coord(
     A pure function of whatever divergence it is given: the per-coordinate self-term
     sum_k alpha^(k) D^(k) results when fed the UNSUMMED per-coordinate divergence of shape
     (..., N, K) that ``free_energy.self_divergence_for_alpha`` routes here for this form
-    (declared ``per_coord=True``). The per-coordinate divergence exists only for the
-    diagonal family + Renyi functional, enforced by the router and at config construction.
+    (declared ``per_coord=True``). Two layouts of D^(k) are admitted (``VFE3Config.__post_init__``): the
+    diagonal family's marginal coordinate KLs, and, for a family declaring ``conditional_kl_coordinates``
+    (``gaussian_full``, inherited by ``gaussian_block``), the ordered conditional terms
+    D_k = E_q[KL(q(x_k|x_<k) || p(x_k|x_<k))], which sum to the full KL but depend on the coordinate order
+    (``FullGaussian.renyi_per_coord``). Only the KL (alpha = 1) is implemented. The full-link receiver alone
+    restricts the per-coordinate form to ``gaussian_diagonal``, whose KL separates by coordinate
+    (``config.py`` full-link checks and ``inference.e_step.e_step_iteration``; audit 2026-10-31,
+    minimal-agent-receiver-7).
     """
     unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
     if unknown:

@@ -387,7 +387,7 @@ def test_tiny_model_direction_matches_a_dense_chart_route_and_descends() -> None
 
     _, loss0, decode_stats = model_loss()
     loss0.backward()
-    provider = PhiFisherStatisticsProvider(model, 2.0)
+    provider = PhiFisherStatisticsProvider(model)
     provider.set_batch(tokens, decode_stats.scored_tokens)
     total = float(decode_stats.scored_tokens)
     H, d = 2, 3
@@ -553,7 +553,7 @@ def test_provider_counts_scored_tokens_and_positional_columns() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = VFEModel(cfg)
-    provider = PhiFisherStatisticsProvider(model, 2.0)
+    provider = PhiFisherStatisticsProvider(model)
     with pytest.raises(RuntimeError, match="without batch tokens"):
         provider(model.prior_bank.phi_embed, torch.tensor([0]))
     tokens = torch.tensor([[0, 1, 1, 5], [5, 5, 2, 1]])

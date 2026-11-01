@@ -68,6 +68,9 @@ from torch.utils.checkpoint import checkpoint
 from vfe3.runtime import ieee_fp32_matmul
 
 CUE_RESULT_TILE_BYTES = 32 * 1024 ** 2          # bound on one chunk's (tokens, m, K, K) tensors, not total memory
+# A low-rank leave-one-out contraction below this many eps |U_k|^2 tr G^(-k) is recomputed directly (audit 2026-10-31
+# A085); the fused kernels use the same 2^12 eps (``_off_axis`` in vfe3/kernels/_cue_result_triton.py).
+_LOO_RESCUE_FACTOR = 2.0 ** 12
 
 
 class CueResultPosterior(NamedTuple):
@@ -319,6 +322,47 @@ def cue_result_exact_posterior(
                               log_weights.reshape(*batch, M), log_evidence.reshape(batch))
 
 
+def _rescue_off_axis(
+    off:   torch.Tensor,                        # (r, m, K) U_k^T G^(-k) U_k from the Gram contraction
+    gram:  torch.Tensor,                        # (r, m, K, rank, rank) leave-one-out Gram G^(-k)
+    p:     torch.Tensor,                        # (r, m, K) diag P_X
+    left:  torch.Tensor,                        # (m, K, rank) U_a
+    right: torch.Tensor,                        # (m, K, rank) V_a
+) -> torch.Tensor:                              # (r, m, K) off with the flagged elements recomputed
+    r"""Recompute :math:`\sum_{l\ne k}p_l(U_k\cdot V_l)^2` directly where the Gram contraction can have cancelled.
+
+    By Cauchy-Schwarz
+    :math:`\sum_lp_l\lvert V_{lr}\rvert\lvert V_{ls}\rvert\le(G^{(-k)}_{rr}G^{(-k)}_{ss})^{1/2}`, so the rounding error
+    of :math:`U_k^\top G^{(-k)}U_k` is of order :math:`\gamma\lvert U_k\rvert^2\operatorname{tr}G^{(-k)}`, with
+    :math:`\gamma` the rounding constant of the sums (a few :math:`\epsilon` typically, about
+    :math:`(K + r^2)\epsilon` at worst). At rank one that is relative to the sum itself (a product of nonnegative
+    factors); at rank two or more it is not, because a factor row :math:`U_k` with entries of both signs cancels inside
+    the contraction however small the couplings :math:`U_k\cdot V_l` are (audit 2026-10-31 A085). Elements whose
+    computed sum lies below :math:`2^{12}\epsilon\lvert U_k\rvert^2\operatorname{tr}G^{(-k)}` are recomputed as the sum
+    of nonnegative terms :math:`p_l(U_k\cdot V_l)^2`, dot products and sum in float64, and gradients reach them through
+    that sum; the unflagged elements keep the contraction, whose relative error is then below
+    :math:`2^{-12}\gamma/\epsilon`. The flag costs one host read per tile; a tile with no flagged element returns
+    ``off`` itself, so its values are unchanged. Flagged elements are processed in chunks whose float64 transients stay
+    near the size of ``gram``."""
+    K, rank = left.shape[-2], left.shape[-1]
+    with torch.no_grad():
+        bound = left.square().sum(-1) * gram.diagonal(dim1=-2, dim2=-1).sum(-1)       # (r, m, K) |U_k|^2 tr G^(-k)
+        flag = off.abs() < (_LOO_RESCUE_FACTOR * torch.finfo(off.dtype).eps) * bound
+        if not bool(flag.any()):
+            return off
+        rows, comps, coords = flag.nonzero(as_tuple=True)                           # (n,) the flagged elements
+    wide = torch.float64
+    lanes = torch.arange(K, device=off.device)
+    step = max(1, gram.numel() * gram.element_size() // (8 * K * (rank + 2)))
+    direct = []
+    for s in range(0, rows.numel(), step):
+        i, a, k = rows[s:s + step], comps[s:s + step], coords[s:s + step]
+        dots = torch.einsum("nr,nlr->nl", left[a, k].to(wide), right[a].to(wide))     # (n, K) U_k . V_l
+        terms = (p[i, a].to(wide) * dots.square()).masked_fill(lanes == k.unsqueeze(-1), 0.0)   # (n, K), l != k
+        direct.append(terms.sum(-1))
+    return off.index_put((rows, comps, coords), torch.cat(direct).to(off.dtype))
+
+
 @ieee_fp32_matmul()
 def _diagonal_tile(
     xi:         torch.Tensor,                   # (r, K)
@@ -343,9 +387,11 @@ def _diagonal_tile(
     expanded form :math:`q + p + 2pa + [UGU^\top]_{kk}` cancelled a positive :math:`q` against :math:`p` where :math:`F`
     cancels a coordinate (audit 2026-10-25 F02), and the remainder :math:`[UGU^\top]_{kk} - p_ka_k^2` with the full
     Gram :math:`G = V^\top PV` lost any off-axis remainder below :math:`\epsilon p_ka_k^2` while accumulating
-    :math:`G` (audit 2026-10-28 F01). :math:`G^{(-k)}` holds no self term and is formed without subtraction, so the
-    rounding error of the off-axis sum is of order :math:`\epsilon\lvert U_k\rvert^2\sum_{l\ne k}p_l\lvert V_l\rvert^2`,
-    which vanishes with the off-axis couplings themselves."""
+    :math:`G` (audit 2026-10-28 F01). :math:`G^{(-k)}` holds no self term and is formed without subtraction, but the
+    rounding error of the contraction is of order :math:`\epsilon\lvert U_k\rvert^2\operatorname{tr}G^{(-k)}`, which
+    vanishes with the off-axis couplings only at rank one (or for a single-entry :math:`U_k`): at rank two or more a
+    factor row with entries of both signs cancels inside it (audit 2026-10-31 A085). Elements whose contraction lies
+    below :math:`2^{12}` times that bound are recomputed directly by :func:`_rescue_off_axis`."""
     K = xi.shape[-1]
     W = c.unsqueeze(-2) + lam                                                            # (r, m, K) diag(L_a + C)
     delta = xi.unsqueeze(-2) - nu                                                        # (r, m, K) xi - nu_a
@@ -365,7 +411,10 @@ def _diagonal_tile(
         zero = torch.zeros_like(e[..., :1, :, :])
         before = torch.cat([zero, e[..., :-1, :, :].cumsum(-3)], dim=-3)                 # sum over l < k, no self term
         after = torch.cat([e[..., 1:, :, :].flip(-3).cumsum(-3).flip(-3), zero], dim=-3)  # sum over l > k
-        off = torch.einsum("akr,iakrs,aks->iak", left, before + after, left)             # U_k^T G^(-k) U_k
+        gram = before + after                                                            # (r, m, K, rank, rank) G^(-k)
+        off = torch.einsum("akr,iakrs,aks->iak", left, gram, left)                       # U_k^T G^(-k) U_k
+        if left.shape[-1] > 1:                                                           # rank 1 cannot cancel (A085)
+            off = _rescue_off_axis(off, gram, p, left, right)
         v_Y = (p * (1.0 + a).square() + torch.clamp_min(off, 0.0)) + q                   # diag F P F^T, then Q
     s, l, w = _shifted_mass(log_w)                                                       # (r,), (r,), (r, m)
     mean = (w.unsqueeze(-1) * m_Y).sum(-2)                                               # (r, K)
@@ -441,7 +490,8 @@ def cue_result_diagonal_posterior(
         offset, left, right = (cast(t) for t in reg)
         rank = 0 if left is None else left.shape[-1]
         # About eight (r, m, K) tensors per tile, plus (r, m, K, K)-sized work for a dense F or about four
-        # (r, m, K, rank, rank) leave-one-out Gram tensors for a low-rank one.
+        # (r, m, K, rank, rank) leave-one-out Gram tensors for a low-rank one (whose rare direct recomputations,
+        # _rescue_off_axis, run in chunks of about one Gram tensor).
         per_pair = K * (8 + (K if offset is not None else 0) + 4 * rank * rank)
         pairs = max(1, int(tile_bytes) // ((torch.finfo(dtype).bits // 8) * per_pair))
         m_step = min(M, pairs)

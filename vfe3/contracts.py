@@ -176,6 +176,11 @@ def host_read(values: Optional[torch.Tensor]) -> Optional[list]:
 _GATHER_SOURCE = "_vfe3_frame_gather_source"
 
 
+class _FrameFlagTypeError(TypeError, ValueError):
+    """A non-bool frame-layout flag: a ``TypeError`` that ``ValueError`` callers still catch, as the configuration's
+    type errors are (audit 2026-10-31 A325)."""
+
+
 def mark_gathered_frame_pair(
     forward:        torch.Tensor,  # (n, H, d, d) occurrence rows, (U, H, d, d) gathered by a row index
     inverse:        torch.Tensor,  # (n, H, d, d)
@@ -187,15 +192,18 @@ def mark_gathered_frame_pair(
     The producer certifies that every occurrence row is a bitwise copy of a unique row and that every
     unique row occurs, so every maximum and every finiteness verdict of the
     :class:`CanonicalFrameContext` residual check is the same over the unique rows as over the
-    occurrences. The record holds only for these exact tensor objects at their current version: any
-    view, slice, product or in-place write produces a tensor the context validates in full.
+    occurrences. The record holds only for these exact tensor objects at their current version, on both
+    sides of the substitution: any view, slice, product or in-place write of an occurrence tensor
+    produces a tensor the context validates in full, and an in-place write of a unique tensor voids the
+    record (audit 2026-10-31 A315).
 
     Inference tensors (created under ``torch.inference_mode()``) carry no version counter, so no record is
     kept for them and the context validates the occurrence pair in full (audit 2026-10-25 F05).
     """
     if any(t.is_inference() for t in (forward, inverse, unique_forward, unique_inverse)):
         return
-    record = (unique_forward, unique_inverse, forward._version, inverse._version)
+    record = (unique_forward, unique_inverse, forward._version, inverse._version,
+              unique_forward._version, unique_inverse._version)
     setattr(forward, _GATHER_SOURCE, record)
     setattr(inverse, _GATHER_SOURCE, record)
 
@@ -205,8 +213,10 @@ def _gathered_source(forward: torch.Tensor, inverse: torch.Tensor) -> Optional[T
     record = getattr(forward, _GATHER_SOURCE, None)
     if record is None or getattr(inverse, _GATHER_SOURCE, None) is not record:
         return None
-    unique_forward, unique_inverse, forward_version, inverse_version = record
+    (unique_forward, unique_inverse, forward_version, inverse_version,
+     unique_forward_version, unique_inverse_version) = record
     if (forward._version != forward_version or inverse._version != inverse_version
+            or unique_forward._version != unique_forward_version or unique_inverse._version != unique_inverse_version
             or unique_forward.shape[1:] != forward.shape[-3:] or unique_forward.dtype != forward.dtype
             or unique_inverse.shape != unique_forward.shape or unique_inverse.dtype != inverse.dtype):
         return None
@@ -224,7 +234,8 @@ class CanonicalFrameContext:
     @torch.no_grad()
     def __post_init__(self) -> None:
         if type(self.block_diagonal) is not bool:
-            raise ValueError("canonical block_diagonal must be a bool")
+            raise _FrameFlagTypeError(
+                f"canonical block_diagonal must be a bool, got {type(self.block_diagonal).__name__}")
         if self.block_diagonal and (self.forward.dim() < 3 or self.forward.shape[-3] < 1):
             raise ValueError("compact canonical frames require a nonempty head axis")
         if self.forward.shape != self.inverse.shape:
@@ -289,8 +300,11 @@ class CanonicalFrameContext:
             * conditioning_scale
         )
         tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
+        # The factor finiteness reads the validated rows too: on a gathered pair every occurrence is a bitwise copy
+        # of a unique row and every unique row occurs, so the verdict is the occurrence verdict without the two
+        # occurrence-sized passes (audit 2026-10-31, transport-geometry-5 and -6).
         flags = torch.stack((
-            torch.isfinite(self.forward).all() & torch.isfinite(self.inverse).all(),
+            torch.isfinite(validated_forward).all() & torch.isfinite(validated_inverse).all(),
             torch.isfinite(forward_inverse).all() & torch.isfinite(inverse_forward).all(),
             (torch.isfinite(residual).all() & torch.isfinite(conditioning_scale).all()
              & torch.isfinite(unbounded_tolerance).all()),
@@ -341,7 +355,7 @@ def trusted_identity_context(
     validating constructor.
     """
     if type(block_diagonal) is not bool:
-        raise TypeError(f"block_diagonal must be a bool, got {type(block_diagonal).__name__}")
+        raise _FrameFlagTypeError(f"block_diagonal must be a bool, got {type(block_diagonal).__name__}")
     if not identity.is_floating_point() or identity.shape[-1] != identity.shape[-2]:
         raise ValueError("the identity frame must be a floating square matrix (stack)")
     context = object.__new__(CanonicalFrameContext)
@@ -349,6 +363,83 @@ def trusted_identity_context(
     object.__setattr__(context, "inverse", identity)
     object.__setattr__(context, "block_diagonal", block_diagonal)
     return context
+
+
+def trusted_dense_frame_context(
+    forward:   torch.Tensor,             # (..., K, K) block-diagonal embedding of validated.forward
+    inverse:   torch.Tensor,             # (..., K, K) block-diagonal embedding of validated.inverse
+    *,
+    validated: CanonicalFrameContext,    # the compact (..., H, d, d) context the pair embeds, already validated
+) -> CanonicalFrameContext:
+    r"""A dense :class:`CanonicalFrameContext` of a validated compact pair's block-diagonal embedding, not re-validated.
+
+    The embedding has exactly zero off-head blocks, so its mutual-inverse residual, its infinity-norm scales and the
+    dimension :math:`K = Hd` of its tolerance are the compact pair's, up to float64 rounding of the on-block
+    products; the compact context's verdict, already registered, is therefore the dense pair's. Validating the
+    dense pair again multiplied two float64 ``(..., K, K)`` copies at the full occurrence count, about 116 GFLOP per
+    forward at the live shape (audit 2026-10-31 A196). Only the layout checks are kept; the caller guarantees the
+    two tensors are the embeddings of ``validated``'s blocks (as ``CompactBlockElement.to_dense`` forms them).
+    """
+    if type(validated) is not CanonicalFrameContext or not validated.block_diagonal:
+        raise ValueError("trusted_dense_frame_context needs the validated compact (block_diagonal) context")
+    H, d = validated.forward.shape[-3], validated.forward.shape[-1]
+    shape = (*validated.forward.shape[:-3], H * d, H * d)
+    if tuple(forward.shape) != shape or tuple(inverse.shape) != shape:
+        raise ValueError(f"the dense frame pair must have shape {shape}, got {tuple(forward.shape)} and "
+                         f"{tuple(inverse.shape)}")
+    if (forward.dtype != validated.forward.dtype or inverse.dtype != validated.inverse.dtype
+            or forward.device != validated.forward.device or inverse.device != validated.inverse.device):
+        raise ValueError("the dense frame pair must keep the validated context's dtype and device")
+    context = object.__new__(CanonicalFrameContext)
+    object.__setattr__(context, "forward", forward)
+    object.__setattr__(context, "inverse", inverse)
+    object.__setattr__(context, "block_diagonal", False)
+    return context
+
+
+# Attribute naming the occurrence-to-row index of a gathered frame pair (see mark_gathered_frame_index).
+_GATHER_INDEX = "_vfe3_frame_gather_index"
+
+
+def mark_gathered_frame_index(
+    forward: torch.Tensor,  # (..., H, d, d) occurrence rows of a pair recorded by mark_gathered_frame_pair
+    inverse: torch.Tensor,  # (..., H, d, d)
+    index:   torch.Tensor,  # (T,) long: the unique row each flattened occurrence row copies, T = prod(...)
+) -> None:
+    r"""Record which unique row each occurrence row of a gathered frame pair copies.
+
+    The producer certifies, beside :func:`mark_gathered_frame_pair`, that ``forward[t]`` and ``inverse[t]`` (occurrences
+    flattened) are bitwise copies of row ``index[t]`` of the unique pair. Type-level consumers read it through
+    :func:`gathered_frame_rows` (the relational scorer's ``relational_type_moments``; audit 2026-10-31
+    relational-operators-1). Like the pair record it holds only for these exact tensors at their current version, and
+    no record is kept for inference tensors.
+    """
+    if any(t.is_inference() for t in (forward, inverse, index)):
+        return
+    record = (index, forward._version, inverse._version)
+    setattr(forward, _GATHER_INDEX, record)
+    setattr(inverse, _GATHER_INDEX, record)
+
+
+def gathered_frame_rows(
+    forward: torch.Tensor,
+    inverse: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:   # (U, H, d, d), (U, H, d, d), (T,)
+    r"""``(unique_forward, unique_inverse, index)`` of a pair gathered from unique rows, if both records still hold.
+
+    The pair record of :func:`mark_gathered_frame_pair` (through :func:`_gathered_source`) and the index record of
+    :func:`mark_gathered_frame_index` must both describe these tensors at their current versions; otherwise ``None``.
+    """
+    source = _gathered_source(forward, inverse)
+    record = getattr(forward, _GATHER_INDEX, None)
+    if source is None or record is None or getattr(inverse, _GATHER_INDEX, None) is not record:
+        return None
+    index, forward_version, inverse_version = record
+    occurrences = forward[..., 0, 0, 0].numel()                                    # the leading occurrence axes
+    if (forward._version != forward_version or inverse._version != inverse_version
+            or index.dim() != 1 or index.numel() != occurrences):
+        return None
+    return source[0], source[1], index
 
 
 @dataclass(frozen=True)
@@ -413,6 +504,11 @@ def is_vfe_config(cfg: object) -> bool:
 class MStepCapture(TypedDict, total=False):
     """Mutable intermediates captured for the M-step self-coupling term."""
 
+    # Diagnostic replays only (VFEModel.build_diagnostic_snapshot, the post-hoc passes): the sub-capture that
+    # forward_beliefs and vfe_stack fill with the encoded and stack-entry beliefs, the per-layer priors, converged
+    # beliefs, outputs, block-MLP seams and routing captures, the first block's E-step trace, the RoPE rotation and the
+    # attention log-prior (audit 2026-10-31 A291).
+    diagnostic:         Dict[str, object]
     block_mlp_input:    BeliefState
     block_mlp_output:   BeliefState
     converged:          BeliefState

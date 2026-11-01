@@ -340,7 +340,13 @@ def calibration_for_run(
             entry["reason"] = (f"{coverage['n_scored']:,} scored targets, {coverage['missing']:,} of "
                                f"{coverage['expected']:,} stream targets missing: run the full test split")
         rows[checkpoint] = entry
-    headline = rows.get(headline_checkpoint) or next(iter(rows.values()))
+    # The headline is the headline checkpoint's own row: another checkpoint's value is never printed under its name
+    # (audit 2026-10-31 A122); the other rows stay in the per-checkpoint table.
+    headline = rows.get(headline_checkpoint)
+    if headline is None:
+        headline = {"status": "skipped",
+                    "reason": (f"the headline checkpoint {headline_checkpoint} has no successful test pass "
+                               f"(rows below for {', '.join(rows)})")}
     return {**base, "status": headline["status"], "reason": headline.get("reason"),
             "word_stream": {"source": word_stream.source, "n_rows": word_stream.n_rows,
                             "n_blank_rows": word_stream.n_blank_rows, "n_words": word_stream.n_words},
@@ -353,18 +359,25 @@ def calibration_for_run(
 # ----------------------------------------------------------------------------------------------
 
 def calibration_table(result: Mapping[str, Any]) -> str:
-    r"""Markdown of ``tab:placeholder_calibration`` (evaluated row), the conventions and the audit."""
+    r"""Markdown of ``tab:placeholder_calibration`` (evaluated row), the conventions and the audit.
+
+    The evaluated row is the headline checkpoint's own: without its test pass it reads "–" with the reason, and the
+    rows of the other checkpoints follow under their own names.
+    """
     status = result.get("status")
-    if status not in ("ok", "audit_failed", "incomplete_coverage"):
+    if status not in ("ok", "audit_failed", "incomplete_coverage") and not (
+            status == "skipped" and result.get("checkpoints")):
         return f"Word-normalized perplexity {status}: {result.get('reason')}.\n"
     context = result["context"]
     context_text = f"{context['seq_len']} tokens, stride {context['stride']}"
     tokenizer = result.get("tokenizer", "BPE")
-    head = result["checkpoints"].get(result["headline_checkpoint"]) or next(iter(result["checkpoints"].values()))
+    head = result["checkpoints"].get(result["headline_checkpoint"]) or {}
     conv = (head.get("conventions") or {}).get(result["headline_convention"], {})
     value = f"{conv['ppl']:.2f}" if conv else "–"
     if status == "audit_failed":
         value += " (TEXT AUDIT FAILED)"
+    if status == "skipped":
+        value += f" ({result.get('reason')})"
     lines = ["| Model and source | Tokenization | Context | Word-normalized test PPL |", "|---|---|---|---|",
              f"| Evaluated realization ({result['headline_checkpoint']}) | {tokenizer} | {context_text} | {value} |",
              "", "| Weights | Step | Convention | Word-level tokens | Word-normalized PPL | BPE PPL | "

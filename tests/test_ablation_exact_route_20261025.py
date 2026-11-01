@@ -4,16 +4,45 @@ Every exact-route sweep must construct against BASELINE_CONFIG with the switch o
 route), every cell of a non-component sweep must meet the route, and the component sweep alone may leave it. With
 the switch on, the resolved baseline is on the route, an arm that leaves the route is refused, and a sweep's base
 cell is labeled at the resolved base value. Nothing is trained.
+
+BASELINE_CONFIG is the click-to-run dictionary of ``ablation.py``, which the user edits, so these tests replace it by a
+complete test-owned baseline and rebuild the sweeps' exact-route requirements from that (audit 2026-10-31
+ablation-harness-7: at one layer, and with the fused memory kernels on, the working-tree dictionary made the registry
+fail here although nothing in the registry had changed).
 """
 import warnings
+from typing import Any, Dict, Iterator
 
 import pytest
 
 import ablation
+from tests.profiles import reference_values
 from vfe3.config import VFE3Config
-from vfe3.exact_route import principled_exact_route_failures
+from vfe3.exact_route import principled_exact_route_failures, principled_exact_route_overrides
 
 EXACT_SWEEPS = sorted(name for name in ablation.SWEEPS if name.startswith("exact_route"))
+
+
+def _test_baseline() -> Dict[str, Any]:
+    r"""A complete ablation baseline from ``tests.profiles``: the frozen reference route at tiny scale with two layers
+    (the exact route carries its regime belief through depth and ties one memory bank across layers, so a single
+    layer would leave the regime and tying contrasts inert) and the torch memory path (``block_memory_triton=False``,
+    which every regression rank the registry sweeps can take)."""
+    return reference_values(n_layers=2, block_memory_triton=False)
+
+
+@pytest.fixture(autouse=True)
+def _test_owned_baseline(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    baseline = _test_baseline()
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", baseline)
+    monkeypatch.setattr(ablation, "principled_exact_route", False)
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        requires = principled_exact_route_overrides(baseline)
+    for name in EXACT_SWEEPS:
+        monkeypatch.setitem(ablation.SWEEPS[name], "requires", dict(requires))
+    yield
 
 
 def _cfg(sweep: str, overrides: dict) -> VFE3Config:

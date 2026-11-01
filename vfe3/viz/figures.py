@@ -28,7 +28,7 @@ from matplotlib.collections import PathCollection, QuadMesh
 from matplotlib.colors import ListedColormap, LogNorm
 from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
 
-from vfe3.viz.text import installed_multilingual_sans_serif, token_label
+from vfe3.viz.text import installed_multilingual_sans_serif, mathtext_literal, token_label
 
 # Wong colorblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
 _CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
@@ -257,17 +257,20 @@ def tidy_figure(fig: object) -> object:
 
     Grid lines are removed from image axes (a heatmap's cells, not its coordinates, carry the
     data), in-axes legends are moved off the data they overlap (:func:`_place_legend`), and log
-    axes get readable tick labels (:func:`_tidy_log_axis`). The figure is laid out once so the
-    legend and data boxes are in their final display positions.
+    axes get readable tick labels (:func:`_tidy_log_axis`). When a legend is to be placed the figure
+    is laid out once first, so the legend and data boxes are in their final display positions; the
+    other passes read only view limits, so a figure without one (every per-head attention heatmap,
+    60 per evaluation) skips that extra draw (audit 2026-10-31 viz-figures-4).
     """
     for ax in fig.axes:
         if ax.images or any(isinstance(c, QuadMesh) for c in ax.collections):
             ax.grid(False)
-    fig.draw_without_rendering()
-    renderer = fig.canvas.get_renderer()
-    for ax in fig.axes:
-        legend = ax.get_legend()
-        if legend is not None and legend.get_visible() and not ax.images:
+    legends = [(ax, ax.get_legend()) for ax in fig.axes
+               if ax.get_legend() is not None and ax.get_legend().get_visible() and not ax.images]
+    if legends:
+        fig.draw_without_rendering()
+        renderer = fig.canvas.get_renderer()
+        for ax, legend in legends:
             _place_legend(ax, legend, renderer)
     for ax in fig.axes:
         for axis in (ax.xaxis, ax.yaxis):
@@ -330,7 +333,7 @@ def _save(fig, path: Optional[str]):
 # text width, and no text below 6 pt at that width. The compact rc below is applied while those
 # figures are built AND saved, so draw-time tick labels inherit it.
 MAX_FIGURE_WIDTH_IN = 7.2
-MIN_TEXT_PT = 6.0
+MIN_TEXT_PT = 6.0                 # the floor the figure tests check; referenced only by them
 _COMPACT_RC: Dict[str, object] = {
     "font.size":        7.0,
     "axes.titlesize":   7.5,
@@ -347,7 +350,11 @@ class FigureSkipped(RuntimeError):
 
     The message is the logged skip reason. Nothing is written: a caller that catches this logs the
     reason and moves on, and a caller that treats every exception as a failed figure still logs the
-    reason text. Retired placeholders (a text box saying "unavailable") are no longer drawn.
+    reason text. Four builders still draw a text placeholder instead of raising it:
+    ``plot_beta_channel_decomposition`` and ``plot_context_sensitivity`` for a saved probe record marked
+    unavailable (``_unavailable_probe_figure`` prints the recorded reason) or holding no value,
+    ``_history_dashboard`` (and every dashboard built on it) when no panel has a finite column, and
+    ``plot_ppl_offset`` without a point (audit 2026-10-31 viz-figures-10).
     """
 
 
@@ -526,7 +533,11 @@ def plot_attention_graph(
     threshold: float = 0.05,
     path:      Optional[str] = None,
 ):
-    """Draw the attention graph (spring layout, edge width ~ weight)."""
+    """Draw the attention graph (spring layout, edge width ~ weight).
+
+    A registry utility (``get_figure("attention_graph")``): no driver in this repository calls it, only
+    ``tests/test_viz.py`` (audit 2026-10-31 viz-figures-10).
+    """
     import networkx as nx
     G = attention_graph(beta, threshold=threshold)
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -641,7 +652,8 @@ def plot_attention_grid(
     across all panels (default ``log``) makes heads/layers comparable and resolves the peaky
     off-diagonal structure; ``squeeze=False`` keeps the L==1 / H==1 axes array 2-D so indexing is
     uniform. For one figure per (layer, head) instead of a grid, call :func:`plot_attention_heatmap`
-    per panel (as :meth:`RunArtifacts.save_attention_maps` does).
+    per panel (as :meth:`RunArtifacts.save_attention_maps` does). A registry utility: no driver in this
+    repository calls it, only ``tests/test_viz.py`` (audit 2026-10-31 viz-figures-10).
     """
     M = _np(maps)
     if M.ndim == 2:                      # (N, N) -> one layer, one head
@@ -679,7 +691,11 @@ def plot_covariance_ellipses(
     dims:  tuple = (0, 1),
     path:  Optional[str] = None,
 ):
-    """Plot 1-sigma Gaussian ellipses for two belief coordinates (diagonal beliefs)."""
+    """Plot 1-sigma Gaussian ellipses for two belief coordinates (diagonal beliefs).
+
+    A registry utility: no driver in this repository calls it, only ``tests/test_viz.py``; the report draws
+    ``plot_spd_ellipses`` (audit 2026-10-31 viz-figures-10).
+    """
     from matplotlib.patches import Ellipse
     m = _np(mu); s = _np(sigma)
     a, b = dims
@@ -777,9 +793,10 @@ def plot_trajectory(
 
     The x-axis is ``steps`` when given (else the sample index, so the axis is no longer mislabeled
     as a step). A long noisy series (pass ``smooth=w``) draws a faint raw line under a centered
-    ``w``-point rolling mean and no per-point markers, which a thousand-point series otherwise
-    collapses into a solid band; a short series (<=50 points) keeps markers. ``logy`` is for wide-range
-    or heavy-tailed series (perplexity, holonomy). ``annotate='min'|'max'`` marks that extremum with
+    ``w``-point rolling mean (geometric under ``logy``) and no per-point markers, which a
+    thousand-point series otherwise collapses into a solid band; a short series (<=50 points) keeps
+    markers. ``logy`` is for wide-range or heavy-tailed series (perplexity, holonomy).
+    ``annotate='min'|'max'`` marks that extremum with
     its step, ``annotate_final`` tags the last value at the right edge, and ``median_line`` draws the
     series median as a dashed reference (the typical value on a heavy-tailed log axis where the
     spikes sit decades above the floor). ``epoch_boundaries`` adds subdued vertical guides at
@@ -793,7 +810,10 @@ def plot_trajectory(
     fig, ax = plt.subplots(figsize=(5.2, 3.3))
     if smooth and smooth > 1 and v.size > 50:
         ax.plot(x, vplot, lw=0.7, color=color, alpha=0.25)            # faint raw underlay
-        ax.plot(x, _rolling_mean(vplot, smooth), lw=1.8, color=color) # rolling-mean trend
+        # Rolling-mean trend, geometric on a log axis (_log_rolling_mean): the arithmetic mean drew a
+        # decaying val_ppl 8 to 16 percent above its samples (audit 2026-10-31 viz-figures-8).
+        trend = _log_rolling_mean(vplot, smooth) if logy else _rolling_mean(vplot, smooth)
+        ax.plot(x, trend, lw=1.8, color=color)
     elif v.size <= 50:
         ax.plot(x, vplot, marker="o", ms=3, lw=1.5, color=color)
     else:
@@ -994,7 +1014,8 @@ def plot_free_energy_relationship(
 
     Twin y-axes over the real training step -- the inner alignment energy (self-coupling +
     the lambda_beta-scaled belief-coupling and attention-entropy, left, solid) and the held-out
-    validation CE (right, dashed) -- each a faint raw line under a rolling-mean trend. This energy
+    validation CE (right, dashed) -- each a faint raw line under a rolling-mean trend above 50 rows,
+    and drawn point by point otherwise. This energy
     contains no observation likelihood and is therefore not the canonical full variational free
     energy; the CE is a separate held-out readout. The final values are tagged and the Pearson
     association of the two curves is in the title; it summarizes co-movement and does not establish
@@ -1004,13 +1025,18 @@ def plot_free_energy_relationship(
     objective_label, objective_units = _KL_AXIS
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
+    # Smoothed above 50 rows only (as _series_panel): the window-5 mean of a ten-row eval series drew a trend
+    # up to 2.25 nats/token off the evaluations (audit 2026-10-31 viz-figures-8).
+    smooth = total.size > 50
     w = max(5, total.size // 80)
     fig, ax = plt.subplots(figsize=(6.6, 3.9))
-    ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
+    if smooth:
+        ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
     # Final values fold into the legend labels; standalone right-edge annotations otherwise land on top
     # of the opposite (twin) axis tick labels -- the left energy tag overlaps the right CE ticks.
     flab = f"inner energy (left) = {total[-1]:.1f}" if step.size else "inner energy (left)"
-    ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label=flab)
+    ln1, = ax.plot(step, _rolling_mean(total, w) if smooth else total, lw=2.0, color=_CB[0], label=flab,
+                   marker=None if smooth else "o", ms=3)
     ax.set(xlabel="training step", ylabel=_objective_axis_text(
         f"inner {objective_label}", objective_units, per_token=True))
     ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
@@ -1018,9 +1044,11 @@ def plot_free_energy_relationship(
         _step_xaxis(ax)
     ax2 = ax.twinx()
     ax2.spines["right"].set_visible(True)                         # set_publication_style hides it by default
-    ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
+    if smooth:
+        ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
     clab = f"val CE (right) = {ce[-1]:.2f}" if step.size else "val CE (right)"
-    ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=2.0, color=_CB[1], ls="--", label=clab)
+    ln2, = ax2.plot(step, _rolling_mean(ce, w) if smooth else ce, lw=2.0, color=_CB[1], ls="--", label=clab,
+                    marker=None if smooth else "o", ms=3)
     ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
     if total.size > 2:
         r = float(np.corrcoef(total, ce)[0, 1])
@@ -1184,7 +1212,8 @@ def plot_canonical_free_energy_relationship(
     Left: the per-token canonical :math:`F` of ``diagnose_canonical_free_energy`` (the self-coupling
     :math:`\alpha_iD(q_i\|p_i)+R(\alpha_i)` plus the :math:`\lambda_\beta`-weighted belief coupling and router
     entropy of the canonical router :math:`\beta^*`) and the validation CE on twin axes, each a faint raw
-    line under a rolling mean, with their Pearson association in the title. Right, when logged: the total
+    line under a rolling mean above 50 rows and drawn point by point otherwise, with their Pearson
+    association in the title. Right, when logged: the total
     variation between the model's router and :math:`\beta^*` (and the canonical self weight). On the
     projected routes nothing optimizes :math:`F`, so the figure makes no E-step or co-descent claim.
     ``population`` names the batch the :math:`F` columns were evaluated on, in the title and the note: the
@@ -1198,23 +1227,28 @@ def plot_canonical_free_energy_relationship(
                       for key, _ in _CANONICAL_ROUTER_SERIES if key in history}
     step, total, ce = step[keep], total[keep], ce[keep]
     has_router = any(np.isfinite(values).any() for values in router_history.values())
+    smooth = total.size > 50                                     # an eval-cadence series is drawn as logged
     w = max(5, total.size // 80)
     with _compact_style():
         fig, axes = plt.subplots(1, 2 if has_router else 1, squeeze=False,
                                  figsize=(MAX_FIGURE_WIDTH_IN if has_router else 4.6, 3.0))
         ax = axes[0][0]
-        ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
+        if smooth:
+            ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
         flab = f"canonical F (left) = {total[-1]:.2f}" if step.size else "canonical F (left)"
-        ln1, = ax.plot(step, _rolling_mean(total, w), lw=1.6, color=_CB[0], label=flab)
+        ln1, = ax.plot(step, _rolling_mean(total, w) if smooth else total, lw=1.6, color=_CB[0], label=flab,
+                       marker=None if smooth else "o", ms=2.5)
         ax.set(xlabel="training step", ylabel="canonical F (nats/token)")
         ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
         if step.size and _set_finite_xlim(ax, step):
             _step_xaxis(ax)
         ax2 = ax.twinx()
         ax2.spines["right"].set_visible(True)
-        ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
+        if smooth:
+            ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
         clab = f"val CE (right) = {ce[-1]:.2f}" if step.size else "val CE (right)"
-        ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=1.6, color=_CB[1], ls="--", label=clab)
+        ln2, = ax2.plot(step, _rolling_mean(ce, w) if smooth else ce, lw=1.6, color=_CB[1], ls="--", label=clab,
+                        marker=None if smooth else "o", ms=2.5)
         ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
         ax2.grid(False)
         title = f"{title_prefix} canonical F (diagnostic) and validation CE"
@@ -1319,11 +1353,13 @@ def _grad_norm_decomp_fig(
 ):
     r"""Shared body for the mu / sigma / phi gradient-norm decomposition figures (M-step and E-step).
 
-    Each series is a faint raw line under a rolling-mean trend on a log y (norms are strictly positive
-    and span orders of magnitude), with its final value folded into the legend label (a separate
-    right-edge tag collides with the upper-right legend). A component that is identically zero / absent
-    (a dead or off substep) drops out under the log-y positive mask rather than flatlining at 0, and its
-    role is omitted from the title suffix.
+    Each series above 50 samples is a faint raw line under a rolling geometric-mean trend
+    (:func:`_log_rolling_mean`) on a log y (norms are strictly positive and span orders of magnitude);
+    a shorter one is drawn point by point. The arithmetic mean lifted the trend of one 10x sample to 2.86
+    over five rows against a raw median of 1.02 (audit 2026-10-31 viz-figures-8). The final value is folded
+    into the legend label (a separate right-edge tag collides with the upper-right legend). A component that
+    is identically zero / absent (a dead or off substep) drops out under the log-y positive mask rather than
+    flatlining at 0, and its role is omitted from the title suffix.
     """
     step = _np(history["step"]).astype(float)
     with _compact_style():
@@ -1339,8 +1375,11 @@ def _grad_norm_decomp_fig(
             if not vv.size:
                 continue
             roles.append(role)
-            ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
-            ax.plot(x, _rolling_mean(vv, w), lw=1.5, color=color, label=f"{label} (last {vv[-1]:.3g})")
+            if vv.size > 50:
+                ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
+                ax.plot(x, _log_rolling_mean(vv, w), lw=1.5, color=color, label=f"{label} (last {vv[-1]:.3g})")
+            else:
+                ax.plot(x, vv, "o-", ms=2.0, lw=1.2, color=color, label=f"{label} (last {vv[-1]:.3g})")
         if roles:
             ax.set_yscale("log")
             marked = sum(_overlay_spike_markers(ax, spikes, key, color, logy=True)
@@ -1695,7 +1734,12 @@ def plot_phi_numerics_reference(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Plot fp32/fp64 flat-closure references and the group-product factor radii."""
+    r"""Plot fp32/fp64 flat-closure references and the group-product factor radii.
+
+    A residual that is not finite (a failed or missing measurement, counted in the record's
+    ``flatness_reference_nonfinite_count``) is labeled ``non-finite`` at its bar instead of reading as a zero,
+    and the panel note separates "non-finite" from "zero at displayed precision" (audit 2026-10-31
+    viz-figures-6)."""
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6))
     flatness = record.get("flatness", {})
     labels = ["holonomy", "cocycle", "inverse"]
@@ -1714,6 +1758,7 @@ def plot_phi_numerics_reference(
     axes[0].bar(x + 0.18, fp64, 0.36, color=_CB[1], label="fp64 reference")
     axes[0].set_xticks(x, labels)
     finite = [value for value in fp32 + fp64 if np.isfinite(value) and value > 0.0]
+    nonfinite = [not np.isfinite(value) for value in fp32 + fp64]
     if finite:
         axes[0].set_yscale("log")
         # Printed values: on a log axis a bar's visible height is set by the arbitrary axis floor.
@@ -1722,7 +1767,18 @@ def plot_phi_numerics_reference(
                 if np.isfinite(value) and value > 0.0:
                     axes[0].annotate(_plain_tick(value), (xi, value), xytext=(0, 2),
                                      textcoords="offset points", ha="center", va="bottom", fontsize=7)
+                else:                                            # no visible bar on the log axis
+                    text = ("non-finite" if not np.isfinite(value) else "0" if value == 0.0
+                            else f"{value:.2g}")
+                    axes[0].annotate(text, (xi, min(finite) / 10.0), xytext=(0, 2), textcoords="offset points",
+                                     ha="center", va="bottom", fontsize=6, rotation=90)
         axes[0].set_ylim(min(finite) / 10.0, max(finite) * 1e3)
+    elif any(nonfinite):
+        names = [f"{name} {precision}" for precision, values in (("fp32", fp32), ("fp64", fp64))
+                 for name, value in zip(labels, values) if not np.isfinite(value)]
+        zero_note = "; the rest zero at displayed precision" if not all(nonfinite) else ""
+        axes[0].text(0.5, 0.92, f"non-finite: {', '.join(names)}{zero_note}",
+                     transform=axes[0].transAxes, ha="center", va="top", fontsize=8, wrap=True)
     else:
         axes[0].text(0.5, 0.92, "zero at displayed precision",
                      transform=axes[0].transAxes, ha="center", va="top", fontsize=8)
@@ -1806,6 +1862,7 @@ def _series_panel(
 
     *,
     logy:    bool = False,
+    smooth:  bool = True,                # False: index-valued columns (an argmax layer) are never averaged
 ) -> int:
     r"""Plot each PRESENT, finite series of ``specs`` onto ``ax`` (a faint raw line under a rolling-mean
     trend for a long series, ``o-`` markers for a short one), masking non-finite samples per series so
@@ -1813,7 +1870,9 @@ def _series_panel(
     actually drawn.
 
     The rolling mean applies only above 50 finite samples (as in :func:`plot_trajectory`): an
-    eval-cadence series of ten points is drawn point by point, not smoothed through."""
+    eval-cadence series of ten points is drawn point by point, not smoothed through. On a log axis it is
+    the geometric mean (:func:`_log_rolling_mean`). ``smooth=False`` draws every series as logged: the
+    mean of an argmax-layer column drew layers {3, 9} as 5.0 to 6.6 (audit 2026-10-31 viz-figures-8)."""
     drawn = 0
     for key, label, color in specs:
         if key not in history:
@@ -1826,12 +1885,15 @@ def _series_panel(
         if not vv.size:
             continue
         drawn += 1
-        if vv.size > 50:
+        if smooth and vv.size > 50:
+            window = max(5, vv.size // 80)
             ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
-            ax.plot(x, _rolling_mean(vv, max(5, vv.size // 80)), lw=1.5, color=color,
-                    label=f"{label} (last {vv[-1]:.3g})")
-        else:
+            ax.plot(x, _log_rolling_mean(vv, window) if logy else _rolling_mean(vv, window), lw=1.5,
+                    color=color, label=f"{label} (last {vv[-1]:.3g})")
+        elif vv.size <= 50:
             ax.plot(x, vv, "o-", ms=2.5, lw=1.2, color=color, label=f"{label} (last {vv[-1]:.3g})")
+        else:                                                    # a long unsmoothed index column: markers
+            ax.plot(x, vv, "o", ms=1.5, color=color, label=f"{label} (last {vv[-1]:.3g})")
     if drawn:
         if logy:
             ax.set_yscale("log")
@@ -1927,13 +1989,14 @@ def _labeled_series_panel(
 
     *,
     logy:    bool = False,
+    smooth:  bool = True,                # False: draw every series as logged (index-valued columns)
 ) -> int:
     r"""Plot each present series like :func:`_series_panel`, but name the lines at their right ends.
 
     The trend of a long series is a rolling mean, taken in log space on a log axis
-    (:func:`_log_rolling_mean`). The y range is fitted to the drawn values; with two or more series
-    each line gets a label in a gutter right of the axes (:func:`_add_direct_labels`), so no legend
-    covers the data. Returns the series count drawn.
+    (:func:`_log_rolling_mean`); ``smooth=False`` draws the samples as logged. The y range is fitted to
+    the drawn values; with two or more series each line gets a label in a gutter right of the axes
+    (:func:`_add_direct_labels`), so no legend covers the data. Returns the series count drawn.
     """
     entries, drawn_values = [], []
     for key, label, color in specs:
@@ -1946,7 +2009,7 @@ def _labeled_series_panel(
         x, vv = step[keep], v[keep]
         if not vv.size:
             continue
-        if vv.size > 50:
+        if smooth and vv.size > 50:
             window = max(5, vv.size // 80)
             trend = _log_rolling_mean(vv, window) if logy else _rolling_mean(vv, window)
             ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
@@ -2078,7 +2141,8 @@ def _history_dashboard(
             source = p.get("data", history)
             panel_step = _np(source["step"]).astype(float)
             draw = _labeled_series_panel if labels == "direct" else _series_panel
-            draw(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)))
+            draw(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)),
+                 smooth=bool(p.get("smooth", True)))
             if "data" not in p:
                 for key, _, color in p["series"]:
                     marked += _overlay_spike_markers(ax, spikes, key, color, logy=bool(p.get("logy", False)))
@@ -2221,7 +2285,7 @@ def _readout_panels(
             ("relational_clamped_row_frac_head_max", "fully clamped rows, head max", _CB[1]),
             ("relational_self_weight_head_max", r"mean self weight $\beta_{ii}$, head max", _CB[3]),
             ("relational_self_argmax_frac_head_max", "self-argmax rows, head max", _CB[2])]},
-        {"title": "Routing cap location", "ylabel": "layer", "series": [
+        {"title": "Routing cap location", "ylabel": "layer", "smooth": False, "series": [   # layer indices
             ("relational_score_klmax_frac_argmax_layer", "capped entries", _CB[0]),
             ("relational_clamped_row_frac_argmax_layer", "fully clamped rows", _CB[1]),
             ("relational_self_lock_argmax_layer", "self weight", _CB[3])]},
@@ -2281,13 +2345,28 @@ def plot_readout_diagnostics(
                               "Routing and readout diagnostics", path, ncols=2)
 
 
+def _sigma_panel_text(covariance_frozen: bool) -> Dict[str, str]:
+    r"""Title stems and axis symbols of the dashboards' covariance panels.
+
+    On a route whose covariance is frozen at encode (:func:`vfe3.metrics.covariance_frozen_at_encode`) the
+    converged :math:`\Sigma_i` is exactly the input token's table row :math:`\Sigma(x_i)`, so the
+    conditioning, effective-rank, precision and guard statistics describe that table over the batch tokens,
+    not beliefs (audit 2026-10-31 viz-figures-3), as the two Sigma figures already say
+    (:func:`_sigma_trace_labels`)."""
+    if covariance_frozen:
+        return {"subject": "Input-token table", "held_out": "Held-out input-token table",
+                "sigma": r"\Sigma(x_i)", "circularity": "token-table circularity"}
+    return {"subject": "Belief", "held_out": "Held-out", "sigma": r"\Sigma", "circularity": "belief circularity"}
+
+
 @register_figure("geometry_health")
 def plot_geometry_health(
     history: Dict,                       # step + gauge/SPD/Fisher/guard health columns (any subset)
 
     *,
-    family:         Optional[str] = None,
-    path:           Optional[str] = None,
+    family:            Optional[str] = None,
+    covariance_frozen: bool          = False,   # covariance frozen at encode -> token-table titles
+    path:              Optional[str] = None,
 ):
     r"""Gauge / SPD / Fisher geometry-health dashboard over training.
 
@@ -2296,7 +2375,9 @@ def plot_geometry_health(
     belief-covariance conditioning and effective rank, belief Fisher precision, numerical-guard
     saturation, and attention-entropy collapse. Together they say whether the learned geometry
     stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
-    a guard-pinned fixed point. Each panel self-gates on column presence."""
+    a guard-pinned fixed point. Each panel self-gates on column presence. With ``covariance_frozen`` the
+    covariance panels are titled as statistics of the input-token table (:func:`_sigma_panel_text`)."""
+    text = _sigma_panel_text(covariance_frozen)
     fisher_label = pub_label("fisher_trace_mean", family=family)
     # The flat-transport closure panel (holonomy_wilson, cocycle_residual, holonomy_deviation) was removed:
     # no projected route writes those columns (audit 2026-10-12 round 2, item 13).
@@ -2308,7 +2389,7 @@ def plot_geometry_health(
         # the complex structure J (0 = proper); both columns are absent for every other group.
         {"title": "Complex structure (block_glmc)", "ylabel": "radians / [0, 1)", "series": [
             ("gauge_head_phase_abs_mean", r"mean $|\arg\det_{\mathbb{C}} U_h|$", _CB[0]),
-            ("belief_circularity_mean", "belief circularity", _CB[3])]},
+            ("belief_circularity_mean", text["circularity"], _CB[3])]},
         {"title": "Gauge-frame magnitude", "ylabel": r"$\|\phi\|$", "series": [
             ("phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
@@ -2329,16 +2410,19 @@ def plot_geometry_health(
             ("vertex_cond_median", "median", _CB[0]),
             ("vertex_cond_p95", "p95", _CB[1]),
             ("vertex_cond_p99", "p99", _CB[3])]},
-        {"title": "Belief conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True, "series": [
+        {"title": f"{text['subject']} conditioning", "ylabel": rf"$\kappa({text['sigma']})$", "logy": True,
+         "series": [
             ("belief_cond_p95", "p95", _CB[1]),
             ("belief_cond_max", "max", _CB[3])]},
-        {"title": "Belief effective rank", "ylabel": r"$\mathrm{erank}(\Sigma)$", "series": [
+        {"title": f"{text['subject']} effective rank", "ylabel": rf"$\mathrm{{erank}}({text['sigma']})$",
+         "series": [
             ("eff_rank_p5", "p5", _CB[2]),
             ("eff_rank_median", "median", _CB[0]),
             ("eff_rank_p95", "p95", _CB[4])]},
-        {"title": "Belief precision", "ylabel": fisher_label,
+        {"title": f"{text['subject']} precision", "ylabel": fisher_label,
          "logy": True, "series": [("fisher_trace_mean", fisher_label, _CB[3])]},
-        {"title": "Guard saturation", "ylabel": "fraction", "series": [
+        {"title": "Guard saturation" if not covariance_frozen else f"{text['subject']} guard saturation",
+         "ylabel": "fraction", "series": [
             ("guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
             ("guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1])]},
         {"title": "Numerical safety", "ylabel": "fraction", "series": [
@@ -2371,8 +2455,9 @@ def plot_validation_sanity(
     history: Dict,                       # step + held-out generalization / positional / attention / geometry columns
 
     *,
-    family: Optional[str] = None,
-    path:    Optional[str] = None,
+    family:            Optional[str] = None,
+    covariance_frozen: bool          = False,   # covariance frozen at encode -> token-table titles
+    path:              Optional[str] = None,
 ):
     r"""Held-out validation-sanity dashboard over training.
 
@@ -2386,7 +2471,9 @@ def plot_validation_sanity(
     The generalization gap is ``generalization_gap_fixed`` (validation CE minus the CE of a fixed
     training-split sample under the evaluation protocol) when the run logged it; otherwise the
     legacy single-training-batch ``generalization_gap``, titled as such because one batch makes it
-    swing by tenths of a nat between evaluations."""
+    swing by tenths of a nat between evaluations. With ``covariance_frozen`` the held-out covariance
+    panels are titled as statistics of the input-token table (:func:`_sigma_panel_text`)."""
+    text = _sigma_panel_text(covariance_frozen)
     fisher_label = pub_label("val_fisher_trace_mean", family=family)
     gap_ylabel = r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$"
     gap_panel = (
@@ -2413,11 +2500,11 @@ def plot_validation_sanity(
             ("val_head_redundancy_js", "redundancy JS", _CB[2])]},
         {"title": "Held-out gauge spread", "ylabel": "spread",
          "series": [("val_gauge_invariant_spread", "frame class-function spread", _CB[3])]},
-        {"title": "Held-out conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True,
+        {"title": f"{text['held_out']} conditioning", "ylabel": rf"$\kappa({text['sigma']})$", "logy": True,
          "series": [("val_belief_cond_p95", "p95", _CB[1])]},
-        {"title": "Held-out precision", "ylabel": fisher_label,
+        {"title": f"{text['held_out']} precision", "ylabel": fisher_label,
          "logy": True, "series": [("val_fisher_trace_mean", fisher_label, _CB[3])]},
-        {"title": "Held-out guard saturation", "ylabel": "fraction", "series": [
+        {"title": f"{text['held_out']} guard saturation", "ylabel": "fraction", "series": [
             ("val_guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
             ("val_guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1])]},
         {"title": "Held-out frame norm", "ylabel": r"$\|\phi\|$", "series": [
@@ -3058,6 +3145,10 @@ def plot_ln3_symmetry_breaking(
     Panel A: val CE vs step for the frozen (gauge off) and learned (gauge on) arms, with the
     analytic averaging floor CE = ln 3 drawn. Panel B: the directed transport asymmetry of the
     learned arm. Panel C: per-head period-3 / prev-token structure scores, frozen vs learned.
+
+    No driver in this repository calls it, only ``tests/test_viz.py``: a sweep must supply each arm's
+    validation curve, its dense (N, N, K, K) transport and its (H, N, N) attention on the period-3 stream
+    (audit 2026-10-31 viz-figures-10).
     """
     from vfe3 import metrics
     ln3 = float(np.log(3.0))
@@ -3189,7 +3280,10 @@ def plot_gauge_equivariance(
     One bar per layer and quantity: the maximum relative deviation
     :math:`\max|x'-x|/\max|x|` under random passive frame actions
     :math:`(U_i,\mu_i,\Sigma_i)\mapsto(g_iU_i,\,g_i\mu_i,\,g_i\Sigma_ig_i^\top)`, computed in float64,
-    on a log axis with the float64 unit roundoff as a reference line.
+    on a log axis with the float64 unit roundoff as a reference line. An exact zero is drawn at that
+    floor; a non-finite residual (a moved evaluation non-finite where the base is finite, ``inf``, or a
+    missing or incomparable measurement, ``NaN``) draws no bar and is labeled at the floor, since drawing
+    it at the floor made a failed measurement read as an exact pass (audit 2026-10-31 viz-figures-6).
     """
     residuals = resid.get("residuals", {})
     keys = [key for key in _EQUIVARIANCE_LABELS if key in residuals]
@@ -3204,10 +3298,16 @@ def plot_gauge_equivariance(
         for layer in range(n_layers):
             values = np.array([residuals[key][layer] if layer < len(residuals[key]) else np.nan
                                for key in keys], dtype=float)
-            # A bitwise-exact quantity has zero deviation; draw it at the reference floor.
-            shown = np.where(values > 0, values, floor)
-            ax.bar(x + (layer - (n_layers - 1) / 2) * width, shown, width,
-                   color=_CB[layer % len(_CB)], label=f"layer {layer}")
+            # A bitwise-exact quantity has zero deviation; draw it at the reference floor. A non-finite
+            # residual keeps its NaN height (no bar) and a label instead.
+            shown = np.where(np.isfinite(values), np.where(values > 0, values, floor), np.nan)
+            centers = x + (layer - (n_layers - 1) / 2) * width
+            ax.bar(centers, shown, width, color=_CB[layer % len(_CB)], label=f"layer {layer}")
+            for center, value in zip(centers, values):
+                if not np.isfinite(value):
+                    ax.annotate("NaN" if np.isnan(value) else "inf", (center, floor), xytext=(0, 2),
+                                textcoords="offset points", ha="center", va="bottom", rotation=90,
+                                fontsize=5.5, color=_CB[layer % len(_CB)])
         ax.axhline(floor, color="#444444", ls=":", lw=1, label="float64 unit roundoff")
         ax.set_yscale("log")
         ax.set_xticks(x)
@@ -3304,6 +3404,9 @@ def plot_head_block_norms(
         return _save(fig, path)
 
 
+_DECAY_LEGEND_MAX_CURVES = 12            # attention_structure panel C: above this, color by layer, no legend
+
+
 @register_figure("attention_structure")
 def plot_attention_structure(
     beta: object,                        # (L,H,N,N) or (H,N,N) attention weights
@@ -3319,7 +3422,9 @@ def plot_attention_structure(
     attention sharpen). Panel B: the (layer,head)x(layer,head) Jensen-Shannon redundancy heatmap
     (which maps are specialized vs redundant, across layers too). Panel C: the per-(layer,head)
     attention-vs-offset profile on a log axis (positional decay). A single-layer (H, N, N) input
-    falls back to plain ``h{h}`` labels.
+    falls back to plain ``h{h}`` labels. Above :data:`_DECAY_LEGEND_MAX_CURVES` curves panel C drops its
+    per-curve legend, which at the live 60 maps stood 2.36 times the axes height (audit 2026-10-31
+    viz-figures-5), and colors each curve by its layer with a layer colorbar (by head for one layer).
     """
     from vfe3 import metrics
     import torch
@@ -3329,6 +3434,7 @@ def plot_attention_structure(
         labels = [f"L{l}H{hh}" for l in range(L) for hh in range(H)]   # L0H0, L0H1, L1H0, ... matches reshape(-1)
         b = b.reshape(-1, b.shape[-2], b.shape[-1])
     else:                                                        # (H, N, N) single layer -> plain head labels
+        L, H = 1, int(b.shape[0])
         labels = [f"h{hh}" for hh in range(int(b.shape[0]))]
     rows = _np(metrics.attention_entropy_rows(b))               # (L*H, N)
     n = b.shape[-1]
@@ -3350,13 +3456,27 @@ def plot_attention_structure(
     dd = metrics.attention_distance_decay(b)
     prof = _np(dd["profile"])                                    # (L*H, N)
     off = _np(dd["offsets"])
+    by_group = h > _DECAY_LEGEND_MAX_CURVES                      # too many curves for a readable legend
+    n_groups, group_name = (L, "layer") if L > 1 else (H, "head")
     for i in range(h):
         # Below 1e-8 the profile is numerical zero: end the curve there instead of drawing the
         # floor as a plateau that stretches the log axis over decades of nothing.
-        axes[2].plot(off, np.where(prof[i] > 1e-8, prof[i], np.nan), color=plt.cm.viridis(i / max(h - 1, 1)), lw=1.2, label=labels[i])
+        color = (plt.cm.viridis((i // H if L > 1 else i) / max(n_groups - 1, 1)) if by_group
+                 else plt.cm.viridis(i / max(h - 1, 1)))
+        axes[2].plot(off, np.where(prof[i] > 1e-8, prof[i], np.nan), color=color,
+                     lw=0.8 if by_group else 1.2, label=labels[i])
     axes[2].set_yscale("log")
-    axes[2].set(xlabel=r"offset $|i-j|$", ylabel=r"mean $\beta$", title="Attention distance decay")
-    axes[2].legend(fontsize=7, frameon=False, ncol=2)
+    axes[2].set(xlabel=r"offset $|i-j|$", ylabel=r"mean $\beta$",
+                title=f"Attention distance decay (color: {group_name})" if by_group else "Attention distance decay")
+    if by_group:
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+        mappable = ScalarMappable(norm=Normalize(vmin=0, vmax=max(n_groups - 1, 1)), cmap="viridis")
+        bar = fig.colorbar(mappable, ax=axes[2], shrink=0.8, label=group_name)
+        bar.locator = MaxNLocator(integer=True)
+        bar.update_ticks()
+    else:
+        axes[2].legend(fontsize=7, frameon=False, ncol=2)
     fig.tight_layout()
     return _save(fig, path)
 
@@ -3704,6 +3824,10 @@ def plot_estep_capacity(
     Parameters stay flat while inference depth changes. This displays the observed relationship;
     it does not presume monotonic improvement or convergence. An optional wall-time inset
     shows the compute cost.
+
+    No driver in this repository calls it, only ``tests/test_viz.py``: the scaling cells of the inference
+    route record the test CE and BPC of each ``n_e_steps`` but not the final-iterate objective, so that column
+    must be recorded first (``plot_inference_capacity`` draws the CE axis; audit 2026-10-31 viz-figures-10).
     """
     x = _np(n_e_steps)
     objective_label, objective_units = _KL_AXIS
@@ -3951,6 +4075,32 @@ def plot_numerical_trust(
 # analyzer tables use one implementation.
 # ===========================================================================
 
+_POWER_LAW_BOUND_RTOL = 1e-6            # a parameter this close to a box bound (relative to the box) sits on it
+
+
+def _power_law_bound_flags(
+    params: Sequence[float],             # (E, A, alpha) of the offset fit
+    lower:  Sequence[float],             # their lower box bounds
+    upper:  Sequence[float],             # their upper box bounds (inf: none)
+) -> List[str]:
+    r"""Names (``E_lower``, ``alpha_upper``, ...) of the offset-law parameters that sit on a box bound.
+
+    A parameter within :data:`_POWER_LAW_BOUND_RTOL` of the box width (of the bound itself for a one-sided
+    box) from a bound counts as on it; the trust-region solver approaches an active bound without reaching it
+    exactly. A pinned parameter is not identified by the data, and a percentile bootstrap of the fit is
+    inconsistent there (Andrews 2000, *Econometrica* 68, 399-405).
+    """
+    flags = []
+    for name, value, lo, hi in zip(("E", "A", "alpha"), params, lower, upper):
+        width = (hi - lo) if np.isfinite(hi) else max(abs(lo), np.finfo(float).tiny)
+        tol = _POWER_LAW_BOUND_RTOL * width
+        if value <= lo + tol:
+            flags.append(f"{name}_lower")
+        elif np.isfinite(hi) and value >= hi - tol:
+            flags.append(f"{name}_upper")
+    return flags
+
+
 def _fit_power_law(
     N:       object,                     # (P,) parameter counts (or tokens / FLOPs)
     L:       object,                     # (P,) loss at each point (test CE)
@@ -3964,6 +4114,12 @@ def _fit_power_law(
     ``L = E + A * N^{-alpha}`` via ``scipy.optimize.curve_fit`` and silently falls back to the
     log-log fit if scipy is absent or the solve fails. Degenerate input (<2 distinct finite positive
     sizes) returns NaNs so the caller can skip the overlay; malformed weights raise ``ValueError``.
+
+    The offset fit is boxed to :math:`0 \le E \le \min L`, :math:`A \ge 10^{-12}` and
+    :math:`10^{-3} \le \alpha \le 3`; ``at_bound`` lists the parameters the realized offset fit leaves on a
+    bound (:func:`_power_law_bound_flags`; empty for the log-log form). On sizes without curvature the fit
+    puts :math:`E` on 0, so neither :math:`E` nor :math:`\alpha` is identified as an offset-law parameter
+    (audit 2026-10-31 analysis-statistics-2).
     """
     N = _np(N).astype(float).reshape(-1)
     L = _np(L).astype(float).reshape(-1)
@@ -3981,7 +4137,7 @@ def _fit_power_law(
     n_distinct_sizes = int(np.unique(N).size)
     out: Dict[str, object] = {"alpha": float("nan"), "A": float("nan"), "E": 0.0,
                               "r2": float("nan"), "n_points": int(N.size),
-                              "n_distinct_sizes": n_distinct_sizes, "form": "power_law"}
+                              "n_distinct_sizes": n_distinct_sizes, "form": "power_law", "at_bound": []}
     if with_offset and n_distinct_sizes < 4:
         out["form"] = "power_law_fallback_underdetermined"
     if N.size < 2 or n_distinct_sizes < 2:
@@ -3992,9 +4148,10 @@ def _fit_power_law(
             from scipy.optimize import curve_fit
             p0 = [max(0.0, float(L.min()) * 0.5), float(np.exp(np.mean(y))), 0.3]
             sig = None if w is None else (L / np.sqrt(np.clip(w, 1e-300, None)))   # m29: WLS (SEM=L/sqrt(w)); ignored when None
+            lower, upper = [0.0, 1e-12, 1e-3], [float(L.min()), np.inf, 3.0]        # (E, A, alpha) box
             popt, _ = curve_fit(lambda n, E, A, al: E + A * np.power(n, -al), N, L, p0=p0,
                                 sigma=sig, absolute_sigma=False,
-                                bounds=([0.0, 1e-12, 1e-3], [float(L.min()), np.inf, 3.0]),
+                                bounds=(lower, upper),
                                 maxfev=20000)
             E, A, al = (float(v) for v in popt)
             Lp = E + A * np.power(N, -al)
@@ -4002,7 +4159,8 @@ def _fit_power_law(
             ss_tot = float(np.sum((L - L.mean()) ** 2))
             return {"alpha": al, "A": A, "E": E, "n_points": int(N.size),
                     "n_distinct_sizes": n_distinct_sizes, "form": "offset_power_law",
-                    "r2": (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"))}
+                    "r2": (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")),
+                    "at_bound": _power_law_bound_flags((E, A, al), lower, upper)}
         except Exception:
             out["form"] = "power_law_fallback_solver"
     import warnings
@@ -4031,11 +4189,11 @@ def _t95(n: int) -> float:
 
 def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, Any]:
     r"""Per-point seed aggregation: returns x, mean, sem, ci95, n (one entry per point with >=1 finite
-    seed), the flattened per-seed (seed_x, seed_y) cloud for the faint scatter, and the pooled
+    seed), the flattened per-seed (seed_x, seed_y) cloud for the faint scatter, the pooled
     pure-error variance of log CE over those points (``pooled_log_var``,
-    :func:`_scaling_pooled_log_variance`)."""
-    x, mean, sem, ci, ns, sx, sy, groups = [], [], [], [], [], [], [], []
-    for p in points:
+    :func:`_scaling_pooled_log_variance`), and the input positions of the kept points (``index``)."""
+    x, mean, sem, ci, ns, sx, sy, groups, kept = [], [], [], [], [], [], [], [], []
+    for i, p in enumerate(points):
         seeds = [float(s) for s in p.get("ce_seeds", []) if np.isfinite(s)]
         try:
             xv = float(p.get(x_key, float("nan")))
@@ -4047,11 +4205,23 @@ def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, Any
         x.append(xv); mean.append(float(arr.mean())); ns.append(arr.size)
         s = float(arr.std(ddof=1)) / np.sqrt(arr.size) if arr.size > 1 else 0.0
         sem.append(s); ci.append(_t95(arr.size) * s)
-        sx.extend([xv] * arr.size); sy.extend(seeds); groups.append(seeds)
+        sx.extend([xv] * arr.size); sy.extend(seeds); groups.append(seeds); kept.append(i)
     return {"x": np.asarray(x), "mean": np.asarray(mean), "sem": np.asarray(sem),
             "ci95": np.asarray(ci), "n": np.asarray(ns, dtype=int),
             "seed_x": np.asarray(sx), "seed_y": np.asarray(sy),
-            "pooled_log_var": _scaling_pooled_log_variance(groups)}
+            "pooled_log_var": _scaling_pooled_log_variance(groups),
+            "index": np.asarray(kept, dtype=int)}
+
+
+def _scaling_input_weights(weights: object, n_points: int, st: Mapping[str, Any], name: str) -> np.ndarray:
+    r"""Caller weights given one per input point, restricted to the points :func:`_scaling_point_stats` kept."""
+    w = _np(weights).astype(float).reshape(-1)
+    if w.size != n_points:
+        raise ValueError(f"{name} has length {w.size}; expected one weight per input point ({n_points})")
+    w = w[st["index"]]
+    if w.size and (not np.all(np.isfinite(w)) or np.any(w < 0.0) or not np.any(w > 0.0)):
+        raise ValueError(f"{name} must be finite, nonnegative, and contain a positive value")
+    return w
 
 
 def _scaling_pooled_log_variance(seed_groups: Sequence[Sequence[float]]) -> float:
@@ -4077,29 +4247,38 @@ def _scaling_sem_weights(
     n_seeds:             object = None,          # (P,) seeds per point; with pooled_log_variance
     pooled_log_variance: Optional[float] = None, # s^2 of _scaling_pooled_log_variance
 ) -> np.ndarray:
-    r"""Inverse-variance weights for a log-loss fit from point means and their SEMs.
+    r"""Inverse-variance weights for a log-loss fit from point means and their standard errors.
 
-    By the delta method, ``Var(log(mean)) ~= (SEM / mean)^2``, so the WLS weight is
-    ``(mean / SEM)^2``. A point without its own SEM (a single seed, or seeds with zero spread)
-    receives the pooled pure-error variance instead, weight ``n_i / s^2`` with ``s^2`` from
-    :func:`_scaling_pooled_log_variance`, so it neither gains infinite leverage nor counts as a fitted
-    size while carrying a vanishing weight next to the replicated points (audit 2026-10-10 #52).
-    Without a pooled estimate (no replicated point) every point keeps unit weight.
+    With the seed counts :math:`n_i` and the pooled pure-error variance :math:`s^2` of log CE
+    (:func:`_scaling_pooled_log_variance`), every point takes the pooled standard error
+    :math:`s / \sqrt{n_i}` of its log mean, weight :math:`n_i / s^2`. This is the common-variance model of
+    the analyzer's lack-of-fit test, offset-law bootstrap and frontier test (``scaling_analysis``), and the
+    pure-error F reference distribution presumes the fitted values of this n_i-weighted least-squares fit
+    (Draper and Smith 1998, *Applied Regression Analysis*, 3rd ed., Sec. 2.1). A point's own SEM rests on
+    :math:`n_i - 1` degrees of freedom; at three seeds the weights :math:`(\bar L_i / SEM_i)^2` built from it
+    varied 13-fold (median) across five sizes of one law, pulled the fit toward sizes whose seeds agreed by
+    chance, and made both scaling F-tests reject a true law in about 12 percent of analyses at a nominal
+    5 percent (audit 2026-10-31 analysis-statistics-1). A point without a seed count keeps unit weight.
+
+    Without the seed counts or a pooled estimate (no replicated point, or zero spread) the weight is the
+    delta-method ``(mean / SEM)^2`` of the point's own SEM, ``Var(log(mean)) ~= (SEM / mean)^2``, and a
+    point without its own SEM keeps unit weight (audit 2026-10-10 #52).
     """
     mean_arr = _np(mean).astype(float).reshape(-1)
     sem_arr = _np(sem).astype(float).reshape(-1)
     if mean_arr.size != sem_arr.size:
         raise ValueError(f"mean and sem must have equal lengths, got {mean_arr.size} and {sem_arr.size}")
     weights = np.ones_like(mean_arr)
-    positive = np.isfinite(mean_arr) & np.isfinite(sem_arr) & (mean_arr > 0.0) & (sem_arr > 0.0)
-    weights[positive] = (mean_arr[positive] / sem_arr[positive]) ** 2
     if (n_seeds is not None and pooled_log_variance is not None
             and np.isfinite(pooled_log_variance) and pooled_log_variance > 0.0):
         n_arr = _np(n_seeds).astype(float).reshape(-1)
         if n_arr.size != mean_arr.size:
             raise ValueError(f"n_seeds must have length {mean_arr.size}, got {n_arr.size}")
-        imputed = ~positive & np.isfinite(n_arr) & (n_arr >= 1.0)
-        weights[imputed] = n_arr[imputed] / float(pooled_log_variance)
+        counted = np.isfinite(n_arr) & (n_arr >= 1.0)
+        weights[counted] = n_arr[counted] / float(pooled_log_variance)
+        return weights
+    positive = np.isfinite(mean_arr) & np.isfinite(sem_arr) & (mean_arr > 0.0) & (sem_arr > 0.0)
+    weights[positive] = (mean_arr[positive] / sem_arr[positive]) ** 2
     return weights
 
 
@@ -4128,13 +4307,18 @@ def plot_scaling_law(
     xlabel:      str  = "parameters N",
     with_offset: bool = False,
     title:       str  = "Scaling law (test CE vs parameters)",
+    weights:     object = None,          # (P,) one fit weight per input point; None -> pooled-variance weights
     path:        Optional[str] = None,
 ):
     r"""Headline scaling figure: log-log ``test_ce`` vs ``N`` with per-seed points, cross-seed 95% CI
     error bars, the fitted power law overlaid, and a residual subpanel.
 
-    The fit is a (SEM-weighted) log-log least squares ``L = A N^{-alpha}`` (or the Chinchilla
-    ``E + A N^{-alpha}`` when ``with_offset``); the exponent ``alpha`` is annotated, and ``R^2`` only
+    The fit is a weighted log-log least squares ``L = A N^{-alpha}`` (or the Chinchilla
+    ``E + A N^{-alpha}`` when ``with_offset``) with the pooled pure-error weights :math:`n_i / s^2`
+    (:func:`_scaling_sem_weights`), or with the caller's ``weights`` (one per entry of ``points``; a point
+    dropped for a missing ``x_key`` or seed drops its weight), which ``scaling_analysis`` passes with its
+    deduplicated points so the figure draws the fit its summary reports (audit 2026-10-31
+    analysis-statistics-5). The exponent ``alpha`` is annotated, and ``R^2`` only
     from :func:`~vfe3.metric_contracts.scaling_min_testable_sizes` distinct sizes of the fitted form (four for
     the two-parameter law, five for the offset law; fewer are labeled "not testable").
     The residual panel plots ``log(mean / fit)`` against ``log N`` -- systematic curvature there is
@@ -4150,8 +4334,11 @@ def plot_scaling_law(
                     capsize=3, lw=0, elinewidth=1.2, label="mean (95% CI)", zorder=3)
     fit = None
     if np.unique(st["x"]).size >= 2:
-        w = _scaling_sem_weights(st["mean"], st["sem"], n_seeds=st["n"],
-                                 pooled_log_variance=st["pooled_log_var"])
+        if weights is None:
+            w = _scaling_sem_weights(st["mean"], st["sem"], n_seeds=st["n"],
+                                     pooled_log_variance=st["pooled_log_var"])
+        else:
+            w = _scaling_input_weights(weights, len(points), st, "weights")
         fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
         xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
         yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
@@ -4164,7 +4351,8 @@ def plot_scaling_law(
         lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, "
                + (rf"$R^2$={fit['r2']:.3f}" if testable
                   else f"not testable (<{min_sizes} sizes)")
-               + (f", E={fit['E']:.3f}" if fit["form"] == "offset_power_law" else "")
+               + (f", E={fit['E']:.3f}" + (" on its bound" if fit.get("at_bound") else "")
+                  if fit["form"] == "offset_power_law" else "")
                + f", {_scaling_fit_form_label(fit['form'])}")
         ax.plot(xx, yy, "--", color="#444444", lw=1.6, label=lbl, zorder=4)
         yfit_pts = fit["E"] + fit["A"] * np.power(st["x"], -fit["alpha"])
@@ -4193,15 +4381,25 @@ def plot_scaling_routes(
     title:            str = "Routes to N: does the frontier collapse?",
 
     weights_by_route: Optional[Mapping[str, np.ndarray]] = None,
+    pooled_points:    Optional[list]                     = None,
+    pooled_weights:   object                             = None,
     path:             Optional[str]                      = None,
 ):
     r"""Multi-route overlay: ``test_ce`` vs ``N`` with points colored AND markered by which knob grew
     ``N`` (embed_dim / gauge block size / depth / ...), each route's own power-law fit, and a dashed
     pooled fit. Routes that fall on one line share a frontier; a route offset above/below it (or a
     different slope) does not -- the visual companion to the analyzer's ANCOVA test. Marker shape
-    duplicates the color so the routes survive grayscale printing."""
+    duplicates the color so the routes survive grayscale printing.
+
+    ``weights_by_route`` holds each route's weights after point filtering. The dashed pooled line fits
+    ``pooled_points`` when given (the analyzer's points with identical training runs counted once), with
+    ``pooled_weights`` one per entry of ``pooled_points``; otherwise it fits every route's points together,
+    which counts a run reached through two routes twice (audit 2026-10-31 analysis-statistics-5)."""
     routes = sorted({str(p.get("route", "?")) for p in points})
-    pooled_log_var = _scaling_point_stats(points, x_key)["pooled_log_var"]   # one pure-error model for all routes
+    if pooled_weights is not None and pooled_points is None:
+        raise ValueError("pooled_weights is given one per entry of pooled_points; pass pooled_points too")
+    pooled_st = _scaling_point_stats(points if pooled_points is None else pooled_points, x_key)
+    pooled_log_var = pooled_st["pooled_log_var"]                             # one pure-error model for all routes
     route_stats = []
     for r in routes:
         st = _scaling_point_stats([p for p in points if str(p.get("route", "?")) == r], x_key)
@@ -4225,6 +4423,19 @@ def plot_scaling_routes(
                     f"weights_by_route[{r!r}] must be finite, nonnegative, and contain a positive value"
                 )
         route_stats.append((r, st, weights))
+    if pooled_points is not None:
+        pooled_x, pooled_mean = pooled_st["x"], pooled_st["mean"]
+        pooled_w = (
+            _scaling_sem_weights(pooled_st["mean"], pooled_st["sem"], n_seeds=pooled_st["n"],
+                                 pooled_log_variance=pooled_log_var)
+            if pooled_weights is None
+            else _scaling_input_weights(pooled_weights, len(pooled_points), pooled_st, "pooled_weights"))
+    elif route_stats:
+        pooled_x = np.concatenate([st["x"] for _, st, _ in route_stats])
+        pooled_mean = np.concatenate([st["mean"] for _, st, _ in route_stats])
+        pooled_w = np.concatenate([weights for _, _, weights in route_stats])
+    else:
+        pooled_x = pooled_mean = pooled_w = np.array([], dtype=float)
 
     markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
     fig, ax = plt.subplots(figsize=(6.4, 4.8))
@@ -4241,14 +4452,8 @@ def plot_scaling_routes(
                           rf"{_scaling_fit_form_label(fit['form'])})")
         else:
             ax.plot([], [], marker=mk, color=c, lw=0, label=f"{_scaling_route_label(r)} (1 pt)")
-    if route_stats:
-        pooled_x = np.concatenate([st["x"] for _, st, _ in route_stats])
-        pooled_mean = np.concatenate([st["mean"] for _, st, _ in route_stats])
-        pooled_weights = np.concatenate([weights for _, _, weights in route_stats])
-    else:
-        pooled_x = pooled_mean = pooled_weights = np.array([], dtype=float)
     if np.unique(pooled_x).size >= 2:
-        g = _fit_power_law(pooled_x, pooled_mean, weights=pooled_weights, with_offset=with_offset)
+        g = _fit_power_law(pooled_x, pooled_mean, weights=pooled_w, with_offset=with_offset)
         xx = np.geomspace(pooled_x.min(), pooled_x.max(), 60)
         yy = g["E"] + g["A"] * np.power(xx, -g["alpha"])
         ax.plot(xx, yy, "--", color="#444444", lw=1.6,
@@ -4324,7 +4529,7 @@ def _distinct_token_labels(decode, ids: Sequence[int]) -> List[str]:
                 raw = ""
             visible = raw.replace(" ", "\u00b7").replace("\n", "\n").replace("\t", "\t")
             if visible and visible.isprintable():
-                label = visible if len(visible) <= 12 else visible[:11] + "\u2026"
+                label = mathtext_literal(visible if len(visible) <= 12 else visible[:11] + "\u2026")
         out.append(label)
     counts = Counter(out)
     return [f"{label} #{int(tid)}" if counts[label] > 1 else label for tid, label in zip(ids, out)]
@@ -4508,6 +4713,7 @@ def plot_reliability_diagram(
     *,
     ece:        Optional[float] = None,
     population: Optional[str]   = None,  # the sample the bins come from, e.g. "test split, n=8,320"
+    n_bins:     int             = 15,    # equal-width bins of the producer (both producers use 15)
     path:       Optional[str]   = None,
 ):
     r"""B1/EXP-3 control: decode-calibration reliability diagram (accuracy vs confidence).
@@ -4517,7 +4723,15 @@ def plot_reliability_diagram(
     is perfect calibration, and the gap (over/under-confidence) integrated and frac-weighted is the
     ECE annotated in the title. Consumes the bins ``run_artifacts`` already computes (conf / acc /
     frac) but never plotted. ``population`` is printed under the title, so bins from the report bank
-    and bins from a ``research.json`` sample are not mistaken for one another."""
+    and bins from a ``research.json`` sample are not mistaken for one another.
+
+    The producers (``report._reliability_from_ce_bank``, ``run_artifacts._calibration_and_strata``) omit
+    empty bins of ``n_bins`` equal-width bins, so a bar is at most 0.9 of the bin width ``1 / n_bins``,
+    centered on its bin's mean confidence, and narrowed so it neither crosses the midpoint to a neighbor
+    nor leaves [0, 1]. The width once divided by the number of occupied bins, and five occupied bins drew
+    bars three times the bin width that covered their neighbors (audit 2026-10-31 viz-figures-7)."""
+    if type(n_bins) is not int or n_bins < 1:
+        raise ValueError(f"n_bins must be a positive integer, got {n_bins!r}")
     rel = list(reliability or [])
     conf = np.array([b["conf"] for b in rel], float)
     acc = np.array([b["acc"] for b in rel], float)
@@ -4528,9 +4742,14 @@ def plot_reliability_diagram(
         fig, ax = plt.subplots(figsize=(3.8, 3.7))
         ax.plot([0, 1], [0, 1], color=_CB[7], lw=1.0, ls="--", label="perfect calibration (y=x)")
         if conf.size:
-            # Each bar is centered on its bin's mean confidence; narrow the edge bars so none
-            # extends past [0, 1].
-            width = np.minimum(0.9 / max(len(rel), 1), 2.0 * np.minimum(conf, 1.0 - conf))
+            # Each bar is centered on its bin's mean confidence: at most 0.9 of one bin, and narrowed so
+            # it stays inside [0, 1] and short of the midpoint to each neighboring bar.
+            order = np.argsort(conf, kind="stable")
+            centers = conf[order]
+            gaps = 0.5 * np.diff(centers)
+            room = np.minimum(np.concatenate(([centers[0]], gaps)), np.concatenate((gaps, [1.0 - centers[-1]])))
+            width = np.empty_like(conf)
+            width[order] = 2.0 * np.clip(np.minimum(0.45 / n_bins, room), 0.0, None)
             ax.bar(conf, acc, width=width, color=_CB[0], alpha=0.55,
                    edgecolor=_CB[0], label="empirical accuracy")
             ax.scatter(conf, acc, s=6.0 + 160.0 * frac, color=_CB[1], zorder=3,
@@ -4605,8 +4824,10 @@ def plot_sigma_stratified_error(
         ax.set_title(rf"{title} (Spearman $\rho$ = {rho:+.3f})")
     else:
         ax.set_title(f"{title} (insufficient tokens)")
+    # Matplotlib's default formatter keeps as many digits as the tick step needs. _count_label, a token-count
+    # format, printed ticks 2840 to 2920 of a frozen route's tr Sigma(x_i) = 2880 as 2.8k, 2.9k, 2.9k, 2.9k,
+    # 2.9k (audit 2026-10-31 viz-figures-2).
     ax.set(xlabel=labels["axis"], ylabel="cross-entropy (nats)")
-    ax.xaxis.set_major_formatter(FuncFormatter(_count_label))
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
@@ -4737,7 +4958,11 @@ def plot_f_ce_relationship(
 
     Target blindness establishes structural separation from the prediction objective. It does not
     imply any correlation sign across a finite depth sweep; the displayed correlations are descriptive.
-    Points are ordered and annotated by n_e_steps."""
+    Points are ordered and annotated by n_e_steps.
+
+    No driver or test in this repository calls it: like :func:`plot_estep_capacity` it needs the
+    final-iterate objective ``final_f`` of each ``n_e_steps`` cell, which no sweep records (audit 2026-10-31
+    viz-figures-10)."""
     objective_label, objective_units = _KL_AXIS
     pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
     ne = np.array([float(a["n_e_steps"]) for a in pts])
@@ -4929,8 +5154,8 @@ def plot_kmup_stability(
 
     Test PPL vs K per route with cross-seed 95% CI bars (the small-sample t-quantile, not a fixed 1.96)
     and a requested offset power-law fit ``PPL = A K^{-alpha} + E`` overlaid when at least four
-    distinct widths identify it. Smaller grids, including the live three-size ``grow_K`` route, show
-    and label the realized log-log fallback without reporting an irreducible floor. The exponent
+    distinct widths identify it. A route or arm with fewer than four widths shows and labels the
+    realized log-log fallback without reporting an irreducible floor. The exponent
     ``b = -alpha`` is annotated per route. The grow_K_mup route is split into its matched /fixed and /mup arms upstream, so
     |b_fixed - b_muP| -- the width-stability readout -- is read directly off the two muP curves; a large
     gap means the headline exponent is partly optimization mis-tuning the muP rate rule removes."""
@@ -4959,17 +5184,18 @@ def plot_kmup_stability(
 
 @register_figure("ppl_offset")
 def plot_ppl_offset(
-    points: list,                        # [{embed_dim, ppl_mean, [ppl_sem], [n_seeds]}, ...] pooled param points
+    points: list,                        # [{embed_dim, ppl_mean, [ppl_sem], [n_seeds]}, ...] width-route points
 
     *,
     path:   Optional[str] = None,
 ):
-    r"""Pooled test-PPL fit against width over all parameter points.
+    r"""Pooled test-PPL fit against width over the parameter points it is given.
 
     The figure requests ``PPL = E + A K^{-alpha}`` when at least four distinct widths identify the
     three-parameter form and otherwise labels the realized log-log fallback without an ``E`` estimate.
-    It pools every parameter route -- distinct from ``kmup_stability``, which splits
-    the muP arms to read the width-stability contrast. Each point carries the across-seed mean PPL with
+    It pools the points it receives into one width law, unlike ``kmup_stability``, which splits the muP arms to
+    read the width-stability contrast; ``scaling_analysis`` passes the routes whose scale knob is ``embed_dim``,
+    without the muP rate arm (audit 2026-10-31, A073). Each point carries the across-seed mean PPL with
     a small-sample t-quantile CI when seeds are present; the realized fit and exponent ``b`` are overlaid."""
     pts = sorted([p for p in points
                   if np.isfinite(float(p.get("embed_dim", float("nan"))))
@@ -5161,6 +5387,31 @@ def plot_ppl_noise_band(
     return _save(fig, path)
 
 
+def _band_edges(
+    mean: np.ndarray,                    # (S,) across-seed mean
+    sd:   np.ndarray,                    # (S,) across-seed SD
+    k:    float,                         # band half-width in SDs
+
+    *,
+    logy: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Edges of the mean :math:`\pm k` SD band; on a log axis the log-normal band with that mean and SD.
+
+    Moment matching gives the log-normal law of mean :math:`m` and SD :math:`s`,
+    :math:`\sigma_{\log}^2 = \log(1 + s^2/m^2)` and :math:`\mu_{\log} = \log m - \sigma_{\log}^2/2`, and the
+    band :math:`\exp(\mu_{\log} \pm k\sigma_{\log})` is positive and symmetric on the log axis. The linear band
+    :math:`m - ks` goes nonpositive for a heavy-tailed column and was clipped to the axis floor (audit
+    2026-10-31 viz-figures-8). A nonpositive mean has no log-axis band (NaN edges).
+    """
+    if not logy:
+        return mean - k * sd, mean + k * sd
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_var = np.log1p(np.square(sd / mean))
+        log_mean = np.log(mean) - 0.5 * log_var
+        log_sd = np.sqrt(log_var)
+        return np.exp(log_mean - k * log_sd), np.exp(log_mean + k * log_sd)
+
+
 def plot_curve_band(
     steps: np.ndarray,                   # (S,) training-step grid
     mean:  np.ndarray,                   # (S,) across-seed mean per step
@@ -5175,21 +5426,27 @@ def plot_curve_band(
 ):
     r"""Across-seed mean +/-1 SD (and +/-2 SD) ribbon of one training curve over steps.
 
-    The band is the init+optimization spread (the per-run reseed shares the data order; a lower bound
-    on deployment variance). Steps where only one seed reported (NaN SD, e.g. the sparse ``val_*``
-    columns) draw the mean without a ribbon."""
+    The band is the across-seed spread. Seeds that share one explicit ``DATA_SEED`` train on one data
+    order, so the band is the init+optimization spread only, a lower bound on deployment variance;
+    with ``DATA_SEED = None`` every seed has its own order and the band includes data-order variance.
+    Steps where only one seed reported (NaN SD, e.g. the sparse ``val_*`` columns) draw the mean
+    without a ribbon."""
     steps = np.asarray(steps, float)
     mean  = np.asarray(mean, float)
     sd    = np.asarray(sd, float)
     fig, ax = plt.subplots(figsize=(7.0, 4.2))
     finite = np.isfinite(mean)
     ax.plot(steps[finite], mean[finite], color=_CB[0], lw=1.6, label="mean")
-    band = finite & np.isfinite(sd)
+    # Under logy the ribbons are log-normal bands with the step's mean and SD (_band_edges).
+    lo2, hi2 = _band_edges(mean, sd, 2.0, logy=logy)
+    lo1, hi1 = _band_edges(mean, sd, 1.0, logy=logy)
+    band = finite & np.isfinite(sd) & np.isfinite(lo2) & np.isfinite(hi2)
     if band.any():
-        ax.fill_between(steps[band], (mean - 2 * sd)[band], (mean + 2 * sd)[band],
-                        color=_CB[0], alpha=0.10, label="$\\pm 2$ SD")
-        ax.fill_between(steps[band], (mean - sd)[band], (mean + sd)[band],
-                        color=_CB[0], alpha=0.22, label="$\\pm 1$ SD")
+        kind = " (log-normal)" if logy else ""
+        ax.fill_between(steps[band], lo2[band], hi2[band],
+                        color=_CB[0], alpha=0.10, label=f"$\\pm 2$ SD{kind}")
+        ax.fill_between(steps[band], lo1[band], hi1[band],
+                        color=_CB[0], alpha=0.22, label=f"$\\pm 1$ SD{kind}")
     if logy:
         ax.set_yscale("log")
     n_seeds = None
@@ -5224,9 +5481,10 @@ def plot_curve_band_grid(
         sd    = np.asarray(c["sd"], float)
         finite = np.isfinite(mean)
         ax.plot(steps[finite], mean[finite], color=_CB[0], lw=1.4)
-        band = finite & np.isfinite(sd)
+        lo, hi = _band_edges(mean, sd, 1.0, logy=bool(c.get("logy")))     # log-normal band on a log axis
+        band = finite & np.isfinite(sd) & np.isfinite(lo) & np.isfinite(hi)
         if band.any():
-            ax.fill_between(steps[band], (mean - sd)[band], (mean + sd)[band], color=_CB[0], alpha=0.22)
+            ax.fill_between(steps[band], lo[band], hi[band], color=_CB[0], alpha=0.22)
         if c.get("logy"):
             ax.set_yscale("log")
         ax.set_title(pub_label(c.get("title", "")), fontsize=9)

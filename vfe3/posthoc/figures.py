@@ -32,6 +32,7 @@ import numpy as np
 
 MAX_WIDTH_IN: float = 7.2
 MIN_FONT_PT: float = 6.0
+LINK_SPECTRUM_COLUMNS: int = 8          # panels per row of plot_link_spectrum (deeper models wrap to more rows)
 MAP_NAMES = ("S_Q", "S_K", "T", "O")
 MAP_LABELS = {"S_Q": r"$S_{Q,h}$", "S_K": r"$S_{K,h}$", "T": r"$T_h$", "O": r"$O_h$"}
 
@@ -66,6 +67,21 @@ def _save(fig: Any, out_dir: Path, name: str) -> List[Path]:
 def _title(ax: Any, letter: str, label: str) -> None:
     r"""Left-aligned panel title led by the bold panel letter."""
     ax.set_title(r"$\mathbf{" + letter + "}$  " + label, loc="left")
+
+
+def _panel_letter(index: int) -> str:
+    r"""Panel letter ``index`` (from 0): A to Z, then AA, AB, ..., so any number of panels has a letter."""
+    letters = ""
+    index += 1
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+def _gain_spread(row: Mapping[str, Any]) -> float:
+    r""":math:`g_{\max}/g_{\min}`, NaN when :math:`g_{\min}` is zero (a clamped non-positive eigenvalue) or missing."""
+    return (row["gain_max"] / row["gain_min"]) if row.get("gain_min") else float("nan")
 
 
 def _grid(rows: Sequence[Mapping[str, Any]], key: str) -> np.ndarray:
@@ -152,14 +168,27 @@ def plot_head_block_norms(
 # S1 panel B
 # ----------------------------------------------------------------------------------------------
 
+def _scale_column(rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
+    r"""``(column, label)`` of the S1 panel B scale: the common scale ``scale_rms``, or, when no row has a finite one
+    because the scale is a signal-to-noise coordinate (noisy-key routing, the minimal agent), the scale in noise
+    units ``scale_rms_noise_units`` (:func:`vfe3.posthoc.maps.map_invariants`)."""
+    def finite(key: str) -> bool:
+        return any(isinstance(r.get(key), (int, float)) and math.isfinite(r[key]) for r in rows)
+
+    if finite("scale_rms") or not finite("scale_rms_noise_units"):
+        return "scale_rms", "common scale"
+    return "scale_rms_noise_units", r"scale$/\sqrt{n_h}$"
+
+
 def _invariant_panels(rows: Sequence[Mapping[str, Any]]) -> List[tuple]:
+    column, scale_label = _scale_column(rows)
     spread = [dict(r, gain_spread=(r["gain_max"] / r["gain_min"]) if r.get("gain_min") else float("nan"),
-                   log10_scale=math.log10(r["scale_rms"]) if r.get("scale_rms", 0) > 0 else float("nan"),
+                   log10_scale=math.log10(r[column]) if r.get(column, 0) > 0 else float("nan"),
                    log10_sigma=(math.log10(r["M_sigma_max"])
                                 if r.get("M_sigma_max") and r["M_sigma_max"] > 0 else float("nan")))
               for r in rows]
     return [
-        (_grid(spread, "log10_scale"), r"$\log_{10}$ common scale", "{:.2f}"),
+        (_grid(spread, "log10_scale"), r"$\log_{10}$ " + scale_label, "{:.2f}"),
         (_grid(spread, "gain_spread"), r"gain spread $g_{\max}/g_{\min}$", "{:.1f}"),
         (_grid(spread, "angle_median_deg"), "median angle (deg)", "{:.0f}"),
         (_grid(spread, "log10_sigma"), r"$\log_{10}\sigma_{\max}(O_hT_h)$", "{:.2f}"),
@@ -192,7 +221,7 @@ def plot_map_invariant_curves(
     _style()
     steps = sorted({int(r["step"]) for r in rows})
     layers = sorted({int(r["layer"]) for r in rows})
-    keys = [("scale_rms", "common scale", True),
+    keys = [(*_scale_column(rows), True),
             ("gain_spread", r"gain spread $g_{\max}/g_{\min}$", True),
             ("angle_median_deg", "median angle (deg)", False),
             ("M_sigma_max", r"$\sigma_{\max}(O_hT_h)$", True),
@@ -206,7 +235,7 @@ def plot_map_invariant_curves(
                 for r in rows:
                     if int(r["step"]) != step or int(r["layer"]) != layer:
                         continue
-                    value = (r["gain_max"] / r["gain_min"]) if key == "gain_spread" else r.get(key)
+                    value = _gain_spread(r) if key == "gain_spread" else r.get(key)
                     if value is not None and np.isfinite(value):
                         values.append(float(value))
                 series.append(np.median(values) if values else np.nan)
@@ -232,17 +261,24 @@ def plot_link_spectrum(
 
     These are the nonzero spectrum of the content map :math:`M_h = O_h T_h`, a similarity invariant of the
     content links. The dashed unit circle separates amplifying from attenuating directions, and the '+'
-    marks :math:`\lambda = 1`, the flat-composition point :math:`T_h O_h = I`.
+    marks :math:`\lambda = 1`, the flat-composition point :math:`T_h O_h = I`. Every layer gets a panel and a
+    letter (:func:`_panel_letter`), at most :data:`LINK_SPECTRUM_COLUMNS` panels per row.
     """
     import matplotlib.pyplot as plt
 
     _style()
     layers = sorted({int(r["layer"]) for r in rows})
     heads = sorted({int(r["head"]) for r in rows})
-    fig, axes = plt.subplots(1, len(layers), figsize=(MAX_WIDTH_IN, MAX_WIDTH_IN / max(len(layers), 1)),
+    n_cols = max(1, min(len(layers), LINK_SPECTRUM_COLUMNS))
+    n_rows = max(1, math.ceil(len(layers) / n_cols))
+    fig, grid = plt.subplots(n_rows, n_cols, figsize=(MAX_WIDTH_IN, n_rows * MAX_WIDTH_IN / n_cols),
                              squeeze=False, constrained_layout=True)
+    axes = list(grid.reshape(-1))
+    for ax in axes[len(layers):]:
+        ax.set_visible(False)
     circle = np.linspace(0.0, 2.0 * np.pi, 256)
-    for ax, letter, layer in zip(axes[0], "ABCDEFGHIJKLMNOP", layers):
+    for index, (ax, layer) in enumerate(zip(axes, layers)):
+        letter = _panel_letter(index)
         ax.plot(np.cos(circle), np.sin(circle), linestyle="--", linewidth=0.6, color="0.6")
         ax.axhline(0.0, linewidth=0.4, color="0.85")
         ax.axvline(0.0, linewidth=0.4, color="0.85")
@@ -256,7 +292,8 @@ def plot_link_spectrum(
         ax.set_xlabel(r"Re $\lambda$")
         ax.set_ylabel(r"Im $\lambda$")
         _title(ax, letter, f"layer {layer}")
-    axes[0][-1].legend(loc="best", fontsize=MIN_FONT_PT)
+    if layers and axes[len(layers) - 1].get_legend_handles_labels()[0]:
+        axes[len(layers) - 1].legend(loc="best", fontsize=MIN_FONT_PT)
     return _save(fig, out_dir, name)
 
 

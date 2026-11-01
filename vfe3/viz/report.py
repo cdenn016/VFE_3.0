@@ -103,8 +103,8 @@ FEATURE_HISTORY_FIGURES = ("minimal_agent_heads", "prototype_templates")
 # routing_holonomy.csv; vfe3.viz.figures.routing_head_table), drawn when any of the tables exists.
 ROUTING_HISTORY_FIGURES = ("routing_heads", "routing_heads_training")
 _ROUTING_HISTORY_TABLES = ("cap_activation.csv", "cap_clamped_rows.csv", "routing_holonomy.csv")
-# Report tokens the end-of-run feature probes replay (vfe3.posthoc.feature_probes); the prototype gap reruns the
-# block in the other inference mode on at most FEATURE_GAP_TOKENS of them.
+# Report tokens the end-of-run feature probes replay (vfe3.posthoc.feature_probes); the minimal-agent and prototype
+# gaps rerun the feature in the other inference mode on at most FEATURE_GAP_TOKENS of them.
 FEATURE_PROBE_TOKENS = 4096
 FEATURE_GAP_TOKENS = 2048
 
@@ -338,11 +338,16 @@ def _decode_workspace_requirements(
     return None, None, None
 
 
+# Equal-width confidence bins of the reliability diagram: this module's bank reduction and the research.json
+# fallback (run_artifacts._calibration_and_strata) both use 15; the figure sizes its bars by it.
+_RELIABILITY_N_BINS = 15
+
+
 def _reliability_from_ce_bank(
     bank: Optional[Mapping[str, torch.Tensor]],
 
     *,
-    n_bins: int = 15,
+    n_bins: int = _RELIABILITY_N_BINS,
 ) -> 'Optional[List[Dict[str, float]]]':
     r"""Bin confidence and correctness from the report's current split.
 
@@ -435,7 +440,12 @@ def _prepare_missing_saved_probes(
     logger:         logging.Logger,
     split:          str = "validation",
 ) -> None:
-    r"""Persist missing finalization probes from the loaded model and first retained report batch."""
+    r"""Persist missing finalization probe records from the loaded model and first retained report batch.
+
+    Only the JSON records are written. The figure worker renders them afterwards through its atomic writer
+    (``vfe3.viz.figure_worker._render_saved_probe_figures``); drawing them here as well rendered the beta-channel and
+    context-sensitivity figures twice, the first time directly onto the final path (audit 2026-10-31 viz-pipeline-11).
+    """
     phi_path = run_dir / "phi_numerics.json"
     pending = []
     for name in ("estep_character", "beta_channel_decomposition", "context_sensitivity"):
@@ -478,13 +488,6 @@ def _prepare_missing_saved_probes(
                                        "sequence_length": int(tokens.shape[1])}
             _write_json_atomic(run_dir / f"{name}.json", record)
             logger.info("refreshed supported probe -> %s", name)
-            if name == "estep_character":                 # single readout: record only, no figure
-                continue
-            try:
-                fig = getattr(figs, f"plot_{name}")(record, path=str(run_dir / f"{name}.png"))
-                figs.plt.close(fig)
-            except figs.FigureSkipped as exc:
-                logger.info("probe figure %r skipped (%s); record kept in %s.json", name, exc, name)
         except Exception as exc:
             logger.warning("supported probe %s failed (%s); skipped", name, exc)
 
@@ -675,6 +678,9 @@ def generate_feature_probe_figures(
     and :func:`vfe3.posthoc.feature_probes.prototype_probe`, writes their results to ``run_dir/feature_probes.json``
     and draws ``minimal_agent_gap``, ``template_usage`` and ``template_codebook``; ``template_umap`` only under
     ``generate_embedding_figures``. A model with neither feature writes nothing. Best-effort: a failure is logged.
+    Returns the figure paths written under ``figdir``; the JSON summary is a record in the run root, logged and not
+    returned, since ``make_figures.py`` admits only published paths under ``figures/`` (audit 2026-10-31
+    viz-pipeline-1).
     """
     from vfe3.posthoc import feature_probes
     from vfe3.viz import feature_figures
@@ -687,7 +693,8 @@ def generate_feature_probe_figures(
         batches.append(ids)
         seen += int(ids.numel())
     results: Dict[str, object] = {}
-    for key, probe in (("minimal_agent_gap", lambda: feature_probes.minimal_agent_gap(model, batches, device)),
+    for key, probe in (("minimal_agent_gap", lambda: feature_probes.minimal_agent_gap(
+                            model, batches, device, gap_tokens=FEATURE_GAP_TOKENS)),
                        ("prototype", lambda: feature_probes.prototype_probe(
                            model, batches, device, gap_tokens=FEATURE_GAP_TOKENS))):
         try:
@@ -705,7 +712,7 @@ def generate_feature_probe_figures(
         if "prototype" in summary:                       # the template means stay out of the JSON summary
             summary["prototype"] = {**summary["prototype"], "layers": [
                 {k: v for k, v in row.items() if k != "nu"} for row in summary["prototype"]["layers"]]}
-        written.append(_write_json_atomic(run_dir / "feature_probes.json", summary))
+        logger.info("feature probe summary -> %s", _write_json_atomic(run_dir / "feature_probes.json", summary))
     except Exception as exc:
         logger.warning("feature_probes.json failed (%s); continuing", exc)
     jobs = []
@@ -724,6 +731,42 @@ def generate_feature_probe_figures(
         if path is not None:
             written.append(path)
     return written
+
+
+# Figures of generate_feature_probe_figures, drawn only for the opt-in features.
+_FEATURE_PROBE_FIGURES = ("minimal_agent_gap", "template_usage", "template_codebook", "template_umap")
+
+
+def _remove_unwritten_figures(
+    figdir:  Path,
+    written: Sequence[Path],
+    logger:  logging.Logger,
+) -> List[Path]:
+    r"""Remove every figure of this driver's inventory that the current invocation did not write.
+
+    The inventory is the single-run model-replay set, the history, feature-history and routing figures, and the
+    feature-probe figures. A figure an earlier finalization or report wrote under one of those names, and that this
+    invocation skipped (missing input, route gate, memory guard) or failed, would otherwise stay in ``figures/``
+    beside the current set with nothing marking it stale, for example a test-split figure beside a validation-split
+    report (audit 2026-10-31 viz-pipeline-12). Other files in ``figures/`` are left alone. Returns the removed paths.
+    """
+    owned = {*_SINGLE_RUN_FIGURE_INVENTORY,
+             *(f"{name}.png" for name in (*HISTORY_FIGURES, *FEATURE_HISTORY_FIGURES, *ROUTING_HISTORY_FIGURES,
+                                          *_FEATURE_PROBE_FIGURES))}
+    kept = {Path(path).name for path in written}
+    removed: List[Path] = []
+    for name in sorted(owned - kept):
+        path = figdir / name
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("stale figure %s could not be removed (%s)", path, exc)
+            continue
+        removed.append(path)
+        logger.info("removed stale figure %s (not written by this invocation)", path)
+    return removed
 
 
 def generate_figures(
@@ -768,7 +811,9 @@ def generate_figures(
     :func:`vfe3.viz.figures.route_figure_skip_reasons` is logged instead (flat-transport holonomy,
     the belief-covariance figures when the covariance is frozen at encode). ``head_block_norms`` (the head x frame-block energy of the interface maps)
     needs :func:`vfe3.posthoc.maps.head_block_norms` and the relational maps. The eval-cadence
-    history figures of :func:`generate_history_figures` are written too.
+    history figures of :func:`generate_history_figures` are written too. On completion every figure of
+    this driver's inventory that the invocation did not write (skipped or failed) is removed from
+    ``figures/``, so the directory holds one invocation's set (:func:`_remove_unwritten_figures`).
     """
     if type(generate_embedding_figures) is not bool:
         raise TypeError("generate_embedding_figures must be bool")
@@ -785,6 +830,9 @@ def generate_figures(
         best = checkpoint_path if checkpoint_path is not None else run_dir / "best_model.pt"
         if not best.exists():
             raise FileNotFoundError(f"no model checkpoint at {best}; train with RunArtifacts first")
+        # The state is read on the host and released once copied into the (host) parameters, so model.to(device)
+        # below makes the only device copy. Read onto the device, it round-tripped every weight and kept a second
+        # device copy alive for the whole report (audit 2026-10-31 viz-pipeline-9).
         if checkpoint_path is None:
             expected_code_identity, expected_selection_data_identity = (
                 _load_run_selection_contract(run_dir))
@@ -794,7 +842,7 @@ def generate_figures(
                 model.state_dict(),
                 expected_code_identity,
                 expected_selection_data_identity,
-                map_location=device or "cpu",
+                map_location="cpu",
             )
         else:
             expected_code_identity, expected_selection_data_identity = (
@@ -805,12 +853,13 @@ def generate_figures(
                 model.state_dict(),
                 expected_code_identity,
                 expected_selection_data_identity,
-                map_location=device or "cpu",
+                map_location="cpu",
             )
         model.load_state_dict(
             model_state,
             strict=True,
         )
+        del model_state
     else:
         cfg = model.cfg
         dataset = ""
@@ -1119,7 +1168,7 @@ def generate_figures(
     # Sigma_q<->CE figures (stratified error curve, rho scatter) off the belief_ce_bank join.
     _emit("reliability_diagram",
           lambda p: figs.plot_reliability_diagram(reliability, population=reliability_population,
-                                                  path=p),
+                                                  n_bins=_RELIABILITY_N_BINS, path=p),
           "reliability_diagram.png" in planned_figures)
     # On the frozen route the scatter also reports CV(tr Sigma) over the vocabulary types, the
     # frequency-unweighted spread of the encode table (the bank CV is occurrence-weighted).
@@ -1180,5 +1229,7 @@ def generate_figures(
         except Exception as exc:
             logger.warning("semantic analysis failed (%s); continuing", exc)
 
+    # figures/ describes this invocation alone: a planned figure it did not write leaves no earlier copy behind.
+    _remove_unwritten_figures(figdir, written, logger)
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written

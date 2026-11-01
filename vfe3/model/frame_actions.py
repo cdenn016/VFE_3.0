@@ -33,14 +33,17 @@ def frames_identity_reason(
 ) -> Optional[str]:
     r"""Why every realized frame :math:`U_i = \exp(X_{x_i})\exp(Y_i)` of ``cfg`` is the identity, else ``None``.
 
-    The one rule shared by the semantics run (``SemanticRun.frames_active``), the frozen interventions and the
-    post-hoc routing-covariance gap (audit 2026-10-10 round 2, #46). The token frames are the identity under
-    ``gauge_transport='off'`` (which coerces ``phi_scale=0``, ``m_phi_lr=0`` and ``pos_phi='none'`` and refuses a
-    frame-space RoPE), for a group without generators, and for a token table that starts at zero and never moves
-    (``phi_scale=0`` with ``m_phi_lr=0``). ``gauge_transport='frozen'`` is not the identity: its random fixed
-    frames act on every forward pass. With ``positional`` a positional factor (``pos_phi`` over a group with
-    generators, or a frame-space RoPE fold) keeps the composed frame active; without it only the token factor
-    :math:`\exp(X_v)` is judged.
+    The one rule shared by the semantics run (``SemanticRun.frames_active``), the frozen interventions, the
+    post-hoc routing-covariance gap (audit 2026-10-10 round 2, #46) and the frame builder of the table Fisher step.
+    The token frames are the identity under ``gauge_transport='off'`` (which coerces ``phi_scale=0``,
+    ``m_phi_lr=0`` and ``pos_phi='none'`` and refuses a frame-space RoPE), for a group without generators, for a
+    token table that starts at zero and never moves (``phi_scale=0`` with ``m_phi_lr=0``), and under
+    ``encode_mode='per_token_additive'``, whose encoder reads the frame table as an additive mean code and returns
+    :math:`\varphi = 0`, so :math:`\exp(X_v) = I` while the table itself trains (the rule
+    ``VFE3Config.inactive_fields`` applies to the coordinate selectors; audit 2026-10-31, transport-geometry-3).
+    ``gauge_transport='frozen'`` is not the identity: its random fixed frames act on every forward pass. With
+    ``positional`` a positional factor (``pos_phi`` over a group with generators, or a frame-space RoPE fold) keeps
+    the composed frame active; without it only the token factor :math:`\exp(X_v)` is judged.
     """
     if getattr(cfg, "gauge_transport", "on") == "off":
         return ("gauge_transport='off': every realized frame is the identity (phi_scale=0, m_phi_lr=0 and "
@@ -49,6 +52,9 @@ def frames_identity_reason(
         reason = "the gauge group has no generators, so every token frame is the identity"
     elif float(getattr(cfg, "phi_scale", 1.0)) == 0.0 and float(getattr(cfg, "m_phi_lr", 1.0)) == 0.0:
         reason = "phi_scale=0 with m_phi_lr=0: the token frames start at the identity and never move"
+    elif getattr(cfg, "encode_mode", "per_token") == "per_token_additive":
+        reason = ("encode_mode='per_token_additive' reads the frame table as an additive mean code and returns "
+                  "phi = 0, so every token frame is the identity")
     else:
         return None
     if positional and ((int(n_gen) > 0 and getattr(cfg, "pos_phi", "none") != "none")

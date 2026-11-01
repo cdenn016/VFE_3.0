@@ -303,7 +303,8 @@ def test_every_layer_columns_and_the_per_layer_eigenvalue_alarm(caplog: pytest.L
     tokens = torch.randint(0, V, (B, N), generator=torch.Generator().manual_seed(3))
     d = model.diagnostics(tokens)
     extremes = model.last_belief_layer_extremes
-    assert len(extremes["lam_min"]) == len(extremes["lam_max"]) == 2
+    assert len(extremes["lam_min"]) == len(extremes["lam_max"]) == len(extremes["cond_max"]) == 2
+    assert max(extremes["cond_max"]) == pytest.approx(d["belief_cond_max_layer_max"])
     assert d["belief_lam_min_layer_min"] == pytest.approx(min(extremes["lam_min"]))
     assert d["belief_lam_max_layer_max"] == pytest.approx(max(extremes["lam_max"]))
     assert d["belief_lam_min_layer_min"] <= d["belief_lam_min"]               # the last layer is one of the layers
@@ -315,13 +316,15 @@ def test_every_layer_columns_and_the_per_layer_eigenvalue_alarm(caplog: pytest.L
         assert key in d
     assert d["relational_capped_mass_mean_layer_max"] >= d["relational_capped_mass_mean"] or math.isnan(
         d["relational_capped_mass_mean"])
-    # The alarm reads every layer: layer 0 collapsed, the last layer healthy.
+    # The alarm reads every layer: layer 0 collapsed, the last layer healthy (per-token condition, audit 2026-10-31
+    # training-diagnostics-2).
     warned: set = set()
     records: List[Dict[str, Any]] = []
     with caplog.at_level(logging.WARNING):
-        T._warn_eigenvalue_collapse({"belief_lam_min": 1.0, "belief_lam_max": 2.0}, warned,
+        T._warn_eigenvalue_collapse({"belief_lam_min": 1.0, "belief_lam_max": 2.0, "belief_cond_max": 2.0}, warned,
                                     logging.getLogger("audit-l2"), belief_layer=1,
-                                    layer_extremes={"lam_min": [1e-9, 1.0], "lam_max": [10.0, 2.0]},
+                                    layer_extremes={"lam_min": [1e-9, 1.0], "lam_max": [10.0, 2.0],
+                                                    "cond_max": [1e10, 2.0]},
                                     sink=records.append)
     assert ("belief_eigenvalue_ratio", 0, -1) in warned and ("belief_eigenvalue_ratio", 1, -1) not in warned
 

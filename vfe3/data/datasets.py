@@ -2,7 +2,9 @@ r"""Tokenized-dataset loading for VFE_3.0 (reads a pre-tokenized cache; no token
 
 The cache holds 1-D token-id streams under
 ``{cache_dir}/{dataset}_{split}_{tokenizer}_tokens.{pt|bin}``:
-  .pt   a torch int64 tensor (torch.load), e.g. wikitext-103 (gpt2), wiki-ja (cl100k).
+  .pt   a torch integer tensor (torch.load), e.g. wikitext-103 (gpt2), wiki-ja (cl100k): int64 in the
+        existing caches, int32 in a new build of the cache builders (half the page cache; the loader reads
+        either, and a window is cast to int64 when it is read).
   .bin  a raw int32 memmap with an ``n_tokens`` sidecar ``.meta.json``, e.g. wiki-en.
 ``TokenWindows`` slices the stream into causal-LM (input, target) windows:
 ``input = tokens[i:i+L]``, ``target = tokens[i+1:i+L+1]``. No neural code, no CLI.
@@ -384,7 +386,9 @@ def load_cached_tokens(
     Tries the ``.pt`` (torch.load) cache, then the ``.bin`` memmap (size and dtype from the
     ``.meta.json`` sidecar). An uncapped load keeps the corpus mapped in its NATIVE integer
     dtype (any of :data:`SUPPORTED_TOKEN_DTYPES`) -- no corpus-sized int64 copy is allocated;
-    the caller (``TokenWindows``) converts to ``torch.long`` before indexing. A ``limit`` yields
+    the caller (``TokenWindows``) converts to ``torch.long`` before indexing. The ``.bin`` map is
+    copy-on-write (``mode="c"``): a write into the tensor stays in process memory and never reaches
+    the file, and torch receives a writable array. A ``limit`` yields
     an OWNED ``torch.long`` clone of exactly the first ``limit`` tokens, sliced before any int64
     materialization. The dtype is validated before either branch can slice or cast, so bool /
     floating / complex caches are rejected rather than silently reinterpreted as token ids.
@@ -406,7 +410,7 @@ def load_cached_tokens(
         resolved, _meta_path, _provenance_path = _resolved_binary_cache_paths(binp)
         meta, dtype = _binary_cache_metadata(resolved)
         n = int(meta["n_tokens"])
-        mm = np.memmap(resolved, dtype=dtype, mode="r", shape=(n,))
+        mm = np.memmap(resolved, dtype=dtype, mode="c", shape=(n,))       # copy-on-write: no copy, never written back
         if limit is not None:
             capped = torch.from_numpy(np.asarray(mm[:limit]))
             return capped.clone() if capped.dtype == torch.long else capped.to(torch.long)
@@ -489,7 +493,11 @@ def _load_identity_bound_tokens(
     cache_dir: Optional[Path] = None,
     limit:     Optional[int]  = None,
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
-    r"""Load tokens only when the exact source identity is stable across the load."""
+    r"""Load tokens only when the exact source identity is stable across the load.
+
+    An uncapped load stays mapped on both formats (:func:`load_cached_tokens`), so the stream costs page cache
+    rather than process memory (audit 2026-10-31 A178).
+    """
     _require_word_cache_matches_vocabulary(dataset, split, cache_dir=cache_dir)
     identity_before = cache_source_identity(dataset, split, cache_dir=cache_dir)
     tokens = (
@@ -497,8 +505,6 @@ def _load_identity_bound_tokens(
         if limit is None
         else load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=limit)
     )
-    if limit is None and identity_before["format"] == "bin":
-        tokens = tokens.clone()
     identity_after = cache_source_identity(dataset, split, cache_dir=cache_dir)
     if identity_before != identity_after:
         differing = sorted(
@@ -682,8 +688,12 @@ def tokens_per_char(
     r"""Corpus constant ``n_tokens / n_unicode_codepoints`` for ``dataset``/``split``, or None.
 
     The bits-per-character correction factor: ``BPC = (CE / ln 2) * tokens_per_char`` turns the
-    model's bits-per-TOKEN into true bits-per-CHARACTER, so PPL/BPC compare across tokenizers and
-    languages (gpt2 vs cl100k; English vs Japanese/Arabic, where a token spans ~3 codepoints).
+    model's bits-per-TOKEN into true bits-per-CHARACTER, so BPC compares across tokenizers and
+    languages (gpt2 vs cl100k; English vs Japanese/Arabic, where a token spans ~3 codepoints) over
+    the same source text. Two streams of one corpus built from different texts do not share a
+    denominator: the GPT-2 ``wikitext-103`` stream counts the raw text with blank rows dropped and the
+    ``@-@`` markers merged (1,136,998 validation characters), the word streams the ``<unk>``-masked
+    text with its spaced markers and blank rows (1,138,080), so their BPC compares different texts.
     Computed by decoding the split's cached token stream once with its OWN tokenizer and counting
     Unicode codepoints incrementally in bounded token chunks. The tiktoken path decodes bytes and
     carries UTF-8 state across chunk boundaries, so a codepoint split across two BPE tokens is counted
@@ -756,13 +766,14 @@ class TokenWindows(Dataset):
     and the inflation grows as ``seq_len`` shrinks. Setting ``stride < seq_len`` gives the standard
     sliding-window evaluation instead -- each window still runs on its full ``seq_len`` of context,
     but only its final ``stride`` targets are scored and the overlapping prefix is masked to
-    ``-100``, so every transition is counted exactly ONCE and at ``seq_len - stride`` tokens of
-    context or better. The masked prefix is context, not padding: ``train.evaluate`` runs the model
-    on the whole window and weights it by the count of non-ignored targets, so the masked positions
-    inform the prediction without entering the average. This is the recipe in HuggingFace's
-    fixed-length-model perplexity documentation; it costs ``seq_len / stride`` times more forward
-    passes and always reports a LOWER perplexity than the disjoint windows, so the two are different
-    metrics and must not be mixed inside one comparison.
+    ``-100``, so every transition is counted exactly ONCE, and every transition scored after the first
+    window has ``seq_len - stride + 1`` tokens of context or more (the first window scores all of its
+    targets, ``seq_len - stride`` of them with fewer). The masked prefix is context, not padding:
+    ``train.evaluate`` runs the model on the whole window and weights it by the count of non-ignored
+    targets, so the masked positions inform the prediction without entering the average. This is the
+    recipe in HuggingFace's fixed-length-model perplexity documentation; it costs ``seq_len / stride``
+    times more forward passes and always reports a LOWER perplexity than the disjoint windows, so the
+    two are different metrics and must not be mixed inside one comparison.
 
     Window ``i`` starts at ``i * stride`` and scores transitions ``[max(0, i*stride + seq_len -
     stride), i*stride + seq_len)``, which tile the stream contiguously from zero; ``n`` is the

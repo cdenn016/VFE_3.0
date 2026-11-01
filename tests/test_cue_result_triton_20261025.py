@@ -8,10 +8,12 @@ backward in Triton register tiles for a low-rank regression. These tests pin:
 * CPU tensors run the torch tiles whatever the toggle (bitwise the same loss and gradients) and never import triton;
 * under the Triton interpreter (CPU, ``TRITON_INTERPRET=1``) the fused kernels reproduce the torch route's mean,
   variances, log weights, log evidence and every gradient (float64 to 1e-11; float32 as close to a float64 reference
-  as the torch route's float32 within a factor 4) on ragged shapes, ranks 1 to 4, shared and per-token priors and
-  several row chunks, and the tied model with a carried regime gives the torch route's loss and gradients;
-* the five kernels compile offline for the RTX 5090 target (sm_120) at ranks 2 and 4, with no register spills at
-  rank 2 (at rank 4 the column backward spilled 212 bytes when written; the counts are recorded).
+  as the torch route's float32 within a factor 4) on ragged shapes, ranks 1 to 4, one to six coordinate tiles,
+  shared and per-token priors and several row chunks, and the tied model with a carried regime gives the torch
+  route's loss and gradients;
+* the five kernels compile offline for the RTX 5090 target (sm_120) at ranks 1, 2 and 4, at four coordinate tiles
+  and, for ranks 1 and 2, at the live K = 192 (NKTP = 8), with no register spills at ranks 1 and 2 (at rank 4 the
+  column backward spilled 212 bytes when written; the counts are recorded).
 
 The interpreter and compile checks run in subprocesses, so the test process never imports triton. Nothing runs on the
 GPU here.
@@ -175,8 +177,13 @@ def rel(a, b):
     return float((a.double() - b.double()).abs().max() / b.double().abs().max().clamp_min(1e-300))
 
 results = []
+# The last five shapes span three to six coordinate tiles of BK = 32 (NKTP padding included; K = 192 is the live
+# width) at every rank, with per-token priors and several row chunks (audit 2026-10-31 memory-local-learner-6).
 for R, M, K, rank, per_token, tile in ((5, 7, 3, 1, False, 10 ** 9), (6, 37, 35, 2, True, 6000),
-                                       (3, 33, 5, 3, False, 10 ** 9), (4, 9, 6, 4, True, 2000)):
+                                       (3, 33, 5, 3, False, 10 ** 9), (4, 9, 6, 4, True, 2000),
+                                       (3, 5, 70, 1, True, 10 ** 9), (2, 3, 192, 1, False, 10 ** 9),
+                                       (3, 6, 100, 3, True, 3000), (2, 5, 96, 4, False, 10 ** 9),
+                                       (3, 4, 130, 2, True, 2500)):
     ops, cot = operands(R, M, K, rank, per_token, seed=R + M)
     ref = run(ops, cot, torch.float64, False, 10 ** 9)
     entry = {"shape": [R, M, K, rank, per_token, tile]}
@@ -240,14 +247,15 @@ kernels = {"fwd_weights": tk.cr_fwd_weights_kernel, "fwd_moments": tk.cr_fwd_mom
            "bwd_pairs": tk.cr_bwd_pairs_kernel, "bwd_rows": tk.cr_bwd_rows_kernel, "bwd_cols": tk.cr_bwd_cols_kernel}
 ints = {"R", "M", "K", "NKT", "LP_STRIDE", "ROWS_PER_SPLIT"}
 out = {}
-for rank in (2, 4):
+# NKTP = 4: K = 128 at BK = 32, four coordinate tiles; NKTP = 8: the live K = 192, six tiles padded to eight.
+for rank, nktp in ((1, 8), (2, 4), (2, 8), (4, 4)):
     for key, kernel in kernels.items():
         cfg = cfgs[key]
         consts = {"BA": cfg["BA"], "BK": cfg["BK"], "RANK": rank, "RP": 1 << (rank - 1).bit_length(), "ACC": True}
         if "WRITE_LOGW" in kernel.arg_names:                    # the forward's variant (it writes the log weights)
             consts["WRITE_LOGW"] = True
-        if "NKTP" in kernel.arg_names:                          # K = 128 at BK = 32: four coordinate tiles
-            consts["NKTP"] = 4
+        if "NKTP" in kernel.arg_names:
+            consts["NKTP"] = nktp
         sig = {n: ("constexpr" if n in consts else "i32" if n in ints else "fp32" if n == "HALF_K_LOG2PI"
                    else "*i32" if n == "IND" else "*fp32") for n in kernel.arg_names}
         compiled = triton.compile(ASTSource(fn=kernel, signature=sig, constexprs=consts),
@@ -261,19 +269,22 @@ for rank in (2, 4):
                                  capture_output=True, text=True)
         text = log.stdout + log.stderr
         spill = re.search(r"(\\d+) bytes spill stores, (\\d+) bytes spill loads", text)
-        out[f"{key}_rank{rank}"] = {"registers": int(re.search(r"Used (\\d+) registers", text).group(1)),
-                                    "spill_stores": int(spill.group(1)), "spill_loads": int(spill.group(2))}
+        out[f"{key}_rank{rank}_nktp{nktp}"] = {"registers": int(re.search(r"Used (\\d+) registers", text).group(1)),
+                                               "spill_stores": int(spill.group(1)),
+                                               "spill_loads": int(spill.group(2))}
 print(json.dumps(out))
 """
 
 
 def test_kernels_compile_for_sm120(tmp_path: Path, record_property: Any) -> None:
     report = _run_script(_COMPILE_SCRIPT, _subprocess_env(TRITON_CACHE_DIR=str(tmp_path / "triton_cache")))
-    assert len(report) == 10
+    assert len(report) == 20
     for key, r in report.items():
         record_property(f"sm120_{key}", json.dumps(r))
         assert r["registers"] <= 255, (key, r)
-        if key.endswith("rank2"):                               # the launcher's rank: no spills in any kernel
+        # Ranks 1 and 2, at four coordinate tiles and at the live K = 192 (NKTP = 8): no spills in any kernel. Rank 4
+        # is recorded only (its column backward spilled when the kernels were written).
+        if "_rank1_" in key or "_rank2_" in key:
             assert r["spill_stores"] == 0 and r["spill_loads"] == 0, (key, r)
 
 

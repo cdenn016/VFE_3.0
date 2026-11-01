@@ -551,8 +551,12 @@ def _install_clip_spy(monkeypatch):
         params = list(parameters)
         calls.append(({id(p) for p in params}, float(max_norm)))
 
-    # train_step clips by get_total_norm (before its fused host transfer) + clip_grads_with_norm_.
+    import vfe3.train as vfe3_train
+
+    # train_step clips by get_total_norm (before its fused host transfer) + clip_grads_with_norm_, or, for a set that
+    # holds the token-gathered frame table, by its row form (audit 2026-10-31, train-step-3); one call per set.
     monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", spy)
+    monkeypatch.setattr(vfe3_train, "_clip_grads_with_norm_rows_", spy)
     return calls
 
 

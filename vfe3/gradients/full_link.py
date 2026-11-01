@@ -3,16 +3,17 @@ r"""Frozen, fully connected Gaussian receiver forces.
 .. math::
     L_{ij}^{(h)}=U_iO_hT_hU_j^{-1}.
 
-The receiver law is the channel likelihood (projected_gradient.tex, Eq. quadratic_family): it scores
+The receiver law is the channel likelihood (GL(K)_supplementary_v2.tex, Section sec:receiver_inference,
+Proposition prop:rec_closed_form and Eq. eq:rec_quadratic): it scores
 the receiver's partial law P_h xi_i against the sender's d-dimensional message as an expected likelihood
 and counts the receiver entropy once (c = alpha). The measurement P_h is the head-h rows of O'^{-1}
 under ``receiver_measurement='inverse'``, or the adjoint O'_h^T.
 
 The state-dependent self-coupling alpha*(D) = c0/(b0 + D), D = KL(q_i||p_i) (summed per token, or per
-local coordinate on the diagonal family), is profiled out (projected_gradient.tex, Sec. profiled
-self-coupling): the receiver energy becomes c0 log(b0 + D) + G(q), its exact force is alpha*(q) dD/dq
-+ dG/dq, and freezing alpha at the current state gives a majorizer whose exact minimizer is the
-existing closed form.
+local coordinate on the diagonal family), is profiled out (GL(K)_supplementary_v2.tex, Section
+sec:rec_updates, the profiled-coupling paragraph): the receiver energy becomes c0 log(b0 + D) + G(q), its
+exact force is alpha*(q) dD/dq + dG/dq, and freezing alpha at the current state gives a majorizer whose
+exact minimizer is the existing closed form.
 """
 
 import math
@@ -224,12 +225,18 @@ def _head_weights(
 
 
 def _spd_precision(target: torch.Tensor) -> torch.Tensor:
-    r"""Return target^{-1} from a zero-jitter Cholesky factor, retrying a failed batch in float64.
+    r"""Return target^{-1} from a zero-jitter Cholesky factor, retrying the failed entries in float64.
 
-    A float32 factorization fails near cond(target) ~ 1/eps_32. The retry recomputes the batch in
-    float64 (one host sync on the info tensor), counts the failed entries in the receiving-law
-    retry counter (:func:`receiver_law_retry_counter`, not the projected-covariance recovery
-    counter), and raises only if float64 also fails.
+    A float32 factorization fails near cond(target) ~ 1/eps_32. The retry factors the failed entries
+    in float64 (one host sync on the info tensor), counts them in the receiving-law retry counter
+    (:func:`receiver_law_retry_counter`, not the projected-covariance recovery counter), and raises
+    only if a failed entry fails in float64 too. Only the failed entries take the float64 inverse,
+    cast back; every other entry keeps its float32 inverse (bit for bit on the CPU), so a failing
+    later source does not change the pooled precision of an earlier receiver (audit 2026-10-31 A091,
+    the analog of the kernel route's per-receiver write-back of 2026-10-16 F41). Each branch factors
+    the identity in place of the other branch's entries, and the first attempt's factor does not
+    enter the output, so backward never differentiates a failed factor, whose Cholesky adjoint is
+    not finite; a retry therefore refactors the batch once more in float32.
     """
     factor, info = torch.linalg.cholesky_ex(target)
     failed = info != 0
@@ -237,10 +244,16 @@ def _spd_precision(target: torch.Tensor) -> torch.Tensor:
         if target.dtype == torch.float64:
             raise torch.linalg.LinAlgError("receiving-law covariance is not positive definite")
         _count_receiver_law_retry(failed)
-        factor64, info64 = torch.linalg.cholesky_ex(target.to(torch.float64))
+        mask = failed[..., None, None]
+        eye = torch.eye(target.shape[-1], dtype=target.dtype, device=target.device)
+        eye64 = torch.eye(target.shape[-1], dtype=torch.float64, device=target.device)
+        factor64, info64 = torch.linalg.cholesky_ex(torch.where(mask, target.to(torch.float64), eye64))
         if bool((info64 != 0).any()):
             raise torch.linalg.LinAlgError("receiving-law covariance is not positive definite in float64")
-        return torch.cholesky_inverse(factor64).to(target.dtype)
+        # The healthy entries refactored with the identity at the failed ones: bitwise the first attempt's factors.
+        healthy = torch.cholesky_inverse(torch.linalg.cholesky_ex(torch.where(mask, eye, target))[0])
+        wide = torch.cholesky_inverse(factor64)                             # the identity at the healthy entries
+        return torch.where(mask, wide.to(target.dtype), healthy)
     return torch.cholesky_inverse(factor)
 
 
@@ -510,13 +523,13 @@ def build_full_link_context(
         Lambda, eta = _local_pullback(pooled_precision, pooled_eta, channel_frame)
         if sigma_p.ndim == mu_p.ndim:
             prior_precision = torch.diag_embed(sigma_p.to(dtype).reciprocal())
-        else:
-            prior_precision = torch.cholesky_inverse(torch.linalg.cholesky(sigma_p.to(dtype)))
-        if sigma_p.ndim == mu_p.ndim:
             prior_logdet = sigma_p.to(dtype).log().sum(-1)
         else:
-            prior_logdet = 2 * torch.linalg.cholesky(sigma_p.to(dtype)).diagonal(
-                dim1=-2, dim2=-1).log().sum(-1)
+            # One factor of the full prior covariance serves the precision and the log-determinant (audit 2026-10-31
+            # A193).
+            prior_factor = torch.linalg.cholesky(sigma_p.to(dtype))                       # (..., N, K, K)
+            prior_precision = torch.cholesky_inverse(prior_factor)
+            prior_logdet = 2 * prior_factor.diagonal(dim1=-2, dim2=-1).log().sum(-1)
         profile = SelfCouplingProfile(
             lambda_alpha_mode, b0, c0, mu_p.to(dtype), sigma_p.to(dtype), prior_precision,
             (prior_precision @ mu_p.to(dtype).unsqueeze(-1)).squeeze(-1), prior_logdet, Lambda, eta)
@@ -623,7 +636,7 @@ def full_link_minimizer(
     eps:              float = 1e-6,
     sigma_max:        Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Exact frozen-context receiver update in natural parameters (projected_gradient.tex, Prop. flow).
+    r"""Exact frozen-context receiver update in natural parameters (GL(K)_supplementary_v2.tex, Prop. prop:rec_flow).
 
     .. math::
         J^+=(1-\rho)\Sigma^{-1}+\rho\Lambda/c,\qquad

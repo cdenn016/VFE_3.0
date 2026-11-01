@@ -6,7 +6,8 @@ Modules (imported lazily by the caller; this package imports nothing heavy on it
   training-split sample), identity-checked by SHA-256 and token count, and article segmentation.
 * :mod:`~vfe3.posthoc.evaluate`: model loading, the per-target NLL pass under the run's own evaluation
   protocol, cross-checked against :func:`vfe3.train.evaluate`, and the article-level bootstrap.
-* :mod:`~vfe3.posthoc.interventions`: the M5 frozen interventions (rows 1-12) as reversible patches.
+* :mod:`~vfe3.posthoc.interventions`: the M5 frozen interventions (rows 1-12, and the comparison-space RoPE arm,
+  row 13) as reversible patches.
 * :mod:`~vfe3.posthoc.klcap`: beta-weighted activation of the KL cost cap per layer and head.
 * :mod:`~vfe3.posthoc.attention`: per-head attention statistics (S2 panel B).
 * :mod:`~vfe3.posthoc.maps`: invariants of the relational maps (S1 panel B, S2 panel A).

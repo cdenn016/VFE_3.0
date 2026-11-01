@@ -1,5 +1,7 @@
 # TODO
 
+Every timing, launch count and memory figure in the three performance sections below was measured on October 12, 2026 at that day's launcher shape (K=20, two heads, four layers, N=128, batch 64 or 16). The live route has since changed (on October 31: K=192, six heads, ten layers, N=512, B=8, a tied block MLP, noisy-key routing with the fused diagonal moments and the table Fisher step), so re-profile at the current shape before planning against these numbers.
+
 ## Triton kernels for the edge and latent link routes
 
 Profiled on October 12, 2026 on the RTX 5090 under the live `train_vfe3.py` configuration (K=20, two heads, four layers, N=128, `decode_ce_triton=True`), one training step on a random token batch, with only the overrides shown changed. Caveat: these runs shared the GPU with another job. The same live-config step measured 64.5 ms later on an idle GPU, against 135 ms here, so the absolute times and the edge-to-baseline ratios below are inflated by an unknown amount. Re-measure on an idle GPU before using them. The φ₁ share of GPU time comes from the kernel breakdown and should survive, but that is also unverified.
@@ -13,7 +15,7 @@ Profiled on October 12, 2026 on the RTX 5090 under the live `train_vfe3.py` conf
 | `"lowrank"` | 16 | 178 | 5.1 GB |
 | `"lowrank"` + latent | 16 | 627 | 17.8 GB |
 
-On both edge routes, 75 to 90 percent of GPU time is the per-edge coefficient $\Phi_{ij} = \varphi_1(B_j^\top A_i)$. `vfe3/model/edge_links.py::phi1` evaluates it through `relational_operators._phi1`, a `torch.linalg.matrix_exp` of the augmented $2r\times 2r$ block (8×8 at r=4), over a (B, N, N) batch that holds about $10^6$ matrices at batch 64. cuBLAS runs these as batched gemv kernels (`gemmSN_NN`) that do almost no useful work. The autograd backward exponentiates a 16×16 block per edge. The latent route repeats both inside `torch.autograd.grad(create_graph=True)` on every fixed-point step of `infer_latent_receivers`. The step time also grows faster than the batch: 6.5 ms per `matrix_exp` call at batch 16 against 137 ms at batch 64.
+On both measured edge routes, the curved mode `"lowrank"` with and without latent factors, 75 to 90 percent of GPU time is the per-edge coefficient $\Phi_{ij} = \varphi_1(B_j^\top A_i)$. `vfe3/model/edge_links.py::phi1` evaluates it through `relational_operators._phi1`, a `torch.linalg.matrix_exp` of the augmented $2r\times 2r$ block (8×8 at r=4), over a (B, N, N) batch that holds about $10^6$ matrices at batch 64. cuBLAS runs these as batched gemv kernels (`gemmSN_NN`) that do almost no useful work. The autograd backward exponentiates a 16×16 block per edge. The latent route repeats both inside `torch.autograd.grad(create_graph=True)` on every fixed-point step of `infer_latent_receivers`. The step time also grows faster than the batch: 6.5 ms per `matrix_exp` call at batch 16 against 137 ms at batch 64.
 
 ### 1. Batched small-matrix φ₁ kernel (first)
 
@@ -21,7 +23,7 @@ One program per matrix computes $\varphi_1(X)$ for r×r inputs entirely in regis
 
 The backward is the adjoint Fréchet derivative. For a power series with real coefficients, $L_{\varphi_1}(X)^*[G] = L_{\varphi_1}(X^\top)[G]$, so the backward kernel is the forward-mode Fréchet kernel evaluated at $X^\top$. The latent route differentiates through the gradient (`create_graph=True`), so it also needs the second Fréchet derivative $L^{(2)}_{\varphi_1}(X)[E, F]$. That can be done with second-order dual numbers carried through the same fixed schedule, plus its adjoint.
 
-The kernel is a drop-in replacement for `edge_links.phi1`. It also serves `loop_energy`, which runs in float64, and the `"pure_gauge"` mode.
+The kernel is a drop-in replacement for `edge_links.phi1`. It also serves `loop_energy`, which runs in float64. The `"pure_gauge"` mode gains little: since 2026-10-21 (`b10e2dd`) it evaluates φ₁ once per sender, 2N matrices per sequence (`edge_links.edge_coefficients`), so the 75 to 90 percent share above applies to the curved mode only.
 
 Evidence so far: written as plain elementwise PyTorch on a (64, 128, 128, 4, 4) batch, the same Taylor schedule (degree 14, three doublings) takes 34 ms for forward plus backward, against 111 ms for `_phi1`, with a maximum difference of 1.9e-6. A register kernel reads and writes 16 floats per matrix, so it should take well under a millisecond; that is an estimate, not a measurement.
 
@@ -37,25 +39,26 @@ The backward needs hand-derived adjoints of the $\Xi$, $Y$ and $q$ accumulations
 
 ## CUDA graph for the training step (live route, no edges)
 
-Measured October 12, 2026 on an idle RTX 5090 under the live configuration, synthetic batch (B=64, N=128).
+Measured October 12, 2026 on an idle RTX 5090 under that day's live configuration (K=20, two heads, four layers), synthetic batch (B=64, N=128). The live route has since changed shape and operations (see the note at the top), so the launch counts, the 14 percent estimate and the sync sites need a re-profile at the current shape.
 
 The step is CPU-bound, not sync-bound. A step takes 64.5 ms of wall time. Under the profiler, its GPU kernels are busy for 45.9 ms of a 95 ms span. There are 2,984 kernel launches per step: 1,083 from the forward, 1,432 from the backward, 59 from the optimizer, and the rest from the decode kernels and bookkeeping. 2,079 of them run under 5 µs. The forward takes 34 ms of CPU time to issue kernels that keep the GPU busy for 8.5 ms. The backward takes 52 ms of CPU time for 16 ms of GPU time. The 12 host syncs per step wait only 1.8 ms in total. Removing them would therefore not speed anything up by itself; they matter only because they block graph capture. Two cheap variants were within noise: disabling the `opt_einsum` path search (63.3 ms against 64.5 ms) and the sync-free exponential for the shared content link (62.5 ms).
 
 Evidence for the gain: in a probe with the in-step sync sites patched out (listed below), capturing forward plus backward in one `torch.cuda.CUDAGraph` and replaying it took 44.6 ms, against 53.4 ms eager. Loss and every gradient were bitwise identical between replay and eager (maximum gradient difference 0.0). The expected step time falls from about 64.5 ms to about 56 ms, roughly 14 percent. Beyond that the step is close to GPU-bound, and further gains have to come from GPU time in the roughly 180 kernels longer than 50 µs, not from launches.
 
-Sync sites inside forward and backward that block capture, with the fix each needs:
+Sync sites inside forward and backward that block capture on the current diagonal route (`gaussian_diagonal` with `diagonal_chunked` decoding), with the fix each needs:
 
 1. `relational_operators._content_link_exp` calls `torch.linalg.matrix_exp`, which reads its squaring counts on the host: three syncs in the forward and three in the backward per step. Route it through `transport._FixedScheduleMatrixExp`. That needs a static norm bound for the generator $OT$, which is unbounded today, so either choose a bound or cap the squaring count with a fail-closed check.
 2. `transport._content_rows` uses `torch.unique`, whose output size is data-dependent. Either deduplicate on the host from the loader's CPU token batch and copy the indices non-blocking, or use the static per-occurrence path. The static path was measured 2x slower at K=128; the K=20 probe used it and still got the 44.6 ms above.
-3. `numerics.safe_cholesky` branches on `bool(ok.all())` in `prior_bank._prepare_full_covariance_for_decode`. Replay optimistically, carry `ok` to the end-of-step gate, and redo the step eagerly when it is false.
-4. `deferred_host_checks` resolves its raise-only verdicts with `host_read` before backward. Move them to the existing end-of-step gate. Raising before `optimizer.step` still keeps uncertified values out of every parameter update.
-5. `PriorBank._validate_fused_ce_targets` consumes a loader stamp keyed on the target tensor's `id` and `_version`. In a graph the targets are copied into a static buffer, so the stamp has to be checked at the copy.
+3. `deferred_host_checks` resolves its raise-only verdicts with `host_read` before backward. Move them to the existing end-of-step gate. Raising before `optimizer.step` still keeps uncertified values out of every parameter update. (`train_step` opens this scope; a bare forward and backward does not reach it.)
+4. `PriorBank._validate_fused_ce_targets` consumes a loader stamp keyed on the target tensor's `id` and `_version`. In a graph the targets are copied into a static buffer, so the stamp has to be checked at the copy.
+
+Full-covariance decoders only (`full_chunked` and the other paths through `prior_bank._prepare_full_covariance_for_decode`, not reached on the diagonal route): `numerics.safe_cholesky` branches on `bool(ok.all())` there. Replay optimistically, carry `ok` to the end-of-step gate, and redo the step eagerly when it is false.
 
 Scope: graph only silent steps, meaning `metrics_out is None`, `grad_accum_steps == 1`, and fixed B and N. Logging steps, evaluation and precision-retry replays stay eager. The optimizer, clipping and scheduler stay outside the graph, reading the static `.grad` buffers. The end-of-step gate in `train_step` (loss, gradient finiteness, target partition, clip norms) remains the one host read per step; it gates the precision-retry ladder, so overlapping CPU and GPU across steps would need that gate redesigned. Tests: graph replay against eager, bitwise, for loss and every gradient over several steps with different batches; the fallback when a captured `ok` or host-check flag fails.
 
 ## Concurrent training runs in the multi-run launchers
 
-A single run leaves the GPU idle for roughly 30 percent of each step while Python issues kernels (see the CUDA graph section). A second training process on the same GPU fills those gaps with its own kernels. Each run needs one to two cores and 3.6 GB at the live configuration, so two concurrent runs leave the 9900X free for other work. The expected total throughput is 1.3 to 1.4 times a single run, an estimate from the 46 ms of GPU work in a 64.5 ms step, not a measurement. Pinning the process to one CCD, raising its priority or capping torch's intra-op threads would gain at most a few percent and is not worth doing.
+A single run leaves the GPU idle for roughly 30 percent of each step while Python issues kernels (see the CUDA graph section). A second training process on the same GPU fills those gaps with its own kernels. Each run needs one to two cores, so two concurrent runs leave the 9900X free for other work. At the October 12 configuration (batch 64) each run also held 3.6 GB; the current live shape needs far more memory (its frame table and two AdamW moments alone are about 3.5 GiB), so re-measure before planning concurrency. The expected total throughput is 1.3 to 1.4 times a single run, an estimate from the 46 ms of GPU work in a 64.5 ms step, not a measurement. Pinning the process to one CCD, raising its priority or capping torch's intra-op threads would gain at most a few percent and is not worth doing.
 
 Step 1 is to measure. Time two concurrent live-config runs against one on an idle GPU (about 10 minutes). Below about 1.2 times total throughput, drop the item.
 
@@ -86,7 +89,7 @@ The exact alternative, a derivation sketch that has not been checked: give each 
 
 ## Local learner: further tests (deferred)
 
-Recorded on October 25, 2026, after stages A to C of the local-learner test (`docs/research/2026-10-21-local-learner-test/findings.md`). The linear-Gaussian test is finished: one-pass stepwise EM reaches 0.925 and 0.906 of backpropagation's gain at d = 32 and 64, backpropagation's optimum is an EM fixed point, and the remaining gap is optimization speed. Further tuning of that learner is out of scope. Two tests remain.
+Recorded on October 25, 2026, after stages A to C of the local-learner test (`docs/research/2026-10-21-local-learner-test/local_learner_findings.md`, a local record: `docs/` is not tracked). The linear-Gaussian test is finished: one-pass stepwise EM reaches 0.925 and 0.906 of backpropagation's gain at d = 32 and 64, backpropagation's optimum is an EM fixed point, and the remaining gap is optimization speed. Further tuning of that learner is out of scope. Two tests remain.
 
 ### 1. Switching linear-Gaussian stage (first, more informative)
 

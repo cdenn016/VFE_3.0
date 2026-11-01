@@ -1,6 +1,6 @@
 r"""One switch to the fully gauge-covariant model (``fully_gauge_covariant`` in ``train_vfe3.py``).
 
-:func:`fully_gauge_covariant_overrides` returns the smallest set of launcher keys that puts a configuration on the
+:func:`fully_gauge_covariant_overrides` returns a set of launcher keys that puts a configuration on the
 gauge facet of the pure-path report (every ``gauge_flags`` entry of
 :func:`vfe3.run_artifacts._pure_path_report` true), leaving every other key as given. Under a common gauge
 transformation :math:`U_i \to g_iU_i` the model then transforms covariantly end to end:
@@ -12,19 +12,33 @@ transformation :math:`U_i \to g_iU_i` the model then transforms covariantly end 
   ``projected_predictive`` only), or are covariant on their own (``canonical_frame``, ``gauge_gate`` with an
   equivariant norm, or no block MLP under the equivariant ``none`` or ``mahalanobis`` norm, where
   ``block_coordinates`` is left as given);
-* the decoder reads the reference moments :math:`(\xi_i, C_i)` (``decode_coordinates='reference'``);
+* the decoder reads the reference moments :math:`(\xi_i, C_i)` (``decode_coordinates='reference'``), and a prior-bank
+  decoder scores them against its own untied bank (``untie_decode_bank=True``): a tied bank returns the encoder's
+  prior tables, whose moments the encoder reads in each type's own frame, so they move with the frames while the
+  reference query does not (audit 2026-10-31, gauge-covariance-e2e-1);
 * no fixed-coordinate cap or trust region rewrites the covariance or the frames (``sigma_max``,
-  ``phi_mstep_max_matrix_norm``, ``phi_frame_condition_max``, ``m_phi_update_mode``);
+  ``phi_mstep_max_matrix_norm``, ``phi_frame_condition_max``, ``m_phi_update_mode``). The frame M-step is then chart
+  AdamW on the exponential coordinates of the frame table, which is not covariant itself (the coordinates transform
+  nonlinearly under :math:`U_i \to g_iU_i` and the second-moment normalization is coordinatewise), so the switch
+  makes every forward map covariant, not the training trajectory;
 * the encoder has no additive per-coordinate control, RoPE (if any) acts in comparison space, and the self term
-  uses the frame-invariant total KL (``lambda_alpha_mode='state_dependent'``).
+  uses the frame-invariant total KL (``lambda_alpha_mode='state_dependent'``);
+* no type-level frame dropout (``phi_type_dropout=0``): a dropped type reads the identity frame in a training forward
+  while its moments keep their local values, so that forward is not covariant, and the covariant way to drop a frame,
+  together with the passive action :math:`U_i^{-1}` on that agent's moments, changes no output (audit 2026-10-31,
+  gauge-covariance-e2e-2).
 
 The content links are not touched: ``content_link_chart``, ``content_link_edges`` (the Lie-algebra links
 :math:`L_{ij}`) and the latent-link settings stay as configured. Neither are the routing, the attention prior, the
-readout, the predictive covariance and its floor, the decode covariance, the learning rates or the numerics. Both
-floors are covariant under the declared action: the prior floor :math:`f\Sigma_{p,i}` moves with the prior, and the
-relative floor :math:`f\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` has an invariant :math:`\operatorname{tr}C_i`
-and so maps to :math:`g_i(\cdot)g_i^\top`; the relative floor fails only under a non-orthogonal global right
-action :math:`U_i \to U_ia`, which the switch does not declare (audit 2026-10-17, item 43). Under
+readout, the predictive covariance and its floor, the decode covariance, the learning rates or the numerics. All
+three floor modes are covariant under the declared action: the prior floor :math:`f\Sigma_{p,i}` moves with the
+prior; the relative floor :math:`f\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` has an invariant
+:math:`\operatorname{tr}C_i` and so maps to :math:`g_i(\cdot)g_i^\top`; and the max floor, their larger, is
+covariant as well. On full layouts it is :math:`f\Sigma_p^{1/2}\max(W, I)\Sigma_p^{1/2}` with :math:`W` the relative
+floor whitened by :math:`f\Sigma_p`; the Cholesky whitening differs from any other square root of the prior floor by
+an orthogonal factor, and the spectral clip :math:`\max(W, I)` is orthogonally equivariant. The relative and max
+floors fail only under a non-orthogonal global right action :math:`U_i \to U_ia`, which the switch does not declare
+(audit 2026-10-17, item 43). Under
 ``decode_coordinates='reference'`` the decode covariance ``"constant"`` is :math:`\sigma_{\mathrm{init}}I` in
 reference coordinates, so it is invariant as well (audit 2026-10-17, item 25).
 
@@ -78,23 +92,27 @@ def fully_gauge_covariant_overrides(
         "phi_mstep_max_matrix_norm": None,
         "phi_frame_condition_max":   None,
         "lambda_alpha_mode":         "state_dependent",
+        "phi_type_dropout":          0.0,
     }
     # gaussian_frame_diagonal keeps its family: its stored reference variances c_i are invariant under the action, and
     # Sigma_i = U_i diag(c_i) U_i^T moves to g_i Sigma_i g_i^T with the frame.
     if get("family") not in ("gaussian_full", "gaussian_block", "gaussian_frame_diagonal"):
         wanted["family"] = "gaussian_full"
-        # The decoder kernel must match the covariance rank; the second-order linear term is diagonal-only.
-        if get("decode_mode") == "diagonal_chunked":
-            wanted["decode_mode"] = "full_chunked"
+        # The decoder is kept: diagonal_chunked reads diag C_i of the full family, whose cross-entropy equals the full
+        # kernel's (the logits differ by a per-position constant), with no dense C_i or Cholesky factor per position
+        # (audit 2026-10-31, gauge-covariance-e2e-3). The second-order linear term is diagonal-only.
         wanted["decode_second_order"] = False
-    elif get("family") == "gaussian_frame_diagonal" and get("decode_mode") != "linear":
-        # A tied decode bank pairs the encoder's local-frame mean with the reference variance c_v, which the frame
-        # change moves by about 3e-2 in the logits; the untied bank's own tables are both reference coordinates
-        # (audit 2026-10-20 item 59).
+    if get("decode_mode") != "linear":
+        # A tied decode bank returns the encoder's prior tables, which the encoder reads in the type's own frame: under
+        # a frame change they move with the frame while the reference query (xi_i, C_i) does not, by 30 nats of loss on
+        # the full and head-block families (audit 2026-10-31, gauge-covariance-e2e-1) and about 3e-2 in the logits on
+        # gaussian_frame_diagonal (audit 2026-10-20 item 59). The untied bank's own tables are reference coordinates.
         wanted["untie_decode_bank"] = True
     if get("encode_mode") == "per_token_additive":
         wanted["encode_mode"] = "per_token"
     if get("m_phi_update_mode") in ("pullback_group", "fisher_group"):
+        # The manifold steps carry a fixed-coordinate trust region (fisher_group: the chart-norm gate
+        # phi_chart_max_norm). Chart AdamW has none, but its step is not covariant either (module docstring).
         wanted["m_phi_update_mode"] = "adamw"
     if get("rope_mode") in ("frame", "frame_value"):
         # Frame-space RoPE folds a rotation into the content frame, so the reference decoder has no frame to read;

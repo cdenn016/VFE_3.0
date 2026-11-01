@@ -51,6 +51,17 @@ _PRIORS: Dict[str, Callable] = {}
 _PRIOR_CAUSALITY: Dict[str, tuple[Callable, bool, Optional[str]]] = {}
 
 
+def _refuse_misspelled_slope(
+    kwargs:  Dict[str, object],             # the builder's swallowed keyword arguments
+    builder: str,                           # the builder's name, for the message
+) -> None:
+    r"""Raise on a ``slope`` keyword: the ALiBi builders read ``alibi_slope``, and their ``**kwargs`` (which take the
+    parameters the model threads to every builder) would otherwise ignore it (audit 2026-10-31 A275)."""
+    if "slope" in kwargs:
+        raise TypeError(f"{builder}() got an unexpected keyword argument 'slope'; the ALiBi slope keyword is "
+                        "'alibi_slope'")
+
+
 @dataclass(frozen=True)
 class AttentionPriorRegistration:
     """One active prior builder and its next-token causality declaration."""
@@ -183,6 +194,7 @@ def prior_causal_alibi(
     On the causal triangle ``i - j >= 0`` so ``|i - j| == i - j``, matching the
     directed ``-slope*(i-j)`` convention of the original ``causal_alibi`` prior.
     """
+    _refuse_misspelled_slope(kwargs, "prior_causal_alibi")
     i       = torch.arange(n_query, device=device).unsqueeze(-1)
     j       = torch.arange(n_key,   device=device).unsqueeze(0)
     dist    = (i - j).abs().to(dtype)                               # (N_q, N_k)
@@ -212,6 +224,7 @@ def prior_causal_alibi_noself(
     stays allowed since row 0 has no other causal key (an all--inf logits row NaNs the softmax);
     its ALiBi bias there is -slope_h * 0 = 0. Returns ``(H, N_q, N_k)``, ``H = n_heads``.
     """
+    _refuse_misspelled_slope(kwargs, "prior_causal_alibi_noself")
     i       = torch.arange(n_query, device=device).unsqueeze(-1)
     j       = torch.arange(n_key,   device=device).unsqueeze(0)
     dist    = (i - j).abs().to(dtype)                               # (N_q, N_k)
@@ -256,13 +269,15 @@ def attention_log_prior(
     *,
     device:  'torch.device | str | None'  = None,
     dtype:   torch.dtype                   = torch.float32,
-    **kwargs,                              # variant params (e.g. alibi's `slope`)
+    **kwargs,                              # variant params (e.g. ALiBi's `alibi_slope`, the band's `window`)
 ) -> torch.Tensor:
     r"""Dispatch to the registered attention-prior `name`; returns log-prior bias (Nq, Nk).
 
     `device`/`dtype` are universal (every builder consumes them); variant-specific
-    params (e.g. ALiBi's `slope`) flow through **kwargs, so a new prior with a novel
-    param (windowed width, learned-bias handle, ...) slots in by `register_prior` +
-    config without editing this dispatcher.
+    params (e.g. ALiBi's `alibi_slope`, `causal_windowed`'s `window`) flow through **kwargs, so a new prior with a
+    novel param (windowed width, learned-bias handle, ...) slots in by `register_prior` +
+    config without editing this dispatcher. A builder ignores the params it does not read (the model threads
+    `n_heads`, `alibi_slope` and `window` to every builder); the ALiBi builders refuse the misspelling `slope`,
+    which they would otherwise ignore at their default slope 0.5 (audit 2026-10-31 A275).
     """
     return get_prior(name)(n_query, n_key, device=device, dtype=dtype, **kwargs)

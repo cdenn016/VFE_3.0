@@ -28,7 +28,6 @@ from vfe3.families.base import (
     renyi_per_coord,
     register_functional_per_coord,
     get_functional_per_coord,
-    has_per_coord_functional,
     divergence_functionals_per_coord,
 )
 from vfe3.families import gaussian as _gaussian     # noqa: F401  (registers the Gaussian families)
@@ -46,7 +45,6 @@ __all__ = [
     "get_functional",
     "register_functional_per_coord",
     "get_functional_per_coord",
-    "has_per_coord_functional",
     "divergence_functionals_per_coord",
     "get_family",
     "register_family",

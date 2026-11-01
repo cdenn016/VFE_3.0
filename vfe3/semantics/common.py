@@ -80,6 +80,8 @@ class VectorView:
         if not np.isfinite(self.X).all():
             raise ValueError(f"view {self.name!r}: X contains non-finite values")
         self._row_of: Dict[int, int] = {int(t): r for r, t in enumerate(self.ids)}
+        # center -> prepared rows, while vfe3.semantics.vectors.prepared_rows_cache holds them; None otherwise
+        self._prepared: Optional[Dict[bool, np.ndarray]] = None
 
     @property
     def n(self) -> int:
@@ -175,22 +177,29 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
     r"""Whether the global positive-diagonal rescaling is an exact redundancy of this model.
 
     The rescaling acts as $\mu \mapsto D\mu$, $\log\sigma^2 \mapsto \log\sigma^2 + 2\log D$,
-    $e^{X_v} \mapsto D e^{X_v}$ with compensating changes of the coordinate MLP and the decoder. It
-    was measured to leave the logits unchanged (to fp32 round-off) only for the probed class:
-    ``gauge_group="block_glk"``, ``attention_mode="projected_predictive"``, the coordinate block MLP
-    (or none), no CG coupling, no RoPE, and no coordinate normalization.
+    $e^{X_v} \mapsto D e^{X_v}$ with compensating changes of the coordinate MLP and the decoder. Under
+    ``family="gaussian_frame_diagonal"``, whose table stores the reference variances $c_v$ of
+    $\Sigma_v = U_v\,\mathrm{diag}(c_v)\,U_v^\top$, the frame carries it: $U_v \mapsto DU_v$,
+    $\mu_v \mapsto D\mu_v$ with $c_v$ fixed, so $\Sigma_v \mapsto D\Sigma_vD$. It was measured to leave
+    the logits unchanged (to fp32 round-off) only for the probed class: ``gauge_group="block_glk"``,
+    ``attention_mode="projected_predictive"``, the coordinate block MLP (or none), no CG coupling, no
+    RoPE, and no coordinate normalization.
 
     Returns ``(status, reason)`` with ``status`` one of
 
     * ``"exact"`` -- the configuration is in the probed class;
     * ``"broken"`` -- a structural reason rules it out: a LayerNorm (affine or not) normalizes
-      across coordinates, so $\mathrm{LN}(D\mu) \ne D\,\mathrm{LN}(\mu)$; or $D e^{X}$ leaves the
-      gauge group (compact/symplectic groups, tied or traceless variants), so the compensated frame
-      is not representable by ``phi_embed``;
+      across coordinates in local block coordinates, so $\mathrm{LN}(D\mu) \ne D\,\mathrm{LN}(\mu)$;
+      or $D e^{X}$ leaves the gauge group (compact/symplectic groups, tied or traceless variants), so
+      the compensated frame is not representable by ``phi_embed``;
     * ``"assumed"`` -- nothing rules it out but the configuration was not probed (e.g. a
-      Mahalanobis norm, which is equivariant, or a CG coupling / RoPE / other block MLP).
+      Mahalanobis norm, which is equivariant, a LayerNorm conjugated by the frame under
+      ``block_coordinates="reference"``, which acts as $x \mapsto U\,\mathrm{LN}(U^{-1}x)$ and is
+      covariant by construction, or a CG coupling / RoPE / other block MLP). The reference-coordinate
+      LayerNorm is the block of the fully gauge-covariant route (audit 2026-10-31 semantics-vectors-4).
     """
-    if getattr(cfg, "norm_type_block", "none") == "layernorm":
+    layernorm = getattr(cfg, "norm_type_block", "none") == "layernorm"
+    if layernorm and getattr(cfg, "block_coordinates", "local") != "reference":
         return "broken", ("a LayerNorm (affine or not) normalizes across coordinates, so "
                           "LN(Dμ) ≠ D LN(μ) for a non-uniform D")
     group = getattr(cfg, "gauge_group", "block_glk")
@@ -200,6 +209,9 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
         return "broken", ("D e^X leaves the tied block_glk group I_H (x) GL(d) unless D repeats across heads, "
                           "so the compensated frame is not representable")
     unprobed = []
+    if layernorm:
+        unprobed.append("a LayerNorm conjugated by the frame (block_coordinates='reference'; covariant by "
+                        "construction, not measured)")
     if getattr(cfg, "attention_mode", None) != "projected_predictive":
         unprobed.append(f"attention_mode={getattr(cfg, 'attention_mode', None)!r}")
     if getattr(cfg, "use_block_mlp", False) and getattr(cfg, "block_mlp_mode", "coordinate") != "coordinate":

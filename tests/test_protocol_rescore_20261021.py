@@ -49,7 +49,10 @@ def test_own_and_shorter_protocols_match_plain_evaluation(tmp_path: Path) -> Non
             for split in ("validation", "test"):
                 plain = _plain(run_dir, cache_dir, entry["checkpoint"], N, s, split)
                 assert entry["splits"][split]["ce"] == float(plain["ce"])
-        assert report["protocol"]["min_context"] == N - s
+        # Every window after the first scores targets with at least N - s + 1 tokens of context; window 0 scores
+        # N - s targets with fewer (audit 2026-10-31 A282).
+        assert report["protocol"]["min_context_after_first_window"] == N - s + 1
+        assert report["protocol"]["first_window_targets_below_min_context"] == N - s
         assert len(comparison_table(report).splitlines()) == 3
     own = run_protocol_rescore(tmp_path / "own.json", options=ProtocolRescoreOptions(
         entries=entries[:1], seq_len=8, eval_stride=4, device="cpu", precision="fp32", cache_dir=str(cache_dir)),

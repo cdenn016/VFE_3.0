@@ -255,7 +255,8 @@ def test_m2_gpu_hours_are_training_only_with_wall_time_beside(tmp_path: Path) ->
     resolved = resolve_manifest({"arms": {"Arm": [str(run_dir)]}, "selection": "final"})
     latex, markdown, rows = pt.main_results_table(resolved, read_checkpoints=False)
     assert rows[0]["device_hours"] == [pytest.approx(0.2)] and rows[0]["wall_device_hours"] == [pytest.approx(0.3)]
-    assert "$0.2$" in latex and "0.20 / 0.30" in markdown and "training-only" in markdown
+    # Two significant figures below one hour (audit 2026-10-31, paper-claims-6; one decimal printed 0.2).
+    assert "$0.20$" in latex and "0.20 / 0.30" in markdown and "training-only" in markdown
 
 
 def test_methods_contract_reports_replays_precision_toggles_per_role_clip_and_sample_caps() -> None:

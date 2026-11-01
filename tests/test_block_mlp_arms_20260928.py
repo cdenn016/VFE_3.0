@@ -232,13 +232,14 @@ def test_gauge_gate_flops_follow_the_covariance_layout():
     irrep_dims = (3, 1, 2)
     n_blocks, K, expansion, n_layers = len(irrep_dims), sum(irrep_dims), 3, 2
     gate_mlp = 4.0 * expansion * n_blocks ** 2
-    cholesky = sum(2.0 * d ** 3 + 2.0 * d ** 2 for d in irrep_dims)
+    # The Cholesky solve and its certificate (validated_cholesky_solve; audit 2026-10-31 A186).
+    cholesky = sum(2.0 * d ** 3 + 2.0 * d ** 2 + (10.0 / 3.0) * d ** 3 + 12.0 * d ** 2 for d in irrep_dims)
 
     full = _metadata("gauge_gate", irrep_dims, covariance_layout="full")
     diagonal = _metadata("gauge_gate", irrep_dims, covariance_layout="diagonal")
 
     assert _metadata("gauge_gate", irrep_dims).flops_per_token == full.flops_per_token
-    assert full.flops_per_token == n_layers * (gate_mlp + cholesky)
+    assert full.flops_per_token == pytest.approx(n_layers * (gate_mlp + cholesky), rel=1e-14)
     assert diagonal.flops_per_token == n_layers * (gate_mlp + 3.0 * K)
     assert diagonal.parameter_count == full.parameter_count
     assert diagonal.report_label == full.report_label == "invariant_scalar_gate"

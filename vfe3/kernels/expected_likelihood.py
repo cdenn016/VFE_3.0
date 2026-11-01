@@ -55,7 +55,8 @@ this route launches, so CPU-only machines never import it.
 from typing import Any, Optional, Tuple
 
 import torch
-from torch.autograd.function import once_differentiable
+
+from vfe3.kernels._autograd import strict_once_differentiable
 
 _KERNELS: Any = None
 
@@ -85,9 +86,11 @@ def _grid_launch(kernel: Any, n_programs: int, cfg: dict, *args: Any, **constexp
 class ExpectedLikelihoodCE(torch.autograd.Function):
     r"""Mean expected-likelihood cross-entropy over packed rows; saves only the row states (S,) besides inputs.
 
-    The backward is ``once_differentiable``: its gradients are Triton writes autograd does not track, so a
+    The backward is once differentiable: its gradients are Triton writes autograd does not track, so a
     ``create_graph=True`` gradient would carry a truncated graph (the temperature gradient through tau alone) and
-    a wrong second derivative. A double backward raises instead (audit 2026-10-16, F49).
+    a wrong second derivative. A double backward raises instead (audit 2026-10-16, F49), also toward a leaf upstream
+    of any differentiable input under a constant cotangent (``strict_once_differentiable``, for which the decode
+    tables are saved beside their transposed copies; audit 2026-10-31 triton-kernels-2).
     """
 
     @staticmethod
@@ -123,15 +126,17 @@ class ExpectedLikelihoodCE(torch.autograd.Function):
         # The second row state costs registers in the rows backward kernel: offline sm_120a ptxas (triton 3.5.1,
         # K = 20) reports spill stores of 396 -> 460 bytes there; the cols kernel loads the row state after its
         # energy tile and spills 0 bytes (4 before). The forward's 228 bytes predate F48. GPU time is unmeasured.
-        ctx.save_for_backward(mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l)
+        # mu_v and sigma_v themselves are saved only so a double backward toward their upstream leaves is refused
+        # (they are references to tensors the caller holds; the kernels read the transposed copies).
+        ctx.save_for_backward(mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l, mu_v, sigma_v)
         ctx.has_u, ctx.fast_log = has_u, fast_log
         return ce_rows.sum() / max(S, 1)
 
     @staticmethod
-    @once_differentiable
+    @strict_once_differentiable
     def backward(ctx: Any, grad_ce: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
-        mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l = ctx.saved_tensors
+        mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l, _, _ = ctx.saved_tensors
         S, K = mu_q.shape
         V = mu_v_t.shape[1]
         need = ctx.needs_input_grad

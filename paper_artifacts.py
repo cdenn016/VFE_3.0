@@ -1,8 +1,13 @@
 r"""Click-to-run: assemble the manuscript tables and figures of GL(K)_attention_v2 from run directories.
 
-Edit ``CONFIG`` below and run ``python paper_artifacts.py``, or pass a JSON file with the same keys as
-the only command-line argument. No model is built and nothing is written into the run directories;
-everything goes to ``CONFIG["out_dir"]`` (see :mod:`vfe3.paper.assemble` for the layout):
+Edit ``CONFIG`` below and run ``python paper_artifacts.py``. To read a JSON manifest with the same keys
+instead (``paper_arms.py`` writes ``m2_manifest.json``), set ``CONFIG["manifest"]`` to its path: its run
+keys (``arms``, ``evaluated_run``, ``final_run``, ``numerics_run``, ``scaling``, ``selection``) then come
+from the file alone, CONFIG supplies only the reading options, and ``paper_artifacts.json`` records every
+key's origin (:func:`vfe3.paper.assemble.manifest_config`). The command line is not read: an argument is
+refused, so a manifest passed the earlier way, as the only argument, cannot be ignored in favor of CONFIG's
+runs. No model is built and nothing is written into the run directories; everything goes to
+``CONFIG["out_dir"]`` (see :mod:`vfe3.paper.assemble` for the layout):
 
 * tables (LaTeX tabular with the manuscript's column layout, plus markdown with sources):
   ``tab:placeholder_main_results``, ``tab:placeholder_per_seed``, ``tab:relational_run``,
@@ -79,6 +84,9 @@ CONFIG = {
     "numerics_run":               None,          # None -> the evaluated run
     "scaling":                    {"K": [], "depth": []},
     "selection":                  "best",        # "best" (best recorded validation) or "final"
+    # None, or the path of a JSON manifest with the keys above (paper_arms.py writes m2_manifest.json), whose
+    # keys replace these; the manifest path is never a command-line argument.
+    "manifest":                   None,
     "out_dir":                    None,          # None -> <this folder>/paper_artifacts
     "drop_unknown_config_fields": True,          # read configs of older code lines (2026-09-28 policy)
     "read_checkpoints":           True,          # read saved weights (mmap) when no record holds a value
@@ -94,14 +102,16 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 def main(argv: "list[str]") -> int:
     from vfe3.paper import assemble
+    from vfe3.paper.assemble import manifest_config
 
     if len(argv) > 2:
         raise SystemExit(f"usage: {argv[0]} [manifest.json]")
-    config = dict(CONFIG)
-    if len(argv) == 2:
-        config.update(json.loads(Path(argv[1]).read_text(encoding="utf-8")))
+    # A JSON manifest owns its run keys (arms, evaluated/final/numerics runs, scaling, selection): CONFIG
+    # supplies only the reading options beside it, and paper_artifacts.json records every key's origin.
+    manifest = json.loads(Path(argv[1]).read_text(encoding="utf-8")) if len(argv) == 2 else None
+    config, origin = manifest_config(CONFIG, manifest)
     out_dir = config.get("out_dir") or Path(__file__).resolve().parent / "paper_artifacts"
-    report = assemble(config, out_dir=out_dir, log=lambda message: print(message, flush=True))
+    report = assemble(config, out_dir=out_dir, log=lambda message: print(message, flush=True), origin=origin)
     failed = [name for name, entry in report["tables"].items() if "error" in entry]
     failed += [name for name, entry in report["figures"].items() if entry.get("status") == "failed"]
     print(f"\nindex: {Path(report['out_dir']) / 'PAPER_ARTIFACTS.md'}")
@@ -112,5 +122,20 @@ def main(argv: "list[str]") -> int:
     return 1 if failed else 0
 
 
+def _config_argv(command_line: "list[str]") -> "list[str]":
+    r"""The argument list :func:`main` reads, built from ``CONFIG`` alone: this script, then ``CONFIG["manifest"]``
+    when it is set.
+
+    Click-to-run takes no command-line configuration. An argument in ``command_line`` is refused rather than
+    ignored: the manifest used to be passed as the only argument, and ignoring it would assemble CONFIG's runs in
+    its place.
+    """
+    if len(command_line) > 1:
+        raise SystemExit(f"{Path(command_line[0]).name} takes no command-line arguments; set CONFIG['manifest'] "
+                         "to the JSON manifest's path and run it again")
+    manifest = CONFIG["manifest"]
+    return [__file__] if manifest is None else [__file__, str(manifest)]
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(main(_config_argv(sys.argv)))

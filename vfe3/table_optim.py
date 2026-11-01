@@ -5,13 +5,18 @@ The prior of type :math:`v` is :math:`p_v = \mathcal N(\mu_v, \operatorname{diag
 :math:`G_v = \operatorname{diag}(1/s_v, 1/2)`. A step's loss is the mean over :math:`N` scored targets and row
 :math:`v` is gathered at the :math:`n_v` input positions that hold :math:`v`, so the step preconditions that row
 with :math:`(n_v/N)G_v`, the Fisher metric of the prior family :math:`p_v` counted once per occurrence. That
-matrix is the exact Hessian of the self-coupling term :math:`\frac1N\sum_i \mathrm{KL}(q_i\|p_{x_i})` in
-:math:`\mu_v` (and its expected Hessian in :math:`l_v`) and of nothing else; for the cross-entropy the step
-trains it is a chosen preconditioner, not the metric of that objective (audit 2026-10-10 round 2, item 35).
-The implemented M-step self term (``mstep_self_coupling_weight > 0``) is that type-prior KL only at ``n_layers = 1``
-or ``prior_handoff_rho = 0`` (and ``prior_handoff_sigma = 0``): otherwise it reads the prior handed into the final
-block, whose mean :math:`(1-\rho)\mu_p + \rho\mu_{\mathrm{belief}}` carries the previous block's output, so the
-metric above is not its Hessian either (audit 2026-10-20 item 70).
+matrix is the exact Hessian in :math:`\mu_v` (and the expected Hessian in :math:`l_v`) of the type-prior KL
+:math:`\frac1N\sum_i \mathrm{KL}(q_i\|p_{x_i})` with every :math:`q_i` held fixed and unit weight, and of nothing
+else; no configuration trains that functional. For the cross-entropy the step trains it is a chosen preconditioner,
+not the metric of that objective (audit 2026-10-10 round 2, item 35). The implemented M-step self term
+(``mstep_self_coupling_weight > 0``) is not that functional at any depth. It is :math:`\alpha^*`-weighted, with the
+gradient of the profile :math:`c_0\log(b_0 + D_i)` and therefore its rank-one curvature correction, and it
+differentiates through :math:`q_i^* = \mathrm{readout}(p)`: at ``n_layers = 1`` under the passthrough covariance it
+is a Mahalanobis penalty on the attention increment with no curvature in :math:`l_v`. Beyond one layer (unless
+``prior_handoff_rho = 0`` and ``prior_handoff_sigma = 0``) it also reads the prior handed into the final block, whose
+mean :math:`(1-\rho)\mu_p + \rho\mu_{\mathrm{belief}}` carries the previous block's output (audit 2026-10-20 item 70).
+At one layer the metric above differs from the term's Hessian by 0.23 to 0.66 in :math:`\mu_v` and 0.84 to 1.00 in
+:math:`l_v`, relative (audit 2026-10-31, gap-mstep-self-coupling-handoff-7).
 The natural direction is
 
 .. math::
@@ -103,13 +108,21 @@ from vfe3.numerics import bounded_variance_from_log
 
 # Log-row diagnostics of the table step (fixed key set; NaN when no row was active or the step was skipped).
 # table_fisher_step_norm_mean is the realized Fisher norm of the scheduled gradient step,
-# lr_t/lr_0 * min(||d||, r) per active row (decay excluded).
+# lr_t/lr_0 * min(||d||, r) per active row (decay excluded); table_fisher_unscheduled_step_norm_mean is
+# min(||d||, r) per active row, the trust-scaled step before the schedule factor, which the step-collapse alarm reads
+# because the scheduled norm falls with lr_t/lr_0 (by 1e6 between the last two log rows of a cosine-to-zero schedule;
+# audit 2026-10-31, tables-families-2).
 TABLE_FISHER_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "table_fisher_active_rows",
     "table_fisher_trust_scale_mean",
     "table_fisher_trust_scale_min",
     "table_fisher_step_norm_mean",
+    "table_fisher_unscheduled_step_norm_mean",
 )
+# The same key set for the untied decode bank's Fisher step (m_decode_update_mode='fisher'; audit 2026-10-31,
+# tables-families-6). Its active rows are those with a nonzero direction: every decode row takes a softmax gradient.
+DECODE_FISHER_DIAGNOSTIC_KEYS: Tuple[str, ...] = tuple(
+    key.replace("table_fisher_", "decode_fisher_") for key in TABLE_FISHER_DIAGNOSTIC_KEYS)
 
 
 class TableFisherStatistics:
@@ -155,9 +168,14 @@ class TableFisherStatistics:
         return self._targets
 
     def decode_variances(self, dtype: torch.dtype) -> torch.Tensor:   # (V, K) t_v
-        r"""The decode-bank variances :math:`t_v` as the decoder reads them (``bounded_variance_from_log``, floor eps)."""
+        r"""The decode-bank variances :math:`t_v` as the decoder reads them (``bounded_variance_from_log``, floor eps).
+
+        The table itself, as in :meth:`variances`: a detached copy is a new tensor, so the overflow verdict the forward
+        cached on the table's (id, version) missed and every decode Fisher step paid a (V, K) reduction and a host read
+        (audit 2026-10-31, tables-families-5). The values are those of the detached copy.
+        """
         pb = self._prior_bank
-        return bounded_variance_from_log(pb._decode_sigma_log_table().detach().to(dtype), eps=pb.eps)
+        return bounded_variance_from_log(pb._decode_sigma_log_table().to(dtype), eps=pb.eps).detach()
 
     @property
     def reads_frames(self) -> bool:
@@ -188,12 +206,16 @@ class TableFisherStatistics:
                                "immediately before the optimizer step")
         return self._tokens, self._scored
 
-    def variances(self, dtype: torch.dtype) -> torch.Tensor:   # (V, K) s_v
+    def variances(
+        self,
+        dtype: torch.dtype,
+        index: Optional[torch.Tensor] = None,       # (R,) row ids: exponentiate only those rows
+    ) -> torch.Tensor:                              # (V, K) s_v, or (R, K) on ``index``
         # The table itself, not a fresh detached copy: the forward already checked this (id, version) of the
         # table for overflow, so the cached verdict is reused instead of a new host read (audit 2026-10-10
-        # round 2, item 57). The values are those of the detached copy.
+        # round 2, item 57). The values are those of the detached copy; with ``index`` they are its rows.
         pb = self._prior_bank
-        return bounded_variance_from_log(pb._prior_sigma_log_table().to(dtype), eps=pb.eps).detach()
+        return bounded_variance_from_log(pb._prior_sigma_log_table().to(dtype), eps=pb.eps, index=index).detach()
 
 
 def type_counts(
@@ -299,6 +321,7 @@ class _TableFisherMixin:
         self._table_fisher_trust_radius = float(trust_radius)
         self._collect_table_diag = False
         self._table_diag: Dict[str, float] = {}
+        self._decode_diag: Dict[str, float] = {}         # DECODE_FISHER_DIAGNOSTIC_KEYS, on a collecting step
 
     def _table_fisher_groups(self) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
         marked = {group["table_fisher"]: group for group in self.param_groups if group.get("table_fisher")}
@@ -310,11 +333,18 @@ class _TableFisherMixin:
 
     @torch.no_grad()
     def _decode_fisher_step(self) -> None:
-        r"""The natural-gradient step of the untied decode bank (module docstring, ``m_decode_update_mode``)."""
+        r"""The natural-gradient step of the untied decode bank (module docstring, ``m_decode_update_mode``).
+
+        On a collecting step (``_collect_table_diag``) it records :data:`DECODE_FISHER_DIAGNOSTIC_KEYS` in
+        ``_decode_diag`` from the trust factors and squared Fisher norms of :func:`_robust_table_steps`, over the rows
+        with a nonzero direction, with one host read (audit 2026-10-31, tables-families-6); the update is unchanged.
+        """
         mu_group, sigma_group = self._decode_fisher_groups()
         m = mu_group["params"][0] if mu_group is not None else None               # (V, K) decode_mu_embed
         log_t = sigma_group["params"][0] if sigma_group is not None else None     # (V, K) decode_sigma_log_embed
         live = [p for p in (m, log_t) if p is not None and p.grad is not None]
+        if self._collect_table_diag:
+            self._decode_diag = {}
         if not live:
             return
         grad_scale, found_inf = getattr(self, "grad_scale", None), getattr(self, "found_inf", None)
@@ -337,10 +367,11 @@ class _TableFisherMixin:
             return g if grad_scale is None else g / grad_scale.to(device=g.device, dtype=dtype)
 
         every_row = torch.ones(V, dtype=torch.bool, device=reference.device)
-        step_m, step_l, _, _, _ = _robust_table_steps(gradient(m), gradient(log_t), weight, t,
-                                                      self._table_fisher_lr, self._table_fisher_trust_radius,
-                                                      every_row)                                    # (V, K) float64
-        for p, step, group in ((m, step_m, mu_group), (log_t, step_l, sigma_group)):
+        step_m, step_l, sq_m, sq_l, trust = _robust_table_steps(gradient(m), gradient(log_t), weight, t,
+                                                                self._table_fisher_lr, self._table_fisher_trust_radius,
+                                                                every_row)                          # (V, K) float64
+        realized_sq = torch.zeros(V, dtype=torch.float64, device=reference.device)   # (V,) ||scheduled step||^2
+        for p, step, group, part in ((m, step_m, mu_group, sq_m), (log_t, step_l, sigma_group, sq_l)):
             if p is None or p.grad is None:
                 continue
             decay = float(group["lr"]) * float(group.get("weight_decay", 0.0))
@@ -354,10 +385,40 @@ class _TableFisherMixin:
             if factor != 0.0:
                 update = (factor * step).to(p.dtype)                                                # (V, K)
                 p.add_(update if skip is None else torch.where(skip, torch.zeros_like(update), update))
+                realized_sq = realized_sq + factor ** 2 * part
             p.grad = None
+        if self._collect_table_diag:
+            unscheduled = (sq_m + sq_l).sqrt()                                     # (V,) min(||d||, r) in float64
+            moved = unscheduled > 0                                                # (V,) rows with a nonzero direction
+            n_moved = moved.sum().to(torch.float64)
+            values = torch.stack([
+                n_moved,
+                torch.where(moved, trust, torch.zeros_like(trust)).sum() / n_moved,
+                torch.where(moved, trust, torch.full_like(trust, float("inf"))).amin(),
+                torch.where(moved, realized_sq.sqrt(), torch.zeros_like(realized_sq)).sum() / n_moved,
+                torch.where(moved, unscheduled, torch.zeros_like(unscheduled)).sum() / n_moved,
+                (skip if skip is not None else torch.zeros((), dtype=torch.bool, device=reference.device)).to(
+                    torch.float64),
+            ]).cpu().tolist()
+            if values[5]:                                                                            # overflow skip
+                return
+            nan = float("nan")
+            self._decode_diag = dict(zip(DECODE_FISHER_DIAGNOSTIC_KEYS, (
+                values[0], *((nan,) * 4 if values[0] == 0.0 else values[1:5]))))
 
     @torch.no_grad()
     def _table_fisher_step(self) -> None:
+        r"""The natural-gradient step of the type-prior tables (module docstring), on the step's input rows.
+
+        Every quantity is formed on the rows of :func:`_overflow_candidate_rows`, the step's input ids (repeats kept)
+        or every row when there are at least :math:`V` ids: a superset of the active rows :math:`\{v : n_v > 0\}` of
+        host-known size, gathered with no host read. A row absent from the step has :math:`n_v = 0`, zero trust and so
+        no gradient step, so the dense form's (V, K) planes were zero there; at the live shape at most 4,096 of 50,257
+        rows are active (audit 2026-10-31, tables-families-4, the 2026-10-28 audit's O02). Each row's result is computed
+        from the same gathered values by the same row-wise operations as on the full table, so it equals the dense
+        step's row bit for bit, and a repeated id scatters equal values. Only the decoupled decay acts on every row, as
+        AdamW applies it. The diagnostics reduce over the (V,) rows as before, from the per-row values scattered back.
+        """
         mu_group, sigma_group = self._table_fisher_groups()
         mu = mu_group["params"][0] if mu_group is not None else None              # (V, K) mu_embed
         log_s = sigma_group["params"][0] if sigma_group is not None else None     # (V, K) sigma_log_embed
@@ -373,56 +434,58 @@ class _TableFisherMixin:
         reference = live[0]
         dtype = torch.promote_types(reference.dtype, torch.float32)
         V = reference.shape[0]
-        skip = None if found_inf is None else found_inf.to(device=reference.device) != 0             # () bool
-        count = type_counts(tokens, V, reference.device).to(dtype)                                   # (V,) n_v
-        total = scored.to(device=reference.device, dtype=dtype).clamp_min(1.0)                       # () N
-        weight = (total / count.clamp_min(1.0)).unsqueeze(-1)                                       # (V, 1) N/n_v
-        s = self.table_statistics_provider.variances(dtype)                                         # (V, K)
+        device = reference.device
+        skip = None if found_inf is None else found_inf.to(device=device) != 0                      # () bool
+        count = type_counts(tokens, V, device).to(dtype)                                            # (V,) n_v
+        total = scored.to(device=device, dtype=dtype).clamp_min(1.0)                                # () N
+        rows = _overflow_candidate_rows(tokens, V, device)                                          # (R,) row ids
+        count_r = count.index_select(0, rows)                                                       # (R,) n_v
+        active = count_r > 0                                                                        # (R,)
+        weight = (total / count_r.clamp_min(1.0)).unsqueeze(-1)                                     # (R, 1) N/n_v
+        s = self.table_statistics_provider.variances(dtype, index=rows)                             # (R, K) s_v
 
-        def gradient(p: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        def gradient(p: Optional[torch.Tensor], index: torch.Tensor) -> Optional[torch.Tensor]:   # (len(index), K)
             if p is None or p.grad is None:
                 return None
-            g = p.grad.to(dtype)
+            g = p.grad.index_select(0, index).to(dtype)
             return g if grad_scale is None else g / grad_scale.to(device=g.device, dtype=dtype)
 
-        g_mu, g_l = gradient(mu), gradient(log_s)
+        g_mu, g_l = gradient(mu, rows), gradient(log_s, rows)                                       # (R, K)
         # gaussian_frame_diagonal: the step is the diagonal step in xi_v = U_v^{-1} mu_v, whose gradient is U_v^T g_mu.
         frames = self.table_statistics_provider.frames() if g_mu is not None else None
+        if frames is not None and frames[0].numel() == 0:
+            frames = None
         if frames is not None:
-            rows, frame = frames
-            rows = rows.to(device=g_mu.device)
-            forward = frame.forward.to(device=g_mu.device)                         # (R, G, d, d) or (R, K, K)
-            g_mu = g_mu.index_copy(0, rows, frame_matvec(forward.transpose(-1, -2), g_mu[rows],
-                                                         frame.block_diagonal))      # (V, K) g_xi on the rows
+            frame_rows, frame = frames
+            frame_rows = frame_rows.to(device=device)                              # (R_u,) distinct types, sorted
+            forward = frame.forward.to(device=device)                              # (R_u, G, d, d) or (R_u, K, K)
+            position = torch.searchsorted(frame_rows, rows).clamp_max(frame_rows.numel() - 1)   # (R,) row -> frame
+            framed = frame_rows.index_select(0, position) == rows                  # (R,) the row has a frame
+            g_xi = frame_matvec(forward.transpose(-1, -2), gradient(mu, frame_rows), frame.block_diagonal)   # (R_u, K)
+            g_mu = torch.where(framed.unsqueeze(-1), g_xi.index_select(0, position), g_mu)          # (R, K)
         eta = self._table_fisher_lr
-        step_mu = None if g_mu is None else -eta * weight * s * g_mu                                 # (V, K)
-        step_l = None if g_l is None else -eta * weight * 2.0 * g_l                                  # (V, K)
-        norm_sq_mu = None if step_mu is None else (step_mu.square() / s).sum(-1)                     # (V,)
-        norm_sq_l = None if step_l is None else 0.5 * step_l.square().sum(-1)                        # (V,)
-        norm_sq = torch.zeros(V, dtype=dtype, device=reference.device)
+        step_mu = None if g_mu is None else -eta * weight * s * g_mu                                 # (R, K)
+        step_l = None if g_l is None else -eta * weight * 2.0 * g_l                                  # (R, K)
+        norm_sq_mu = None if step_mu is None else (step_mu.square() / s).sum(-1)                     # (R,)
+        norm_sq_l = None if step_l is None else 0.5 * step_l.square().sum(-1)                        # (R,)
+        norm_sq = torch.zeros(rows.shape[0], dtype=dtype, device=device)
         if norm_sq_mu is not None:
             norm_sq = norm_sq + norm_sq_mu
         if norm_sq_l is not None:
             norm_sq = norm_sq + norm_sq_l
-        norm = norm_sq.sqrt()                                                                        # (V,)
-        active = count > 0
+        norm = norm_sq.sqrt()                                                                        # (R,)
         trust = (self._table_fisher_trust_radius / norm.clamp_min(torch.finfo(dtype).tiny)).clamp(max=1.0)
-        trust = torch.where(active, trust, torch.zeros_like(trust)).unsqueeze(-1)                    # (V, 1)
+        trust = torch.where(active, trust, torch.zeros_like(trust)).unsqueeze(-1)                    # (R, 1)
         # Overflow-robust rows (audit 2026-10-17 item 47). A large finite gradient overflows norm_sq (|g| ~ 1e17 at
         # N/n_v = 8192, s = 5: trust 0, the row frozen) or the step itself (|g| ~ 1e35: trust * inf = NaN reaches
         # the table). Those rows, and only those (a finite norm_sq keeps every other row bit-identical), take the
-        # same trust-region step from the float64 direction, where neither can overflow for float32 gradients.
-        overflow = active & ~torch.isfinite(norm_sq)                                                 # (V,)
-        # The float64 twin runs on the candidate rows only (audit 2026-10-20 item 44): an overflowed row is active,
-        # so it is among the step's input ids, a set of host-known size with no host read; each twin output is
-        # row-wise, so a gathered row equals its full-table value bit for bit and duplicates scatter equal values.
-        cand = _overflow_candidate_rows(tokens, V, reference.device)                                 # (R,) row ids
-        cand_overflow = overflow[cand]                                                               # (R,)
+        # same trust-region step from the float64 direction, where neither can overflow for float32 gradients. The
+        # twin runs on the same rows (audit 2026-10-20 item 44); each of its outputs is row-wise.
+        overflow = active & ~torch.isfinite(norm_sq)                                                 # (R,)
         wide_mu, wide_l, wide_sq_mu, wide_sq_l, wide_trust = _robust_table_steps(
-            None if g_mu is None else g_mu[cand], None if g_l is None else g_l[cand], weight[cand], s[cand], eta,
-            self._table_fisher_trust_radius, active[cand])                                           # (R, K), (R,)
-        realized_sq = torch.zeros(V, dtype=dtype, device=reference.device)    # (V,) ||scheduled step||^2 / trust^2
-        overflow_sq = torch.zeros(V, dtype=torch.float64, device=reference.device)   # (V,) ||scheduled step||^2
+            g_mu, g_l, weight, s, eta, self._table_fisher_trust_radius, active)                      # (R, K), (R,)
+        realized_sq = torch.zeros(rows.shape[0], dtype=dtype, device=device)  # (R,) ||scheduled step||^2 / trust^2
+        overflow_sq = torch.zeros(rows.shape[0], dtype=torch.float64, device=device)   # (R,) ||scheduled step||^2
         for p, step, group, part, wide, wide_sq in ((mu, step_mu, mu_group, norm_sq_mu, wide_mu, wide_sq_mu),
                                                     (log_s, step_l, sigma_group, norm_sq_l, wide_l, wide_sq_l)):
             if step is None:
@@ -436,36 +499,46 @@ class _TableFisherMixin:
                     p.mul_(torch.where(skip, torch.ones_like(keep), keep))
             factor = _schedule_factor(group)
             if factor != 0.0:
-                scheduled = torch.where(trust > 0, factor * trust * step, torch.zeros_like(step))   # (V, K)
-                scheduled = scheduled.index_put(
-                    (cand,), torch.where(cand_overflow.unsqueeze(-1), (factor * wide).to(dtype), scheduled[cand]))
+                scheduled = torch.where(trust > 0, factor * trust * step, torch.zeros_like(step))   # (R, K)
+                scheduled = torch.where(overflow.unsqueeze(-1), (factor * wide).to(dtype), scheduled)
+                target = rows
                 if frames is not None and p is mu:
-                    # Delta mu_v = U_v Delta xi_v on the step's rows (every other row's step is zero).
-                    scheduled = scheduled.index_copy(0, rows, frame_matvec(forward, scheduled[rows],
-                                                                           frame.block_diagonal))   # (V, K)
+                    # Delta mu_v = U_v Delta xi_v on the framed types, from the rows' (equal) steps of each type.
+                    xi = scheduled.new_zeros(frame_rows.shape[0], scheduled.shape[-1]).index_put_(
+                        (position[framed],), scheduled[framed])                                     # (R_u, K)
+                    scheduled, target = frame_matvec(forward, xi, frame.block_diagonal), frame_rows  # (R_u, K)
                 update = scheduled.to(p.dtype)
-                p.add_(update if skip is None else torch.where(skip, torch.zeros_like(update), update))
+                if skip is not None:
+                    update = torch.where(skip, torch.zeros_like(update), update)
+                p.index_put_((target,), p.index_select(0, target) + update)
                 realized_sq = realized_sq + factor ** 2 * torch.where(overflow, torch.zeros_like(part), part)
-                overflow_sq = overflow_sq.index_put((cand,), overflow_sq[cand] + factor ** 2 * wide_sq)
+                overflow_sq = overflow_sq + factor ** 2 * wide_sq
             p.grad = None
         if self._collect_table_diag:
-            accepted = trust.squeeze(-1).index_put(
-                (cand,), torch.where(cand_overflow, wide_trust.to(dtype), trust.squeeze(-1)[cand]))   # (V,)
-            n_active = active.sum().to(dtype)
-            realized = torch.where(overflow, overflow_sq.sqrt().to(dtype),
-                                   accepted * realized_sq.sqrt())                                    # (V,) realized norm
+            accepted_r = torch.where(overflow, wide_trust.to(dtype), trust.squeeze(-1))              # (R,)
+            realized_r = torch.where(overflow, overflow_sq.sqrt().to(dtype), accepted_r * realized_sq.sqrt())
+            unscheduled_r = torch.where(overflow, (wide_sq_mu + wide_sq_l).sqrt().to(dtype),
+                                        trust.squeeze(-1) * norm)                                   # (R,) min(||d||, r)
+
+            def per_type(values: torch.Tensor) -> torch.Tensor:                   # (R,) -> (V,), zero off the rows
+                return values.new_zeros(V).index_put_((rows,), values)
+
+            accepted, realized, unscheduled = per_type(accepted_r), per_type(realized_r), per_type(unscheduled_r)
+            active_v = count > 0                                                                     # (V,)
+            n_active = active_v.sum().to(dtype)
             values = torch.stack([
                 n_active,
-                torch.where(active, accepted, torch.zeros_like(accepted)).sum() / n_active,
-                torch.where(active, accepted, torch.full_like(accepted, float("inf"))).amin(),
-                torch.where(active, realized, torch.zeros_like(realized)).sum() / n_active,
-                (skip if skip is not None else torch.zeros((), dtype=torch.bool, device=reference.device)).to(dtype),
+                torch.where(active_v, accepted, torch.zeros_like(accepted)).sum() / n_active,
+                torch.where(active_v, accepted, torch.full_like(accepted, float("inf"))).amin(),
+                torch.where(active_v, realized, torch.zeros_like(realized)).sum() / n_active,
+                torch.where(active_v, unscheduled, torch.zeros_like(unscheduled)).sum() / n_active,
+                (skip if skip is not None else torch.zeros((), dtype=torch.bool, device=device)).to(dtype),
             ]).cpu().tolist()
-            if values[4]:                                                                            # overflow skip
+            if values[5]:                                                                            # overflow skip
                 return
             nan = float("nan")
             self._table_diag = dict(zip(TABLE_FISHER_DIAGNOSTIC_KEYS, (
-                values[0], *((nan, nan, nan) if values[0] == 0.0 else values[1:4]))))
+                values[0], *((nan,) * 4 if values[0] == 0.0 else values[1:5]))))
 
     @torch.no_grad()
     def step(self, closure=None):                                       # type: ignore[override]

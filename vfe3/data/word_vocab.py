@@ -151,7 +151,10 @@ def vocabulary_size_for_min_count(
     min_count: int = DEFAULT_MIN_COUNT,
     eos: bool = False,
 ) -> int:
-    r"""Number of ids :func:`vocabulary_from_counts` would produce, without materializing the list."""
+    r"""Number of ids :func:`vocabulary_from_counts` would produce, without materializing the list.
+
+    Test oracle: referenced only by the tests.
+    """
     reserved = _reserved_words(eos)
     return len(reserved) + sum(1 for word, n in counts.items() if word not in reserved and n > min_count)
 

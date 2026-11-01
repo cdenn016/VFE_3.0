@@ -45,7 +45,7 @@ def _transport(
     *,
     transport_mode:         str   = "flat",     # connection-regime registry key (default = flat)
     gauge_mode:             str   = "learned",  # 'learned' | 'trivial' (forwarded to the builder)
-    materialize:            bool = True,         # compatibility/diagnostic boundary
+    materialize:            bool = True,         # with right_phi only: False returns the FactoredTransport
 
     validity_max_norm:      Optional[float]          = None,  # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     mu:                     Optional[torch.Tensor]   = None,  # (N,K) or (B,N,K) means
@@ -55,7 +55,7 @@ def _transport(
     sigma_key:              Optional[torch.Tensor]   = None,  # detached key-slot variances
     right_phi:              Optional[torch.Tensor] = None,  # exact right positional factor
     exactness_out:          Optional[dict]         = None,  # run-sticky feature status sink
-) -> 'torch.Tensor | CompactFactoredTransport | FactoredTransport':
+) -> 'torch.Tensor | FactoredTransport':
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
     The build goes through ``get_transport_registration(transport_mode)``; 'flat' is the
@@ -71,7 +71,12 @@ def _transport(
     Rank-aware: a 2-D (N, n_gen) frame (the unbatched diagnostics / trajectory path) is transported
     as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched
     forward) flows straight through. ``mu``/``mu_key`` are unsqueezed to match so a registered
-    belief-dependent builder always sees batched (B, N, K) means."""
+    belief-dependent builder always sees batched (B, N, K) means.
+
+    ``materialize`` is read only with ``right_phi`` on the flat key, whose exact factored build returns its
+    :class:`FactoredTransport` under ``materialize=False`` and the dense Omega otherwise. Every other call returns the
+    registered builder's ``"Omega"``, the dense (..., N, N, K, K) tensor for ``"flat"``, whatever ``materialize`` is
+    (audit 2026-10-31 A344); :func:`build_belief_transport` builds the vertex factors itself."""
     # A None state is the pure (stateless flat) path: normalize once here, since the builders are
     # handed the mapping as keyword arguments and the registration declares its own state keys.
     transport_state = dict(transport_state or {})
@@ -197,8 +202,8 @@ def build_belief_transport(
 
 def e_step_iteration(
     belief:                    BeliefState,
-    mu_p:                      torch.Tensor,        # (N, K)
-    sigma_p:                   torch.Tensor,        # (N, K)
+    mu_p:                      torch.Tensor,        # (..., N, K) prior means
+    sigma_p:                   torch.Tensor,        # (..., N, K) diagonal or (..., N, K, K) full prior covariance
     group:                     Optional[GaugeGroup],  # unread: kept positionally for the callers (audit 2026-10-16 F97)
 
     *,
@@ -226,6 +231,7 @@ def e_step_iteration(
     link_state:               Optional[dict] = None,   # content_link_loop_weight > 0: cross-layer link state
 
     _full_link_context:         Optional[FullLinkContext] = None,
+    _full_link_context_current: bool = False,   # the context was built from this belief (the episode's first step)
 ) -> BeliefState:
     r"""Update a projected receiver while retaining its incoming outer graph.
 
@@ -241,7 +247,9 @@ def e_step_iteration(
     (rho = 1) is its majorize-minimize step; a damped diagonal-family closed form is not guaranteed
     to descend (see full_link_minimizer). ``'closed_form_profiled'`` returns the limit of those MM steps
     from the current iterate, a stationary point of the profiled energy, in one solve
-    (full_link_profiled_minimizer).
+    (full_link_profiled_minimizer). A context built from this belief (here, or by :func:`e_step` for the episode's
+    first iteration, ``_full_link_context_current``) is already frozen at it and is read as built, and the closed
+    forms read no receiver force, which is then formed only for ``grad_record`` (audit 2026-10-31 A193).
     """
     if (relational_operators is None
             or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
@@ -274,6 +282,7 @@ def e_step_iteration(
             for role in ("mu", "sigma", "phi"):
                 grad_record[role] = None
     else:
+        context_current = _full_link_context_current
         if _full_link_context is None:
             _full_link_context = build_full_link_context(
                 belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
@@ -281,14 +290,20 @@ def e_step_iteration(
                 receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
                 value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture,
                 lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0)
+            context_current = True
             if relational_capture is not None:
                 with torch.no_grad():
                     relational_capture["relational_receiver_cost_before"] = full_link_cost(
                         belief.mu, belief.sigma, _full_link_context).detach()
-        # The episode context with alpha frozen at this iterate.
-        iterate_context = full_link_context_at(_full_link_context, belief.mu, belief.sigma)
-        grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, iterate_context)
+        # The episode context with alpha frozen at this iterate; a context built from this belief already is
+        # (build_full_link_context freezes alpha at its snapshot; audit 2026-10-31 A193).
+        iterate_context = (_full_link_context if context_current
+                           else full_link_context_at(_full_link_context, belief.mu, belief.sigma))
         closed_form = relational_operators.receiver_update in ("closed_form", "closed_form_profiled")
+        # The closed forms read no force: it is formed for the Euler step and a gradient record only (A193).
+        grad_mu = grad_sigma = None
+        if not closed_form or grad_record is not None:
+            grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, iterate_context)
         if grad_record is not None:
             grad_record["mu"] = grad_mu.detach().pow(2).sum().sqrt()
             grad_record["sigma"] = (grad_sigma.detach().pow(2).sum().sqrt()
@@ -336,8 +351,8 @@ def e_step_iteration(
 
 def e_step(
     belief:            BeliefState,
-    mu_p:              torch.Tensor,        # (N, K)
-    sigma_p:           torch.Tensor,        # (N, K)
+    mu_p:              torch.Tensor,        # (..., N, K) prior means
+    sigma_p:           torch.Tensor,        # (..., N, K) diagonal or (..., N, K, K) full prior covariance
     group:             Optional[GaugeGroup],  # unread: kept positionally for the callers (audit 2026-10-16 F97)
 
     *,
@@ -406,7 +421,7 @@ def e_step(
         state_record.update(
             sequence_index=sequence_index, beliefs=[belief],
             semantics=relational_operators.inference_semantics)
-    for _ in range(n_iter):
+    for iteration in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
             e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, lambda_beta=lambda_beta,
@@ -419,6 +434,8 @@ def e_step(
             relational_value_frame=relational_value_frame,
             relational_capture=relational_capture,
             _full_link_context=full_link_context,
+            # The context was built from the episode-initial belief, which the first iteration receives (A193).
+            _full_link_context_current=iteration == 0,
             **({"link_state": link_state} if link_state is not None else {}))
         if state_record is not None:
             state_record["beliefs"].append(belief)

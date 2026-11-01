@@ -84,7 +84,7 @@ def lie_bracket_coords(
     *,
     gram_pinv_: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:                        # (..., n_gen) coords of [embed phi1, embed phi2]
-    r"""Bracket in coordinates: extract([embed(phi1), embed(phi2)])."""
+    r"""Bracket in coordinates: extract([embed(phi1), embed(phi2)]). Test oracle: referenced only by the tests."""
     A = embed_phi(phi1, generators)
     B = embed_phi(phi2, generators)
     return extract_phi(lie_bracket_matrix(A, B), generators, gram_pinv_=gram_pinv_)
@@ -315,9 +315,11 @@ def project_phi_to_slk(
     with torch.amp.autocast(phi.device.type, enabled=False):
         # bf16/fp16 -> fp32 (neither pinv nor the mixed-dtype matmul below has a reduced-precision
         # kernel); fp32/fp64 are returned unchanged by promote_types, so nothing is ever downcast.
+        # The trace vectors follow phi_c, so a float64 input against a float32 basis (the frame bound's
+        # float64 positional template) projects in float64 instead of failing the matmul (audit 2026-10-31).
         phi_c = phi.to(torch.promote_types(phi.dtype, torch.float32))
         V = (generators.block_trace_vectors() if hasattr(generators, "block_trace_vectors")
-             else _block_trace_vectors(generators, irrep_dims)).to(device=phi_c.device)   # (H, n_gen)
+             else _block_trace_vectors(generators, irrep_dims)).to(device=phi_c.device, dtype=phi_c.dtype)  # (H, n_gen)
         gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
         s = phi_c @ V.transpose(-1, -2)                       # (..., H)
         coeffs = s @ gram_pinv                                # (..., H) joint solve, not per-block

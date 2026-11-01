@@ -34,6 +34,11 @@ def _pair(name: str, n_heads: int, dtype: torch.dtype):
     lazy = get_group(name)(8, n_heads, dtype=dtype)
     dense = get_group(name)(8, n_heads, dtype=dtype)
     dense.generators = dense.generators.clone()
+    # A replacement also withdraws the declared Frobenius Gram (audit 2026-10-31, gauge-structure-2); the clone is
+    # the builder's basis, so the twin re-declares it and differs from the lazy group in the local certificate only.
+    dense.frobenius_gram_diagonal = lazy.frobenius_gram_diagonal
+    dense.frobenius_gram_uniform = lazy.frobenius_gram_uniform
+    dense._gram_certificate_key = dense._generator_cache_key()
     assert lazy.certified_block_local_basis() is not None
     assert dense.certified_block_local_basis() is None
     return lazy, dense

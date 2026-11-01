@@ -1,17 +1,20 @@
 """Full-input projected Gaussian routing and predictive content readout."""
 
-from typing import Any, Dict, Optional, Tuple
+import math
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.geometry.rope import (
     rope_commutant_diagonal, rope_commutant_is_diagonal, rope_commutant_projection, rope_rotated_pairs,
 )
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
-from vfe3.model.relational_operators import RelationalOperators, strictly_causal_routing_prior
+from vfe3.model.relational_operators import RelationalOperators, _spread_tile_plan, strictly_causal_routing_prior
 from vfe3.relational_scoring import (
     _compute_dtype, diagonal_kl_term_medians, projected_condition_recovery, projected_moments, routing_cost,
+    type_rows,
 )
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -20,6 +23,44 @@ from vfe3.runtime import ieee_fp32_matmul
 _QUERY_SHIFTED_REFERENCES: Tuple[str, ...] = ("query_shifted", "query_shifted_v1")
 # The routing costs with a closed-form diagonal route for a structurally diagonal P(G) (_diagonal_comparison_route).
 _DIAGONAL_ROUTE_COSTS: Tuple[str, ...] = ("gaussian_kl", "noisy_query", "noisy_key")
+
+# The finite mask of an attention log-prior, keyed weakly by the prior tensor and checked against its version counter
+# (_finite_prior; audit 2026-10-31 A155).
+_PRIOR_FINITE_CACHE: "WeakTensorKeyDictionary" = WeakTensorKeyDictionary()
+
+
+def _finite(x: torch.Tensor) -> torch.Tensor:          # same shape, bool
+    r"""``torch.isfinite(x)`` as :math:`\lvert x\rvert < \infty` of the detached tensor (audit 2026-10-31 A138).
+
+    The same boolean (NaN and :math:`\pm\infty` fail the comparison) from two kernels instead of the four of the
+    ``isfinite`` composite, and no transient ``AbsBackward`` node holding ``x`` when it carries gradient.
+    """
+    return x.detach().abs() < float("inf")
+
+
+def _finite_prior(log_prior: torch.Tensor) -> torch.Tensor:   # (..., N, N) or (..., H, N, N) bool
+    r"""``torch.isfinite(log_prior)``, computed once per prior tensor (audit 2026-10-31 A155).
+
+    The mask is cached weakly by the tensor and checked against its version counter, as
+    :func:`vfe3.model.relational_operators.strictly_causal_routing_prior` caches its verdict. The model caches its
+    prior per sequence length (:meth:`vfe3.model.model.VFEModel._attention_log_prior`), so every layer and step of a
+    length reads one mask. An inference tensor, which carries no version counter, and any call under inference mode
+    compute the mask afresh and cache nothing.
+    """
+    version: Optional[int] = None
+    if not torch.is_inference_mode_enabled():
+        try:
+            version = log_prior._version
+        except RuntimeError:                                  # inference tensors carry no version counter
+            version = None
+    if version is not None:
+        cached = _PRIOR_FINITE_CACHE.get(log_prior)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+    finite = _finite(log_prior)
+    if version is not None:
+        _PRIOR_FINITE_CACHE[log_prior] = (version, finite)
+    return finite
 
 
 def _key_log_volume(
@@ -36,7 +77,9 @@ def _key_log_volume(
     (:func:`vfe3.relational_scoring.diagonal_kl_term_medians`), with :math:`G_j + n_hI` under ``noisy_key`` (the
     broadened key law the cost scores) and :math:`G_j` under ``noisy_query``. ``mean_distance`` reads no covariance
     and returns zeros. Under a joint rescaling of a head's comparison maps :math:`(S_Q, S_K) \to c(S_Q, S_K)` every
-    :math:`G_j \to c^2G_j`, so :math:`\ell_j \to \ell_j + r\ln c` for every key at once, which is the shift the
+    :math:`G_j \to c^2G_j`; under ``noisy_key`` the rescaling is a symmetry of the cost only with the key noise
+    scaled with the maps, :math:`n_h \to c^2n_h`, so that :math:`G_j + n_hI \to c^2(G_j + n_hI)` (audit 2026-10-31
+    A239). Either way :math:`\ell_j \to \ell_j + r\ln c` for every key at once, which is the shift the
     query-shifted cost :math:`D_{ij} - c_i` takes (audit 2026-10-20 item 1). It carries gradient. The dense route
     factors :math:`G_j` once more by Cholesky in the working dtype; a key whose factorization fails gives NaN, which
     :func:`query_shifted_row_reference` leaves out of the row mean. On the diagonal route the broadened key law of
@@ -91,6 +134,9 @@ def query_shifted_row_reference(
     score:          torch.Tensor,                  # (..., H, N, N) cost without its query constant, D_ij - c_i
     key_log_volume: torch.Tensor,                  # (..., H, N) ell_j of :func:`_key_log_volume`
     log_prior:      Optional[torch.Tensor] = None,  # (..., N, N) or (..., H, N, N), -inf = inadmissible
+
+    *,
+    prior_finite:   Optional[torch.Tensor] = None,  # isfinite(log_prior) when the caller holds it (a tile's view)
 ) -> torch.Tensor:                                 # (..., H, N, 1) m_i
     r"""Row mean of the key log-volumes over each query's admissible keys, the ``query_shifted`` clamp reference.
 
@@ -100,17 +146,40 @@ def query_shifted_row_reference(
     with :math:`\mathcal A_i` the keys of row :math:`i` whose cost and attention log-prior are finite and whose
     log-volume is finite; :math:`m_i = 0` on a row with none. It carries gradient (the exact derivative of the
     clamped cost; where nothing is capped every row of the softmax gradient sums to zero and the term vanishes up to
-    roundoff, as for the ``row_min`` reference).
+    roundoff, as for the ``row_min`` reference). The sum is ``where(A, ell, 0)`` over an integer count, which holds
+    the boolean mask of :math:`\mathcal A` for backward where a float weight grid was held, with the same values and
+    gradient (audit 2026-10-31 A138); the prior's mask is cached per prior tensor (:func:`_finite_prior`).
     """
-    finite_volume = torch.isfinite(key_log_volume).unsqueeze(-2)                # (..., H, 1, N)
-    admissible = torch.isfinite(score) & finite_volume                          # (..., H, N, N)
-    if log_prior is not None:
-        admissible = admissible & torch.isfinite(log_prior)
+    finite_volume = _finite(key_log_volume).unsqueeze(-2)                       # (..., H, 1, N)
+    admissible = _finite(score) & finite_volume                                 # (..., H, N, N)
+    if log_prior is not None or prior_finite is not None:
+        admissible = admissible & (_finite_prior(log_prior) if prior_finite is None else prior_finite)
     volume = torch.where(finite_volume, key_log_volume.unsqueeze(-2),
-                         torch.zeros_like(key_log_volume.unsqueeze(-2)))         # (..., H, 1, N)
-    weights = admissible.to(score.dtype)                                        # (..., H, N, N)
-    count = weights.sum(-1, keepdim=True)                                       # (..., H, N, 1)
-    return (weights * volume.to(score.dtype)).sum(-1, keepdim=True) / count.clamp(min=1)
+                         torch.zeros_like(key_log_volume.unsqueeze(-2))).to(score.dtype)   # (..., H, 1, N)
+    count = admissible.sum(-1, keepdim=True)                                    # (..., H, N, 1) int64
+    return torch.where(admissible, volume, 0.0).sum(-1, keepdim=True) / count.clamp(min=1)
+
+
+def factorizes_projected_covariances(operators: RelationalOperators) -> bool:
+    r"""Whether the router of ``operators`` passes any reduced covariance to a factorization.
+
+    It follows the route decisions of :func:`relational_score`: a comparison block on the diagonal comparison route
+    (:func:`_diagonal_comparison_route`) forms only :math:`\operatorname{diag}P(G)` and factors nothing, and the
+    covariance-blind ``mean_distance`` cost reads no covariance; every other block factors its query and key
+    covariances once per (window, token, head). The minimal-agent readout factors its query and record covariances on
+    every route. The S1 panel D factorization counter reads it (``vfe3.train._numerics_counter_skip_reasons``; audit
+    2026-10-31 training-diagnostics-1). :func:`projected_condition_recovery` is read now, as the router reads it.
+    """
+    if getattr(operators, "predictive_readout", "kernel") == "minimal_agent":
+        return True
+    if operators.routing not in _DIAGONAL_ROUTE_COSTS:                          # mean_distance: no covariance read
+        return False
+    if (getattr(operators, "comparison_rope_base", None) is None
+            or operators.rope_comparison_covariance != "rotation_invariant"):
+        return True
+    return any(not _diagonal_comparison_route(operators, S_q.shape[-2],
+                                              rope_rotated_pairs(S_q.shape[-2], operators.comparison_rope_fraction))
+               for S_q, _ in operators.comparison_runs())
 
 
 def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: int) -> bool:
@@ -140,6 +209,37 @@ def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: 
             and not projected_condition_recovery())
 
 
+def _shares_canonical_mean(
+    operators:   RelationalOperators,
+    frame:       CanonicalFrameContext,
+    value_frame: Optional[CanonicalFrameContext],
+
+    *,
+    diagonal_covariance: bool,                   # the routed covariance is the (..., N, K) diagonal
+) -> bool:
+    r"""Whether the kernel readout computes :math:`\xi_i = U_i^{-1}\mu_i` once for the router and the content.
+
+    Under ``operators.shared_canonical_mean`` (config ``relational_shared_canonical_mean``) the readout's
+    :meth:`RelationalOperators.canonical_mean` feeds both the diagonal comparison route's projected means
+    (``canonical_mean`` of :func:`relational_score`) and :meth:`RelationalOperators.predictive_content`, where each
+    otherwise forms it. It applies where :func:`relational_score` reads it: a diagonal covariance (the moments take
+    ``canonical_mean`` only then, :func:`vfe3.relational_scoring.projected_moments`), compact equal-head frames, one
+    frame for routing and value, no ``frame_diagonal`` reference frame, and the diagonal comparison route
+    (:func:`_diagonal_comparison_route`); elsewhere every consumer forms its own (audit 2026-10-31 perf-live-path-1).
+    A full or head-block covariance would share :math:`\xi` with the content alone, which changes only the gradient
+    summation order, so it is left out, as ``VFE3Config.inactive_fields`` states for those families.
+    """
+    if not getattr(operators, "shared_canonical_mean", False) or not diagonal_covariance:
+        return False
+    if (value_frame is not None and value_frame is not frame) or not frame.block_diagonal or operators.mixed_heads:
+        return False
+    if (getattr(operators, "frame_diagonal", False) or getattr(operators, "comparison_rope_base", None) is None
+            or operators.rope_comparison_covariance != "rotation_invariant"):
+        return False
+    r = operators.comparison_runs()[0][0].shape[-2]
+    return _diagonal_comparison_route(operators, r, rope_rotated_pairs(r, operators.comparison_rope_fraction))
+
+
 def relational_score(
     mu:           torch.Tensor,                        # (..., N, K) receiver (query) means
     sigma:        torch.Tensor,                        # (..., N, K) diagonal or (..., N, K, K) full covariance
@@ -153,7 +253,9 @@ def relational_score(
     row_invariant: bool = False,
     term_support:  Optional[torch.Tensor] = None,      # (..., N, N) or (..., H, N, N) bool pairs of the term medians
     routing_aux:   Optional[Dict[str, torch.Tensor]] = None,   # out-param: key_log_volume (..., H, N)
-) -> torch.Tensor:                                     # (..., H, N, N) projected routing costs
+    query_tiles:   Optional[Sequence[Tuple[int, int]]] = None,  # causal query rows [i0, i1) (routing_causal_tiles)
+    canonical_mean: Optional[torch.Tensor] = None,     # (..., N, K) the caller's xi_i = U_i^{-1} mu_i
+) -> 'torch.Tensor | List[torch.Tensor]':              # (..., H, N, N) projected routing costs, or one per tile
     r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j) or the noisy-query cost, retaining full reduced covariance.
 
     ``operators.routing`` selects the cost: ``"gaussian_kl"`` (projected_gaussian_kl) or
@@ -185,8 +287,17 @@ def relational_score(
     With ``capture`` on the diagonal route of the Gaussian KL, ``score_term_medians_pre`` records the per-head medians of the four cost
     terms (:func:`vfe3.relational_scoring.diagonal_kl_term_medians`, a (4, H + 1) float64 tensor, rows query constant,
     key log-determinant, trace, Mahalanobis, columns the heads and then all heads pooled) over the pairs of
-    ``term_support`` (every pair when None); the dense
-    route does not form the terms and records nothing (audit 2026-10-17 item 9).
+    ``term_support`` (every pair when None); under ``noisy_key`` the terms are those of the Gaussian KL it scores,
+    against the broadened key variance :math:`g_j + n_h` (audit 2026-10-31 A255), and ``noisy_query``, which is not a
+    Gaussian KL, records none. The dense route does not form the terms and records nothing (audit 2026-10-17 item 9).
+    ``projected_factorized_entries_pre`` (an int) counts the (window, token, head, role) entries whose reduced
+    covariance the cost factored: zero on the diagonal route and under ``mean_distance`` (audit 2026-10-31
+    training-diagnostics-1).
+
+    ``query_tiles`` (``routing_causal_tiles``, :func:`routing_causal_tile_rows`; audit 2026-10-31 A140) scores each
+    query tile :math:`[i_0, i_1)` against the keys :math:`[0, i_1)` only and returns one (..., H, i1 - i0, i1) cost per
+    tile; the moments, the rotation and the key log-volumes stay token-linear over all N tokens. It needs the diagonal
+    route on every head run, whose scorer reads no source tuple, and no ``capture``.
 
     Under ``rope_mode='comparison_invariant'`` (``operators.rope_comparison_covariance == 'rotation_invariant'``) each
     comparison covariance is replaced by its projection :math:`P(G)` onto the commutant of the RoPE torus
@@ -207,16 +318,31 @@ def relational_score(
     declare that frame (``identity_frame`` of :func:`vfe3.relational_scoring.projected_moments`), so it is never
     multiplied, and the diagonal route reads :math:`\operatorname{diag}(S\operatorname{diag}(c_i)S^\top) =
     (S\circ S)c_i` as one GEMM (audit 2026-10-20 item 46).
+
+    On the diagonal route of a belief scored against itself, two opt-in shortcuts leave the costs unchanged and the
+    gradients at rounding level (audit 2026-10-31 relational-operators-1, perf-live-path-1). ``canonical_mean`` is the
+    caller's :math:`\xi_i = U_i^{-1}\mu_i` (``relational_shared_canonical_mean``, :func:`_shares_canonical_mean`), from
+    which the projected means are read. A covariance declared type-determined with this frame
+    (:func:`vfe3.relational_scoring.declare_type_rows`, ``relational_type_moments``) has its comparison variances
+    evaluated once per distinct token type (``type_rows`` of :func:`vfe3.relational_scoring.projected_moments`).
+    Under ``operators.pair_kl_gemm_shift == 'rotation_aware'`` the diagonal Gaussian-KL and noisy-key costs center
+    their expansion at zero in the rotating planes (``rotating_coordinates`` of
+    :func:`vfe3.relational_scoring.projected_gaussian_kl`; audit 2026-10-31 numerics-5).
     """
     # gaussian_frame_diagonal: the moments read the reference variances through the identity frame, which
     # projected_moments then never multiplies (identity_frame; audit 2026-10-20 item 46).
     frame_diagonal = bool(getattr(operators, "frame_diagonal", False))
+    # relational_type_moments: the covariance and the frame were declared type-determined for this forward, so the
+    # diagonal comparison variances are evaluated per distinct token type (read before any frame replacement).
+    shared_rows = (type_rows(sigma, frame) if not frame_diagonal and sigma is source_sigma and mu is source_mu
+                   else None)
     if frame_diagonal:
         from vfe3.model.frame_actions import frame_diagonal_reference, frame_matvec
         same = source_mu is mu
         mu, reference_frame = frame_diagonal_reference(mu, frame)                 # (..., N, K) xi, identity frame
         source_mu = mu if same else frame_matvec(frame.inverse, source_mu, frame.block_diagonal)
         frame = reference_frame
+        canonical_mean = None
     dims = operators.irrep_dims
     inverse = frame.inverse
     if not frame.block_diagonal:
@@ -262,12 +388,16 @@ def relational_score(
     if gaussian_kl and operators.pair_kl_gemm_tol is not None:
         cost_options["gemm_expansion_tol"] = operators.pair_kl_gemm_tol
     key_log_noise = getattr(operators, "routing_key_log_noise", None)             # (H,) noisy_key only
+    if query_tiles is not None and capture is not None:
+        raise ValueError("query_tiles scores causal tiles of the pair grid; a capture records the full grid")
     scores, captured_q, captured_k, term_medians = [], [], [], []
+    captured_diagonal = []                                                      # per run: diagonal-route capture
     key_volumes, query_constants = [], []                                       # per run (..., H_run, N)
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads), unless its
     # verdicts can only raise (the diagonal route), which deferred_host_checks then queues.
     first_head = 0                                                             # index of the run's first head
+    factorized_entries = 0                     # (window, token, head, role) entries passed to a factorization
     for (S_q, S_k), inverse in zip(comparison, inverse_runs):
         H, K = S_q.shape[0], S_q.shape[-1]
         # Both roles read the one shared frame: there is no separate key-side inverse.
@@ -289,8 +419,17 @@ def relational_score(
         n_pairs = rope_rotated_pairs(S_q.shape[-2], operators.comparison_rope_fraction) if invariant else 0
         # A structurally diagonal P(G) needs only diag(G): the moments return it (..., N, H, r) in place of G.
         diagonal = invariant and _diagonal_comparison_route(operators, S_q.shape[-2], n_pairs)
+        if query_tiles is not None and not diagonal:
+            raise ValueError("query_tiles needs the diagonal comparison route, whose scorer reads no source tuple")
         moment_options = {"head_dims": head_dims, **({"diagonal_only": True} if diagonal else {}),
                           **({"identity_frame": True} if frame_diagonal else {})}
+        if diagonal and self_scored and len(comparison) == 1:
+            # Opt-in shortcuts of the diagonal moments (relational_type_moments, relational_shared_canonical_mean).
+            if shared_rows is not None and inverse is frame.inverse:
+                moment_options["type_rows"] = shared_rows
+            if canonical_mean is not None:
+                moment_options["canonical_mean"] = canonical_mean.unsqueeze(-2).expand(
+                    *canonical_mean.shape[:-1], H, K)                           # (..., N, H, K) head-broadcast xi
         if tied:
             a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, **moment_options)  # (..., N, H, d), (..., N, H, d, d)
             a_k, G_k = a_q, G_q
@@ -313,9 +452,12 @@ def relational_score(
             G_q = project(G_q, n_pairs)                                         # (..., N, H, r[, r])
             G_k = G_q if tied else project(G_k, n_pairs)
         if capture is not None:
-            # The capture records the matrix P(G) on both routes.
-            captured_q.append((torch.diag_embed(G_q.detach()) if diagonal else G_q.detach()).to(public))
-            captured_k.append((torch.diag_embed(G_k.detach()) if diagonal else G_k.detach()).to(public))
+            # The capture records P(G): the (..., N, H, r, r) matrix on the dense route and its (..., N, H, r) diagonal
+            # on the diagonal route, marked by projected_covariance_diagonal_pre (projected_covariance_runs), so the
+            # diagonal route stores r instead of r^2 entries per (token, head) (audit 2026-10-31 A142).
+            captured_q.append(G_q.detach().to(public))
+            captured_k.append(G_k.detach().to(public))
+            captured_diagonal.append(diagonal)
         projection_q = (sigma_h, inverse, S_q, mu_h)
         projection_k = (source_sigma_h, key_inverse, S_k, source_mu_h)
         if rope_base is not None:
@@ -365,26 +507,45 @@ def relational_score(
                 query_constants.append(_query_row_constant(G_q.detach(), operators.routing, diagonal=diagonal))
         if diagonal:
             run_options["diagonal_covariance"] = True                           # G_q, G_k are (..., N, H, r)
-            # The term medians decompose the Gaussian KL; the noisy costs record none, as on their dense routes.
-            if capture is not None and operators.routing == "gaussian_kl":
+            if gaussian_kl and getattr(operators, "pair_kl_gemm_shift", "first_key") == "rotation_aware":
+                # Center the pair-KL expansion at zero in the 2 n_pairs rotating coordinates (numerics-5).
+                run_options["rotating_coordinates"] = 2 * n_pairs
+            # The term medians decompose the Gaussian KL, under noisy_key that of its broadened key law g_j + n_h
+            # (audit 2026-10-31 A255); noisy_query, not a Gaussian KL, records none, as on its dense route.
+            if capture is not None and gaussian_kl:
                 run_support = (term_support[..., first_head - H:first_head, :, :]   # this run's heads
                                if term_support is not None and term_support.dim() >= 3
                                and term_support.shape[-3] > 1 else term_support)
-                term_medians.append(diagonal_kl_term_medians(a_q, G_q, a_k, G_k, run_support))   # (4, H_run + 1)
+                key_law = (G_k if "key_noise" not in run_options                # (..., N, H, r) g_j or g_j + n_h
+                           else G_k.detach() + run_options["key_noise"].detach().to(G_k.dtype)[:, None])
+                term_medians.append(diagonal_kl_term_medians(a_q, G_q, a_k, key_law, run_support))   # (4, H_run + 1)
         elif invariant:
             run_options["commutant_pairs"] = n_pairs
+        if capture is not None and not diagonal and operators.routing in _DIAGONAL_ROUTE_COSTS:
+            # The covariance-reading costs factor each role's P(G) (or G) once per (window, token, head) on the dense
+            # route, a tied pair twice as the scorer's recovery decisions count it; the diagonal route and the
+            # covariance-blind mean_distance cost factor none (audit 2026-10-31 training-diagnostics-1).
+            factorized_entries += a_q.numel() // a_q.shape[-1] + a_k.numel() // a_k.shape[-1]
         # G_q, G_k are bitwise symmetric here (projected_moments and the RoPE branch both end in a
         # symmetrization), so the scorer skips its isclose symmetry check.
-        scores.append(score(
-            a_q, G_q, a_k, G_k,
-            projection_q=projection_q,
-            projection_k=projection_k,
-            symmetric_inputs=True,
-            **run_options).to(public))
+        if query_tiles is None:
+            scores.append(score(
+                a_q, G_q, a_k, G_k,
+                projection_q=projection_q,
+                projection_k=projection_k,
+                symmetric_inputs=True,
+                **run_options).to(public))
+        else:
+            # The query rows [i0, i1) of each tile against their causal keys [0, i1) (audit 2026-10-31 A140).
+            scores.append([score(a_q[..., i0:i1, :, :], G_q[..., i0:i1, :, :], a_k[..., :i1, :, :],
+                                 G_k[..., :i1, :, :], symmetric_inputs=True, **run_options).to(public)
+                           for i0, i1 in query_tiles])                          # per tile (..., H_run, i1 - i0, i1)
     if capture is not None:
-        # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
+        # One tensor for equal heads; a list with one per run for mixed head sizes (the diagonal flags likewise).
         capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q
         capture["projected_key_covariance_pre"] = captured_k[0] if len(captured_k) == 1 else captured_k
+        capture["projected_covariance_diagonal_pre"] = (captured_diagonal[0] if len(captured_diagonal) == 1
+                                                        else captured_diagonal)
         if term_medians:
             # (4, H + 1): the heads, then the median pooled over every head (NaN across several runs).
             pooled = (term_medians[0][:, -1:] if len(term_medians) == 1
@@ -392,9 +553,109 @@ def relational_score(
             capture["score_term_medians_pre"] = torch.cat([*(t[:, :-1] for t in term_medians), pooled], dim=-1)
         if query_constants:
             capture["score_query_constant_pre"] = torch.cat(query_constants, dim=-2)    # (..., H, N) c_i
+        capture["projected_factorized_entries_pre"] = factorized_entries      # int: the S1 factorization count
     if want_key_volume:
         routing_aux["key_log_volume"] = torch.cat(key_volumes, dim=-2)              # (..., H, N) ell_j
+    if query_tiles is not None:
+        return [tile[0] if len(tile) == 1 else torch.cat(tile, dim=-3) for tile in zip(*scores)]   # (..., H, I, i1)
     return scores[0] if len(scores) == 1 else torch.cat(scores, dim=-3)      # (..., H, N, N)
+
+
+def projected_covariance_runs(
+    capture: Dict[str, Any],                     # one layer's relational capture
+) -> 'list[Tuple[torch.Tensor, torch.Tensor, bool]]':   # per run (G_q, G_k, diagonal)
+    r"""The captured query and key projected covariances of one layer, per run, with their layout.
+
+    ``diagonal`` marks the diagonal comparison route, whose capture holds the ``(..., N, H_r, r)`` diagonal of
+    :math:`P(G)`; otherwise the tensors are the ``(..., N, H_r, r, r)`` matrices (``projected_covariance_diagonal_pre``
+    of :func:`relational_score`; a capture without the flag, such as the minimal agent's, is dense).
+    """
+    query_cov, key_cov = capture["projected_covariance_pre"], capture["projected_key_covariance_pre"]
+    diagonal = capture.get("projected_covariance_diagonal_pre", False)
+    if torch.is_tensor(query_cov):                                             # equal heads: one tensor
+        query_cov, key_cov = [query_cov], [key_cov]
+    flags = [bool(diagonal)] * len(query_cov) if isinstance(diagonal, bool) else [bool(d) for d in diagonal]
+    return list(zip(query_cov, key_cov, flags))
+
+
+# The router's scorer as defined here: routing_causal_tile_rows keeps the full grid when a caller has replaced the
+# module binding (the counterfactual scorers of vfe3.posthoc.interventions score the grid they were written for).
+_RELATIONAL_SCORE = relational_score
+
+
+def routing_causal_tile_rows(
+    operators: RelationalOperators,
+    mu:        torch.Tensor,                    # (..., N, K) working means of the routed belief
+    log_prior: Optional[torch.Tensor],          # the attention log-prior object the routing reads
+) -> Optional[List[Tuple[int, int]]]:           # query rows [i0, i1) of each causal tile, or None: the full grid
+    r"""The causal query tiles of the kernel router under ``routing_causal_tiles`` (audit 2026-10-31 A140).
+
+    When ``log_prior`` forbids every key after its query (:func:`strictly_causal_routing_prior`), :math:`\beta_{ij} = 0`
+    exactly for :math:`j > i`, so the rows :math:`[i_0, i_1)` need only the keys :math:`[0, i_1)`: the pair cost, the
+    row reference and cap, the Gibbs weights and the content contraction of T equal tiles form :math:`(T + 1)/(2T)` of
+    the pair grid. The tiles follow the routed-spread plan (:func:`vfe3.model.relational_operators._spread_tile_plan`
+    under ``causal``): at most :math:`\lceil N/4\rceil` rows, fewer when the budget of one row of the (..., H, N) cost
+    grid asks for it. Values and gradients agree with the full grid to rounding, not bitwise: a shorter row changes
+    the order of the row reductions only, and the first-key centering of the pair-KL expansion is unchanged, since key
+    0 lies in every tile. The full grid (None) runs unless the operators set ``routing_causal_tiles``, every head run
+    takes the diagonal comparison route (:func:`_diagonal_comparison_route`, whose scorer reads no source tuple and
+    queues only raise-only verdicts), ``pair_kl_gemm_tol`` is off (its fallback reads the host and counts per call),
+    the module's :func:`relational_score` is the one defined here, and the prior is strictly causal.
+    """
+    if log_prior is None or not getattr(operators, "routing_causal_tiles", False):
+        return None
+    if getattr(operators, "pair_kl_gemm_tol", None) is not None or relational_score is not _RELATIONAL_SCORE:
+        return None
+    if (getattr(operators, "comparison_rope_base", None) is None
+            or operators.rope_comparison_covariance != "rotation_invariant"):
+        return None
+    for S_q, _ in operators.comparison_runs():
+        r = S_q.shape[-2]
+        if not _diagonal_comparison_route(operators, r, rope_rotated_pairs(r, operators.comparison_rope_fraction)):
+            return None
+    if not strictly_causal_routing_prior(log_prior):
+        return None
+    N = mu.shape[-2]
+    per_row = math.prod(mu.shape[:-2]) * len(operators.irrep_dims) * N * mu.element_size()   # one (..., H, 1, N) row
+    step, _ = _spread_tile_plan(N, per_row, True)
+    return [(i, min(N, i + step)) for i in range(0, N, step)]
+
+
+def _causal_routing_rows(
+    raw_rows:       Sequence[torch.Tensor],     # per tile (..., H, i1 - i0, i1) raw costs of relational_score
+    tiles:          Sequence[Tuple[int, int]],  # query rows [i0, i1) of each tile
+    operators:      RelationalOperators,
+
+    *,
+    kl_max:         float,
+    tau:            'float | torch.Tensor',     # the routing temperature (RelationalOperators.routing_temperature)
+    log_prior:      torch.Tensor,               # (..., N, N) or (..., H, N, N) working-dtype prior
+    key_log_volume: Optional[torch.Tensor],     # (..., H, N) ell_j under 'query_shifted'
+) -> List[torch.Tensor]:                        # per tile (..., H, i1 - i0, i1) routing rows beta_ij over j < i1
+    r"""The clamped cost and Gibbs weights of each causal tile (:func:`routing_causal_tile_rows`).
+
+    Each tile reads the prior's rows :math:`[i_0, i_1)` over the keys :math:`[0, i_1)` and the matching view of its
+    cached finite mask (:func:`_finite_prior`); :func:`clamped_routing_cost` and
+    :func:`vfe3.free_energy.attention_weights` are those of the full grid.
+    """
+    from vfe3.free_energy import attention_weights
+    prior_finite = _finite_prior(log_prior)                                     # (..., N, N) bool
+    rows = []
+    for (i0, i1), raw in zip(tiles, raw_rows):
+        prior = log_prior[..., i0:i1, :i1]                                      # (..., I, i1)
+        score = clamped_routing_cost(raw, operators, kl_max=kl_max, log_prior=prior,
+                                     key_log_volume=None if key_log_volume is None else key_log_volume[..., :i1],
+                                     prior_finite=prior_finite[..., i0:i1, :i1])
+        rows.append(attention_weights(score, tau=tau, log_prior=prior))         # (..., H, I, i1)
+    return rows
+
+
+def _causal_rows_grid(
+    rows: Sequence[torch.Tensor],               # per tile (..., H, I, i1) routing rows
+    n:    int,                                  # N, the number of keys
+) -> torch.Tensor:                              # (..., H, N, N)
+    r"""The full routing grid of causal row tiles, each padded with exact zeros after its causal keys."""
+    return torch.cat([torch.nn.functional.pad(b, (0, n - b.shape[-1])) for b in rows], dim=-2)
 
 
 def clamped_routing_cost(
@@ -404,13 +665,15 @@ def clamped_routing_cost(
     kl_max:    float,
     log_prior: Optional[torch.Tensor] = None,    # (..., N, N) or (..., H, N, N), -inf = inadmissible
     key_log_volume: Optional[torch.Tensor] = None,   # (..., H, N) ell_j; required under 'query_shifted'
+    prior_finite: Optional[torch.Tensor] = None,     # isfinite(log_prior) when the caller holds it (a tile's view)
 ) -> torch.Tensor:
     r"""Clamp the kernel-router cost at ``kl_max`` relative to ``operators.kl_max_reference``.
 
     ``absolute`` clamps :math:`D_{ij}` to :math:`[0, \kappa]`. ``query_shifted`` receives the cost without its
     query-only row constant, :math:`\tilde D_{ij} = D_{ij} - c_i` (:func:`relational_score` drops it, audit 2026-10-17
     item 2), subtracts the admissible row mean :math:`m_i` of the key log-volumes :math:`\ell_j = \tfrac12\log\det G_j`
-    (:func:`query_shifted_row_reference`, ``key_log_volume`` from :func:`relational_score`) and clamps from above only,
+    (:math:`\tfrac12\log\det(G_j + n_hI)` under ``noisy_key``, the broadened key law it scores;
+    :func:`query_shifted_row_reference`, ``key_log_volume`` from :func:`relational_score`) and clamps from above only,
 
     .. math::
         \bar D_{ij} = \min(D_{ij} - c_i - m_i, \kappa) = \min(t_{ij} + q_{ij} + \ell_j - m_i, \kappa),
@@ -419,9 +682,14 @@ def clamped_routing_cost(
     :math:`\kappa`. Beta is the softmax of the unclamped cost wherever nothing is capped (:math:`c_i + m_i` is a row
     constant). The tested quantity is invariant under a joint rescaling :math:`(S_Q, S_K) \to c(S_Q, S_K)` of a head's
     comparison maps, which leaves every KL and beta unchanged: :math:`t` and :math:`q` are invariant and every
-    :math:`\ell_j` moves by :math:`r\ln c`, as does :math:`m_i`. More generally a common map :math:`A` of the
+    :math:`\ell_j` moves by :math:`r\ln c`, as does :math:`m_i`. Under ``noisy_key`` the symmetry carries the key noise
+    with the maps, :math:`(S_Q, S_K, n_h) \to (cS_Q, cS_K, c^2n_h)`, so that :math:`G_j + n_hI \to c^2(G_j + n_hI)`;
+    the maps alone change the cost and beta (audit 2026-10-31 A239). More generally a common map :math:`A` of the
     comparison space that commutes with the RoPE rotations (:math:`G \to AGA^\top`, :math:`a \to Aa`) moves every
-    :math:`\ell_j` and :math:`m_i` by :math:`\log|\det A|` and leaves :math:`\bar D` unchanged. The audit 2026-10-17
+    :math:`\ell_j` and :math:`m_i` by :math:`\log|\det A|` and leaves :math:`\bar D` unchanged; under ``noisy_key``
+    only a scaled orthogonal :math:`A = cQ` with :math:`n_h \to c^2n_h` does, since :math:`n_hI` must stay isotropic.
+    The cap holds one boolean mask for backward (:func:`vfe3.families.base.clamp_nonfinite`, as does the
+    ``safe_kl_clamp`` of the other references; audit 2026-10-31 A138). The audit 2026-10-17
     form ``query_shifted_v1``, :math:`\min(D_{ij} - c_i, \kappa)`, kept the key log-determinant and so moved by
     :math:`r\ln c` along that flat direction; heads crossed the cap by scale alone and stayed fully clamped with zero
     router gradient (audit 2026-10-20 item 1). It is retained for configs saved before the fix. ``row_min`` clamps the gap
@@ -439,19 +707,20 @@ def clamped_routing_cost(
     exceeds the cap the softmax gradient already sums to zero over the row, and the added term vanishes up to
     roundoff.
     """
-    from vfe3.families.base import safe_kl_clamp
+    from vfe3.families.base import clamp_nonfinite, safe_kl_clamp
     if operators.kl_max_reference == "query_shifted_v1":
-        return score.clamp(max=kl_max).nan_to_num(nan=kl_max, posinf=kl_max)
+        return clamp_nonfinite(score, upper=kl_max)
     if operators.kl_max_reference == "query_shifted":
         if key_log_volume is None:
             raise ValueError("routing_kl_max_reference='query_shifted' clamps relative to the row mean of the key "
                              "log-volumes; pass key_log_volume (relational_score's routing_aux)")
-        shifted = score - query_shifted_row_reference(score, key_log_volume, log_prior)   # (..., H, N, N)
-        return shifted.clamp(max=kl_max).nan_to_num(nan=kl_max, posinf=kl_max)
+        shifted = score - query_shifted_row_reference(score, key_log_volume, log_prior,
+                                                      prior_finite=prior_finite)   # (..., H, N, N)
+        return clamp_nonfinite(shifted, upper=kl_max)
     if operators.kl_max_reference == "row_min":
-        admissible = torch.isfinite(score)
-        if log_prior is not None:
-            admissible = admissible & torch.isfinite(log_prior)
+        admissible = _finite(score)
+        if log_prior is not None or prior_finite is not None:
+            admissible = admissible & (_finite_prior(log_prior) if prior_finite is None else prior_finite)
         row_min = score.masked_fill(~admissible, float("inf")).amin(dim=-1, keepdim=True)   # (..., H, N, 1)
         row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
         score = score - row_min                                                 # (..., H, N, N)
@@ -498,7 +767,10 @@ def relational_predictive_readout(
     query constant, :math:`D_{ij} - c_i`, and ``score_row_shift_pre`` ((..., H, N) float64) is the whole row
     constant removed before the clamp, :math:`c_i + m_i` (:math:`c_i` under ``query_shifted_v1``), so that
     ``score_energy_pre`` plus it is the absolute cost as the router read it, :math:`\min(D_{ij}, \kappa + c_i + m_i)`
-    (audit 2026-10-20 item 39).
+    (audit 2026-10-20 item 39). Under ``operators.routing_causal_tiles`` with a strictly causal prior and no
+    ``capture`` the router runs in causal query tiles (:func:`routing_causal_tile_rows`; audit 2026-10-31 A140): the
+    cost, its clamp, the Gibbs weights and the content contraction of each tile read its causal keys only, and the
+    covariance update and the edge links read the tiles padded to the full grid with exact zeros.
 
     Under ``predictive_readout='minimal_agent'`` the routing, the content and the residual are replaced by the
     exact Gaussian conditioning of :meth:`RelationalOperators.minimal_agent_update`, which reads the ROUTING frame
@@ -532,9 +804,19 @@ def relational_predictive_readout(
         support = (None if capture is None or log_prior is None
                    else torch.isfinite(log_prior.detach()))                  # (..., N, N) or (..., H, N, N)
         routing_aux: Dict[str, torch.Tensor] = {}
+        # routing_causal_tiles: the causal query tiles of the pair grid (audit 2026-10-31 A140); a capture records the
+        # full grid. raw_score, score and beta are then lists with one (..., H, i1 - i0, i1) entry per tile.
+        tiles = None if capture is not None else routing_causal_tile_rows(operators, mu_work, log_prior)
+        # relational_shared_canonical_mean: xi_i = U_i^{-1} mu_i once for the router's projected means and the content.
+        shared_xi = (operators.canonical_mean(mu_work, frame)
+                     if _shares_canonical_mean(operators, frame, value_frame,
+                                               diagonal_covariance=sigma_work.shape == mu_work.shape)
+                     else None)                                                 # (..., N, K) or None
         raw_score = relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
                                      **({"row_invariant": True} if row_invariant else {}),
                                      **({"term_support": support} if support is not None else {}),
+                                     **({"query_tiles": tiles} if tiles is not None else {}),
+                                     **({"canonical_mean": shared_xi} if shared_xi is not None else {}),
                                      routing_aux=routing_aux)                   # (..., H, N, N)
         # The clamp maps NaN and +inf to kl_max, so a capped captured cost cannot tell a failed cost from a
         # finite one at the cap; the capture keeps which raw costs were non-finite (audit 2026-10-16 F10).
@@ -549,7 +831,7 @@ def relational_predictive_readout(
                 capture["score_raw_row_max_pre"] = raw.masked_fill(~admissible, float("-inf")).amax(dim=-1).where(
                     admissible.any(dim=-1), torch.tensor(float("nan"), dtype=raw.dtype, device=raw.device))
         key_log_volume = routing_aux.get("key_log_volume")                     # (..., H, N) or None
-        score = clamped_routing_cost(
+        score = None if tiles is not None else clamped_routing_cost(           # tiles: clamped by _causal_routing_rows
             raw_score, operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype),
             key_log_volume=key_log_volume)
         if capture is not None and "score_query_constant_pre" in capture:
@@ -562,19 +844,34 @@ def relational_predictive_readout(
                         raw_score.detach(), key_log_volume.detach(),
                         None if log_prior is None else log_prior.to(dtype)).squeeze(-1).double()
                 capture["score_row_shift_pre"] = shift
-        beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype),
-                                 log_prior=None if log_prior is None else log_prior.to(dtype))
+        if tiles is None:
+            beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype),
+                                     log_prior=None if log_prior is None else log_prior.to(dtype))
+        else:
+            beta = _causal_routing_rows(raw_score, tiles, operators, kl_max=kl_max,
+                                        tau=operators.routing_temperature(tau, dtype), log_prior=log_prior.to(dtype),
+                                        key_log_volume=key_log_volume)          # per tile (..., H, i1 - i0, i1)
+        beta_rows = None if tiles is None else beta                              # causal row tiles, or None
+        if beta_rows is not None and (return_covariance
+                                      or getattr(operators, "content_link_edges", "off") != "off"):
+            # The covariance update and the edge links read the full grid: exact zeros after each row's keys.
+            beta = _causal_rows_grid(beta_rows, mu_work.shape[-2])                # (..., H, N, N)
         if getattr(operators, "content_link_edges", "off") != "off":
             inference = ({} if not latent else dict(
                 sigma=sigma_work, log_prior=None if log_prior is None else log_prior.to(dtype),
                 link_state=link_state, latent_out=latent_out))
-            edges = operators.edge_context(mu_work, beta, value_frame or frame, **inference)
+            # A strictly causal prior lets the lowrank phi_1 skip the pairs j > i (audit 2026-10-31 A187).
+            edges = operators.edge_context(mu_work, beta, value_frame or frame,
+                                           causal=strictly_causal_routing_prior(log_prior), **inference)
             receive = [edge_receive_heads(edges, len(operators.irrep_dims))]
         else:
             _, receive = operators.content_factor_runs()         # O' once per layer for mean and covariance
         shared = {} if edges is None else {"edges": edges}
-        result = operators.predictive_content(mu_work, beta, value_frame or frame, receive,
-                                              **shared).to(mu.dtype)
+        # Without edge links the content contracts each causal tile against its own keys only.
+        result = operators.predictive_content(mu_work, beta if beta_rows is None or edges is not None else beta_rows,
+                                              value_frame or frame, receive,
+                                              **shared, **({"canonical": shared_xi} if shared_xi is not None else {})
+                                              ).to(mu.dtype)
         if operators.attention_residual:
             result = mu + result
         # beta_ij = 0 exactly wherever the prior is -inf, so a strictly causal prior lets the routed spreads skip the

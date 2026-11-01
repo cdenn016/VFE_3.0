@@ -20,7 +20,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -54,6 +54,36 @@ def _write(path: Path, text: str) -> str:
     return str(path)
 
 
+# Keys that say which runs an experiment holds and how they are read. A JSON manifest owns them: the driver's
+# CONFIG never fills one in beside it, so artifacts assembled for one experiment cannot describe a run of
+# another (audit 2026-10-31, paper-claims-10).
+MANIFEST_KEYS: Tuple[str, ...] = ("arms", "evaluated_run", "final_run", "numerics_run", "scaling", "selection",
+                                  "decision", "paper_arms")
+ABSENT_FROM_MANIFEST = "absent from the manifest; CONFIG's value not used"
+
+
+def manifest_config(
+    defaults: Mapping[str, Any],
+    manifest: Optional[Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    r"""``(config, origin)`` of a driver's ``defaults`` (its CONFIG) and an optional JSON ``manifest``.
+
+    Without a manifest the config is ``defaults``. With one, every key of :data:`MANIFEST_KEYS` comes from the
+    manifest alone and only the reading options (``out_dir``, ``drop_unknown_config_fields``,
+    ``read_checkpoints``, ``threads``, ...) from ``defaults``. ``origin`` names the source of every key,
+    ``"manifest"`` or ``"CONFIG"``, and records each CONFIG run key the manifest withheld as
+    :data:`ABSENT_FROM_MANIFEST`; :func:`assemble` writes it to ``paper_artifacts.json``.
+    """
+    if manifest is None:
+        return dict(defaults), {str(key): "CONFIG" for key in defaults}
+    config = {key: value for key, value in defaults.items() if key not in MANIFEST_KEYS}
+    config.update(manifest)
+    origin = {str(key): ("manifest" if key in manifest else "CONFIG") for key in config}
+    origin.update({str(key): ABSENT_FROM_MANIFEST for key in defaults
+                   if key in MANIFEST_KEYS and key not in manifest})
+    return config, origin
+
+
 def _index_markdown(report: Mapping[str, Any]) -> str:
     lines = [f"# Manuscript artifacts ({report['created']})", "",
              f"Selection rule: `{report['selection']}`. Tables are LaTeX tabular environments with the "
@@ -61,6 +91,9 @@ def _index_markdown(report: Mapping[str, Any]) -> str:
              ""]
     if report["problems"]:
         lines += ["## Manifest problems", ""] + [f"- {p}" for p in report["problems"]] + [""]
+    if report.get("config_origin"):
+        lines += ["## Configuration origin", ""] + [f"- `{key}`: {value}"
+                                                    for key, value in report["config_origin"].items()] + [""]
     lines += ["## Arms", "", "| Arm | Runs | Seeds (model / data) | Homogeneous | Differing fields |",
               "|---|---|---|---|---|"]
     for arm in report["arms"]:
@@ -108,13 +141,15 @@ def assemble(
     *,
     out_dir: Optional[Any] = None,
     log:     Callable[[str], None] = print,
+    origin:  Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     r"""Resolve ``config`` (a manifest, see :mod:`vfe3.paper.runs`) and write every table and figure.
 
     ``config`` also takes ``out_dir`` (used when the argument is None), ``drop_unknown_config_fields``
     (default True) and ``read_checkpoints`` (default True: parameter counts, optimizer groups, map
     invariants and log-variance tables may be read memory-mapped from the saved weights when no
-    record holds them). Returns the report written to ``paper_artifacts.json``.
+    record holds them). ``origin`` (:func:`manifest_config`), when given, is recorded as the report's
+    ``config_origin`` and listed in the index. Returns the report written to ``paper_artifacts.json``.
     """
     started = time.perf_counter()
     target = Path(out_dir if out_dir is not None else config.get("out_dir") or "paper_artifacts")
@@ -135,6 +170,8 @@ def assemble(
                            "homogeneity": grid.homogeneity} for axis, grid in manifest.scaling.items()},
         "tables": {}, "figures": {},
     }
+    if origin is not None:
+        report["config_origin"] = {str(key): str(value) for key, value in origin.items()}
     log(f"manifest: {len(manifest.arms)} arms, "
         f"{sum(len(a.runs) for a in manifest.arms)} runs, selection '{manifest.selection}'")
     contract_run = manifest.final or manifest.evaluated

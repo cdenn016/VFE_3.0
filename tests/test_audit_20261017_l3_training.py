@@ -230,7 +230,8 @@ def test_eigenvalue_and_table_step_alarms_warn_once_and_reach_the_sink(tmp_path:
     records: List[Dict[str, Any]] = []
     warned: set = set()
     logger = logging.getLogger("audit-l3-warn")
-    d = {"belief_lam_min": 2.0e-14, "belief_lam_max": 1.0,
+    # The alarm reads the per-token condition (audit 2026-10-31 training-diagnostics-2).
+    d = {"belief_lam_min": 2.0e-14, "belief_lam_max": 1.0, "belief_cond_max": 5.0e13,
          "relational_projected_cov_min_eigenvalue_layer_min": 6.6e-13,
          "relational_projected_cov_min_eigenvalue_argmin_layer": 1.0}
     with caplog.at_level(logging.WARNING, logger="audit-l3-warn"):
@@ -241,7 +242,7 @@ def test_eigenvalue_and_table_step_alarms_warn_once_and_reach_the_sink(tmp_path:
         assert not T._warn_table_step_collapse(0.1, 0.05, logger, step=1100, sink=records.append)
     assert [r["kind"] for r in records] == ["belief_eigenvalue_ratio", "projected_floor", "table_step_collapse"]
     assert records[0]["layer"] == 2 and records[1]["layer"] == 1
-    healthy = {"belief_lam_min": 1e-2, "belief_lam_max": 1.0}
+    healthy = {"belief_lam_min": 1e-2, "belief_lam_max": 1.0, "belief_cond_max": 1e2}
     T._warn_eigenvalue_collapse(healthy, set(), logger, belief_layer=0, sink=records.append)
     assert len(records) == 3
     path = T._append_run_warning(tmp_path, {**records[0], "value": float("nan")})

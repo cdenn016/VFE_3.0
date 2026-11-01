@@ -27,23 +27,27 @@ import logging
 import math
 import subprocess
 import sys
+import threading
+from collections import deque
 from pathlib import Path
-from typing import List, Mapping, Optional
+from typing import Callable, Deque, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from vfe3.process_utils import run_process_tree
+from vfe3.process_utils import spawn_process_tree
 from vfe3.run_artifacts import _unique_sibling_temp
 
 RUN_ROOT = "vfe3_runs"
 _FIGURE_TIMEOUT_SECONDS = 2 * 60 * 60
+_WORKER_CLEANUP_SECONDS = 10.0          # bound on releasing the worker's process tree and joining its reader
+_WORKER_OUTPUT_TAIL_LINES = 400         # output lines a failure message can quote
 
 CONFIG = {
     "run_dir":       None,                                  # None -> newest run under RUN_ROOT
     "device":        "cuda" if torch.cuda.is_available() else "cpu",
     "split":         "validation",                          # split the representative batch is drawn from
     "max_sequences": 256,                                   # report-batch population of the model-replay figures
-    "n_e_steps":     None,                                  # E-step trace length (None -> trained cfg.n_e_steps)
+    "n_e_steps":     None,                                  # ignored (no retained figure reads it); None | positive int
     "generate_embedding_figures": False,                    # slow semantic-geometry analysis (vfe3.semantics)
 }
 
@@ -136,6 +140,68 @@ def _newest_run(root: str) -> Path:
     )
 
 
+def _log_worker_line(line: str) -> None:
+    r"""Forward one line of the figure worker's output to this driver's log as it arrives."""
+    logging.getLogger(__name__).info("%s", line)
+
+
+def _run_figure_worker(
+    command: Sequence[str],
+
+    *,
+    cwd:     str,
+    env:     Mapping[str, str],
+    timeout: float,
+    on_line: Callable[[str], None],
+) -> Tuple[int, str]:
+    r"""Run the figure worker in a contained process tree, handing each output line to ``on_line`` as it arrives.
+
+    The worker's stdout and stderr share one pipe that a reader thread drains line by line, so a click-to-run report
+    shows its progress while it runs, not only after the child exits (audit 2026-10-31 viz-pipeline-12). Returns the
+    exit code and the last lines of output, which a failure message quotes. A worker that outlives ``timeout``
+    seconds is terminated with its descendants and ``subprocess.TimeoutExpired`` is raised; an interruption also
+    terminates the tree.
+    """
+    tree = spawn_process_tree(
+        list(command),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    process = tree.process
+    if process.stdin is not None:                  # the containment gate is written; the worker reads no input
+        process.stdin.close()
+    tail: Deque[str] = deque(maxlen=_WORKER_OUTPUT_TAIL_LINES)
+
+    def drain() -> None:
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\r\n")
+            tail.append(line)
+            try:
+                on_line(line)
+            except Exception:                      # a failing sink never stalls the pipe
+                pass
+
+    reader = threading.Thread(target=drain, name="figure-worker-output", daemon=True)
+    reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    finally:
+        # After a normal exit this releases the containment job (and any descendant still alive); after a timeout or
+        # an interruption it terminates the tree.
+        tree.terminate(reason="figure worker finished or was interrupted", timeout=_WORKER_CLEANUP_SECONDS)
+        reader.join(timeout=_WORKER_CLEANUP_SECONDS)
+        if process.stdout is not None and not reader.is_alive():
+            process.stdout.close()
+    return int(returncode), "\n".join(tail)
+
+
 def _generate_figures_isolated(
     run_dir: Path,
 
@@ -150,7 +216,9 @@ def _generate_figures_isolated(
 
     ``run_dir`` is resolved to an absolute path first: the child runs with the repository root as its
     working directory, so a relative path would resolve there, and the worker's ownership check of the
-    result file would fail whenever this process was launched elsewhere (audit 2026-10-17 item 67).
+    result file would fail whenever this process was launched elsewhere (audit 2026-10-17 item 67). The
+    child's output is logged line by line while it runs (:func:`_run_figure_worker`). ``n_e_steps`` is
+    forwarded and ignored by the worker: no retained figure reads it.
     """
     if type(generate_embedding_figures) is not bool:
         raise TypeError("generate_embedding_figures must be bool")
@@ -171,17 +239,14 @@ def _generate_figures_isolated(
             environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
             environment["VFE3_FIGURE_REQUEST"] = str(request_path)
             environment["PYTHONUNBUFFERED"] = "1"
+            environment["PYTHONIOENCODING"] = "utf-8"          # the streamed lines are decoded as UTF-8
             try:
-                completed = run_process_tree(
+                returncode, output_tail = _run_figure_worker(
                     [sys.executable, "-m", "vfe3.viz.figure_worker"],
                     cwd=str(Path(__file__).resolve().parent),
                     env=environment,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     timeout=_FIGURE_TIMEOUT_SECONDS,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    on_line=_log_worker_line,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
@@ -189,18 +254,11 @@ def _generate_figures_isolated(
                 ) from exc
             except (OSError, subprocess.SubprocessError) as exc:
                 raise RuntimeError(f"isolated figure generation could not start: {exc}") from exc
-            if completed.returncode != 0:
-                detail = completed.stderr.strip() or "no stderr"
+            if returncode != 0:
+                detail = output_tail.strip() or "no output"
                 raise RuntimeError(
-                    f"isolated figure generation exited with code {completed.returncode}: "
+                    f"isolated figure generation exited with code {returncode}: "
                     f"{detail[-4000:]}"
-                )
-            if completed.stdout.strip():
-                logging.getLogger(__name__).info(completed.stdout.rstrip())
-            if completed.stderr.strip():
-                logging.getLogger(__name__).info(
-                    "isolated figure process diagnostics:\n%s",
-                    completed.stderr.rstrip(),
                 )
             try:
                 payload = json.loads(result_path.read_text(encoding="utf-8"))

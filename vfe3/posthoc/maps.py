@@ -11,7 +11,12 @@ Theorem ``thm:reference_moments`` (3) leaves every cost unchanged under
 message unchanged under :math:`(T_h, O_h) \mapsto (B T_h, O_h B^{-1})`, and routing and means unchanged
 under the common reference change :math:`(U_i, S, T_h, O_h) \mapsto (U_i a, S a, T_h a, a^{-1} O_h)`
 (block-diagonal :math:`a` on the evaluated route; the moment-matched covariance floor is not invariant
-under it). The quantities reported are
+under it). The comparison-map statement is that of the Gaussian-KL router. Under
+``relational_routing='noisy_key'`` the router scores :math:`\mathrm{KL}(N(a_i, V_{Q,i})\,\|\,N(b_j, V_{K,j} + n_hI))`
+with a learned per-head noise :math:`n_h` (``routing_key_log_noise``), which leaves the cost unchanged only under
+orthogonal :math:`A` and under the joint scale :math:`(S_{Q,h}, S_{K,h}, n_h) \mapsto (cS_{Q,h}, cS_{K,h}, c^2n_h)`:
+the cost reads the comparison maps only through :math:`S/\sqrt{n_h}`, so at fixed :math:`n_h` their scale sets the
+routing sharpness, as the channel noise does for the minimal agent. The quantities reported are
 
 * the relative gains, :math:`g = \sqrt{\operatorname{eig}((S_K S_K^\top)^{-1} S_Q S_Q^\top)}`, and
   the principal angles between the row spaces of :math:`S_{Q,h}` and :math:`S_{K,h}`: invariant under
@@ -28,6 +33,12 @@ optimizers without weight decay do not: the common scale
 :math:`\sqrt{\operatorname{tr}(S_Q S_Q^\top + S_K S_K^\top)/(2r)}` and the drifts from initialization
 :math:`\|S_Q S_Q^\top + S_K S_K^\top - 2I\|_F` (orthonormal-row initialization) and
 :math:`\|T T^\top - O^\top O - (1 - s_0^2) I\|_F` (block-placed :math:`T = I`, :math:`O = s_0 I`).
+Where the common scale is a signal-to-noise coordinate rather than a symmetry coordinate (noisy-key routing and
+the minimal agent's channel noise) ``scale_rms`` and ``conserved_S_drift`` are NaN, and the rows carry the noise
+:math:`n_h` with the scale and the comparison maps' singular values in noise units, the scale divided by
+:math:`\sqrt{n_h}` (``scale_rms_noise_units``), which the joint scale leaves unchanged. Under noisy-key routing the
+gradient-flow charge of the joint scale is :math:`\tfrac12(\|S_Q\|_F^2 + \|S_K\|_F^2) + 2\log n_h` (untied maps); it
+is not reported.
 
 :func:`head_block_norms` gives the S2 panel A matrices: the Frobenius norm of each head's map restricted
 to each frame block's coordinates (input columns for :math:`S_Q, S_K, T`; output rows for :math:`O`).
@@ -59,9 +70,11 @@ _LEAF_BY_MAP = {"S_Q": "raw_score_q", "S_K": "raw_score_k", "T": "T", "O": "O"}
 EDGE_MAP_NAMES: Tuple[str, ...] = ("edge_receiver_map", "edge_site_basis", "edge_sender_map")
 # predictive_readout='minimal_agent' (vfe3/model/minimal_agent.py): the channel log-noise, read under its own name.
 MINIMAL_AGENT_NAMES: Tuple[str, ...] = ("channel_log_noise",)
+# relational_routing='noisy_key': the per-head key log-noise log n_h of N(b_j, V_K,j + n_h I), read under its own name.
+NOISY_KEY_NAMES: Tuple[str, ...] = ("routing_key_log_noise",)
 _LAYER_KEY = re.compile(r"^relational_operators(?:_extra\.(\d+))?\."
                         r"(raw_score_q|raw_score_k|T|O|edge_receiver_map|edge_site_basis|edge_sender_map"
-                        r"|channel_log_noise)$")
+                        r"|channel_log_noise|routing_key_log_noise)$")
 _SNAPSHOT_FILE = re.compile(r"^step_(\d+)\.pt$")
 
 
@@ -105,10 +118,12 @@ def relational_maps(
     ``raw_score_k`` and no ``O``) ties the key to the content, so ``"S_K"`` is its ``T``; it has no ``"O"`` (the
     receiving map is derived from the receiver covariance) and carries ``"channel_log_noise"``.
     A kernel layer stored without ``raw_score_k`` (``tie_comparison_maps``) reports ``"S_K"`` as its ``"S_Q"``.
+    A noisy-key layer (``relational_routing='noisy_key'``) carries its key log-noise ``"routing_key_log_noise"``
+    (:data:`NOISY_KEY_NAMES`), :math:`\log n_h` per head.
     """
     layers: Dict[int, Dict[str, torch.Tensor]] = {}
     inverse = {leaf: name for name, leaf in _LEAF_BY_MAP.items()}
-    inverse.update({name: name for name in EDGE_MAP_NAMES + MINIMAL_AGENT_NAMES})
+    inverse.update({name: name for name in EDGE_MAP_NAMES + MINIMAL_AGENT_NAMES + NOISY_KEY_NAMES})
     for key, value in state.items():
         match = _LAYER_KEY.match(key)
         if match is None:
@@ -301,6 +316,16 @@ def map_invariants(
     gradient flow. ``conserved_S_drift`` is then NaN and the row carries ``comparison_rope = 1.0``;
     ``scale_rms`` (the trace charge, which survives) is kept, and the gains and angles are invariants
     of the larger GL(r) group, not of the model's symmetry (audit 2026-10-08, transformer-ml#5).
+
+    Under ``relational_routing='noisy_key'`` (``routing_key_log_noise`` stored) the key law
+    :math:`N(b_j, V_{K,j} + n_hI)` reads the comparison maps only through :math:`S/\sqrt{n_h}`, so a common scale
+    of :math:`(S_Q, S_K)` is a symmetry only together with :math:`n_h \to c^2n_h`, and at fixed :math:`n_h` it sharpens
+    or flattens the routing. Such a row carries ``noisy_key = 1.0`` and ``key_noise`` :math:`= n_h`; ``scale_rms`` and
+    ``conserved_S_drift`` are NaN (neither is a symmetry coordinate, and the GL(r) charge has no conservation law
+    there), and the scale and the singular values of :math:`S_Q`, :math:`S_K` are reported in noise units,
+    ``scale_rms_noise_units`` and ``{S_Q,S_K}_sv_noise_units_{min,max}`` (divided by :math:`\sqrt{n_h}`), as for the
+    minimal agent's channel noise (audit 2026-10-31 posthoc-routing-1). The gains and angles stay: they are invariant
+    under every orthogonal and scalar :math:`A`.
     """
     state, _ = unwrap_state(state)
     s0 = _output_init_scale(cfg)
@@ -369,6 +394,23 @@ def map_invariants(
                     (S_Q.square().sum() + S_K.square().sum()) / (2 * r)))) / unit
                 for name, mat in (("S_Q", S_Q), ("T", S_K)):
                     sv = torch.linalg.svdvals(mat) / unit
+                    row[f"{name}_sv_noise_units_min"] = float(sv.min())
+                    row[f"{name}_sv_noise_units_max"] = float(sv.max())
+            if "routing_key_log_noise" in maps:                       # noisy_key: KL(N(a, V_Q) || N(b, V_K + n_h I))
+                # The cost reads (S_Q, S_K) only through S / sqrt(n_h): (S_Q, S_K) -> (A S_Q, A S_K) is a symmetry
+                # only for orthogonal A, and a common scale c only together with n_h -> c^2 n_h. The gains and angles
+                # stay; the common scale is the routing signal-to-noise coordinate and S_Q S_Q^T + S_K S_K^T has no
+                # conservation law, so those two columns are replaced by noise-unit values, as for the minimal agent.
+                n_h = float(maps["routing_key_log_noise"][h].exp())
+                unit = math.sqrt(n_h)
+                row["noisy_key"] = 1.0
+                row["key_noise"] = n_h
+                row["scale_rms"] = float("nan")
+                row["conserved_S_drift"] = float("nan")
+                row["scale_rms_noise_units"] = float(math.sqrt(float(
+                    (S_Q.square().sum() + S_K.square().sum()) / (2 * r)))) / unit
+                for name, mat in (("S_Q", S_Q), ("S_K", S_K)):
+                    sv = torch.linalg.svdvals(mat) / unit                  # (r,) singular values in noise units
                     row[f"{name}_sv_noise_units_min"] = float(sv.min())
                     row[f"{name}_sv_noise_units_max"] = float(sv.max())
             if comparison_rope:                                       # RoPE breaks GL(r) to its commutant

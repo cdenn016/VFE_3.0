@@ -282,6 +282,7 @@ def run_vfe(
     label:     str,
     device:    Optional[Union[str, torch.device]] = None,
     logger:    Optional[logging.Logger] = None,
+    resume_from: Optional[Union[str, Path]] = None,
 ) -> Path:
     r"""Train ``cfg`` on ``dataset`` and finalize the run; return its (renamed) run directory.
 
@@ -292,6 +293,11 @@ def run_vfe(
     seeds the training shuffle generator only. ``label`` names the run directory
     ``<out_root>/<timestamp>_<label>`` while training and ``<out_root>/<test PPL:.2f>_<label>``
     after finalization. ``device`` defaults to CUDA when available.
+
+    ``resume_from`` continues an interrupted run of the same config, seed and data seed from its training
+    checkpoint ``<run>/checkpoints/step_<N>.pt`` (``train(resume_from=...)``: weights, optimizer, RNG and data
+    cursor), in a new run directory as the launcher's resume does; ``summary.json`` names the source
+    (``resume_source``). A ``resume_from`` inherited in ``cfg`` is still cleared (:func:`_without_resume`).
     """
     from vfe3.data.datasets import _validate_path_component, tokens_per_char
     from vfe3.model.model import VFEModel
@@ -330,7 +336,8 @@ def run_vfe(
     try:
         return _train_and_finalize(model, cfg, artifacts, run_dir, label, dataset=dataset, data_seed=data_seed,
                                    train_loader=train_loader, val_loader=val_loader, val_tpc=val_tpc,
-                                   test_loader=test_loader, test_tpc=test_tpc, device=device, logger=logger)
+                                   test_loader=test_loader, test_tpc=test_tpc, device=device, logger=logger,
+                                   resume_from=resume_from)
     except Exception as exc:
         # A crash is a recorded failure of the seed pair, not an unfinished run (audit 2026-10-17 item 28).
         write_failure_record(run_dir, exc, stage="train_or_finalize")
@@ -354,6 +361,7 @@ def _train_and_finalize(
     test_tpc:     Any,
     device:       torch.device,
     logger:       logging.Logger,
+    resume_from:  Optional[Union[str, Path]] = None,
 ) -> Path:
     r"""The training, final validation, test scoring and rename of :func:`run_vfe`."""
     from vfe3.data.datasets import _tokenizer_tag
@@ -377,6 +385,7 @@ def _train_and_finalize(
         device=device,
         logger=logger,
         artifacts=artifacts,
+        resume_from=resume_from,
         _final_validation_out=final_validation,
         sample_dataset=dataset,
     )

@@ -171,7 +171,8 @@ def test_probe_and_history_figures_are_written_and_umap_is_gated(tmp_path: Path)
     figdir.mkdir()
     names = {p.name for p in report.generate_feature_probe_figures(
         model, [ids], tmp_path, figdir, torch.device("cpu"), generate_embedding_figures=False)}
-    assert names == {"feature_probes.json", "minimal_agent_gap.png", "template_usage.png", "template_codebook.png"}
+    # The returned paths are figures only; the JSON summary is a run-root record (audit 2026-10-31 viz-pipeline-1).
+    assert names == {"minimal_agent_gap.png", "template_usage.png", "template_codebook.png"}
     summary = json.loads((tmp_path / "feature_probes.json").read_text())
     assert "nu" not in summary["prototype"]["layers"][0]
     (tmp_path / "diagnostics").mkdir()

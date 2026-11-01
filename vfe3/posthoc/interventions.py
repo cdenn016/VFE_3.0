@@ -26,11 +26,15 @@ row   key                                    modification
 10    ``frames_removed_routing_covariance``  :math:`C_i = U_i^{-1}\Sigma_{p,x_i}U_i^{-\top} \to \Sigma_{p,x_i}` only
 11    ``frames_removed_norm_mlp``            :math:`U_i^{-1}\Phi^{(\ell)}(U_i\,\cdot) \to \Phi^{(\ell)}` only
 12    ``frames_removed_decoder``             :math:`W_{\mathrm{out}}U_i\xi_i^{(L)} \to W_{\mathrm{out}}\xi_i^{(L)}` only
+13    ``comparison_rope_identity``           comparison-space RoPE :math:`R_i \to I` in the routing cost, the
+                                             commutant projection :math:`P(G)` kept
 ====  =====================================  ==============================================================
 
 Rows 9-12 remove the composed frame :math:`U_i` from one role of the reference normal form
 (Corollary ``cor:normal_form``, Figure ``fig:placeholder_reference_gauge``) while every other role keeps
-the trained frames; :func:`frames_removed` derives the local-coordinate form the model computes.
+the trained frames; :func:`frames_removed` derives the local-coordinate form the model computes. Rows 1-12 are the
+manuscript's Table M5 (:data:`INTERVENTIONS`); row 13 (:data:`EXTENSIONS`, :func:`comparison_rope_identity`) isolates
+the positional channel of a comparison ``rope_mode`` and runs with them.
 
 Table substitutions swap a parameter's ``.data`` for a zero-stride zero tensor and swap the original
 storage back on exit, so no table is copied (``phi_embed`` is 1 GB on K160) and the restored model is
@@ -385,6 +389,7 @@ def _reference_coordinate_score(
     scorer:        Optional[Callable[..., torch.Tensor]],
     public:        torch.dtype,                      # the dtype the trained call on the original inputs returns
     routing_aux:   Optional[Dict[str, torch.Tensor]] = None,   # relational_score's out-param (key log-volumes)
+    term_support:  Optional[torch.Tensor] = None,    # (..., N, N) or (..., H, N, N) bool pairs of the term medians
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""The trained router scored on reference moments: :math:`\xi_i = U_i^{-1}\mu_i`, covariance ``C``, frame :math:`I`.
 
@@ -396,7 +401,9 @@ def _reference_coordinate_score(
     recovery route rebuilds :math:`G` (audit 2026-10-16 F120: the counterfactual scorers rebuilt the cost
     themselves without the rotation and refused a comparison ``rope_mode``). The reference means are
     formed at the frame's precision under the IEEE-fp32 pin of the trained projection; a dense frame that
-    couples heads is refused as the router refuses it.
+    couples heads is refused as the router refuses it. A diagnostic capture's ``term_support`` passes through, so
+    the captured term medians describe the substituted costs over the capture's pairs (audit 2026-10-31
+    posthoc-routing-4).
     """
     from vfe3.runtime import ieee_fp32_matmul
 
@@ -412,7 +419,8 @@ def _reference_coordinate_score(
         source_xi = xi if source_mu is mu else _frame_matvec(frame.inverse, source_mu.to(dtype), frame.block_diagonal)
     score = (scorer or _unpatched_relational_score())(
         xi, C, source_xi, source_C, _identity_frame(frame, operators, dtype), operators, capture,
-        row_invariant=row_invariant, **({"routing_aux": routing_aux} if routing_aux is not None else {}))
+        row_invariant=row_invariant, **({"routing_aux": routing_aux} if routing_aux is not None else {}),
+        **({"term_support": term_support} if term_support is not None else {}))
     if routing_aux is not None and isinstance(routing_aux.get("key_log_volume"), torch.Tensor):
         # the substituted covariances' key log-volumes, which the query_shifted clamp reads (audit 2026-10-20 item 1)
         routing_aux["key_log_volume"] = routing_aux["key_log_volume"].to(public)
@@ -449,6 +457,7 @@ def _identity_covariance_score(
     row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
     scorer:        Optional[Callable[..., torch.Tensor]] = None,   # the unpatched relational_score
     routing_aux:   Optional[Dict[str, torch.Tensor]] = None,       # relational_score's out-param, passed through
+    term_support:  Optional[torch.Tensor] = None,                   # a capture's term-median pairs, passed through
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with every reference covariance :math:`C_i` replaced by :math:`I`.
 
@@ -467,7 +476,7 @@ def _identity_covariance_score(
         C = torch.ones((), dtype=work, device=mu.device).expand(sigma.shape)
     return _reference_coordinate_score(mu, C, source_mu, C, frame, operators, capture,
                                        row_invariant=row_invariant, scorer=scorer, public=public,
-                                       routing_aux=routing_aux)
+                                       routing_aux=routing_aux, term_support=term_support)
 
 
 @contextmanager
@@ -653,9 +662,19 @@ def _role_trained_frame_free(model: torch.nn.Module, role: str) -> Optional[str]
     ``block_coordinates='reference'`` trains :math:`\mu \mapsto U_i\Phi(U_i^{-1}\mu)` (normalization and MLP
     in reference coordinates), so row 11 has nothing to remove and a second conjugation
     would be wrong; ``decode_coordinates='reference'`` trains logits :math:`W_{\mathrm{out}}U_i^{-1}\mu_i`
-    (or a Gaussian decode of :math:`(U_i^{-1}\mu_i, C_i)`), so row 12 has nothing to remove.
+    (or a Gaussian decode of :math:`(U_i^{-1}\mu_i, C_i)`), so row 12 has nothing to remove. Under
+    ``gaussian_frame_diagonal`` (operators with ``frame_diagonal``) the stored covariance holds the reference variances
+    :math:`c_i` and the router reads :math:`C_i = \operatorname{diag}(c_i)` through the identity frame
+    (:func:`vfe3.gradients.relational.relational_score`), so row 10's substitution :math:`C_i \to \Sigma_{p,x_i}`
+    would rescore the trained cost and report a measured zero (audit 2026-10-31 posthoc-routing-2).
     """
     cfg = model.cfg
+    if role == ROLE_ROUTING_COVARIANCE and any(
+            bool(getattr(op, "frame_diagonal", False))
+            for op in (getattr(model, "relational_operators_by_layer", None) or ()) if op is not None):
+        return (f"family={getattr(cfg, 'family', None)!r}: the stored covariance already holds the reference "
+                "variances c_i and the router reads C_i = diag(c_i) through the identity frame, so the routing "
+                "covariance carries no frame: nothing to remove")
     if role == ROLE_NORM_MLP and getattr(cfg, "block_coordinates", "local") == "reference":
         return ("block_coordinates='reference': the normalization and MLP already act in reference "
                 "coordinates (mu -> U_i Phi(U_i^{-1} mu)), so the norm/MLP role carries no frame: "
@@ -688,6 +707,7 @@ def _frame_free_covariance_score(
     row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
     scorer:        Optional[Callable[..., torch.Tensor]] = None,   # the unpatched relational_score
     routing_aux:   Optional[Dict[str, torch.Tensor]] = None,       # relational_score's out-param, passed through
+    term_support:  Optional[torch.Tensor] = None,                   # a capture's term-median pairs, passed through
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with the frame removed from the routing covariance only (row 10).
 
@@ -705,7 +725,7 @@ def _frame_free_covariance_score(
     source_C = C if source_sigma is sigma else source_sigma.to(work)
     return _reference_coordinate_score(mu, C, source_mu, source_C, frame, operators, capture,
                                        row_invariant=row_invariant, scorer=scorer, public=public,
-                                       routing_aux=routing_aux)
+                                       routing_aux=routing_aux, term_support=term_support)
 
 
 @contextmanager
@@ -786,7 +806,9 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     mixer or CG coupling; row 10 also needs covariance passthrough in attention and MLP, row 11 a mean-only
     normalization or MLP acting in local coordinates, row 12 the linear decoder. A model trained with
     ``block_coordinates='reference'`` (row 11) or ``decode_coordinates='reference'`` (row 12) carries no
-    frame in that role, so the row raises :class:`NotApplicable` rather than conjugating twice. The decoder patch acts on
+    frame in that role, so the row raises :class:`NotApplicable` rather than conjugating twice; under
+    ``gaussian_frame_diagonal`` the routing covariance is :math:`\operatorname{diag}(c_i)` with no frame, so row 10
+    raises it too (:func:`_role_trained_frame_free`). The decoder patch acts on
     the logits readout (``forward_beliefs(..., return_logits=True)``, the post-hoc evaluation path), not on
     the fused training cross-entropy.
     """
@@ -862,8 +884,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
 
     def scored(*args: Any, **kwargs: Any) -> torch.Tensor:
         record["intercepted_calls"] += 1
-        kwargs.pop("term_support", None)   # the diagnostic term medians are not captured in this intervention
-        return _frame_free_covariance_score(*args, scorer=scorer, **kwargs)
+        return _frame_free_covariance_score(*args, scorer=scorer, **kwargs)   # term_support passes through
 
     bound_decode = model._decode_belief_with_context
 
@@ -924,8 +945,10 @@ def frame_role_composite_check(
     Both are the predictor with :math:`U_i = I` in every role (:func:`frames_removed`), so the per-target
     NLLs agree up to the floating-point round trips :math:`U_i(U_i^{-1}x)`. Without positional frames
     the reference is row 7 alone (``positional_frames`` False). A role the model was trained without a
-    frame in (``block_coordinates`` or ``decode_coordinates`` set to ``'reference'``) is already
-    frame-free, so it is left out of the patch and listed under ``frame_free_by_construction``.
+    frame in (``block_coordinates`` or ``decode_coordinates`` set to ``'reference'``, or the routing covariance of
+    ``gaussian_frame_diagonal``) is already frame-free, so it is left out of the patch and listed under
+    ``frame_free_by_construction``.
+    Test oracle: referenced only by the tests.
     """
     from vfe3.posthoc import evaluate as ev
 
@@ -950,6 +973,45 @@ def frame_role_composite_check(
             "mean_abs_nll_difference": float(difference.mean()) if difference.size else float("nan"),
             "frame_free_by_construction": frame_free,
             "record": dict(record)}
+
+
+# ----------------------------------------------------------------------------------------------
+# Row 13: the comparison-space RoPE
+# ----------------------------------------------------------------------------------------------
+
+@contextmanager
+def comparison_rope_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
+    r"""Row 13: the comparison-space RoPE rotation :math:`R_i \to I` on every layer, the commutant projection kept.
+
+    Under a comparison ``rope_mode`` position enters the routing cost through the rotated projected means
+    :math:`R_ia_i`, :math:`R_jb_j`, so the mean term reads :math:`a_i - R_{j-i}b_j`; under ``'comparison_invariant'``
+    the scored covariances are the commutant projections :math:`P(V)`, which are position-free. The arm replaces each
+    layer's :meth:`~vfe3.model.relational_operators.RelationalOperators.comparison_rope_rotation` by the identity
+    through an instance override, as the training ablation's ``no_rope`` arm does
+    (:mod:`vfe3.run_artifacts`), so the means are scored unrotated while ``comparison_rope_base``, which gates
+    :math:`P(G)`, the attention log-prior (ALiBi included) and every other input keep their trained values; under
+    ``'comparison'`` the covariances are then unrotated as well. Row 8 removes positional frames (a ``pos_phi``
+    chart or a frame-space RoPE fold) and row 2 the whole cost; neither isolates this channel (audit 2026-10-31
+    posthoc-routing-8). The record counts the intercepted rotations; a model without a comparison ``rope_mode``
+    raises :class:`NotApplicable`.
+    """
+    layers = [op for op in (getattr(model, "relational_operators_by_layer", None) or ())
+              if op is not None and getattr(op, "comparison_rope_base", None) is not None]
+    if not layers:
+        raise NotApplicable("no layer applies a comparison-space RoPE (rope_mode is neither 'comparison' nor "
+                            "'comparison_invariant')")
+    record: Dict[str, Any] = {"layers_changed": len(layers), "intercepted_calls": 0}
+
+    def identity(n: int, r: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:   # (N, r, r) R_i = I
+        record["intercepted_calls"] += 1
+        return torch.eye(r, dtype=dtype, device=device).expand(n, r, r).contiguous()
+
+    with ExitStack() as stack:
+        for op in layers:
+            stack.enter_context(_instance_override(op, "comparison_rope_rotation", identity))
+        yield record
+    if record["intercepted_calls"] == 0:
+        raise NotApplicable("no comparison-space RoPE rotation was intercepted on this route")
 
 
 # ----------------------------------------------------------------------------------------------
@@ -980,18 +1042,27 @@ INTERVENTIONS: Tuple[Intervention, ...] = (
     Intervention(12, "frames_removed_decoder", "Frames removed from the decoder only", frames_removed_decoder),
 )
 
+# Arms beyond the manuscript's rows 1-12, numbered after them and run with them by default (by_key).
+EXTENSIONS: Tuple[Intervention, ...] = (
+    Intervention(13, "comparison_rope_identity",
+                 "Comparison-space RoPE rotation replaced by the identity (commutant projection kept)",
+                 comparison_rope_identity),
+)
+
 # Every row of Table M5 is implemented; kept (empty) for the report's not-implemented bookkeeping.
 NOT_IMPLEMENTED: Tuple[Tuple[int, str, str], ...] = ()
 NOT_IMPLEMENTED_REASON = "not implemented in vfe3.posthoc.interventions"
 
 
 def by_key(keys: Optional[Sequence[str]] = None) -> List[Intervention]:
-    r"""The registered interventions in row order, restricted to ``keys`` (always including the baseline)."""
+    r"""The registered interventions in row order (Table M5 rows 1-12, then :data:`EXTENSIONS`), restricted to
+    ``keys`` (always including the baseline)."""
+    registry = INTERVENTIONS + EXTENSIONS
     if keys is None:
-        return list(INTERVENTIONS)
-    known = {i.key for i in INTERVENTIONS}
+        return list(registry)
+    known = {i.key for i in registry}
     unknown = sorted(set(keys) - known)
     if unknown:
         raise ValueError(f"unknown interventions {unknown}; known: {sorted(known)}")
     wanted = set(keys) | {"baseline"}
-    return [i for i in INTERVENTIONS if i.key in wanted]
+    return [i for i in registry if i.key in wanted]

@@ -23,7 +23,8 @@ An arm mapping may also carry ``"inapplicable": "<reason>"`` (written by ``paper
 that does not apply to its base); the tables then print ``n/a`` for it instead of ``pending``. A
 ``paper_arms.py`` manifest also holds ``paper_arms.rows[label]``; its ``reuse_verified``, ``stale``, ``failed``
 (finished runs without a finite test CE), ``code_identity_mismatch`` and ``window_protocol_mismatch`` records are
-carried onto the :class:`Arm` (the decision rule reads them).
+carried onto the :class:`Arm` (the decision rule reads them), and ``paper_arms.seeds``, the planned
+``(seed, data_seed)`` pairs, onto :attr:`Manifest.planned_seed_pairs`.
 
 :func:`load_run` reads ``config.json`` (strictly, then, for configs written by older code lines,
 through :func:`vfe3.legacy_config.lenient_config_from_serialized`, recording the dropped retired
@@ -50,9 +51,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # Config fields excluded from the within-arm homogeneity check: the model seed (the data-order seed is a
 # train_vfe3 argument recorded in provenance.json, not a config field) and the run-cadence fields, which
-# decide when a run logs or writes a resumable checkpoint and where it resumes from, not the trained weights
-# (a reused base run carries its own cadence; audit 2026-10-17 item 27).
-HOMOGENEITY_CADENCE_FIELDS: Tuple[str, ...] = ("checkpoint_interval", "log_interval", "resume_from")
+# decide when a run logs or writes (and keeps) a resumable checkpoint and where and how it resumes, not the
+# trained weights (a reused base run carries its own cadence; audit 2026-10-17 item 27). run_vfe clears both
+# resume fields, so a base recorded with trust_resume_checkpoint=True replicates runs trained now, and
+# paper_arms.py may write a resumable checkpoint every N steps (audit 2026-10-31, paper-arms-harness-8 and -10).
+HOMOGENEITY_CADENCE_FIELDS: Tuple[str, ...] = ("checkpoint_interval", "log_interval", "resume_from",
+                                               "trust_resume_checkpoint", "checkpoint_keep_last",
+                                               "checkpoint_at_end")
 HOMOGENEITY_IGNORED_FIELDS: Tuple[str, ...] = ("seed", *HOMOGENEITY_CADENCE_FIELDS)
 
 # Provenance fields compared across the runs of one arm (data identity and tokenizer).
@@ -120,8 +125,9 @@ class RunRecord:
         return self.config_raw.get(key, default)
 
     def cfg_like(self) -> Any:
-        r"""The loaded config, or a namespace over the raw saved config when it could not be loaded."""
-        return self.cfg if self.cfg is not None else SimpleNamespace(**self.config_raw)
+        r"""The loaded config, or a namespace over the raw saved config when it could not be loaded
+        (:func:`raw_config_namespace`: the fields the record predates carry the values it ran)."""
+        return self.cfg if self.cfg is not None else raw_config_namespace(self.config_raw)
 
     def metrics(self) -> Optional[Dict[str, Any]]:
         r"""``metrics.csv`` as ``{column: float64 array}`` (cached; None when absent)."""
@@ -187,6 +193,8 @@ class Manifest:
     selection: str = "best"
     problems:  List[str] = field(default_factory=list)
     decision:  Dict[str, str] = field(default_factory=dict)    # registered decision-rule arm labels
+    # The registered design's (seed, data_seed) pairs (paper_arms.seeds); empty for a manifest without one.
+    planned_seed_pairs: List[Tuple[int, int]] = field(default_factory=list)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -389,6 +397,29 @@ def load_config(
                 return None, f"failed: {type(exc).__name__}: {exc}", {}
 
 
+def raw_config_namespace(config_raw: Mapping[str, Any]) -> SimpleNamespace:
+    r"""A namespace over a saved config that :func:`load_config` could not build, filled as the strict loader fills it.
+
+    :func:`vfe3.config.serialize_config` writes every field, so a record lacks a field only when it predates it, and
+    a ``getattr(cfg, field, literal)`` fallback on the bare namespace would decide a value the run never used.
+    :func:`vfe3.config.config_from_serialized` gives such a field, in order, the receiver update of a record older
+    than the receiver-law fields (``"euler"``), the historical pins and era rules of
+    :func:`vfe3.config.historical_default_pins`, and the frozen introduction value of
+    :func:`vfe3.config.introduction_values_for_missing_fields`; the same fills apply here (audit 2026-10-31
+    type-contracts-7). ``attention_mode`` is not filled: the strict loader derives it from the retired selector pair
+    or refuses a record that has neither, so its introduction value is not the route such a record ran. The record's
+    own values, retired keys included, are kept as saved.
+    """
+    from vfe3.config import historical_default_pins, introduction_values_for_missing_fields
+
+    values = dict(config_raw)
+    values.setdefault("relational_receiver_update", "euler")
+    values.update(historical_default_pins(values))
+    values.update({name: value for name, value in introduction_values_for_missing_fields(values).items()
+                   if name != "attention_mode"})
+    return SimpleNamespace(**values)
+
+
 def load_run(
     run_dir: Any,
 
@@ -510,6 +541,15 @@ def resolve_manifest(
     if not isinstance(decision, Mapping):
         raise ValueError("manifest['decision'] must be a mapping of decision-rule arm labels")
     out.decision = {str(key): str(value) for key, value in decision.items() if value is not None}
+    planned = (manifest.get("paper_arms") or {}).get("seeds")
+    if planned is not None:
+        pairs = [tuple(pair) for pair in planned if isinstance(pair, (list, tuple)) and len(pair) == 2
+                 and all(_is_int(value) for value in pair)] if isinstance(planned, (list, tuple)) else []
+        if isinstance(planned, (list, tuple)) and len(pairs) == len(planned):
+            out.planned_seed_pairs = [(int(seed), int(data_seed)) for seed, data_seed in pairs]
+        else:
+            out.problems.append(f"paper_arms.seeds {planned!r} is not a list of (seed, data_seed) int pairs; "
+                                "the decision rule checks no planned pair")
     out.evaluated = single("evaluated_run")
     out.final = single("final_run")
     out.numerics = single("numerics_run") or out.evaluated
@@ -687,12 +727,32 @@ def check_homogeneity(
 # Checkpoint selection
 # ----------------------------------------------------------------------------------------------
 
+def _cross_check_failed(entry: Mapping[str, Any]) -> bool:
+    r"""Whether a post-hoc pass recorded an ``evaluate()`` cross-check that failed (``cross_check.ok`` False)."""
+    check = entry.get("cross_check")
+    return isinstance(check, Mapping) and check.get("ok") is False
+
+
 def posthoc_pass(run: RunRecord, checkpoint: str, split: str) -> Optional[Dict[str, Any]]:
-    r"""The ``posthoc.json`` pass for ``(checkpoint, split)`` on the FULL split with status ok, or None."""
+    r"""The ``posthoc.json`` pass for ``(checkpoint, split)`` on the FULL split with status ok, or None.
+
+    A pass whose :func:`vfe3.train.evaluate` cross-check failed (its NLL disagrees with the training
+    loop's evaluation on the same windows, ``cross_check.ok`` False) is not admitted (audit 2026-10-31,
+    paper-claims-8; :func:`rejected_posthoc_pass` returns it); a pass without a cross-check is admitted.
+    """
     for entry in (run.posthoc or {}).get("passes") or []:
         if (entry.get("checkpoint") == checkpoint and entry.get("split") == split
                 and entry.get("status") == "ok" and not entry.get("subset")
-                and finite_float(entry.get("ce")) is not None):
+                and finite_float(entry.get("ce")) is not None and not _cross_check_failed(entry)):
+            return entry
+    return None
+
+
+def rejected_posthoc_pass(run: RunRecord, checkpoint: str, split: str) -> Optional[Dict[str, Any]]:
+    r"""The full-split ``(checkpoint, split)`` pass that :func:`posthoc_pass` refuses for its failed cross-check."""
+    for entry in (run.posthoc or {}).get("passes") or []:
+        if (entry.get("checkpoint") == checkpoint and entry.get("split") == split
+                and entry.get("status") == "ok" and not entry.get("subset") and _cross_check_failed(entry)):
             return entry
     return None
 
@@ -712,7 +772,8 @@ def select_checkpoint(run: RunRecord, rule: str = "best") -> Dict[str, Any]:
     order, the headline test when the run reloaded the best weights, ``test_best_ce`` (runs trained on
     or after 2026-09-28), the post-hoc full-split test pass at ``best_model.pt``, or the headline test
     when the best step is the final step. ``"final"``: the final weights, ``final_val_ce``, and the
-    headline test at the final weights (or the post-hoc pass at ``final_model.pt``).
+    headline test at the final weights (or the post-hoc pass at ``final_model.pt``). A post-hoc pass whose
+    ``evaluate()`` cross-check failed is not a candidate (:func:`posthoc_pass`); ``reason`` then names it.
 
     Returns ``{"rule", "step", "val_ce", "val_source", "test_ce", "test_ppl", "test_source",
     "status", "reason"}`` with :math:`\mathrm{PPL} = e^{\mathrm{CE}}`; ``status`` is ``"ok"`` when a
@@ -765,6 +826,10 @@ def select_checkpoint(run: RunRecord, rule: str = "best") -> Dict[str, Any]:
         if value is not None:
             out.update(test_ce=value, test_ppl=math.exp(value), test_source=source, status="ok")
             return out
+    rejected = rejected_posthoc_pass(run, "best_model.pt" if rule == "best" else "final_model.pt", "test")
+    if rejected is not None:
+        reason += (f"; posthoc.json holds a {rejected['checkpoint']} test pass whose evaluate() cross-check failed "
+                   f"(delta_ce={(rejected.get('cross_check') or {}).get('delta_ce')!r}), which is not admitted")
     out["reason"] = reason
     return out
 
@@ -826,7 +891,7 @@ def latest_training_checkpoint(run: RunRecord) -> Optional[Path]:
 
 
 def _parameter_cfg_like(run: RunRecord) -> SimpleNamespace:
-    r"""The config fields the parameter breakdown reads (family, vocabulary, decode, frozen tables, tied bank)."""
+    r"""The config fields parameter_breakdown reads (family, vocabulary, decode, frozen tables, tied bank, depth)."""
     return SimpleNamespace(
         model_family=run.value("model_family", "vfe") or "vfe",
         vocab_size=run.value("vocab_size"),
@@ -836,6 +901,8 @@ def _parameter_cfg_like(run: RunRecord) -> SimpleNamespace:
         # (vfe3.run_resources.tied_block_mlp_aliases); both keys are absent (False) on runs before the toggle.
         use_block_mlp=run.value("use_block_mlp", False),
         block_mlp_tie_layers=run.value("block_mlp_tie_layers", False),
+        # The layer count of parameter_reads_per_token_with_layer_reuse (None without it; audit 2026-10-31).
+        n_layers=run.value("n_layers"),
         # Historical key: absent on runs after its 2026-10-02 retirement, which froze the temperature.
         decode_temperature_learned=run.value("decode_temperature_learned", False),
     )

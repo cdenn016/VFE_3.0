@@ -184,6 +184,11 @@ def test_vfe_arms_differ_from_the_base_only_in_declared_fields(tmp_path: Path, c
         if spec["vfe"] and all(not callable(v) and getattr(base.cfg, k) == v for k, v in spec["vfe"].items()):
             assert plan.status == "inapplicable", label        # the tiny base already is this row (affine chart)
             continue
+        # Audit 2026-10-31: on this passthrough base the head-block family is inert, and the learned positional
+        # frames leave the frame-free table without an equivalent.
+        if label == "Head-block family, learned frames" or spec.get("inapplicable") is pa._positional_frames:
+            assert plan.status == "inapplicable", (label, plan.reason)
+            continue
         assert plan.status == "ready", (label, plan.reason)
         declared = set(spec["vfe"]) | set(spec.get("coerced", ()))
         assert set(plan.diff) <= declared, label

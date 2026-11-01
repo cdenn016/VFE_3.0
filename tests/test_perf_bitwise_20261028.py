@@ -2,8 +2,9 @@ r"""Bitwise performance changes of 2026-10-28 (docs/perf-investigation_2026-10-2
 
 * Rank 1: :func:`vfe3.model.frame_actions.identity_frame` builds its context without the float64 value validation
   of :class:`vfe3.contracts.CanonicalFrameContext` (an exact identity always passes it); real frames still validate.
-* Rank 3: the fused cue/result memory allocates its fully overwritten planes uninitialized; seeding them with NaN
-  changes nothing (interpreter subprocess).
+* Rank 3: the fused cue/result memory allocates its fully overwritten planes uninitialized; seeding the float planes
+  with NaN and the integer planes with -1 changes nothing at regression ranks 1 to 4, rank 3 with padded rank planes
+  (interpreter subprocess).
 * Rank 5: the table-Fisher frame capture runs inside :func:`vfe3.contracts.deferred_host_checks`.
 * Rank 11: the fused memory leaves unused output gradients unmaterialized; a loss on the mean alone matches the
   torch route (interpreter subprocess).
@@ -150,18 +151,19 @@ fused_kernels.fused_route_active = lambda xi: True
 _empty = torch.empty
 def nan_empty(*args, **kwargs):
     out = _empty(*args, **kwargs)
-    return out.fill_(float("nan")) if out.is_floating_point() else out
+    return out.fill_(float("nan")) if out.is_floating_point() else out.fill_(-1)   # the int32 indicator planes too
 
-g = torch.Generator().manual_seed(5)
-R, M, K, rank = 5, 9, 37, 2
-d = torch.float64
-ops = {"xi": torch.randn(R, K, generator=g, dtype=d), "c": 0.3 + torch.rand(R, K, generator=g, dtype=d),
-       "nu": torch.randn(M, K, generator=g, dtype=d), "omega": torch.randn(M, K, generator=g, dtype=d),
-       "log_lambda": 0.5 * torch.randn(M, K, generator=g, dtype=d),
-       "log_result_noise": 0.5 * torch.randn(M, K, generator=g, dtype=d) - 1.0,
-       "log_pi": torch.randn(M, generator=g, dtype=d),
-       "regression_left": 0.7 * torch.randn(M, K, rank, generator=g, dtype=d),
-       "regression_right": 0.7 * torch.randn(M, K, rank, generator=g, dtype=d)}
+def operands(rank):
+    g = torch.Generator().manual_seed(5)
+    R, M, K = 5, 9, 37                       # a ragged coordinate tile (K = 37) and a ragged component tile (M = 9)
+    d = torch.float64
+    return {"xi": torch.randn(R, K, generator=g, dtype=d), "c": 0.3 + torch.rand(R, K, generator=g, dtype=d),
+            "nu": torch.randn(M, K, generator=g, dtype=d), "omega": torch.randn(M, K, generator=g, dtype=d),
+            "log_lambda": 0.5 * torch.randn(M, K, generator=g, dtype=d),
+            "log_result_noise": 0.5 * torch.randn(M, K, generator=g, dtype=d) - 1.0,
+            "log_pi": torch.randn(M, generator=g, dtype=d),
+            "regression_left": 0.7 * torch.randn(M, K, rank, generator=g, dtype=d),
+            "regression_right": 0.7 * torch.randn(M, K, rank, generator=g, dtype=d)}
 
 def run(fused, mean_only, nan_fill):
     leaves = {k: v.clone().requires_grad_(True) for k, v in ops.items()}
@@ -183,14 +185,18 @@ def rel(a, b):
     return float((a - b).abs().max() / b.abs().max().clamp_min(1e-300))
 
 report = {}
-for mean_only in (False, True):
-    ref = run(False, mean_only, False)
-    clean = run(True, mean_only, False)
-    seeded = run(True, mean_only, True)
-    key = "mean_only" if mean_only else "all_outputs"
-    report[key] = {"vs_torch": max(rel(a, b) for a, b in zip(clean, ref)),
-                   "nan_seeded_bitwise": all(torch.equal(a, b) for a, b in zip(seeded, clean)),
-                   "finite": all(bool(torch.isfinite(t).all()) for t in seeded)}
+# Ranks 1 to 4 (audit 2026-10-31 recent-changes-2): at rank 3 the planes are padded to RP = 4 > RANK, so the masks
+# of the padded rank planes read poisoned memory if they leak.
+for rank in (1, 2, 3, 4):
+    ops = operands(rank)
+    for mean_only in (False, True):
+        ref = run(False, mean_only, False)
+        clean = run(True, mean_only, False)
+        seeded = run(True, mean_only, True)
+        key = f"rank{rank}_" + ("mean_only" if mean_only else "all_outputs")
+        report[key] = {"vs_torch": max(rel(a, b) for a, b in zip(clean, ref)),
+                       "nan_seeded_bitwise": all(torch.equal(a, b) for a, b in zip(seeded, clean)),
+                       "finite": all(bool(torch.isfinite(t).all()) for t in seeded)}
 print(json.dumps(report))
 """
 
@@ -199,16 +205,20 @@ def test_fused_memory_planes_need_no_initialization_and_unused_grads_stay_unmate
     report = _run_script(_FUSED_SCRIPT, _subprocess_env(TRITON_INTERPRET="1"))
     if report == _NO_TRITON:
         pytest.skip("triton unavailable")
-    for key in ("all_outputs", "mean_only"):
-        assert report[key]["nan_seeded_bitwise"] and report[key]["finite"], report
-        assert report[key]["vs_torch"] < 1e-11, report
+    assert sorted(report) == sorted(f"rank{rank}_{kind}" for rank in (1, 2, 3, 4)
+                                    for kind in ("all_outputs", "mean_only"))
+    for key, entry in report.items():
+        assert entry["nan_seeded_bitwise"] and entry["finite"], (key, entry)
+        assert entry["vs_torch"] < 1e-11, (key, entry)
 
 
-def test_a_float64_gradient_beyond_the_float32_range_takes_the_exact_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The exact check reads each infinity norm in float32, so 1e39 counts as nonfinite there; the float64 set norm is
-    # finite but above the float32 maximum, so the exact check decides and the step is skipped as before.
-    calls, moved, _ = _step(_cfg(), poison=1e39, monkeypatch=monkeypatch, dtype=torch.float64)
-    assert calls == [1] and not moved
+def test_a_float64_gradient_beyond_the_float32_range_takes_its_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A finite float64 entry of 1e39 has a finite float64 set norm, which certifies it finite with no exact check; the
+    # exact check reads its infinity norms in float64 as well, so it agrees, and the step is taken (audit 2026-10-31,
+    # train-step-1; the float32 read before then rejected and replayed it).
+    calls, moved, status = _step(_cfg(), poison=1e39, monkeypatch=monkeypatch, dtype=torch.float64)
+    assert calls == [] and moved and status["did_step"] and not status["nonfinite_skip"]
+    assert bool(T._gradients_finite([torch.full((3,), 1e39, dtype=torch.float64)]))
 
 
 # ------------------------------------------------------------------------------------------------ rank 4

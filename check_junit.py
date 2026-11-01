@@ -52,6 +52,26 @@ def read_junit_counts(path: Path) -> Dict[str, int]:
     return counts
 
 
+def read_junit_skip_reasons(path: Path, width: int = 160) -> Dict[str, int]:
+    """Return the number of skipped test cases per skip reason (first line, at most ``width`` characters).
+
+    A lane that reports only its skip count hides which tests stopped running (audit 2026-10-31
+    test-infrastructure-8); grouping the reasons shows, for example, a whole family of tests skipping for want
+    of an import.
+    """
+    reasons: Dict[str, int] = {}
+    for case in ElementTree.parse(path).getroot().iter():
+        if _local_name(case.tag) != "testcase":
+            continue
+        for child in case:
+            if _local_name(child.tag) != "skipped":
+                continue
+            text = (child.attrib.get("message") or child.text or "").strip()
+            reason = (text.splitlines()[0] if text else "(no reason)")[:width]
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return reasons
+
+
 def junit_is_exact_all_pass(
     counts: Mapping[str, int],
 

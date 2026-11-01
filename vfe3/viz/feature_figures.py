@@ -14,8 +14,10 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
-from vfe3.viz.figures import MAX_FIGURE_WIDTH_IN, FigureSkipped, _compact_style, _layer_colors, _np, _save, plt
+from vfe3.viz.figures import (MAX_FIGURE_WIDTH_IN, FigureSkipped, _compact_style, _layer_colors, _np, _save, plt,
+                               umap_embed)
 from vfe3.viz.text import token_label
+from vfe3.viz.umap_worker import UMAPWorker
 
 _HEAD_PANELS = (
     ("gain_fraction", "gain fraction", False),
@@ -256,17 +258,22 @@ def plot_template_umap(
 ):
     r"""UMAP of the template means :math:`\nu_a` per layer; marker area and color follow log usage, and the
     ``label_top`` most-used templates carry their most frequent token. Expensive: the report runs it only under
-    ``generate_embedding_figures``."""
+    ``generate_embedding_figures``.
+
+    The embeddings run through :func:`vfe3.viz.figures.umap_embed` in one crash-isolated
+    :class:`vfe3.viz.umap_worker.UMAPWorker` shared by the layers (PCA init, one numba thread, the clamped
+    neighborhood and the trivial layout below three points), as every other UMAP call does; umap-learn's
+    native layer can fault the whole process, and in the figure worker that lost the history figures and the
+    semantic analysis after it (audit 2026-10-31 viz-pipeline-6)."""
     rows = probe.get("layers") or []
     if not rows:
         raise FigureSkipped("no prototype_agents layer")
-    import umap
-    with _compact_style():
+    with _compact_style(), UMAPWorker() as worker:
         fig, axes = plt.subplots(1, len(rows), squeeze=False, figsize=(MAX_FIGURE_WIDTH_IN, 3.0))
         for ax, row in zip(axes[0], rows):
             nu = np.asarray(row["nu"], dtype=float)
             usage = np.maximum(np.asarray(row["usage"], dtype=float), 1e-12)
-            xy = umap.UMAP(n_components=2, random_state=seed, n_neighbors=min(15, len(nu) - 1)).fit_transform(nu)
+            xy = umap_embed(nu, n_neighbors=15, seed=seed, worker=worker)                 # (M, 2)
             log_usage = np.log10(usage)
             scatter = ax.scatter(xy[:, 0], xy[:, 1], s=2 + 30 * (log_usage - log_usage.min())
                                  / max(1e-12, np.ptp(log_usage)), c=log_usage, cmap="viridis", lw=0)

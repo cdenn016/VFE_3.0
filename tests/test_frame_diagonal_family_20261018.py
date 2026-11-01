@@ -330,9 +330,10 @@ def test_diagnostics_are_finite_per_layer() -> None:
 def test_live_route_gradient_matches_central_differences_in_float64(over: Dict[str, Any]) -> None:
     r"""Autograd against a Richardson central difference along one random direction of every parameter.
 
-    The M-step self term is left off: its gradient holds the state-dependent alpha fixed (the envelope argument of
-    ``VFEModel.forward``) while its value alpha D omits R(alpha), so it is not the derivative of the logged loss on any
-    family (measured on gaussian_diagonal at a relative gap of 0.8, the same as here).
+    The M-step self term is left off. Its gradient holds the state-dependent alpha fixed (the envelope argument of
+    ``VFEModel.forward``); until audit 2026-10-31 A081 its value alpha D omitted R(alpha), so it was not the derivative
+    of the logged loss (a relative gap of 0.8 on gaussian_diagonal). Its profiled value is now checked against that
+    gradient in tests/test_audit_20261031_model_assembly.py.
     """
     torch.manual_seed(0)
     model = VFEModel(_live(**over)).double()

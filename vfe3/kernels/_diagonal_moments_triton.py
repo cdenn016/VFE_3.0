@@ -12,7 +12,8 @@ frame blocks, and the source root X lives only as that (BR, TB BD) register tile
 padded to a power of two of at least 16 (the masked rows and columns load as zeros and contribute nothing).
 
 Kernels:
-  ``diag_moments_fwd_kernel``  program = (TB tokens, BR rows); g_{t,s} = sum_m sum_e X^2 over the M blocks.
+  ``diag_moments_fwd_kernel``  program = (TB tokens, BR rows), a 1-D grid with the row tile fastest;
+                               g_{t,s} = sum_m sum_e X^2 over the M blocks.
   ``diag_moments_bwd_tok_kernel``  program = TB tokens; per block m, loops over all rows and writes the owned
                                dU_{t,m} and drho_{t,(m,.)} (no atomics: the row sum stays in the program).
   ``diag_moments_bwd_maps_kernel``  program = (BR rows, block m, token split); loops over the split's tokens and
@@ -59,9 +60,17 @@ def _load_roots(ROOT, t0, m, cols, T, K, d, BD: tl.constexpr):
 @triton.jit
 def diag_moments_fwd_kernel(S, U, ROOT, G, T, ROWS, K, M, d,
                             BR: tl.constexpr, BD: tl.constexpr, TB: tl.constexpr):
-    r"""g_{t,s} = \sum_m \sum_e (Y^{(m)}_{s,(t,e)} \rho_{t,(m,e)})^2 for TB tokens and BR rows."""
-    t0 = tl.program_id(0) * TB
-    rows = tl.program_id(1) * BR + tl.arange(0, BR)
+    r"""g_{t,s} = \sum_m \sum_e (Y^{(m)}_{s,(t,e)} \rho_{t,(m,e)})^2 for TB tokens and BR rows.
+
+    A 1-D grid of cdiv(ROWS, BR) * cdiv(T, TB) programs with the row tile varying fastest, so the programs that read
+    one token group's frame tiles run adjacently and U is streamed from memory about once rather than once per row
+    tile (audit 2026-10-31 triton-kernels-1). Each program computes the tile it computed under the former 2-D grid, in
+    the same order, so g is bitwise unchanged.
+    """
+    pid = tl.program_id(0)
+    n_row_tiles = tl.cdiv(ROWS, BR)
+    t0 = (pid // n_row_tiles) * TB
+    rows = (pid % n_row_tiles) * BR + tl.arange(0, BR)
     row_ok = rows < ROWS
     offs_c = tl.arange(0, BD)
     c_ok = offs_c < d

@@ -8,16 +8,16 @@ in ``vfe3/config.py``; each registry-backed ``*_mode`` / ``*_family`` / ``*_grou
 lists its valid keys inline. Any ``VFE3Config`` field omitted here simply takes its dataclass
 default -- add it to this dict to tune it. ``DATASET`` picks the cached corpus under
 ``~/.cache/tokenized_cache`` and ``vocab_size`` follows it by default, so click-to-run works out of
-the box for the BPE corpora and for the word-level one. ``MAX_TOKENS`` caps the training stream
+the box for the BPE corpora and for the two word-level ones. ``MAX_TOKENS`` caps the training stream
 for fast smoke runs.
 
 A missing tokenized cache raises ``FileNotFoundError`` rather than substituting toy data:
 held-out numbers are never silently computed on a synthetic stream and mislabeled as the
-real corpus. Build the corpus cache first: the BPE caches are prebuilt, and the word-level one is
+real corpus. Build the corpus cache first: the BPE caches are prebuilt, and the word-level ones are
 produced by ``build_wikitext103_word_cache.py``.
 
-A full ``max_steps`` run over the whole training split -- 101.4M word tokens, or 116.8M gpt2
-tokens -- is a real (not smoke) job: run it on the CUDA interpreter (the RTX 5090), or drop
+A full ``max_steps`` run over the whole training split -- 101.4M word tokens (103.2M with ``<eos>``),
+or 116.8M gpt2 tokens -- is a real (not smoke) job: run it on the CUDA interpreter (the RTX 5090), or drop
 ``MAX_TOKENS`` / ``max_steps`` for a quick slice on CPU.
 """
 
@@ -61,10 +61,13 @@ from vfe3.train import _fmt_tau, evaluate, train
 # ~/.cache/tokenized_cache; a missing cache raises (no synthetic substitution).
 #   "wikitext-103" | "wikitext-2"                -> gpt2 BPE,     vocab = 50257
 #   "wiki-en" | "wiki-ja" | "wiki-ar"            -> cl100k BPE,   vocab = 100277
-#   "wikitext-103-word"                          -> WORD-level,   vocab = 267734
-# The word corpus is built by `python build_wikitext103_word_cache.py` (whitespace tokens, every
-# training type kept, the corpus's own <unk> marker at id 0). The size is MEASURED for the pinned
-# revision, not the 267735 quoted for the original release. NOTE it is a much larger vocabulary:
+#   "wikitext-103-word"                          -> WORD-level,   vocab = 267734 (101,425,671 / 213,886 / 241,211 tokens)
+#   "wikitext-103-word-eos"                      -> WORD-level,   vocab = 267735 (103,227,021 / 217,646 / 245,569 tokens)
+# Both word corpora are built by `python build_wikitext103_word_cache.py` (its DATASET; whitespace tokens, every
+# training type kept, the corpus's own <unk> marker at id 0). "wikitext-103-word" is the whitespace stream of the
+# pinned revision; "wikitext-103-word-eos" appends one <eos> (id 1) to every row, which reproduces the published
+# WikiText-103 vocabulary and token counts, so its every-target evaluation compares with published word-level
+# results. NOTE either is a much larger vocabulary:
 # phi_embed alone costs V * n_gen parameters, so at the shipped K=20/H=2 shape the model grows
 # ~5.3x (13.1M -> 69.9M). Lower it by setting MIN_COUNT in build_wikitext103_word_cache.py and
 # rebuilding, which drops rare types.
@@ -112,7 +115,9 @@ fully_gauge_covariant = False
 # is kept as configured (an M-step bound on the frames; None for the strictly covariant route). The run is refused unless every
 # requirement holds. The memory's regression rank and result noise, the regime beta and stay, routing prior, floors,
 # learning rates, shape and numerics are not touched. The overrides are logged and listed in config.md.
-# Implies fully_gauge_covariant when phi_frame_condition_max is None. False: the config exactly as written.
+# Implies fully_gauge_covariant when phi_frame_condition_max is None. With fully_gauge_covariant = True as well, the
+# gauge switch overrides that bound to None too (the strictly covariant exact route) and checks every gauge flag.
+# False: the config exactly as written.
 principled_exact_route = False
 
 config = dict(
@@ -121,13 +126,13 @@ config = dict(
     #            Training
     #################################
    
-    vocab_size                       = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / word 267735)
+    vocab_size                       = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / wikitext-103-word 267734 / wikitext-103-word-eos 267735)
                                                                   
     embed_dim                        = 192,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                          = 6,                   # = number of irrep blocks (alibi priors require this)
     
     max_seq_len                      = 256,                 # N, context length
-    eval_stride                      = 64,
+    eval_stride                      = 64,                  # None (disjoint windows) | int in [1, max_seq_len]: held-out windows score their last eval_stride targets
     
     batch_size                       = 32,
     max_steps                        = 120000,
@@ -151,13 +156,13 @@ config = dict(
        
     loss_spike_skip_nats             = None,        # None (off) | float > 0 (reject an update whose loss exceeds the monitor's loss EMA by this many nats)
     
-    kl_max                           = 128,
+    kl_max                           = 128,         # None (8 * embed_dim) | float > 0 (float("inf") disables): divergence clamp in nats
     
     #################################
     #           Modes               #
     #################################
     
-    family                           = "gaussian_diagonal",     # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout) | "gaussian_frame_diagonal" (U diag(c) U^T, diagonal in reference coordinates; kernel readout, coordinate MLP, linear/diagonal_chunked decode)
+    family                           = "gaussian_diagonal",     # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout) | "gaussian_frame_diagonal" (U diag(c) U^T, diagonal in reference coordinates; kernel or minimal_agent readout, coordinate MLP or cue_result_memory, linear/diagonal_chunked decode)
     decode_mode                      = 'diagonal_chunked',       # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
     prior_covariance_table           = "diagonal",               # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     decode_covariance                = "belief",                 # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
@@ -207,7 +212,7 @@ config = dict(
     
       
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
-    block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
+    block_mlp_template_init          = "working_variance",      # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents and cue_result_memory)
     block_memory_regime_transition   = "off",          # "off" | "sticky" | "learned": carry the regime belief through depth (cue_result_memory with block_mlp_tie_layers)
     
     block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
@@ -280,7 +285,7 @@ config = dict(
     pos_phi                          = "none",     # "none" | "learned" | "frozen"
     rope_mode                        = "comparison_invariant",  # "none" | "frame" | "frame_value" 
                                                  #"comparison" | "comparison_invariant" (rotation-invariant comparison)
-    rope_base                        = 100,
+    rope_base                        = 100,     # float > 0: RoPE frequency base (rope_mode != "none")
     rope_fraction                    = 1,       # p-RoPE: fraction of each head's pairs rotated (fastest first); 1.0 = RoPE
     ######################################
     #                Self Energy:
@@ -298,7 +303,7 @@ config = dict(
     #            & Temperatures
     ########################################
     lambda_beta                      = 1.0,        # belief-coupling block weight (1.0 = pure F)
-    kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
+    kappa_beta                       = 1,        # tau = kappa * sqrt(d_head) under gaussian_kl / noisy_query / mean_distance; unread under noisy_key and minimal_agent (tau = 1)
     learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
     beta_attention_prior             = 'causal_alibi',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
@@ -387,10 +392,10 @@ config = dict(
     fp32_matmul_precision            = "high",       # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     relational_diag_moments_kernel   = "triton",     # "torch" | "triton": diagonal comparison route (comparison_invariant) on CUDA: fused Triton diag(G) kernels, no materialized source root    
     decode_ce_checkpoint             = "auto",       # "auto" | "auto_aggregate" (saves memory with recompute)        
-    decode_av_precision              = "fp32",   
+    decode_av_precision              = "fp32",       # "fp32" | "fp64": prior-bank decoders, precision of the a_v reduction
     projected_factorization          = "gram",       # "gram" | "gram_certified" | "cholesky_qr2_certified" 
     
-    routing_kl_max_reference         = "query_shifted",  # "absolute" | "row_min" | "query_shifted" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, or D_ij less its query-only row constant)
+    routing_kl_max_reference         = "query_shifted",  # "absolute" | "row_min" | "query_shifted" | "query_shifted_v1" (kernel router: kl_max caps D_ij, the gap D_ij - min_j D_ij, D_ij - c_i - m_i with c_i the query-only row constant and m_i the row mean of the admissible key log-volumes, or the 2026-10-18 form D_ij - c_i)
     predictive_covariance_floor_mode = "max",            # "prior" | "relative" | "max" (the larger of the two)
     
     pair_kl_gemm_tol                 = None,         # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128) 
@@ -400,7 +405,7 @@ config = dict(
     phi_type_dropout_freq_scale      = 1e-05,     # None (uniform p_v = phi_type_dropout) | f0 > 0: p_v = phi_type_dropout * f0 / (f0 + pi_v), sparing frequent types (needs decode_unigram_prior)
     
     frame_pair_escalation_tol        = None,         # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
-    decode_ranking_fp64_escalation   = False, 
+    decode_ranking_fp64_escalation   = False,        # True | False: prior-bank decoders, recompute an uncertain fp32 argmax in fp64
     decode_logits_amp                = True,         # True | False: linear decode with amp_dtype set only: logits matmul under amp_dtype (CE stays fp32)
     decode_ce_triton                 = True,         # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)
     
@@ -410,8 +415,8 @@ config = dict(
     diagnose_canonical_free_energy        = False,   # log the canonical free energy (gauge-KL routing) at the captured beliefs
     diagnose_agent_elbo                   = False,   # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
    
-    deterministic                         = False,
-    generate_embedding_figures            = False,
+    deterministic                         = False,   # True | False: torch/cuDNN deterministic algorithms (TF32: fp32_matmul_precision)
+    generate_embedding_figures            = False,   # True | False: the slow semantic-geometry figures at finalize
     
     predictive_covariance_checkpoint      = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
     predictive_covariance_fp64_escalation = False,       # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
@@ -477,6 +482,44 @@ def _effective_data_seed(cfg: VFE3Config) -> int:
     return cfg.seed if data_seed is None else data_seed
 
 
+def _checkpoint_data_seed(path: 'str | Path') -> Optional[int]:
+    r"""Seed of the data order a checkpoint's cursor continues, or None when there is none to read.
+
+    A shuffled run's ``data_state`` holds the train loader's epoch-start generator state, and a CPU generator state
+    carries its seed, which a resume restores with it (:func:`vfe3.train.train`); a sequential cursor holds no
+    generator. Best effort: an unreadable file gives None, and ``train()`` performs the validated load.
+    """
+    try:
+        bundle = torch.load(Path(path), map_location="cpu", weights_only=True, mmap=True)
+        state = bundle["data_state"]["epoch_start_generator_state"]
+        if not isinstance(state, torch.Tensor):
+            return None
+        generator = torch.Generator()
+        generator.set_state(state)
+    except Exception:                                     # noqa: BLE001 (a record, never a gate)
+        return None
+    return int(generator.initial_seed())
+
+
+def _reconciled_data_seed(
+    followed:   Optional[int],          # the seed of the order the run follows, when known
+    configured: int,                    # _effective_data_seed(cfg)
+    logger:     logging.Logger,
+
+    *,
+    source:     str,
+) -> int:
+    r"""The data seed to record: ``followed`` when known, else ``configured``. A resume restores the checkpoint's
+    data order, so an edited DATA_SEED (or run seed under DATA_SEED = None) does not apply to it; the difference is
+    logged with both seeds (audit 2026-10-31 A064)."""
+    if followed is None or followed == configured:
+        return configured
+    logger.warning("%s: the data order was drawn from seed %d, not from the configured data seed %d (DATA_SEED, or "
+                   "the run seed when DATA_SEED is None); the run follows the checkpoint's order, and seed %d is "
+                   "recorded", source, followed, configured, followed)
+    return followed
+
+
 def _select_loader(
     dataset: str,
     cfg:     VFE3Config,
@@ -513,7 +556,7 @@ def _select_loader(
 
 
 def _run_label(cfg: VFE3Config, dataset: str) -> str:
-    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix][_mlp][_cross]_s<seed>`` (no
+    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mlp]_s<seed>`` (no
     timestamp, no PPL).
 
     The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
@@ -586,6 +629,8 @@ def _run_once(
     """
     import time
 
+    from vfe3.gauge_covariant import (describe_fully_gauge_covariant_overrides, fully_gauge_covariant_overrides,
+                                      gauge_covariance_failures)
     from vfe3.model.model import VFEModel
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
@@ -594,22 +639,27 @@ def _run_once(
         from vfe3.exact_route import (describe_principled_exact_route_overrides, principled_exact_route_failures,
                                       principled_exact_route_overrides)
         overrides = principled_exact_route_overrides(config)
+        if fully_gauge_covariant:
+            # Both switches: the strictly covariant exact route. The gauge switch also overrides the keys the exact
+            # route keeps as configured (phi_frame_condition_max), and its gauge-flag check below applies as well.
+            overrides.update(fully_gauge_covariant_overrides({**config, **overrides}))
     elif fully_gauge_covariant:
-        from vfe3.gauge_covariant import (describe_fully_gauge_covariant_overrides, fully_gauge_covariant_overrides,
-                                          gauge_covariance_failures)
         overrides = fully_gauge_covariant_overrides(config)
     cfg = VFE3Config(**{**config, **overrides, "seed": seed})   # the run's seed, from SEEDS
     if principled_exact_route:
         failures = principled_exact_route_failures(cfg)
         if failures:
             raise ValueError(f"principled_exact_route=True left these requirements unmet: {failures}")
-        logger.info("principled_exact_route=True: overriding %s",
-                    describe_principled_exact_route_overrides(config, overrides)
-                    or "nothing (the config is already on the exact route)")
-    elif fully_gauge_covariant:
+    if fully_gauge_covariant:
         failures = gauge_covariance_failures(cfg)
         if failures:
             raise ValueError(f"fully_gauge_covariant=True left these gauge flags false: {failures}")
+    if principled_exact_route:
+        logger.info("principled_exact_route=True%s: overriding %s",
+                    " and fully_gauge_covariant=True" if fully_gauge_covariant else "",
+                    describe_principled_exact_route_overrides(config, overrides)
+                    or "nothing (the config is already on the exact route)")
+    elif fully_gauge_covariant:
         logger.info("fully_gauge_covariant=True: overriding %s",
                     describe_fully_gauge_covariant_overrides(config, overrides)
                     or "nothing (the config is already fully gauge covariant)")
@@ -625,9 +675,10 @@ def _run_once(
     train_loader = _select_loader(DATASET, cfg, split="train")
     val_loader = _select_loader(DATASET, cfg, split="validation")
 
-    # Bits-per-CHARACTER correction so PPL/BPC compare across tokenizers and languages (gpt2 vs
-    # cl100k; en/ja/ar -- a cl100k token spans ~3 Japanese codepoints). tokens_per_char =
-    # n_tokens/n_codepoints from the held-out stream; None (synthetic / no tiktoken / cache absent)
+    # Bits-per-CHARACTER correction so BPC compares across tokenizers and languages (gpt2 vs
+    # cl100k; en/ja/ar -- a cl100k token spans ~3 Japanese codepoints) over the same source text: the
+    # GPT-2 and word WikiText-103 streams count different texts (vfe3.data.datasets.tokens_per_char).
+    # tokens_per_char = n_tokens/n_codepoints from the held-out stream; None (synthetic / no tiktoken / cache absent)
     # -> BPC unavailable, while evaluate publishes the always-defined bits_per_token separately.
     from vfe3.data.datasets import tokens_per_char as _tokens_per_char
     val_tpc = _tokens_per_char(DATASET, "validation")
@@ -636,6 +687,12 @@ def _run_once(
     persist = (RUN_ROOT if run_root is None else run_root) is not None
     test_loader = _select_loader(DATASET, cfg, split="test") if persist else None
     test_tpc = _tokens_per_char(DATASET, "test") if persist else None
+
+    # The data order the run follows: DATA_SEED (or the run seed), unless a resume restores the checkpoint's order.
+    data_seed = _effective_data_seed(cfg)
+    if cfg.resume_from is not None:
+        data_seed = _reconciled_data_seed(_checkpoint_data_seed(cfg.resume_from), data_seed, logger,
+                                          source=f"resume from {cfg.resume_from}")
 
     # Run-artifacts directory (config.json, metrics.csv, checkpoints/, best_model.pt, figures).
     # None disables persistence (RUN_ROOT = None); the synthetic fallback also runs unsaved-free.
@@ -651,10 +708,10 @@ def _run_once(
         try:
             from vfe3.config_markdown import write_config_markdown
             write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
-                                  header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg),
+                                  header={"DATASET": DATASET, "data seed": data_seed,
                                           "principled_exact_route": principled_exact_route,
-                                          "fully_gauge_covariant": fully_gauge_covariant or (
-                                              principled_exact_route and cfg.phi_frame_condition_max is None),
+                                          # Of the resolved config: every gauge flag of the pure-path report holds.
+                                          "fully_gauge_covariant": not gauge_covariance_failures(cfg),
                                           "launch overrides": overrides})
         except Exception as exc:
             logger.warning("config.md was not written (%s: %s); the run continues", type(exc).__name__, exc)
@@ -694,6 +751,11 @@ def _run_once(
         sample_dataset=DATASET,          # audit 2026-07-27: key the sample tokenizer, do not guess
     )
     wall = time.perf_counter() - t0
+    # A resume restored the checkpoint's epoch generator, seed included: record the order the run followed.
+    train_generator = getattr(train_loader, "generator", None)
+    if isinstance(train_generator, torch.Generator):
+        data_seed = _reconciled_data_seed(int(train_generator.initial_seed()), data_seed, logger,
+                                          source="the train loader's restored generator")
 
     if final_validation:
         # Preserve the omitted pass's CPU base-seed draw. The handoff admits only the
@@ -722,7 +784,7 @@ def _run_once(
             val_loader=val_loader,
             test_loader=test_loader,
             losses=losses,
-            data_seed=_effective_data_seed(cfg),
+            data_seed=data_seed,
             max_tokens=MAX_TOKENS,
             tokenizer_tag=_tokenizer_tag(DATASET),
             device=torch.device(DEVICE),

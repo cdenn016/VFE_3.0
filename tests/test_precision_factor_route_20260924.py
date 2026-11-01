@@ -323,6 +323,31 @@ def _rebuilt_entries(case: list) -> tuple:
     return tuple(masks)
 
 
+def _gram_flagged_entries(case: list) -> tuple:
+    r"""(query, key) entries (1, N, H) that pass the factor certificate but fail the Gram certificate
+    eps ||G||_F ||P||_F <= 1e-4 on the certified factor route: they keep their CholeskyQR2 factor and their pairs take
+    the factor-trace tiles (audit 2026-10-31 gap-certified-factorization-routes-1)."""
+    from vfe3.relational_scoring import (
+        _factor_gram_certificate, _factor_status, projected_moments, set_projected_condition_recovery,
+    )
+    from vfe3.runtime import ieee_fp32_matmul
+
+    mu_h, sigma_h, blocks, S_q, S_k = case
+    masks = []
+    previous = set_projected_condition_recovery(True)
+    try:
+        for S in (S_q, S_k):
+            _, G = projected_moments(mu_h, sigma_h, blocks, S)
+            status = _factor_status(G, (sigma_h, blocks, S, mu_h))
+            eye = torch.eye(G.shape[-1], dtype=G.dtype, device=G.device)
+            with torch.no_grad(), ieee_fp32_matmul():
+                P = torch.cholesky_inverse(torch.where(status[1][..., None, None], eye, status[0]))
+            masks.append(_factor_gram_certificate(G, P, status))
+    finally:
+        set_projected_condition_recovery(previous)
+    return tuple(masks)
+
+
 def _root_kappas(case: list) -> list:
     r"""(query, key) float64 condition numbers (1, H, N) of the source roots X = S U^{-1} Sigma^{1/2}."""
     from vfe3.relational_scoring import _source_root, projected_moments
@@ -379,7 +404,9 @@ def test_certified_factor_route_rebuilds_its_flagged_entries(factor_route, devic
     Head 0's query roots have kappa(X) ~ ``kappa``: they factor by CholeskyQR2 but fail eps kappa_1(C) <= 3e-4.
     Each flagged entry becomes the float64 QR factor of its float64 source root and is counted, the pairs touching
     it are scored by the float64 triangular-solve tiles and returned in float32, and the pairs touching no flagged
-    entry are bitwise those of the uncertified route.
+    entry are bitwise those of the uncertified route, except those touching an entry that passes the factor
+    certificate but fails the Gram certificate: such an entry keeps its factor, is not counted, and its pairs take the
+    factor-trace tiles, within the first-order pair bound (audit 2026-10-31 gap-certified-factorization-routes-1).
 
     Every touched pair's error against the float64 score is at the float32 rounding floor of the result,
     eps_32 times the case's score scale (max |KL| over the touched pairs): its float64 factor is exact to the
@@ -396,13 +423,18 @@ def test_certified_factor_route_rebuilds_its_flagged_entries(factor_route, devic
         reference = _score(*(x.double() for x in case)).cpu()
         rebuilt_q, rebuilt_k = (mask.cpu() for mask in _rebuilt_entries(case))
         touched = (rebuilt_q[0].T.unsqueeze(-1) | rebuilt_k[0].T.unsqueeze(-2)).unsqueeze(0)  # (1, H, Nq, Nk)
+        gram_q, gram_k = (mask.cpu() for mask in _gram_flagged_entries(case))
+        gram_touched = (gram_q[0].T.unsqueeze(-1) | gram_k[0].T.unsqueeze(-2)).unsqueeze(0) & ~touched
         assert bool(rebuilt_q[0, :, 0].any()) and not bool(rebuilt_q[0, :, 1].any()), seed
         kept, kept_count = _score_and_count(case, False)
         rebuilt, rebuilt_count = _score_and_count(case, True)
         assert kept_count == 0 and rebuilt_count == int(rebuilt_q.sum() + rebuilt_k.sum()), seed
         kept, rebuilt = kept.cpu(), rebuilt.cpu()
         assert rebuilt.dtype == torch.float32 and torch.isfinite(rebuilt).all()
-        assert torch.equal(rebuilt[~touched], kept[~touched]), seed
+        untouched = ~(touched | gram_touched)
+        assert torch.equal(rebuilt[untouched], kept[untouched]), seed
+        gram_error = (rebuilt.double() - reference).abs()[gram_touched]
+        assert bool((gram_error <= _pair_bound(case)[gram_touched]).all()), seed
         error = (rebuilt.double() - reference).abs()[touched]
         kept_error = (kept.double() - reference).abs()[touched]
         floor = eps * float(reference.abs()[touched].max())

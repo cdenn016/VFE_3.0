@@ -57,7 +57,12 @@ VFE base without an attention residual) the first update is
 with :math:`\log\pi` the add-one-smoothed training unigram log-frequencies, evaluated by the same fused
 chunked fp32 cross-entropy (:meth:`vfe3.model.prior_bank.PriorBank.decode_ce_linear_chunked`). Blocks run
 under the configured autocast (``amp_dtype``); normalizations, the softmax, the decode and the CE run
-in fp32. The attention softmax is explicit (no SDPA), so ``torch.use_deterministic_algorithms`` holds.
+in fp32. The attention softmax is explicit by default (no SDPA), so ``torch.use_deterministic_algorithms``
+holds. ``attention_kernel='fused'`` (opt-in, ``deterministic=False`` only) computes the same attention with
+``F.scaled_dot_product_attention`` in fp32, the log-prior as its additive mask, and rotates queries and keys
+pairwise instead of through the dense :math:`(N, d, d)` map; the module then keeps no :math:`(B, H, N, N)`
+scores (whether the backend forms them depends on the SDPA kernel it selects), and the attention maps of
+the diagnostics still come from the explicit path.
 
 Parameter counts. Context processing (every attention, MLP and normalization parameter),
 
@@ -98,6 +103,14 @@ AMP_DTYPES: Tuple[Optional[str], ...] = (None, "bf16", "fp16")
 GRAD_CLIP_SCOPES: Tuple[str, ...] = ("role", "group")
 FP32_MATMUL_PRECISIONS: Tuple[Optional[str], ...] = (None, "highest", "high", "medium")
 DECODE_CE_CHECKPOINTS: Tuple[str, ...] = ("auto", "auto_aggregate", "always", "never")
+ATTENTION_KERNELS: Tuple[str, ...] = ("explicit", "fused")
+# Block-MLP modes of the VFE base whose per-layer parameter count is the arm's two-layer MLP, 2eK^2 + eK + K
+# (vfe3.model.block_mlp.BLOCK_MLP_REGISTRATIONS: the default count of a K-wide mode with no count override).
+DENSE_EQUIVALENT_MLP_MODES: Tuple[str, ...] = ("coordinate", "canonical_frame")
+# d x d matrix products of one torch.linalg.matrix_exp of a batch: its degree-18 Taylor polynomial takes five
+# (Bader, Blanes and Casas 2019, Mathematics 7(12), 1174; five batched products counted on CPU at every 1-norm
+# up to 2). A norm above that degree's threshold adds one squaring per doubling, which is not booked.
+MATRIX_EXP_PRODUCTS: int = 5
 
 # Pre-declared compute-matching rule (Table M2, "matched measured compute"). Hoffmann et al. (2022,
 # arXiv:2203.15556) put the compute-optimal token count near 20 tokens per parameter; Muennighoff et
@@ -196,6 +209,9 @@ class BaselineConfig:
     fp32_matmul_precision: Optional[str] = "highest"
     seed:                  int           = 6
     deterministic:         bool          = True
+    # "explicit" | "fused": the explicit fp32 softmax and dense (N, d, d) rotary map, or (deterministic=False
+    # only) F.scaled_dot_product_attention in fp32 with the log-prior as its mask and a pairwise rotation.
+    attention_kernel:      str           = "explicit"
     # Cadence and resume.
     log_interval:          int           = 100
     eval_interval:         int           = 1500
@@ -293,6 +309,13 @@ class BaselineConfig:
         if self.fp32_matmul_precision not in FP32_MATMUL_PRECISIONS:
             raise ValueError(f"fp32_matmul_precision must be one of {FP32_MATMUL_PRECISIONS}, "
                              f"got {self.fp32_matmul_precision!r}")
+        if self.attention_kernel not in ATTENTION_KERNELS:
+            raise ValueError(f"attention_kernel must be one of {ATTENTION_KERNELS}, got {self.attention_kernel!r}")
+        if self.attention_kernel == "fused" and self.deterministic:
+            # A deterministic run keeps the explicit softmax, the path torch.use_deterministic_algorithms is
+            # validated on; the fused CUDA attention kernels are not (audit 2026-10-31, baseline-generation-9).
+            raise ValueError("attention_kernel='fused' requires deterministic=False; deterministic runs use "
+                             "attention_kernel='explicit'")
         if self.beta_attention_prior not in ATTENTION_PRIORS:
             raise ValueError(f"beta_attention_prior must be one of {ATTENTION_PRIORS} (a causal prior "
                              f"with a self key), got {self.beta_attention_prior!r}")
@@ -426,8 +449,11 @@ class BaselineConfig:
         (:data:`MATCHED_FIELDS`). A base with a ``rope_mode`` other than ``'none'`` gives the arm rotary query/key
         positions at the base's ``rope_base``; for a comparison ``rope_mode`` this is the rotation the base
         applies to its projected routing moments, while frame-space RoPE (absolute, folded into the frame)
-        has no exact dense counterpart and is matched by the same relative rotation. The MLP width is the base's ``block_mlp_expansion`` times :math:`K`
-        (the template router's template count :math:`eK` when the base uses one). The decode is the
+        has no exact dense counterpart and is matched by the same relative rotation. The MLP width is the base's ``block_mlp_expansion`` times :math:`K`;
+        the arm's :math:`2eK^2 + eK + K` MLP parameters per layer are the base's only for one untied two-layer MLP
+        per layer (:data:`DENSE_EQUIVALENT_MLP_MODES`), so a base whose block MLP is tied across more than one
+        layer (``block_mlp_tie_layers``, counted once) or of another ``block_mlp_mode`` (template, prototype,
+        memory or gauge-gate parameters) is refused (audit 2026-10-31, baseline-generation-1). The decode is the
         linear decoder with bias; a base with a Gaussian decode keeps its unigram prior. The per-type
         read map, when requested, has the base's token-frame size :math:`V K d`, and its ``phi_like``
         initialization scale is the base's ``phi_scale``. The peak learning rate, weight decay and
@@ -441,7 +467,10 @@ class BaselineConfig:
         ``tie_comparison_maps=True`` (:math:`K^2` fewer comparison parameters per layer) or
         ``prior_covariance_table='block_cholesky'`` (another per-type table count) is refused. A base with
         ``learn_attention_temperature=True`` is accepted: its :math:`HL` routing log-temperatures are
-        context-processing parameters the matched arm does not have (``paper_arms`` notes the count).
+        context-processing parameters the matched arm does not have (``paper_arms`` notes the count). So is a base with
+        ``relational_routing='noisy_key'``: its :math:`HL` learned log key noises ``routing_key_log_noise`` (one
+        ``(H,)`` vector per layer, in the ``relational_score`` role) are likewise unmatched, and ``paper_arms`` notes
+        them too (audit 2026-10-31 A257).
         """
         values = _vfe_base_values(base)
         for field in ("relational_input_scope", "relational_output_scope"):
@@ -460,6 +489,17 @@ class BaselineConfig:
                              "parameters that dense attention does not have")
         if not values["use_block_mlp"]:
             raise ValueError("matched_to: the base has no block MLP, while the matched arm always builds one")
+        # Audit 2026-10-31 (baseline-generation-1): the arm builds one BaselineMLP per layer. A tied base MLP is
+        # one module for every layer (counted once), and the other modes carry template, prototype, memory or
+        # gate-width parameters, so either one breaks the context-processing count the arm is labeled with.
+        if values.get("block_mlp_tie_layers") and int(values["n_layers"]) > 1:
+            raise ValueError(f"matched_to: block_mlp_tie_layers=True shares one block MLP across the base's "
+                             f"{int(values['n_layers'])} layers (its parameters counted once), while the matched "
+                             "arm builds one MLP per layer; the matched context-processing count does not hold")
+        if values.get("block_mlp_mode", "coordinate") not in DENSE_EQUIVALENT_MLP_MODES:
+            raise ValueError(f"matched_to: block_mlp_mode={values.get('block_mlp_mode')!r} has another parameter "
+                             f"count than the arm's two-layer MLP (2eK^2 + eK + K per layer); only "
+                             f"{DENSE_EQUIVALENT_MLP_MODES} are dense-equivalent")
         # Audit 2026-10-09 round 2 item 19: the tie drops the key comparison map (K^2 per layer fewer
         # context-processing parameters than dense attention) and the frame-free table replaces the
         # (V, K) log-variance and V K d frame tables by (V, H, d(d+1)/2) Cholesky entries, so either one
@@ -687,12 +727,21 @@ class LinearUnigramDecoder(nn.Module):
 
 
 class BaselineAttention(nn.Module):
-    r"""Bias-free multi-head attention with an additive per-head log-prior and an explicit softmax."""
+    r"""Bias-free multi-head attention with an additive per-head log-prior.
 
-    def __init__(self, embed_dim: int, n_heads: int, init_std: float, out_std: float) -> None:
+    ``kernel='explicit'`` forms the fp32 scores and softmax. ``kernel='fused'`` computes the same
+    :math:`\operatorname{softmax}_j(q_i^\top k_j / \sqrt d + B_{h,ij})\,v_j` with
+    :func:`torch.nn.functional.scaled_dot_product_attention` in fp32 (the log-prior is its additive mask), so
+    the module keeps no :math:`(B, H, N, N)` scores or weights; a call that asks for the weights
+    (``weights_out``) runs the explicit softmax under either kernel.
+    """
+
+    def __init__(self, embed_dim: int, n_heads: int, init_std: float, out_std: float,
+                 *, kernel: str = "explicit") -> None:
         super().__init__()
         self.embed_dim, self.n_heads = int(embed_dim), int(n_heads)
         self.d_head = self.embed_dim // self.n_heads
+        self.kernel = str(kernel)
         K = self.embed_dim
         self.w_q = nn.Parameter(torch.empty(K, K))                                          # (K_out, K_in)
         self.w_k = nn.Parameter(torch.empty(K, K))
@@ -709,7 +758,8 @@ class BaselineAttention(nn.Module):
         rope:  Optional[torch.Tensor] = None,  # (N, d, d) per-head rotary map R_i, or None
 
         *,
-        weights_out: Optional[List[torch.Tensor]] = None,
+        weights_out:  Optional[List[torch.Tensor]] = None,
+        rope_factors: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,  # (N, d), (N, d), (d,)
     ) -> torch.Tensor:                       # (B, N, K)
         B, N, K = u.shape
         H, d = self.n_heads, self.d_head
@@ -719,7 +769,20 @@ class BaselineAttention(nn.Module):
             # q_i -> R_i q_i, k_j -> R_j k_j, so q_i^T k_j -> q_i^T R_{j-i} k_j.
             q = torch.einsum("nst,bhnt->bhns", rope.to(q.dtype), q)                        # (B, H, N, d)
             k = torch.einsum("nst,bhnt->bhns", rope.to(k.dtype), k)                        # (B, H, N, d)
+        elif rope_factors is not None:
+            # The same R_i pairwise: (R_i q)_s = R_{i,ss} q_s + R_{i,s pi(s)} q_{pi(s)}, pi swapping 2k <-> 2k+1.
+            cos, sin, partner = rope_factors
+            q = q * cos.to(q.dtype) + q[..., partner] * sin.to(q.dtype)                     # (B, H, N, d)
+            k = k * cos.to(k.dtype) + k[..., partner] * sin.to(k.dtype)                     # (B, H, N, d)
         v = (u @ self.w_v.transpose(0, 1)).view(B, N, H, d).transpose(1, 2)                # (B, H, N, d)
+        if self.kernel == "fused" and weights_out is None:
+            # fp32 at least, as the explicit softmax (float64 stays float64, for finite-difference checks).
+            dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+            with torch.autocast(device_type=u.device.type, enabled=False):
+                z = F.scaled_dot_product_attention(q.to(dtype), k.to(dtype), v.to(dtype), attn_mask=prior.to(dtype),
+                                                   scale=1.0 / math.sqrt(d))                 # (B, H, N, d)
+            z = z.to(v.dtype).transpose(1, 2).reshape(B, N, K)                              # (B, N, K)
+            return z @ self.w_o.transpose(0, 1)                                             # (B, N, K)
         scores = (q @ k.transpose(-1, -2)).float() * (1.0 / math.sqrt(d)) + prior          # (B, H, N, N) fp32
         beta = torch.softmax(scores, dim=-1)                                                # (B, H, N, N) fp32
         if weights_out is not None:
@@ -763,7 +826,7 @@ class BaselineBlock(nn.Module):
         self.attention_residual = cfg.attention_residual
         if self.pre_ln:
             self.ln1 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
-        self.attn = BaselineAttention(K, cfg.n_heads, cfg.init_std, out_std)
+        self.attn = BaselineAttention(K, cfg.n_heads, cfg.init_std, out_std, kernel=cfg.attention_kernel)
         if self.pre_ln:
             self.ln2 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
         self.mlp = BaselineMLP(K, cfg.mlp_expansion, cfg.init_std, out_std)
@@ -787,11 +850,12 @@ class BaselineBlock(nn.Module):
         weights_out: Optional[List[torch.Tensor]] = None,
         shared_norm: Optional[nn.LayerNorm] = None,
         rope:        Optional[torch.Tensor] = None,  # (N, d, d) per-head rotary map, or None
+        rope_factors: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,  # its pairwise form
     ) -> torch.Tensor:                       # (B, N, K)
         u = _fp32_layer_norm(self.ln1, h) if self.pre_ln else h                             # (B, N, K)
         if read is not None:
             u = self._apply_blocks(read, u, self.read_is_increment)                         # (B, N, K)
-        a = self.attn(u, prior, rope, weights_out=weights_out)                              # (B, N, K)
+        a = self.attn(u, prior, rope, weights_out=weights_out, rope_factors=rope_factors)   # (B, N, K)
         if write is not None:
             a = self._apply_blocks(write, a, False)                                         # (B, N, K)
         if self.pre_ln:
@@ -853,7 +917,10 @@ class BaselineTransformer(nn.Module):
             self.type_table = nn.Parameter(table)
         else:
             self.register_parameter("type_table", None)
+        # One entry each, replaced on a miss as VFEModel keeps its caches, so a generation over growing
+        # contexts or a device move holds one prior and one rotation (audit 2026-10-31, baseline-generation-10).
         self._log_prior_cache: Dict[Tuple[Any, ...], torch.Tensor] = {}
+        self._rope_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
     # -- precision -----------------------------------------------------------------------------
 
@@ -882,23 +949,58 @@ class BaselineTransformer(nn.Module):
                 n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope)
             if cached.dim() == 2:                                                           # (N, N) head-free
                 cached = cached.unsqueeze(0).expand(self.cfg.n_heads, -1, -1)
+            self._log_prior_cache.clear()
             self._log_prior_cache[key] = cached
         return cached
 
-    def _rope_rotation(self, n: int, device: torch.device) -> Optional[torch.Tensor]:
-        r"""The ``(N, d, d)`` fp32 per-head rotary map :math:`R_i` under ``pos_rotation='rope'``, else None."""
+    def _rope_entry(self, n: int, device: torch.device) -> Optional[Dict[str, Any]]:
+        r"""The cached rotation record of length ``n`` (``{"rotation": R}``, plus ``"factors"`` once formed)."""
         if self.cfg.pos_rotation != "rope":
             return None
         from vfe3.geometry.rope import build_rope_rotation
 
         key = ("rope", self.cfg.rope_base, self.cfg.rope_fraction, int(n), str(device), self.cfg.d_head)
-        cached = self._log_prior_cache.get(key)
-        if cached is None:
-            cached = build_rope_rotation(torch.arange(int(n), device=device), [self.cfg.d_head],
-                                         base=self.cfg.rope_base, fraction=self.cfg.rope_fraction,
-                                         device=device, dtype=torch.float32)
-            self._log_prior_cache[key] = cached
-        return cached
+        entry = self._rope_cache.get(key)
+        if entry is None:
+            rotation = build_rope_rotation(torch.arange(int(n), device=device), [self.cfg.d_head],
+                                           base=self.cfg.rope_base, fraction=self.cfg.rope_fraction,
+                                           device=device, dtype=torch.float32)             # (N, d, d)
+            entry = {"rotation": rotation}
+            self._rope_cache.clear()
+            self._rope_cache[key] = entry
+        return entry
+
+    def _rope_rotation(self, n: int, device: torch.device) -> Optional[torch.Tensor]:
+        r"""The ``(N, d, d)`` fp32 per-head rotary map :math:`R_i` under ``pos_rotation='rope'``, else None."""
+        entry = self._rope_entry(n, device)
+        return None if entry is None else entry["rotation"]
+
+    def _rope_factors(
+        self,
+        n:      int,
+        device: torch.device,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        r"""The pairwise form ``(cos, sin, partner)`` of :meth:`_rope_rotation`, else None.
+
+        :math:`R_i` rotates the pairs :math:`(2k, 2k+1)` of each head, so
+        :math:`(R_i q)_s = R_{i,ss}\,q_s + R_{i,s\pi(s)}\,q_{\pi(s)}` with :math:`\pi` swapping :math:`2k` and
+        :math:`2k+1`: ``cos`` is the diagonal ``(N, d)``, ``sin`` the ``(N, d)`` entries :math:`R_{i,s\pi(s)}`
+        (zero on an unrotated pair and on the lone last coordinate of an odd head) and ``partner`` the
+        ``(d,)`` index :math:`\pi`. Read from the dense map itself, so both forms use the same cosines and sines.
+        """
+        entry = self._rope_entry(n, device)
+        if entry is None:
+            return None
+        if "factors" not in entry:
+            rotation = entry["rotation"]                                                    # (N, d, d)
+            d = rotation.shape[-1]
+            index = torch.arange(d, device=rotation.device)                                 # (d,)
+            partner = index ^ 1
+            partner = torch.where(partner < d, partner, index)                              # odd d: last stays
+            cos = rotation.diagonal(dim1=-2, dim2=-1).contiguous()                          # (N, d)
+            sin = (rotation[:, index, partner] * (partner != index)).contiguous()           # (N, d)
+            entry["factors"] = (cos, sin, partner)
+        return entry["factors"]
 
     def hidden(
         self,
@@ -912,7 +1014,11 @@ class BaselineTransformer(nn.Module):
             raise ValueError(f"token_ids must be (B, N), got {tuple(token_ids.shape)}")
         device = token_ids.device
         prior = self._attention_log_prior(token_ids.shape[1], device)                      # (H, N, N)
-        rope = self._rope_rotation(token_ids.shape[1], device)                              # (N, d, d) or None
+        rope, rope_factors = None, None
+        if self.cfg.attention_kernel == "fused":
+            rope_factors = self._rope_factors(token_ids.shape[1], device)                  # (N, d) x 2, (d,) or None
+        else:
+            rope = self._rope_rotation(token_ids.shape[1], device)                          # (N, d, d) or None
         h = self.tok_embed[token_ids]                                                       # (B, N, K)
         read, write = None, None
         if self.type_table is not None:
@@ -926,7 +1032,7 @@ class BaselineTransformer(nn.Module):
         with self._amp_context(device):
             for block in self.blocks:
                 h = block(h, prior, read, write, weights_out=weights_out, shared_norm=self.shared_norm,
-                          rope=rope)
+                          rope=rope, rope_factors=rope_factors)
         if self.final_norm is None:
             return h.float()                                                                # (B, N, K) fp32
         return _fp32_layer_norm(self.final_norm, h)                                         # (B, N, K) fp32
@@ -1022,25 +1128,77 @@ class BaselineTransformer(nn.Module):
         temperature: float = 1.0,
         greedy:      bool = False,
         top_k:       Optional[int] = None,
+        top_p:       Optional[float] = None,  # nucleus: smallest set with softmax cumsum >= p
     ) -> torch.Tensor:                       # (B, N0 + max_new_tokens)
-        r"""Autoregressive continuation over the last ``max_seq_len`` tokens (greedy or sampled)."""
+        r"""Autoregressive continuation over the last ``max_seq_len`` tokens (greedy or sampled).
+
+        The sampler and its checks are those of :meth:`vfe3.model.model.VFEModel.generate`, so one RNG state draws
+        the same tokens from the same logits: greedy takes the argmax; otherwise the logits are divided by
+        ``temperature``, then ``top_k`` keeps the k largest, then ``top_p`` keeps the smallest set whose softmax
+        cumsum reaches ``p`` (the top token always kept), and one token is drawn by :func:`torch.multinomial`. A NaN
+        or :math:`+\infty` logit, a row with no finite value, or a non-finite retained logit raises ``ValueError``.
+        Each step decodes the last position only (:meth:`_next_token_logits`), as ``VFEModel.generate`` does.
+        """
         if max_new_tokens < 0:
             raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
-        if not greedy and not temperature > 0.0:
-            raise ValueError(f"temperature must be > 0, got {temperature}")
+        if token_ids.shape[1] <= 0:
+            raise ValueError("generate requires a nonempty token context")
+        if not greedy:
+            if not temperature > 0.0:
+                raise ValueError(f"temperature must be > 0, got {temperature}")
+            if top_k is not None and not 1 <= top_k <= self.cfg.vocab_size:
+                raise ValueError(f"top_k must be in [1, vocab_size={self.cfg.vocab_size}], got {top_k}")
+            if top_p is not None and not 0.0 < top_p <= 1.0:
+                raise ValueError(f"top_p must be in (0, 1], got {top_p}")
         seq = token_ids
         for _ in range(int(max_new_tokens)):
-            logits = self.forward(seq[:, -self.cfg.max_seq_len:])[:, -1, :]               # (B, V)
+            logits = self._next_token_logits(seq[:, -self.cfg.max_seq_len:])               # (B, V)
+            invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)   # (B,)
+            finite_row = torch.isfinite(logits).any(dim=-1)                                  # (B,)
+            if greedy:
+                row_errors = torch.stack((invalid_row, ~finite_row))
+            else:
+                logits = logits / temperature
+                retained = torch.ones_like(logits, dtype=torch.bool)
+                if top_k is not None:
+                    kth = torch.topk(logits, int(top_k), dim=-1).values[:, -1:]             # (B, 1)
+                    remove_topk = logits < kth
+                    retained = ~remove_topk
+                    logits = logits.masked_fill(remove_topk, float("-inf"))
+                retained_invalid = (retained & ~torch.isfinite(logits)).any(dim=-1)          # (B,)
+                row_errors = torch.stack((invalid_row, ~finite_row, retained_invalid))
+            rejected = row_errors.any(dim=-1).tolist()                   # one device-to-host decision per token
+            if rejected[0]:
+                rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(f"generation logits contain NaN or +inf values in rows {rows}")
+            if rejected[1]:
+                rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(f"generation logits have no finite value in rows {rows}")
+            if not greedy and rejected[2]:
+                rows = retained_invalid.nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(f"generation retained logits contain non-finite values in rows {rows}")
             if greedy:
                 nxt = logits.argmax(dim=-1, keepdim=True)
             else:
-                logits = logits / temperature
-                if top_k is not None:
-                    kth = torch.topk(logits, int(top_k), dim=-1).values[:, -1:]
-                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                if top_p is not None:
+                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                    sorted_probs = sorted_logits.softmax(dim=-1)
+                    remove = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_p   # the top token is never removed
+                    logits = logits.masked_fill(remove.scatter(-1, sorted_idx, remove), float("-inf"))
                 nxt = torch.multinomial(torch.softmax(logits, dim=-1), 1)
             seq = torch.cat([seq, nxt], dim=1)
         return seq
+
+    def _next_token_logits(self, window: torch.Tensor) -> torch.Tensor:
+        r"""The fp32 logits ``(B, V)`` of the last position of ``window`` ``(B, n)``.
+
+        The block stack runs over every position (the last one attends to all of them) and the decoder reads
+        only the last state, :math:`2KV` decode FLOPs per generated token instead of :math:`2nKV`
+        (audit 2026-10-31, baseline-generation-10).
+        """
+        h = self.hidden(window)                                                             # (B, n, K) fp32
+        with self._amp_off_context(window.device):
+            return self.decoder.logits(h[:, -1:, :])[:, -1, :]                              # (B, V)
 
     # -- optimization and accounting -----------------------------------------------------------
 
@@ -1063,11 +1221,18 @@ class BaselineTransformer(nn.Module):
     ) -> Dict[str, object]:
         r"""Structural axes and an analytic FLOP count (Kaplan et al. 2020, arXiv:2001.08361, Table 1).
 
-        Forward FLOPs per token :math:`C_f = 2(N_{\rm mm} + VK) + 2 L N_{\rm ctx} K`, with
+        Forward FLOPs per token :math:`C_f = 2(N_{\rm mm} + VK) + 2 L N_{\rm ctx} K + C_{\rm rope} + C_{\exp}`, with
         :math:`N_{\rm mm} = L(4K^2 + 2eK^2) + L K d\,[\text{read map}]` the matrix-multiply
-        parameters and :math:`2 L N_{\rm ctx} K` the attention scores and weighted values; training is
-        :math:`3 C_f` per token. An analytic proxy, not a measurement: the matched-compute arm uses
-        measured device-hours.
+        parameters and :math:`2 L N_{\rm ctx} K` the attention scores and weighted values. Under
+        ``pos_rotation='rope'`` the rotation of queries and keys costs :math:`C_{\rm rope} = 4LKd` through the
+        dense :math:`(N, d, d)` map, or :math:`6LK` in the pairwise form of ``attention_kernel='fused'``. Under
+        ``per_type_table='block_rw'`` the two exponentials :math:`\exp(\mp X)` per token and head cost
+        :math:`C_{\exp} = 2H \cdot` :data:`MATRIX_EXP_PRODUCTS` :math:`\cdot 2d^3 = 20Kd^2` (the products of the
+        degree-18 Taylor evaluation; the squarings a norm above its threshold adds are not booked). Training is
+        :math:`3(C_f - C_{\exp})` plus :math:`9 C_{\exp}` per token: the backward of each exponential is the
+        exponential of a :math:`2d \times 2d` block matrix, booked at eight times its forward (the same product
+        count at twice the width). An analytic proxy, not a measurement: the matched-compute arm uses measured
+        device-hours.
         """
         from vfe3.run_artifacts import _execution_device_fields
 
@@ -1076,7 +1241,14 @@ class BaselineTransformer(nn.Module):
                             cfg.mlp_expansion, cfg.d_head)
         table_mm = {"none": 0, "block_read": L * K * d, "block_rw": 2 * L * K * d}[cfg.per_type_table]
         matmul = L * (4 * K * K + 2 * e * K * K) + table_mm
-        forward_per_token = 2.0 * (matmul + V * K) + 2.0 * L * N * K
+        # Audit 2026-10-31 (baseline-generation-9): the rotation and the block_rw exponentials were not booked.
+        rope = 0.0
+        if cfg.pos_rotation == "rope":
+            rope = 6.0 * L * K if cfg.attention_kernel == "fused" else 4.0 * L * K * d
+        exponentials = (2.0 * cfg.n_heads * MATRIX_EXP_PRODUCTS * 2.0 * d ** 3
+                        if cfg.per_type_table == "block_rw" else 0.0)
+        forward_per_token = 2.0 * (matmul + V * K) + 2.0 * L * N * K + rope + exponentials
+        train_per_token = 3.0 * (forward_per_token - exponentials) + 9.0 * exponentials
         out: Dict[str, object] = {
             "model_family":            MODEL_FAMILY,
             "embed_dim":               K,
@@ -1092,8 +1264,10 @@ class BaselineTransformer(nn.Module):
             "n_learnable_params":      int(sum(p.numel() for p in self.parameters() if p.requires_grad)),
             "n_context_processing_params": int(self.context_processing_parameter_count()),
             "flops_per_token_forward": forward_per_token,
-            "flops_per_token_train":   3.0 * forward_per_token,
-            "est_flops_analytic":      3.0 * forward_per_token * float(tokens_seen),
+            "flops_per_token_rope":    rope,
+            "flops_per_token_type_table_exp": exponentials,
+            "flops_per_token_train":   train_per_token,
+            "est_flops_analytic":      train_per_token * float(tokens_seen),
             **_execution_device_fields(self),
             "amp_dtype":               cfg.amp_dtype,
         }
@@ -1114,14 +1288,18 @@ def build_optimizer(
     Matrices and tables (:math:`E`, :math:`W_{Q,K,V,O}`, :math:`W_{1,2}`, :math:`W_{\rm out}`) decay
     at ``weight_decay``; gains and biases (LayerNorm, :math:`b_{1,2}`, :math:`b_{\rm out}`) do not.
     Both carry role ``"mu"``, so under ``grad_clip_scope='role'`` the loop's per-role clip is one global
-    clip over the transformer; under ``'group'`` each group below is clipped by its own norm.
+    clip over the transformer; under ``'group'`` each group below is clipped by its own norm, except the
+    groups that share a ``clip_set`` key (:func:`vfe3.train.train_step`), which share one.
     The read-map table :math:`X` has its own group (``per_type_table_lr``, ``per_type_table_weight_decay``,
     decaying :math:`A` toward :math:`I`) with role ``"phi"``: like the VFE frame table it replaces, it
     gets its own clip budget and the ``lr_phi`` / ``grad_norm_phi`` columns. Every trainable parameter
     must land in exactly one group. With ``hidden_lr_scale`` :math:`s \ne 1` the hidden matrices
     (:math:`W_{Q,K,V,O}`, :math:`W_{1,2}`) form a fourth group at :math:`s \cdot` ``lr`` with the same decay
     and role (the muP Adam rule for hidden weights, Yang et al. 2022, arXiv:2203.03466, Table 3); :math:`E`
-    and :math:`W_{\rm out}` keep ``lr``. At :math:`s = 1` the groups are the three above.
+    and :math:`W_{\rm out}` keep ``lr``. At :math:`s = 1` the groups are the three above. The hidden group and
+    the decay group then carry ``clip_set='matrices'``, so under ``'group'`` the matrices keep the one clip
+    budget they share at :math:`s = 1`, and the optimizer of a width-transferred arm differs from the matched
+    arm's in the hidden-matrix rate alone (audit 2026-10-31, baseline-generation-2).
     """
     decay: List[nn.Parameter] = []
     hidden: List[nn.Parameter] = []
@@ -1144,8 +1322,9 @@ def build_optimizer(
         {"params": no_decay, "lr": cfg.lr, "weight_decay": 0.0, "role": "mu"},
     ]
     if hidden:
+        groups[0]["clip_set"] = "matrices"
         groups.append({"params": hidden, "lr": cfg.lr * cfg.hidden_lr_scale, "weight_decay": cfg.weight_decay,
-                       "role": "mu"})
+                       "role": "mu", "clip_set": "matrices"})
     if table:
         groups.append({
             "params": table,

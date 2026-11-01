@@ -4,8 +4,9 @@ The fused route (vfe3/kernels/kl_decode.py) keeps the cross-term GEMMs in cuBLAS
 assembly, clamp, temperature, unigram bias, online log-sum-exp, target gather and their backward in Triton. These
 tests pin:
 
-* the field defaults off, is marked inactive off the two KL decoders, sits in the launcher at its default, reaches
-  the prior bank, and the kernel that ran is recorded in summary.json;
+* the field is a bool (on by default since 2026-10-12; the default snapshot test pins the value), is marked inactive
+  off the two KL decoders, sits in the launcher with its valid values, reaches the prior bank, and the kernel that
+  ran is recorded in summary.json;
 * CPU tensors run the torch loop whatever the toggle (bitwise the same CE and gradients) and never import triton;
 * under the Triton interpreter (CPU, ``TRITON_INTERPRET=1``) the fused route reproduces the torch route's CE and
   every gradient on ragged chunks with ignored targets, the unigram bias, small and large temperatures and

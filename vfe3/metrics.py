@@ -603,7 +603,7 @@ def half_fisher_trace(
     return (0.5 / sigma.clamp(min=eps)).sum(dim=-1)
 
 
-fisher_trace = half_fisher_trace
+fisher_trace = half_fisher_trace           # test alias: referenced only by the tests
 
 
 def sigma_trace(
@@ -1005,6 +1005,9 @@ def group_gauge_invariant(
     (traceless generators, det == 1), so it is blind off block_glk. This dispatches the correct
     invariant: GL volume log|det exp(phi)| for block_glk, and total rotation angle
     (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
+
+    Test oracle: referenced only by the tests, which check the blockwise evaluation of
+    ``VFEModel._frame_class_diagnostics`` against it.
     """
     if getattr(group, "skew_symmetric", False):                  # so_n, tied or untied
         ang = torch.angle(eigvals_on_host(exp_phi))              # (..., K) eigenphases
@@ -1045,6 +1048,9 @@ def per_head_gauge_invariants(
     ``gauge_head_aniso_mean`` column changes scale: it is now 0 at an isometric block and grows
     logarithmically, rather than 1 and growing linearly. ``vertex_cond_*`` remains the
     frame-dependent conditioning probe, honestly named, for anyone who wants the old quantity.
+
+    Test oracle: referenced only by the tests, which check the blockwise evaluation of
+    ``VFEModel._frame_class_diagnostics`` against it.
     """
     logdets, anisos = [], []
     start = 0
@@ -1112,6 +1118,7 @@ def per_head_complex_phase(
     The complex block is :math:`Z = A + iB` with :math:`A = (X_{00} + X_{11})/2` and
     :math:`B = (X_{10} - X_{01})/2` over the pair sub-blocks :math:`X_{ab}` = ``X[a::2, b::2]``, which is
     exact on the image of GL(m, C). Invariant under a global GL(m, C) conjugation. Complex128.
+    Test oracle: referenced only by the tests.
     """
     if any(d % 2 for d in irrep_dims):
         raise ValueError(f"per_head_complex_phase needs even head blocks; got {irrep_dims}")
@@ -1257,7 +1264,9 @@ def structured_head_scores(
 
     ``prev_token`` = mean_i beta_{i,i-1}; ``period_match`` = mean over causal pairs with i > j and
     (i - j) mod ``period`` == 0 of beta_ij (the period-3 copy structure on the synthetic stream);
-    ``diagonal_band`` = mean_i sum_{0 < i-j <= band_width} beta_ij. Each keeps leading (head) axes.
+    ``diagonal_band`` = mean over the rows i >= 1 that have a band entry of the band mass
+    sum_{0 < i-j <= band_width} beta_ij (equal to ``prev_token`` at ``band_width`` = 1; it was the mean over band
+    pairs before audit 2026-10-31 A283). Each keeps leading (head) axes.
     """
     n = beta.shape[-1]
     ii = torch.arange(n, device=beta.device).unsqueeze(-1)
@@ -1273,33 +1282,49 @@ def structured_head_scores(
         denom = m.sum().clamp(min=1.0)
         return (beta * m).sum(dim=(-2, -1)) / denom
 
+    band_rows = band_mask.any(dim=-1).to(beta.dtype).sum().clamp(min=1.0)          # rows with a band entry
     return {
         "prev_token":    prev,
         "period_match":  _masked_mean(period_mask),
-        "diagonal_band": _masked_mean(band_mask),
+        "diagonal_band": (beta * band_mask.to(beta.dtype)).sum(dim=(-2, -1)) / band_rows,
     }
 
 
 # --- attention structure (entropy, head redundancy, distance decay) ---
 
 def head_redundancy_js(
-    beta: torch.Tensor,                  # (H, N, N) per-head attention for one layer
+    beta: torch.Tensor,                  # (H, N, N) per-head attention for one layer (or L*H flattened maps)
 
     *,
     eps:  float = 1e-12,
+    max_block_elements: int = 1 << 24,   # elements of one (R, H, N, N) intermediate; R >= 1 rows per block
 ) -> torch.Tensor:                       # (H, H) mean row-wise Jensen-Shannon divergence (nats)
     r"""Pairwise Jensen-Shannon divergence between heads' row distributions (head specialization).
 
     JS(beta^h || beta^h') = mean_i [ (1/2) KL(beta_i^h || m_i) + (1/2) KL(beta_i^h' || m_i) ],
     m_i = (1/2)(beta_i^h + beta_i^h'). High off-diagonal -> specialized heads, low -> redundant.
+
+    The matrix is built in blocks of R rows of the first index, R the largest count whose (R, H, N, N)
+    intermediates hold at most ``max_block_elements`` entries (at least one row), so the transient is
+    O(R H N^2) instead of O(H^2 N^2). The 60 flattened (layer, head) maps of the live attention_structure
+    figure at N = 512 made about 10.7 GiB of (60, 60, N, N) intermediates in one block (audit 2026-10-31
+    viz-figures-1); one layer's heads fit one block, which is the unblocked computation.
     """
     b = beta.clamp(min=eps)                                       # (H, N, N)
-    bh = b.unsqueeze(1)                                           # (H, 1, N, N)
+    n_maps = int(b.shape[0])
+    per_row = max(1, n_maps * int(b.shape[-2]) * int(b.shape[-1]))
+    rows = max(1, min(n_maps, int(max_block_elements) // per_row))
     bh2 = b.unsqueeze(0)                                          # (1, H, N, N)
-    m = 0.5 * (bh + bh2)
-    kl1 = (bh * (torch.log(bh) - torch.log(m))).sum(dim=-1)       # (H, H, N)
-    kl2 = (bh2 * (torch.log(bh2) - torch.log(m))).sum(dim=-1)
-    return (0.5 * (kl1 + kl2)).mean(dim=-1)                       # (H, H)
+    log_bh2 = torch.log(bh2)
+    blocks = []
+    for start in range(0, n_maps, rows):
+        bh = b[start:start + rows].unsqueeze(1)                   # (R, 1, N, N)
+        m = 0.5 * (bh + bh2)                                      # (R, H, N, N)
+        log_m = torch.log(m)
+        kl1 = (bh * (torch.log(bh) - log_m)).sum(dim=-1)          # (R, H, N)
+        kl2 = (bh2 * (log_bh2 - log_m)).sum(dim=-1)
+        blocks.append((0.5 * (kl1 + kl2)).mean(dim=-1))           # (R, H)
+    return blocks[0] if len(blocks) == 1 else torch.cat(blocks, dim=0)   # (H, H)
 
 
 def attention_distance_decay(
@@ -1734,6 +1759,7 @@ def estep_residuals(
     r_mu(t) = ||mu_t - mu_{t-1}||, r_sigma(t) = spd_geodesic_distance(Sigma_{t-1}, Sigma_t)
     (the affine-invariant step, NOT a Euclidean one), r_phi(t) = ||phi_t - phi_{t-1}||. Shrinking
     residuals certify the E-step converges to a fixed point in the geometry it actually moves in.
+    Test oracle: referenced only by the tests.
     """
     r_mu = torch.linalg.norm(mu_traj[1:] - mu_traj[:-1], dim=-1)              # (T, N)
     r_sigma = spd_geodesic_distance(sigma_traj[:-1], sigma_traj[1:], diagonal=diagonal, eps=eps)

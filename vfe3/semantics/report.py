@@ -21,6 +21,10 @@ view drops frames without a real principal logarithm). The unit normalization ``
 \log\sigma^2_{vk}` over all candidates, the same reference set the ``sigma`` section uses; the
 ``phi_log`` chart takes its ``D0`` and barycenter from the first ``frame_ref_count`` candidates (the
 most frequent, or the lowest token ids when training counts are unavailable), as the ``phi`` section does.
+For tables whose ``log_var`` is not the diagonal of a diagonal prior the ``w2_chart`` and ``log_var`` views
+follow the ``sigma`` section: under ``gaussian_frame_diagonal`` (reference variances) ``w2_chart`` is not
+built and ``log_var`` charts :math:`\log c_v`; under ``prior_covariance_table='block_cholesky'`` both
+chart the diagonal marginals :math:`N(\mu_v, \mathrm{diag}\,C_v)` and say so.
 
 Presets (:data:`PRESETS`, option ``"preset"``). ``"full"`` keeps :data:`DEFAULT_OPTIONS`.
 ``"quick"`` is the lean per-seed battery of a multi-seed study: the views are the run's headline
@@ -93,6 +97,7 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
     "views":               None,          # None -> every applicable view (subset of VIEW_NAMES)
     "headline_view":       None,          # None -> first of _HEADLINE_PRIORITY present
     "drop_unknown_config_fields": False,  # True: drop retired config toggles at load (load_semantic_run)
+    "benchmark_dir":       None,          # None -> gensim test data; else the directory of the benchmark files
 }
 
 SECTIONS: Tuple[str, ...] = ("embeddings", "sigma", "phi", "contextual")
@@ -225,9 +230,7 @@ def _natural_parameters(run: Any, ids: np.ndarray) -> np.ndarray:
               = \langle \lambda(q), \eta_v \rangle + c_v + c(q),
               \qquad \lambda(q) = (\mu,\ \mu^2 + \mathrm{diag}\,\Sigma),
 
-    so :math:`\eta_v` is the decode "unembedding" row paired with the lifted belief. This holds
-    only without the prior-bank head-evidence mixer, which weights coordinate :math:`k` of the KL by
-    :math:`1 + c_{\delta,k}`; :func:`build_views` does not build the view when the mixer is on.
+    so :math:`\eta_v` is the decode "unembedding" row paired with the lifted belief.
     """
     m = run.decode_mu(ids)                                                  # (n, K)
     t = np.exp(run.decode_log_var(ids))                                     # (n, K)
@@ -245,11 +248,15 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
     * ``mu_raw`` -- prior means :math:`\mu_v` (trained coordinates);
     * ``mu_sigma_units`` -- :math:`\mu_v d_0` with :math:`\log d_{0,k} = -\tfrac12\,\mathrm{mean}_v\,\log\sigma^2_{vk}`;
     * ``w2_chart`` (Euclidean) -- :math:`[\mu_v d_0,\ \sqrt{v_v}\, d_0]`, whose Euclidean distance is
-      the 2-Wasserstein distance of the diagonal priors in D0 units;
+      the 2-Wasserstein distance of the diagonal priors in D0 units (of the diagonal marginals
+      :math:`N(\mu_v, \mathrm{diag}\,C_v)` under ``block_cholesky``; not built under
+      ``gaussian_frame_diagonal``, whose :math:`(\mu_v, c_v)` are not one Gaussian's moments in one chart);
     * ``xi_ref`` -- reference content :math:`\xi_{v,p} = e^{-Y_p} e^{-X_v}\mu_v`, per-block ZCA
       whitened (:func:`vfe3.semantics.frames.reference_content`), when frames are active;
     * ``log_var`` (Euclidean) -- :math:`\log\sigma^2_v` (for equal means the Fisher-Rao distance is
-      :math:`\|\Delta\log\sigma^2\|/\sqrt 2`);
+      :math:`\|\Delta\log\sigma^2\|/\sqrt 2`; of the diagonal marginals under ``block_cholesky``, and
+      the reference log-variances :math:`\log c_v` without a Fisher-Rao reading under
+      ``gaussian_frame_diagonal``);
     * ``phi_raw`` -- raw algebra coordinates (trained trivialization), when frames are active;
     * ``phi_log`` -- flattened canonical logs :math:`L_v = \log\hat U_v` (``ctx.cache`` or
       :func:`vfe3.semantics.frames.canonical_frames`), rows without a real log excluded;
@@ -278,6 +285,11 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
         notes.append("no view built: the candidate set is empty (see coverage.candidates and the run notes)")
         return views
     d_clause = _d_clause(run.cfg)
+    # Tables whose log_var is not the diagonal of a diagonal prior (audit 2026-10-31 semantics-stats-1), read
+    # as the Sigma section reads them: reference variances c_v of Sigma_v = U_v diag(c_v) U_v^T, or the
+    # diagonal of the per-head block_cholesky covariance C_v.
+    reference = bool(getattr(run, "reference_variances", False))
+    blocks = bool(getattr(run, "prior_covariance_blocks", False))
 
     mu = run.mu(ids)                                                        # (n, K)
     lv = run.log_var(ids)                                                   # (n, K)
@@ -300,17 +312,41 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
         note=("Prior means μ_v in the trained coordinates. Cosine retrieval is not invariant under the "
               f"global positive-diagonal rescaling μ → Dμ, which is {d_clause}; analogy arithmetic "
               "a* − a + b is equivariant, the retrieval metric is not.")))
+    if reference:
+        units_note = ("μ_v·d0 with log d0_k = −½ mean over the candidates of log c_vk, the reference variances of "
+                      "gaussian_frame_diagonal (the Σ section's reference set). The global positive-diagonal "
+                      "rescaling acts on this family as μ → Dμ, U → DU with c_v fixed, so d0 does not compensate it "
+                      f"and this chart is not invariant under it; that rescaling is {d_clause}.")
+    else:
+        units_note = ("μ_v·d0 with log d0_k = −½ mean over the candidates of log σ²_vk (the Σ section's reference "
+                      "set). Invariant under μ → Dμ, log σ² → log σ² + 2 log D; that rescaling is "
+                      f"{d_clause}.")
     attempt("mu_sigma_units", lambda: VectorView(
         name="mu_sigma_units", label="μ·d0 (D0 units)", ids=ids, X=mu_d0, metric="cosine", group="mu",
-        note=("μ_v·d0 with log d0_k = −½ mean over the candidates of log σ²_vk (the Σ section's reference "
-              "set). Invariant under μ → Dμ, log σ² → log σ² + 2 log D; that rescaling is "
-              f"{d_clause}.")))
-    attempt("w2_chart", lambda: VectorView(
-        name="w2_chart", label="W2 chart (μ, √v)", ids=ids, X=gaussians.w2_chart(mu, lv, log_d0),
-        metric="euclidean", group="sigma",
-        note=("Euclidean chart [μ·d0, √v·d0]: the Euclidean distance is the 2-Wasserstein distance between "
-              "the diagonal priors in D0 units, invariant under the global diagonal rescaling, which is "
-              f"{d_clause}.")))
+        note=units_note))
+
+    def w2_view() -> Optional[VectorView]:
+        if reference:
+            notes.append("view w2_chart skipped: gaussian_frame_diagonal stores the reference variances c_v of "
+                         "Σ_v = U_v diag(c_v) U_v^T, so (μ_v, √c_v) are not one Gaussian's moments in one chart and "
+                         "no Euclidean chart gives the 2-Wasserstein distance of the stored priors (the Σ section "
+                         "marks its divergences not applicable for the same reason)")
+            return None
+        if blocks:
+            label = "W2 chart (μ, √diag C)"
+            note = ("Euclidean chart [μ·d0, √(diag C)·d0] of the diagonal marginals N(μ_v, diag C_v) of the "
+                    "block_cholesky prior table: the Euclidean distance is the 2-Wasserstein distance between "
+                    "those marginals in D0 units, not between the stored priors, whose within-head correlations "
+                    f"it drops; invariant under the global diagonal rescaling, which is {d_clause}.")
+        else:
+            label = "W2 chart (μ, √v)"
+            note = ("Euclidean chart [μ·d0, √v·d0]: the Euclidean distance is the 2-Wasserstein distance between "
+                    "the diagonal priors in D0 units, invariant under the global diagonal rescaling, which is "
+                    f"{d_clause}.")
+        return VectorView(name="w2_chart", label=label, ids=ids, X=gaussians.w2_chart(mu, lv, log_d0),
+                          metric="euclidean", group="sigma", note=note)
+
+    attempt("w2_chart", w2_view)
 
     def xi_ref() -> Optional[VectorView]:
         if not run.frames_active:
@@ -331,10 +367,24 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
         if float(np.ptp(lv, axis=0).max()) <= 0.0:
             notes.append("view log_var skipped: the log-variance table is constant over the candidates")
             return None
-        return VectorView(
-            name="log_var", label="log σ²", ids=ids, X=lv, metric="euclidean", group="sigma",
-            note=("Log-variance rows log σ²_v (Euclidean). The global diagonal rescaling is a translation, so "
-                  "distances are invariant; for equal means the Fisher–Rao distance is ‖Δ log σ²‖/√2."))
+        if reference:
+            label = "log c (reference)"
+            note = ("Reference log-variances log c_v of gaussian_frame_diagonal, whose prior covariance is "
+                    "Σ_v = U_v diag(c_v) U_v^T (Euclidean). Each c_v is a variance in its token's own frame, so the "
+                    "distances compare those variances and are not Fisher–Rao distances of the stored priors, whose "
+                    "frames differ between tokens; the global diagonal rescaling (μ → Dμ, U → DU) leaves c_v fixed.")
+        elif blocks:
+            label = "log diag C"
+            note = ("Log-variances log diag C_v of the diagonal marginals N(μ_v, diag C_v) of the block_cholesky "
+                    "prior table (Euclidean). The global diagonal rescaling is a translation, so distances are "
+                    "invariant; for equal means ‖Δ log diag C‖/√2 is the Fisher–Rao distance between those "
+                    "marginals, not between the stored priors, whose within-head correlations it drops.")
+        else:
+            label = "log σ²"
+            note = ("Log-variance rows log σ²_v (Euclidean). The global diagonal rescaling is a translation, so "
+                    "distances are invariant; for equal means the Fisher–Rao distance is ‖Δ log σ²‖/√2.")
+        return VectorView(name="log_var", label=label, ids=ids, X=lv, metric="euclidean", group="sigma",
+                          note=note)
 
     attempt("log_var", log_var_view)
 
@@ -372,7 +422,10 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
                   f"{frames.reference_set_phrase(cf.ref_ids.size, by_count=ctx.counts is not None)}, D0 from "
                   "their mean log-variance): invariant under the split redundancy and the global diagonal "
                   f"rescaling{_invariance_qualifier(cf.diagnostics)}; the rescaling is {d_clause}"
-                  + (f"; {n_bad} rows without a real principal log are excluded." if n_bad else ".")))
+                  + (f"; {n_bad} rows without a real principal log are excluded." if n_bad else ".")
+                  + (" The token frame is pure gauge on this configuration (a per-type reparametrization of the "
+                     "tables leaves every logit unchanged), so these rows also carry the per-type gauge training "
+                     "selected." if frames.token_frame_gauge(run.cfg)["status"] == "gauge" else "")))
 
     attempt("phi_log", phi_log)
 
@@ -475,7 +528,8 @@ def _embeddings_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     batteries: Dict[str, Dict[str, Any]] = {}
     failed: Dict[str, str] = dict(ctx.cache.get("view_errors", {}))
     view_seconds: Dict[str, Dict[str, float]] = {}
-    for name, view in views.items():
+    # one prepare() per view, shared by its battery and its per-view figures (audit 2026-10-31 semantics-vectors-6)
+    for name, view in vectors.views_with_prepared_rows(views):
         t = time.perf_counter()
         try:
             battery = vectors.run_vector_battery(view, ctx)
@@ -899,7 +953,8 @@ _FIGURE_CAPTIONS: Dict[str, str] = {
     "analogy_categories": ("Google analogy 3CosAdd accuracy minus ONLY-B per category and view (cell text: "
                            "accuracy with ONLY-B in parentheses), with micro and macro rows"),
     "analogy_methods": "overall analogy accuracy per method and view",
-    "similarity": "SimLex-999 / WordSim-353 Spearman ρ per view with bootstrap 95% CI",
+    "similarity": ("SimLex-999 / WordSim-353 Spearman ρ per view with a pair-bootstrap 95% CI (pairs resampled "
+                   "as independent although benchmark words recur across pairs)"),
     "fields": ("semantic-field kNN purity with the permutation null band (grey) and the frequency-stratified "
                "null band (tan), and silhouette per view"),
     "geometry": "effective rank, IsoScore, mean cosine and TwoNN intrinsic dimension per view",
@@ -1322,6 +1377,10 @@ def _phi_summary(res: SectionResult) -> str:
                     "did not converge in every block (best iterate used"
                     + (f", largest residual {residual:.1e}" if residual is not None else "")
                     + "), so the chart's invariance holds only up to that residual."))
+    if _get(m, "token_frame_gauge", "status") == "gauge":
+        s.append("On this configuration the token frame is pure gauge (a per-type reparametrization of the tables "
+                 "leaves every logit unchanged), so the per-token frame statistics below describe the gauge "
+                 "training selected rather than model content.")
     comm = m.get("commutator_raw", {})
     iid = comm.get("iid_gaussian_ratio") or []
     if _num(comm.get("ratio_block_median")) is not None:
